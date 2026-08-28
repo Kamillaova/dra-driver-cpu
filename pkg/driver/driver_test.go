@@ -21,12 +21,20 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/containerd/nri/pkg/api"
+	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
+	"k8s.io/utils/cpuset"
 )
 
 type mockNRIRunner struct {
@@ -329,4 +337,64 @@ func TestStartRefusesARootWithNoRoomForTheSocket(t *testing.T) {
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Unix socket path")
+}
+
+// TestPlacementChangesAreSerialized drives every hook that reads or writes a
+// placement against Synchronize, which replaces all three stores wholesale.
+//
+// Under -race this is what catches the pointer swap going unsynchronized: before
+// applyMu, a hook could be reading the store Synchronize was in the middle of
+// replacing. It also covers the CDI manager, which the same lock is what keeps
+// serial.
+func TestPlacementChangesAreSerialized(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-uid-1")
+	claimedCPUs := cpuset.New(0, 1)
+	pod := &api.PodSandbox{Id: "pod-id-1", Name: "pod", Namespace: "ns", Uid: "pod-uid-1"}
+	ctr := &api.Container{
+		Id:           "ctr-id-1",
+		PodSandboxId: pod.Id,
+		Name:         "ctr",
+		Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, claimedCPUs.String())},
+	}
+
+	allocationStore := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, allocationStore.ReserveResourceClaimAllocation(logger, claimUID, claimedCPUs, false))
+
+	d := &CPUDriver{
+		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: claimedCPUs}),
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: allocationStore,
+		claimTracker:       store.NewClaimTracker(),
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+	}
+
+	ctx := context.Background()
+	claims := []kubeletplugin.NamespacedObject{{UID: claimUID}}
+	var wg sync.WaitGroup
+	for range 30 {
+		wg.Add(4)
+		// Every one of these may legitimately fail depending on the interleaving;
+		// what must not happen is a race or a torn view of the stores.
+		go func() { defer wg.Done(); _, _ = d.Synchronize(ctx, []*api.PodSandbox{pod}, []*api.Container{ctr}) }()
+		go func() { defer wg.Done(); _, _, _ = d.CreateContainer(ctx, pod, ctr) }()
+		go func() { defer wg.Done(); _, _ = d.StopContainer(ctx, pod, ctr) }()
+		go func() { defer wg.Done(); _, _ = d.UnprepareResourceClaims(ctx, claims) }()
+	}
+	wg.Wait()
+
+	// Whatever order they ran in, the node still accounts for every CPU exactly
+	// once: prepared and shared partition the allocatable set.
+	prepared := d.cpuAllocationStore.GetPreparedCPUs()
+	shared := d.cpuAllocationStore.GetSharedCPUs()
+	require.True(t, prepared.Intersection(shared).IsEmpty(), "a CPU is both claimed and shared")
+	require.True(t, prepared.Union(shared).Equals(allCPUs), "CPUs went missing")
 }
