@@ -319,6 +319,7 @@ type driverConfigValues struct {
 	GroupBy                               string `json:"groupBy,omitempty"`
 	ReservedCPUs                          string `json:"reservedCPUs,omitempty"`
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
+	DefragEnabled                         bool   `json:"defragEnabled,omitempty"`
 }
 
 // getDriverConfigValues reads the ConfigMap if the daemonset uses --config=, else falls back to
@@ -382,6 +383,55 @@ func makeTesterPodWithNamedClaim(ns, image, claimName string, nodeName string, n
 		},
 	}
 	return e2epod.PinToNode(pod, nodeName)
+}
+
+// createClaimedTesterPod places a pod holding one exclusive claim of numCPUs and
+// returns it along with the claim's UID, which is how /placements names it.
+func createClaimedTesterPod(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, string) {
+	ginkgo.GinkgoHelper()
+	pod, claimUID, err := tryCreateClaimedTesterPodWithUID(ctx, fxt, image, nodeName, cfg, numCPUs, claimTemplateName)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	return pod, claimUID
+}
+
+func tryCreateClaimedTesterPod(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, error) {
+	pod, _, err := tryCreateClaimedTesterPodWithUID(ctx, fxt, image, nodeName, cfg, numCPUs, claimTemplateName)
+	return pod, err
+}
+
+func tryCreateClaimedTesterPodWithUID(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, string, error) {
+	claimTemplate := resourcev1.ResourceClaimTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: claimTemplateName},
+		Spec: resourcev1.ResourceClaimTemplateSpec{
+			Spec: makeResourceClaimSpec(numCPUs, cfg.CPUDeviceMode == "grouped"),
+		},
+	}
+	created, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &claimTemplate, metav1.CreateOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+
+	pod := makeTesterPodWithExclusiveCPUClaim(fxt.Namespace.Name, image, created.Name, int64(numCPUs), nodeName,
+		cfg.PublishNodeAllocatableResourceMapping)
+	pod, err = e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// The generated claim carries the pod's own name, and its UID is what the
+	// driver knows it by.
+	claims, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	for _, claim := range claims.Items {
+		for _, ref := range claim.OwnerReferences {
+			if ref.UID == pod.UID {
+				return pod, string(claim.UID), nil
+			}
+		}
+	}
+	return nil, "", fmt.Errorf("no resource claim found for pod %s/%s", pod.Namespace, pod.Name)
 }
 
 func makeResourceClaimSpec(cpus int, isConsumable bool) resourcev1.ResourceClaimSpec {

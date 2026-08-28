@@ -62,6 +62,14 @@ honor these settings, where applicable.
   gate; the stock kind configs enable it (they require a 1.37+ node image, which is the
   Makefile default).
 
+- `DRACPU_E2E_DEFRAG`: (optional, default `false`): when `true`, *the Makefile* `ci-kind-setup` target
+  deploys the driver with `driverConfig.defragEnabled: true` and the
+  `driverConfig.assumeUnsolicitedUpdatesSafe: true` it requires, and the defragmentation tests run
+  instead of skipping. Only set this on containerd: a runtime whose vendored NRI predates
+  [containerd/nri#301](https://github.com/containerd/nri/pull/301) can deadlock on the container
+  updates a move issues. The tests skip themselves anyway on a node whose CPUs the driver sees as one
+  uncore cache, since there is no spread to recover there.
+
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.
