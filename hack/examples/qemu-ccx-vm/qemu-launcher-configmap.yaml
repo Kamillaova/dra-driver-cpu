@@ -99,6 +99,20 @@ data:
         return ordered
 
     def split(cpus):
+        # With a static shared pool the driver appends the pool CPUs of the
+        # claim's NUMA nodes to the container and names them in DRA_SHARED_CPUS
+        # -- the one placement fact safe to read from the environment, because
+        # the pool is static and a move preserves the claim's NUMA footprint.
+        # Exclusive CPUs are then simply everything else, and control threads go
+        # to the pool, where the kernel scheduler balances them against whatever
+        # else shares it.
+        shared = set(cpu_list(os.environ.get("DRA_SHARED_CPUS", "")))
+        if shared:
+            exclusive = [cpu for cpu in cpus if cpu not in shared]
+            return cache_ordered(exclusive), sorted(shared & set(cpus))
+        # Without a pool, fall back to carving CONTROL_CPUS out of the claim
+        # itself: the cache-ordered tail, which the sibling-adjacent ordering
+        # keeps to whole cores.
         ordered = cache_ordered(cpus)
         control = min(CONTROL_CPUS, max(0, len(ordered) - 1))
         if control == 0:

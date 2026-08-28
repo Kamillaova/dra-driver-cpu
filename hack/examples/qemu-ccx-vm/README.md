@@ -27,19 +27,28 @@ changes inotify cannot see: CPU hotplug and a parent cgroup shrinking. The CPU
 ## vCPU threads vs control threads
 
 QEMU is more than its vCPUs: the main loop, iothreads, vhost workers and RCU
-threads all need CPU time, and left unpinned inside the claim they steal it
-from vCPUs. The launcher therefore splits the claim: the last `CONTROL_CPUS` of
-the cache-ordered set take every thread that is not a vCPU, and the vCPUs get
-the rest -- which is why the whole-cache class claims vCPUs *plus one core*.
+threads all need CPU time, and left unpinned beside the vCPUs they steal it
+from them. Where they belong depends on one driver setting.
 
-The split must live inside the claim: a container's threads cannot be pinned
-outside its own cgroup cpuset, so control threads cannot be sent to the node's
-shared pool. And it must be one claim, not two: a container holding two claims
-is pinned to their union, and nothing inside the container can tell which CPUs
-belong to which claim -- both injected variables say `dynamic`. A per-NUMA
-shared device for control threads, with oversubscribed capacity and admission
-control, is designed in the fork's plan (Option C) and deliberately not built
-yet.
+**With `sharedPoolCPUs` configured (recommended):** the driver appends the pool
+CPUs of the claim's NUMA nodes to the container's cpuset and names them in
+`DRA_SHARED_CPUS`. The launcher pins vCPUs onto `sched_getaffinity() minus DRA_SHARED_CPUS` -- the exclusive CPUs -- and leaves every other thread to the
+kernel scheduler inside the pool, alongside whatever else shares it. The claim
+is sized to the vCPUs alone. `DRA_SHARED_CPUS` is the one placement fact that is
+safe to read from the environment: the pool is static, and a move preserves the
+claim's NUMA footprint, so the value cannot go stale.
+
+**Without a pool:** control threads cannot leave the claim -- a container's
+threads cannot be pinned outside its own cgroup cpuset -- so set `CONTROL_CPUS`
+and size the claim vCPUs *plus one core*: the launcher carves the cache-ordered
+tail, a whole core, out of the claim itself.
+
+It must be one claim either way, not a vcpus claim plus a control claim: a
+container holding two claims is pinned to their union, and nothing inside the
+container can tell which CPUs belong to which -- both identity variables say
+`dynamic`. A per-NUMA shared *device* with oversubscribed capacity and admission
+control (the plan's Option C) remains future work; the static pool is its
+carve-out half, built.
 
 ## Sizing rules worth knowing
 
