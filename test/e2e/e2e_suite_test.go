@@ -430,8 +430,18 @@ func tryCreateClaimedTesterPodWithUID(ctx context.Context, fxt *fixture.Fixture,
 	// scheduler count them twice, and a test that fills a node with claims runs
 	// out of node-allocatable cpu long before it runs out of claimable CPUs.
 	pod := makeTesterPodWithExclusiveCPUClaimWithoutCPURequest(fxt.Namespace.Name, image, created.Name, nodeName)
-	pod, err = e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
+	pod, err = fxt.K8SClientset.CoreV1().Pods(fxt.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
+		return nil, "", err
+	}
+	if err := e2epod.WaitToBeRunning(ctx, fxt.K8SClientset, pod.Namespace, pod.Name); err != nil {
+		// A refusal is a legitimate outcome for callers that fill a node -- but a
+		// pod left behind Pending is not: it would be admitted the moment the
+		// caller deletes something, and haunt the rest of the test with a claim
+		// nobody is tracking.
+		if deleteErr := e2epod.DeleteSync(ctx, fxt.K8SClientset, pod); deleteErr != nil {
+			return nil, "", fmt.Errorf("pod %s was refused (%w) and could not be cleaned up: %w", pod.Name, err, deleteErr)
+		}
 		return nil, "", err
 	}
 
