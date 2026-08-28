@@ -93,4 +93,26 @@ running container's cpuset is a semantic upstream has not sanctioned.
 Record here any place where reality contradicted the design (renamed upstream API, different observed
 behaviour) rather than silently adapting.
 
-- _none yet_
+- **The planner's progress rule is not distance to the ideal packing.** That rule deadlocks. A node
+  whose free CPUs are scattered one per cache has no claim that can reach its ideal in a single step,
+  and a small claim sitting in the cache a large one needs gets no closer to its own ideal by stepping
+  aside, so nothing is ever emitted. A pass instead ranks a placement by wasted caches first and by
+  CPUs occupied that the ideal owes to another claim second, and moves a claim only when that strictly
+  falls. Tests cover both deadlocks: removing either term of the measure makes them fail.
+- **A move can leave its own claim worse placed, so that is checked separately.** The ideal minimises
+  the node's total cost, which does not minimise every claim's: a claim sitting neatly inside one
+  cache can be dealt an awkward remnant once larger claims are packed first. Such a move is skipped.
+- **`BeginRebind` validates only the claim's CPU count**, plus the overlap and state-machine invariants
+  the store owns. Preserving the per-NUMA footprint and taking whole cores are properties of the
+  target, enforced where the target is chosen; duplicating them in the store would give the same
+  policy two homes.
+- **The defragmentation options are flat `defrag*` fields, not a nested block.** `Config` is flat
+  throughout, its dump mirror is a field-for-field type conversion, and two reflection tests walk its
+  fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
+- **One metric carries a `numa_node` label**, against the rule stated in `docs/user/metrics.md`. The
+  rule is amended there rather than quietly broken.
+- **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
+  node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
+  which needs a flag carried through `ContainerState`. Neither affects correctness — the first only
+  lets a pass do avoidable work on a node about to be emptied, and the cooldown covers the churn the
+  second would.
