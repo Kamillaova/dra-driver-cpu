@@ -61,6 +61,7 @@ DaemonSet.
 Symbols the fork adds to an upstream file, which carry no marker of their own:
 
 - `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `GetDeviceCPUSet`
+- `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`
 
 `CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
 placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
