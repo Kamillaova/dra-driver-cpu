@@ -158,3 +158,16 @@ func TestServePlacementsRejectsOtherMethods(t *testing.T) {
 	require.Equal(t, http.StatusMethodNotAllowed, recorder.Code)
 	require.Equal(t, http.MethodGet, recorder.Header().Get("Allow"))
 }
+
+func TestServePlacementsReportsAnErrorItCannotSnapshotThrough(t *testing.T) {
+	// The report starts from the online CPUs; without them there is no truthful
+	// snapshot, so the endpoint must say so rather than serve a partial one.
+	d := newDefragTestDriver(t, 2, 4)
+	d.sysfs = nil
+
+	recorder := httptest.NewRecorder()
+	d.ServePlacements(recorder, httptest.NewRequest(http.MethodGet, "/placements", nil))
+
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "cannot report placements")
+}

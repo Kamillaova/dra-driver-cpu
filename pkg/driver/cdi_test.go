@@ -331,3 +331,33 @@ func TestGetDeviceCPUSetMissingDevice(t *testing.T) {
 	_, err = mgr.GetDeviceCPUSet("claim-cpu-absent")
 	require.Error(t, err)
 }
+
+func TestGetDeviceCPUSetMalformedAnnotation(t *testing.T) {
+	// The annotation is driver-written, so a value that does not parse means the
+	// spec was corrupted or hand-edited. The claim's placement is then unknown,
+	// which must surface as an error rather than as an empty cpuset a caller
+	// would treat as "no CPUs".
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-cpu-corrupt"
+	spec := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name:        deviceName,
+			Annotations: map[string]string{cdiCPUSetAnnotation: "not-a-cpuset"},
+			ContainerEdits: cdiSpec.ContainerEdits{
+				Env: []string{"DRA_CPUSET_claim-cpu-corrupt=0-1"},
+			},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(spec, mgr.getSpecName(deviceName)))
+	require.NoError(t, mgr.Refresh())
+
+	_, err = mgr.GetDeviceCPUSet(deviceName)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to parse")
+	require.Contains(t, err.Error(), cdiCPUSetAnnotation)
+}
