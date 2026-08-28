@@ -118,6 +118,16 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, online cpuset.CPUSet) 
 	cp.applyMu.Lock()
 	defer cp.applyMu.Unlock()
 
+	// A cooldown entry says nothing once its window has lapsed, and claim UIDs
+	// never repeat, so entries left behind would accumulate for every claim ever
+	// moved for as long as the driver runs. Prune here, under the same lock that
+	// guards every other reader.
+	for claimUID, movedAt := range cp.lastMoved {
+		if time.Since(movedAt) >= cp.defrag.claimCooldown {
+			delete(cp.lastMoved, claimUID)
+		}
+	}
+
 	if round := cp.takePendingRound(logger); round != nil {
 		return round, nil
 	}

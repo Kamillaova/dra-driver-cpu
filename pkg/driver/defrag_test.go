@@ -753,3 +753,29 @@ func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, cpuset.New(0, 1), recorded)
 }
+
+func TestDefragPassPrunesExpiredCooldowns(t *testing.T) {
+	// Claim UIDs never repeat, so a cooldown entry that outlives its window is
+	// pure growth: a node with claim churn and defragmentation on would
+	// accumulate one forever for every claim ever moved.
+	d := newDefragTestDriver(t, 2, 4)
+	d.defrag.claimCooldown = time.Minute
+	d.lastMoved["claim-expired"] = time.Now().Add(-2 * time.Minute)
+	d.lastMoved["claim-cooling"] = time.Now()
+
+	d.defragPass(context.Background())
+
+	_, ok := d.lastMoved["claim-expired"]
+	require.False(t, ok, "an entry past its cooldown must be pruned")
+	_, ok = d.lastMoved["claim-cooling"]
+	require.True(t, ok, "an entry still inside its cooldown must survive")
+
+	// With no cooldown configured, nothing may accumulate at all.
+	d.defrag.claimCooldown = 0
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.defragPass(context.Background())
+	require.Contains(t, d.lastMoved, types.UID("claim-1"), "the commit records the move")
+	d.defragPass(context.Background())
+	require.Empty(t, d.lastMoved, "with no cooldown the record has no reader and must not linger")
+}
