@@ -14,7 +14,7 @@ See [docs/user/defragmentation.md](docs/user/defragmentation.md) for how to enab
 | Upstream commit   | `8db2cd8698f6f0b9b7b777520d375acfb82e297b` (`v0.2.0`)                                                                                       |
 | Kubernetes API    | `k8s.io/*` v0.37.0                                                                                                                          |
 | Go                | 1.26.0                                                                                                                                      |
-| Container runtime | containerd tracking `master` (requires [containerd/nri#301](https://github.com/containerd/nri/pull/301), first vendored as nri v0.12.2)     |
+| Container runtime | containerd >= v2.4.0-beta.0 (requires [containerd/nri#301](https://github.com/containerd/nri/pull/301), first vendored as nri v0.12.1)      |
 | CRI-O             | unsupported: v1.36 still vendors nri v0.12.0, which holds the `Adaptation` lock across `updateFn` and can deadlock on an unsolicited update |
 
 ## Required cluster feature gates

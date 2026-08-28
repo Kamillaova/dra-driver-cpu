@@ -128,7 +128,8 @@ on - is configured through other Helm values, not through this file.
   deadlock runtimes whose vendored NRI predates
   [containerd/nri#301](https://github.com/containerd/nri/pull/301), and the NRI `Configure`
   handshake reports the runtime version but not its NRI version, so there is no reliable
-  check. containerd carries the fix from NRI v0.12.2 onwards; CRI-O v1.36 does not.
+  check. containerd carries the fix from NRI v0.12.1 onwards, first released in containerd
+  v2.4.0-beta.0; containerd v2.3.4 and CRI-O v1.36 do not.
 
 `reconcileSharedOnUnprepare` (bool, default: `true`)
 

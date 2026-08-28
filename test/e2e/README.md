@@ -65,9 +65,14 @@ honor these settings, where applicable.
 - `DRACPU_E2E_DEFRAG`: (optional, default `false`): when `true`, *the Makefile* `ci-kind-setup` target
   deploys the driver with `driverConfig.defragEnabled: true` and the
   `driverConfig.assumeUnsolicitedUpdatesSafe: true` it requires, and the defragmentation tests run
-  instead of skipping. Only set this on containerd: a runtime whose vendored NRI predates
-  [containerd/nri#301](https://github.com/containerd/nri/pull/301) can deadlock on the container
-  updates a move issues. The tests skip themselves anyway on a node whose CPUs the driver sees as one
+  instead of skipping. Only set this on a runtime whose vendored NRI carries
+  [containerd/nri#301](https://github.com/containerd/nri/pull/301), first released as NRI v0.12.1 in
+  containerd v2.4.0-beta.0; anything older can deadlock on the container updates a move issues. **A
+  stock kind cluster does not qualify**: `kindest/node:v1.37.0` ships containerd v2.3.4, which vendors
+  NRI v0.12.0. Verify a runtime rather than trusting its version string -- copy the binary out and run
+  `go version -m containerd | grep containerd/nri`. To run these tests, replace each node's
+  `/usr/local/bin/containerd` and `containerd-shim-runc-v2` with a build that qualifies, then
+  `systemctl restart containerd` inside the node. The tests skip themselves anyway on a node whose CPUs the driver sees as one
   uncore cache, since there is no spread to recover there.
 
 - `DRACPU_E2E_FULL_PCPUS_ONLY`: (optional, default `false`): when `true`, *the Makefile*

@@ -57,7 +57,8 @@ type Config struct {
 	// unsolicited updates deadlock runtimes whose vendored NRI predates
 	// containerd/nri#301, and the NRI Configure handshake reports the runtime
 	// version but not its NRI version, so no reliable check exists. containerd
-	// carries the fix from NRI v0.12.2; CRI-O v1.36 does not. Defaults to false.
+	// carries the fix from NRI v0.12.1, released in containerd v2.4.0-beta.0;
+	// containerd v2.3.4 and CRI-O v1.36 do not. Defaults to false.
 	AssumeUnsolicitedUpdatesSafe bool `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
 	// ReconcileSharedOnUnprepare widens shared containers onto the CPUs a claim
 	// released as soon as it is unprepared, instead of leaving them on the

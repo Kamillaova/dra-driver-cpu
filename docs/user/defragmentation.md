@@ -56,7 +56,10 @@ The driver cannot detect this. The NRI `Configure` handshake reports the runtime
 but not its vendored NRI version, and a version table would mis-classify backported builds in both
 directions. So it is an operator assertion:
 
-- **containerd** carries the fix from NRI v0.12.2 onwards.
+- **containerd** carries the fix from NRI v0.12.1 onwards, first released in containerd
+  v2.4.0-beta.0. Earlier releases do not: containerd v2.3.4, which `kindest/node:v1.37.0` ships,
+  still vendors NRI v0.12.0, so a stock kind cluster does **not** meet this floor. Verify a runtime
+  rather than trusting its version string: `go version -m $(which containerd) | grep containerd/nri`.
 - **CRI-O v1.36** still vendors NRI v0.12.0 and is **not** supported. It also never populates
   `Container.CDIDevices`, which this driver uses to verify that a claim a container names really was
   injected into it.
