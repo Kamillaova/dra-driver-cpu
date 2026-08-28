@@ -81,6 +81,9 @@ func newDefragTestDriver(t *testing.T, caches, cpusPerCache int) *defragTestDriv
 	return &defragTestDriver{CPUDriver: d, updater: updater, cdi: cdi, metrics: reg, allCPUs: allCPUs}
 }
 
+// errUpdateFailed stands in for a runtime that could not be reached.
+var errUpdateFailed = errors.New("connection reset")
+
 // placeClaim records a prepared claim on the given CPUs, as Prepare would.
 func (d *defragTestDriver) placeClaim(t *testing.T, claimUID types.UID, cpus cpuset.CPUSet) {
 	t.Helper()
