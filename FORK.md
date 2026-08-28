@@ -22,6 +22,29 @@ alignment lost to claim churn is recovered.
 - `DRANodeAllocatableResources` — optional, but recommended. Without it the scheduler's node-level
   `cpu` accounting is blind to DRA claims. See `docs/user/workload-requirements.md`.
 
+## Migration between upstream and this fork
+
+The `DRA_CPUSET_<claimUID>` variable keeps upstream's name and format, so neither direction needs a
+reader for a legacy format and a claim's identity survives either swap.
+
+**upstream → fork: no drain.** Identity comes from the variable's name. A spec written by upstream
+carries no `dra.cpu/cpuset` annotation, so the fork falls back to parsing that spec's own env value,
+which for an upstream spec is the real placement. Each claim gains an annotation the next time its spec
+is written.
+
+**fork → upstream: no drain while nothing moves a claim**, which holds until the defragmenter lands.
+The annotation always agrees with the env value, so an upstream driver reading these specs behaves
+exactly as it does with its own.
+
+Once claims can move, **a rollback requires draining the node first.** An upstream driver treats the
+env value as the claim's placement, and a moved claim's value no longer describes its container.
+Depending on the value, upstream either rejects the claim — leaving the container holding none, which
+it then classifies as shared and flattens onto the shared pool, losing both its exclusivity and its
+CPUs — or skips the container entirely, leaving its CPUs to be handed out to others as well. Draining
+avoids both. Runbook: drain the node, confirm no remaining pod holds a `dra.cpu` claim
+(`--ignore-daemonsets` skips DaemonSet pods, and static pods cannot be evicted at all), then roll the
+DaemonSet.
+
 ## Conventions
 
 - **Minimal diff to upstream.** New behaviour lives in new packages (`pkg/defrag`, additions to
