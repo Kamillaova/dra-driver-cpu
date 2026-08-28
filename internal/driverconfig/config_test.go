@@ -910,3 +910,67 @@ defragClaimCooldownSeconds: 0
 	assert.Equal(t, 3, result.DefragMinGain)
 	assert.Equal(t, 0, result.DefragClaimCooldownSeconds)
 }
+
+// TestValidate_SharedPoolCPUs: the pool is an explicit carve-out like
+// reservedCPUs, and the config-level checks are the ones that need no
+// topology: syntax, mode, and disjointness from the reserved set. Whether the
+// CPUs exist, are online, and do not split cores is the driver's to check
+// against the node it is standing on.
+func TestValidate_SharedPoolCPUs(t *testing.T) {
+	testCases := []struct {
+		name          string
+		mutate        func(*driverconfig.Config)
+		expectedError string
+	}{
+		{
+			name:   "a valid pool",
+			mutate: func(c *driverconfig.Config) { c.SharedPoolCPUs = "2-3,18-19" },
+		},
+		{
+			name:          "unparseable",
+			mutate:        func(c *driverconfig.Config) { c.SharedPoolCPUs = "a-b" },
+			expectedError: `invalid sharedPoolCPUs "a-b"`,
+		},
+		{
+			name: "individual mode",
+			mutate: func(c *driverconfig.Config) {
+				c.SharedPoolCPUs = "2"
+				c.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+			},
+			expectedError: "requires cpuDeviceMode",
+		},
+		{
+			name:          "overlapping the reserved set",
+			mutate:        func(c *driverconfig.Config) { c.SharedPoolCPUs = "0-1"; c.ReservedCPUs = "0" },
+			expectedError: "overlaps reservedCPUs",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestResolve_SharedPoolCPUsFromFile: settable from a config file, default off.
+func TestResolve_SharedPoolCPUsFromFile(t *testing.T) {
+	assert.Empty(t, driverconfig.Default().SharedPoolCPUs)
+
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+sharedPoolCPUs: "2-3,18-19"
+`)
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{driverconfig.FromFile(cfgFile)})
+	require.NoError(t, err)
+	assert.Equal(t, "2-3,18-19", result.SharedPoolCPUs)
+}
