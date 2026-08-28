@@ -562,3 +562,52 @@ func TestPlanNodeAlwaysConvergesFromRandomLayouts(t *testing.T) {
 		})
 	}
 }
+
+// TestPlanNodeTakesACacheItsIdealPromisedToAnother pins how directly a claim
+// reaches a whole cache when its own ideal slot is unreachable.
+//
+// The shape is one a real node produced. The caches are unequal, so the ideal
+// packs the larger claim into the smaller cache that still fits it and sends the
+// straddling claim to the other one -- and neither can get there, each blocked
+// by the other. The ideal's leftovers then hold exactly the straddling claim's
+// size, spanning both caches, so preferring them means moving it from one split
+// placement to another and waiting for the larger claim to shuffle out of the way
+// first.
+//
+// Offering the wider pool as well lets it take the free cache at once, which it
+// can only do by stepping into the slot the ideal promised to the larger claim.
+// Both routes reach zero cost; this one disturbs one claim instead of two, and a
+// claim moved without improving its own placement is a container re-pinned for
+// nothing.
+func TestPlanNodeTakesACacheItsIdealPromisedToAnother(t *testing.T) {
+	topo := topologyOf([]int{7, 8})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	big := cpuset.New(7, 8, 9, 10, 11, 12)
+	straddling := cpuset.New(5, 6, 13)
+	placements := []defrag.Placement{
+		{ClaimUID: "big", CPUs: big},
+		{ClaimUID: "straddling", CPUs: straddling},
+	}
+	free := topo.CPUDetails.CPUs().Difference(big.Union(straddling))
+
+	require.Equal(t, cpuset.New(0, 1, 2, 3, 4, 14), free)
+	require.Equal(t, 1, dtopo.Cost(placements), "only the straddling claim wastes a cache")
+	require.Equal(t, 1, dtopo.MinSpread(straddling.Size()), "its size fits in one cache")
+
+	plan, err := defrag.PlanNode(dtopo, placements, free, selectorFor(topo), defrag.Options{})
+	require.NoError(t, err)
+	requireValidPlan(t, dtopo, placements, free, plan)
+	require.Len(t, plan.Moves, 1)
+	require.Equal(t, types.UID("straddling"), plan.Moves[0].ClaimUID,
+		"the claim that is already whole must not be the one disturbed")
+	require.Equal(t, 1, dtopo.Spread(plan.Moves[0].To),
+		"the move must land in one cache, not shuffle between two split placements")
+
+	passes, final, _ := converge(t, topo, dtopo, placements, free, defrag.Options{})
+	require.Equal(t, 1, passes, "one pass should settle it")
+	require.Equal(t, 0, dtopo.Cost(final))
+	for _, p := range final {
+		require.Equal(t, 1, dtopo.Spread(p.CPUs), "claim %s should end in one cache", p.ClaimUID)
+	}
+}

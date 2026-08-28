@@ -240,7 +240,7 @@ func plannedMoves(topo *Topology, placements []Placement, ideal map[types.UID]cp
 			continue
 		}
 
-		target, ok := reachableTarget(p.CPUs, wanted, spare, avail, sel)
+		target, ok := reachableTarget(topo, p.CPUs, wanted, spare, avail, othersIdeal, sel)
 		if !ok {
 			blocked++
 			continue
@@ -262,21 +262,40 @@ func plannedMoves(topo *Topology, placements []Placement, ideal map[types.UID]cp
 }
 
 // reachableTarget returns the best CPUs a claim can take right now: its ideal
-// slot when that is free, otherwise the allocator's pick from its own CPUs plus
-// what is still available, preferring the ideal's leftovers so a claim that has
-// to move somewhere provisional does not displace another one.
-func reachableTarget(own, wanted, spare, avail cpuset.CPUSet, sel Selector) (cpuset.CPUSet, bool) {
+// slot when that is free, otherwise whichever of two candidates scores better.
+//
+// The first candidate comes from the ideal's leftovers plus the claim's own
+// slot, so a claim that has to move somewhere provisional does not displace
+// another one. The second comes from everything within reach. Both are offered
+// rather than the first winning outright: when a claim cannot reach its own
+// ideal slot, the only placement that stops it straddling caches may lie inside
+// a slot the ideal promised to someone else, and if that someone cannot move
+// there either, refusing it strands them both. moveScore decides, and wasted
+// caches dominate it, so keeping out of the way still wins every tie that does
+// not cost a cache.
+func reachableTarget(topo *Topology, own, wanted, spare, avail, othersIdeal cpuset.CPUSet, sel Selector) (cpuset.CPUSet, bool) {
 	reachable := avail.Union(own)
 	if wanted.IsSubsetOf(reachable) {
 		return wanted, true
 	}
-	if preferred := reachable.Intersection(wanted.Union(spare)); preferred.Size() >= own.Size() {
-		if target, err := sel(preferred, own.Size()); err == nil {
-			return target, true
+
+	var best cpuset.CPUSet
+	found := false
+	consider := func(pool cpuset.CPUSet) {
+		if pool.Size() < own.Size() {
+			return
+		}
+		target, err := sel(pool, own.Size())
+		if err != nil {
+			return
+		}
+		if !found || moveScore(topo, target, othersIdeal) < moveScore(topo, best, othersIdeal) {
+			best, found = target, true
 		}
 	}
-	target, err := sel(reachable, own.Size())
-	return target, err == nil
+	consider(reachable.Intersection(wanted.Union(spare)))
+	consider(reachable)
+	return best, found
 }
 
 // packingOrder is largest claim first, ties broken by UID: the order the ideal
