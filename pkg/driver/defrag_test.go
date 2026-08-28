@@ -721,3 +721,35 @@ func TestDefragPassMeasuresEveryNUMANodeNotOnlyOccupiedOnes(t *testing.T) {
 	require.InDelta(t, 4, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
 		map[string]string{"numa_node": "1"}), 0.01, "node 1 holds no claims and must still be reported")
 }
+
+func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
+	// Against the real CDI manager, not the double. The manager's cache only
+	// learns of a spec when it is refreshed, so anything in the move path that
+	// reads a spec back can fail to find a claim this driver prepared itself --
+	// which a double whose AddDevice updates a map in place can never show.
+	logger := testr.New(t)
+	d := newDefragTestDriver(t, 2, 4)
+	realCDI, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+	d.cdiMgr = realCDI
+
+	claimUID := types.UID("claim-real-cdi")
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpuset.New(0, 4), false))
+	// Exactly as Prepare writes it, with no Refresh afterwards.
+	require.NoError(t, realCDI.AddDevice(logger, getCDIDeviceName(claimUID),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue), cpuset.New(0, 4)))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", claimUID)
+
+	d.defragPass(context.Background())
+
+	require.Len(t, d.updater.allCalls(), 1, "the move never reached the runtime")
+	moved, ok := d.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(0, 1), moved)
+
+	// And the spec on disk agrees, since that is what a restart rebuilds from.
+	require.NoError(t, realCDI.Refresh())
+	recorded, err := realCDI.GetDeviceCPUSet(getCDIDeviceName(claimUID))
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(0, 1), recorded)
+}

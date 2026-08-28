@@ -279,19 +279,15 @@ func (cp *CPUDriver) claimMovable(claimUID types.UID) bool {
 
 // writeClaimPlacement rewrites a claim's CDI spec to record where it now belongs.
 //
-// The injected environment variable is carried over untouched. It was fixed when
-// the container was created and cannot be corrected there, so rewriting it here
-// would only make the spec disagree with the container it came from.
+// The environment edit is reconstructed rather than read back from the spec. It
+// is a pure function of the claim UID and whether placement is mutable, so
+// rebuilding it is exact -- and reading it would mean querying the CDI cache,
+// which only learns of a spec when it is refreshed and so cannot be relied on to
+// know about a claim this driver prepared itself.
 func (cp *CPUDriver) writeClaimPlacement(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet) error {
 	deviceName := getCDIDeviceName(claimUID)
-	envs, err := cp.cdiMgr.GetDeviceEnv(deviceName)
-	if err != nil {
-		return err
-	}
-	if len(envs) != 1 {
-		return fmt.Errorf("CDI device %q has %d environment edits, expected exactly 1", deviceName, len(envs))
-	}
-	return cp.cdiMgr.AddDevice(logger, deviceName, envs[0], cpus)
+	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cp.cdiEnvValue(cpus))
+	return cp.cdiMgr.AddDevice(logger, deviceName, envVar, cpus)
 }
 
 // roundUpdates builds the one batch of container updates a round consists of: the
