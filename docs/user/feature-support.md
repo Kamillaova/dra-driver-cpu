@@ -52,8 +52,27 @@ Reference: [kubernetes 1.35.0](https://github.com/kubernetes/kubernetes/blob/v1.
 | DistributeCPUsAcrossCores | alpha    | inactive                   | none yet; postponed till k8s feature graduates to beta                 |                       |
 | DistributeCPUsAcrossNUMA  | beta     | active                     | see issue: https://github.com/kubernetes-sigs/dra-driver-cpu/issues/46 | see below for details |
 | PreferAlignByUnCoreCache  | beta     | active                     | builtin; enabled by default                                            |                       |
-| FullPCPUsOnly             | GA       | N/A                        | see issue: https://github.com/kubernetes-sigs/dra-driver-cpu/issues/45 |                       |
+| FullPCPUsOnly             | GA       | N/A                        | `fullPhysicalCPUsOnly: true` config option                             | see note below        |
 | StrictCPUReservation      | GA       | N/A                        | builtin; enabled by default                                            |                       |
+
+### Whole physical cores (FullPCPUsOnly)
+
+`fullPhysicalCPUsOnly: true` allocates whole physical cores, so a core's SMT siblings are never
+split between two claims, nor between a claim and the shared pool. Requires `cpuDeviceMode: grouped`.
+
+It differs from the kubelet CPU Manager in how a request that is not a whole-core multiple is
+handled. The kubelet rejects the pod at admission with an `SMTAlignmentError`. DRA has no
+reject-unless-multiple primitive, so the driver instead publishes a capacity `requestPolicy` whose
+step is the core size and lets the scheduler round the request up. The effect is visible in the
+claim's `status.allocation`, and it resolves at scheduling time rather than failing once the pod is
+already bound.
+
+Two topologies switch the option off for the node rather than failing the driver, because the
+config is usually fleet-wide and refusing to start would take out a whole node pool:
+
+- **Mixed thread counts per core**, as on Intel hybrid parts where performance cores are SMT and
+  efficiency cores are not: there is no single allocation step.
+- **SMT disabled**: every core has one thread, so there is nothing to keep together.
 
 ### Distributing CPUs across NUMA nodes
 

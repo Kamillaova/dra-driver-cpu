@@ -77,21 +77,21 @@ type CPUInfoProvider interface {
 
 // CPUDriver is the structure that holds all the driver runtime information.
 type CPUDriver struct {
-	driverName              string
-	nodeName                string
-	kubeClient              kubernetes.Interface
-	draPlugin               KubeletPlugin
-	nriPlugin               stub.Stub
-	podConfigStore          *store.PodConfig
-	cpuAllocationStore      *store.CPUAllocation
-	cdiMgr                  cdiManager
-	topology                deviceTopology
-	cpuDeviceMode           string
-	cpuDeviceGroupBy        string
+	driverName         string
+	nodeName           string
+	kubeClient         kubernetes.Interface
+	draPlugin          KubeletPlugin
+	nriPlugin          stub.Stub
+	podConfigStore     *store.PodConfig
+	cpuAllocationStore *store.CPUAllocation
+	cdiMgr             cdiManager
+	topology           deviceTopology
+	cpuDeviceMode      string
+	cpuDeviceGroupBy   string
 	// wholeCoreStep is the allocation step in CPUs when whole-core allocation is
 	// in effect on this node, and 0 when it is off or the topology cannot support
 	// it. Decided once at startup so publication and allocation cannot disagree.
-	wholeCoreStep int
+	wholeCoreStep           int
 	claimTracker            *store.ClaimTracker
 	pcieRootMapper          *store.PCIeRootMapper
 	devicesPerResourceSlice int
