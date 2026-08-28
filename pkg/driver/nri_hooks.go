@@ -76,6 +76,9 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				}
 
 				deviceName := getCDIDeviceName(uid)
+				// CCX-FORK: upstream instead requires the container's env to
+				// equal the CDI spec's, and drops the claim when it does not.
+				//
 				// The CDI spec is the driver's own record of where the claim
 				// belongs, and it is rewritten whenever placement changes. The
 				// container's env is only where it belonged when the container
@@ -268,6 +271,9 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		logger.V(2).Info("no guaranteed CPUs found, using shared CPUs", "sharedCPUs", sharedCPUs.String())
 		adjust.SetLinuxCPUSetCPUs(sharedCPUs.String())
 	} else {
+		// CCX-FORK: upstream pins the container to the cpuset parsed out of its
+		// env, after checking that value against the store for equality.
+		//
 		// NRI invokes CreateContainer for all containers. The DRA env only names
 		// which claims the container holds; where each one is placed comes from
 		// the store, so a claim moved between Prepare and CreateContainer is

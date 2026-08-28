@@ -88,6 +88,9 @@ func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claim
 
 // GetResourceClaimAllocationUnion returns the union of the prepared cpusets of
 // the given claims, failing if any of them is not prepared by this driver.
+//
+// CCX-FORK: replaces upstream's ValidateResourceClaimAllocations, which compared
+// the store against caller-supplied cpusets instead of supplying them.
 func (s *CPUAllocation) GetResourceClaimAllocationUnion(claimUIDs ...types.UID) (cpuset.CPUSet, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

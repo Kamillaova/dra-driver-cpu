@@ -49,10 +49,21 @@ DaemonSet.
 
 - **Minimal diff to upstream.** New behaviour lives in new packages (`pkg/defrag`, additions to
   `pkg/cpuinfo`). Touch points inside existing files are single thin calls rather than inline logic.
-- **Every fork-only touch point in an upstream file carries a `// CCX-FORK:` comment** so a rebase is
-  mechanical: `git grep 'CCX-FORK:'` enumerates the entire divergence surface.
+- **Every upstream declaration or block the fork changes carries a `// CCX-FORK:` comment** naming what
+  upstream does instead, so `git grep 'CCX-FORK:'` enumerates every point a rebase has to reconcile. A
+  symbol the fork *adds* needs no marker: there is nothing upstream to reconcile it against, and the
+  table below lists them.
 - Commits follow upstream's conventions (`type:` / `component:` subjects, `Signed-off-by`) and are kept
   atomic so the upstreamable ones cherry-pick cleanly.
+
+### Divergence surface
+
+Symbols the fork adds to an upstream file, which carry no marker of their own:
+
+- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `GetDeviceCPUSet`
+
+`CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
+placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
 
 ## Upstreamable pieces
 

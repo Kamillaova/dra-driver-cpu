@@ -82,6 +82,8 @@ func (c *CdiManager) getSpecName(deviceName string) string {
 //
 // The spec is written atomically by the CDI cache, so a concurrent reader sees
 // either the previous placement or this one, never a mixture.
+//
+// CCX-FORK: upstream takes no cpus argument and records no placement.
 func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar string, cpus cpuset.CPUSet) error {
 	specName := c.getSpecName(deviceName)
 
