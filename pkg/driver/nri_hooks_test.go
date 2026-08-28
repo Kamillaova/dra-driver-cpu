@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/utils/cpuset"
+	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 )
 
 func TestParseDRAEnvToClaimAllocations(t *testing.T) {
@@ -314,6 +315,126 @@ func TestCreateContainer(t *testing.T) {
 			require.ElementsMatch(t, tc.expectedContainerUpdates, updates)
 		})
 	}
+}
+
+func TestCreateContainerRuntimeCDIDeviceAuthentication(t *testing.T) {
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	pod := &api.PodSandbox{Id: "pod-id-1", Name: "my-pod", Namespace: "my-ns", Uid: "pod-uid-1"}
+	victimClaim := types.UID("claim-uid-victim")
+
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	logger := testr.New(t)
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	cdiNameFor := func(uid types.UID) string {
+		return cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName(uid))
+	}
+
+	// A forged env entry naming a claim prepared for another container.
+	forgingContainer := func(reported []*api.CDIDevice) *api.Container {
+		return &api.Container{
+			Id:           "forging-ctr",
+			PodSandboxId: pod.Id,
+			Name:         "forging-ctr",
+			Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, victimClaim, "0-3")},
+			CDIDevices:   reported,
+		}
+	}
+
+	testCases := []struct {
+		name                  string
+		container             *api.Container
+		expectedErrorContains string
+	}{
+		{
+			name:      "runtime confirms the claim",
+			container: forgingContainer([]*api.CDIDevice{{Name: cdiNameFor(victimClaim)}}),
+		},
+		{
+			name:                  "runtime reports a different claim",
+			container:             forgingContainer([]*api.CDIDevice{{Name: cdiNameFor("claim-uid-other")}}),
+			expectedErrorContains: "the runtime injected no CDI device for it",
+		},
+		{
+			name: "runtime reports another driver's device only",
+			container: forgingContainer([]*api.CDIDevice{
+				{Name: "example.com/gpu=gpu0"},
+			}),
+			expectedErrorContains: "the runtime injected no CDI device for it",
+		},
+		{
+			// CRI-O never populates the field. An empty list must stay
+			// inconclusive so this driver keeps working there.
+			name:      "runtime reports nothing",
+			container: forgingContainer(nil),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			allocation := store.NewCPUAllocation(topo, cpuset.New())
+			requirePreparedResourceClaim(t, logger, allocation, victimClaim, cpuset.New(0, 1, 2, 3))
+
+			plugin := &CPUDriver{
+				podConfigStore:     store.NewPodConfig(),
+				cpuAllocationStore: allocation,
+				claimTracker:       store.NewClaimTracker(),
+			}
+
+			_, _, err := plugin.CreateContainer(context.Background(), pod, tc.container)
+			if tc.expectedErrorContains != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.expectedErrorContains)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestSynchronizeSkipsClaimsTheRuntimeDoesNotConfirm(t *testing.T) {
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	claimUID := types.UID("claim-uid-1")
+
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	logger := testr.New(t)
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
+	ctr := &api.Container{
+		Id:           "ctr-1",
+		PodSandboxId: pod.Id,
+		Name:         "ctr",
+		Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0,1")},
+		// The runtime reports a device for some other claim, so this
+		// container's DRA env entry is not corroborated.
+		CDIDevices: []*api.CDIDevice{
+			{Name: cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName("claim-uid-other"))},
+		},
+	}
+
+	mgr := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: cpuset.New(0, 1)})
+	plugin := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             mgr,
+	}
+
+	_, err := plugin.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr})
+	require.NoError(t, err, "an unconfirmed claim is skipped, not fatal")
+
+	// The claim was not adopted, so its CPUs stay in the shared pool rather
+	// than being reserved on the strength of a forgeable env entry.
+	require.Equal(t, allCPUs, plugin.cpuAllocationStore.GetSharedCPUs())
+	require.Zero(t, plugin.claimTracker.Len())
 }
 
 func TestStopContainer(t *testing.T) {
