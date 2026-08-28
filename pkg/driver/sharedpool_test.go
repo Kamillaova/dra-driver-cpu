@@ -295,3 +295,14 @@ func TestSharedPoolEnvIsNotMistakenForAClaim(t *testing.T) {
 	require.Len(t, entries, 1)
 	require.Equal(t, types.UID("claim-1"), entries[0].claimUID)
 }
+
+func TestSharedPoolIsReportedDistinctFromReserved(t *testing.T) {
+	d := newSharedPoolTestDriver(t)
+	d.nodeName = "worker"
+	report, err := d.placements(testr.New(t), false)
+	require.NoError(t, err)
+	require.Equal(t, "1,5,9,13", report.SharedPoolCPUs)
+	require.Equal(t, "1,5,9,13", report.SharedCPUs, "the shared mask is the pool")
+	require.Equal(t, "", report.ReservedCPUs,
+		"nothing here is truly reserved; the fold must not leak into the report")
+}

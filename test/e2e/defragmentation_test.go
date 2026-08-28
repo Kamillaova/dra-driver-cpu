@@ -49,9 +49,10 @@ const placementsPath = "/placements"
 // placementsReport mirrors the driver's /placements payload. Only the fields the
 // tests read are declared.
 type placementsReport struct {
-	DefragEnabled bool   `json:"defragEnabled"`
-	SharedCPUs    string `json:"sharedCPUs"`
-	Claims        []struct {
+	DefragEnabled  bool   `json:"defragEnabled"`
+	SharedPoolCPUs string `json:"sharedPoolCPUs"`
+	SharedCPUs     string `json:"sharedCPUs"`
+	Claims         []struct {
 		ClaimUID   string `json:"claimUID"`
 		CPUs       string `json:"cpus"`
 		MovingFrom string `json:"movingFrom"`
