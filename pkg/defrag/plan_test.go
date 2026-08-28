@@ -529,18 +529,27 @@ func TestPlanNodeAlwaysConvergesFromRandomLayouts(t *testing.T) {
 	// The invariants and the convergence bound are checked on every pass by
 	// converge, so this looks for the layout that breaks one of them: a plan that
 	// churns, oscillates, or proposes CPUs it may not have.
-	topo := topologyOf([]int{4, 4, 4, 4})
-	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+	//
+	// The topology is randomised along with the placements, and deliberately
+	// includes unequal cache sizes: the one convergence defect found on real
+	// hardware only existed on unequal caches, where the ideal's leftovers can
+	// straddle them, and a fleet of equal 4-CPU caches could never have shown it.
 	rng := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // a fixed seed is the point: failures must be reproducible
 
 	for round := range 300 {
+		caches := make([]int, 2+rng.IntN(3))
+		for i := range caches {
+			caches[i] = 2 + rng.IntN(7)
+		}
+		topo := topologyOf(caches)
+		dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
 		all := topo.CPUDetails.CPUs().List()
 		rng.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
 
 		var placements []defrag.Placement
 		taken := 0
 		for claim := range 6 {
-			size := 1 + rng.IntN(5)
+			size := 1 + rng.IntN(max(2, len(all)/2))
 			if taken+size > len(all)-1 {
 				break
 			}
