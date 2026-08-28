@@ -85,6 +85,8 @@ type Recorder interface {
 	RecordPrepare(result Result, duration time.Duration)
 	RecordUnprepare(result Result)
 	RecordClaimAllocatedCPUs(cpus int)
+	// CCX-FORK: upstream's Recorder ends above; the defragmentation methods and
+	// everything serving them in this file are the fork's.
 	SetDefragState(DefragState)
 	RecordDefragPass(result Result, duration time.Duration)
 	RecordDefragMoves(result Result, count int)

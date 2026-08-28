@@ -64,16 +64,32 @@ DaemonSet.
 
 ### Divergence surface
 
-Symbols the fork adds to an upstream file, which carry no marker of their own:
+Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
+to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
-- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `GetDeviceCPUSet`
+- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`, `GetDeviceCPUSet`
+- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `lastMoved` and `pendingRound` fields, and
+  the `Config.Defrag*` options
+- `pkg/driver/nri_hooks.go`: `draEnvEntry`
 - `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`,
   `ResourceClaimAllocations`
 - `pkg/store/claim_tracker.go`: `Owner`
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
+- `internal/driverconfig`: the `Defrag*` fields, their defaults and `validateDefrag`
+- `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
+  behind them
+- `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
+  `e2e_suite_test.go`, and the `defragEnabled`/`fullPhysicalCPUsOnly` config read-back
+- the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
+  they pin, rather than kept apart
 
-`CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
-placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
+Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/driver/defrag.go`, `reconcile.go`,
+`placements.go`, `pkg/cpuinfo/coretopology.go`) are visible to `git diff --stat` on their own and are
+not repeated here.
+
+`CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver only calls it to carry an
+environment edit over unchanged when rewriting a spec; placement itself comes from the annotation. It
+stays on the `cdiManager` interface to keep the diff small.
 
 ## Upstreamable pieces
 
