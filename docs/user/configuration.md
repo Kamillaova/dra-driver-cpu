@@ -153,7 +153,10 @@ on - is configured through other Helm values, not through this file.
 - A structural no-op on nodes with one cache per NUMA node, where there is no spread to
   recover.
 - Workloads must not read their CPUs from the `DRA_CPUSET_*` environment variable, whose
-  value is fixed when the container starts. See
+  value is fixed when the container starts. With this option on, the variable's value is
+  the literal string `dynamic` instead of a cpuset, so a workload that parses it fails
+  loudly rather than pinning itself to CPUs its claim has left. Read
+  `sched_getaffinity(2)` or the container's own `cpuset.cpus.effective` instead. See
   [How it Works](how-it-works.md).
 
 `defragIntervalSeconds` (int, default: `300`)
