@@ -94,6 +94,16 @@ func (ctk *ClaimTracker) SetOwner(logger logr.Logger, podUID k8stypes.UID, conta
 	return newlyBound, nil
 }
 
+// Owner returns the container a claim is bound to, and whether it is bound at
+// all. A claim with no owner is one whose container has not been created yet, or
+// one the driver prepared for a pod that never started.
+func (ctk *ClaimTracker) Owner(claimUID k8stypes.UID) (OwnerIdent, bool) {
+	ctk.mu.Lock()
+	defer ctk.mu.Unlock()
+	owner, ok := ctk.ownerByClaimUID[claimUID]
+	return owner, ok
+}
+
 func (ctk *ClaimTracker) Cleanup(claimUIDs ...k8stypes.UID) {
 	ctk.mu.Lock()
 	defer ctk.mu.Unlock()
