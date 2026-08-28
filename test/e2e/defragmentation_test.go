@@ -258,21 +258,26 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		// does, and that depends on how big the caches are, so the sizes come from
 		// the node's own geometry.
 		//
-		// Two CPUs are left free per cache and the split claim asks for three: no
-		// cache can hold it, and one CPU is still over afterwards. That last CPU
-		// matters -- a claim that would empty the shared pool while other
-		// containers are running is refused, since NRI cannot express an empty
-		// cpuset, so a tighter fit would be rejected rather than split.
-		const victimCPUs = 3
-		const leaveFreePerCache = 2
+		// Everything is counted in allocation steps rather than CPUs, because the
+		// driver may publish a capacity request policy that rounds a request up to
+		// whole cores; a size that is not a multiple of the step is not the size
+		// the claim will get. Two steps are left free per cache and the split claim
+		// asks for three: no cache can hold it, and one step is still over
+		// afterwards. That last step matters -- a claim that would empty the shared
+		// pool while other containers are running is refused, since NRI cannot
+		// express an empty cpuset, so a tighter fit would be rejected rather than
+		// split.
+		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
+		victimCPUs := 3 * step
+		leaveFreePerCache := 2 * step
 		free := baseline.freePerCache()
-		fxt.Log.Info("cache geometry", "freePerCache", free)
-		if len(free) < 2 || free[0] <= leaveFreePerCache {
-			ginkgo.Skip(fmt.Sprintf("fragmenting needs at least two caches with more than %d free CPUs each, got %v",
-				leaveFreePerCache, free))
+		fxt.Log.Info("cache geometry", "freePerCache", free, "allocationStep", step)
+		if len(free) < 2 || free[0] < 3*step {
+			ginkgo.Skip(fmt.Sprintf("fragmenting needs at least two caches with %d or more free CPUs each, got %v",
+				3*step, free))
 		}
 
-		ginkgo.By("filling every cache down to two free CPUs, smallest cache first")
+		ginkgo.By("filling every cache down to two allocation steps free, smallest cache first")
 		var fillers []*v1.Pod
 		for i, cacheFree := range free {
 			pod, err := tryCreateClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues,
@@ -409,4 +414,31 @@ func restartDriverOnNode(ctx context.Context, fxt *fixture.Fixture, nodeName str
 			}
 		}
 	}, pollTimeoutRule, pollIntervalRule).Should(gomega.Succeed(), "the driver did not come back on %s", nodeName)
+}
+
+// allocationStep is the CPU granularity the scheduler will round a capacity
+// request to, taken from the request policy the driver publishes on its device.
+// One means a request is taken literally; two means whole SMT cores.
+func allocationStep(ctx context.Context, cs kubernetes.Interface, nodeName string) int {
+	ginkgo.GinkgoHelper()
+	slices, err := cs.ResourceV1().ResourceSlices().List(ctx, metav1.ListOptions{})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+	for _, slice := range slices.Items {
+		if slice.Spec.NodeName == nil || *slice.Spec.NodeName != nodeName {
+			continue
+		}
+		for _, device := range slice.Spec.Devices {
+			capacity, ok := device.Capacity["dra.cpu/cpu"]
+			if !ok || capacity.RequestPolicy == nil || capacity.RequestPolicy.ValidRange == nil ||
+				capacity.RequestPolicy.ValidRange.Step == nil {
+				continue
+			}
+			step := capacity.RequestPolicy.ValidRange.Step.Value()
+			if step > 1 {
+				return int(step)
+			}
+		}
+	}
+	return 1
 }
