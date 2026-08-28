@@ -19,7 +19,6 @@ package driver
 import (
 	"context"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -203,11 +202,11 @@ func (cp *CPUDriver) planDefragMoves(logger logr.Logger, online cpuset.CPUSet) (
 	keepFree := len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
 
 	placements := defrag.PlacementsByNUMANode(topo, cp.cpuAllocationStore.ResourceClaimAllocations())
-	numaNodeIDs := make([]int, 0, len(placements))
-	for numaNodeID := range placements {
-		numaNodeIDs = append(numaNodeIDs, numaNodeID)
-	}
-	sort.Ints(numaNodeIDs)
+	// Every node the topology has, not only those holding a claim. A node with no
+	// claims has nothing to move, but it still has a shape worth reporting: how
+	// large a claim it could take aligned is most interesting precisely when it is
+	// empty, and a gauge that disappears as a node drains cannot be alerted on.
+	numaNodeIDs := topo.CPUDetails.NUMANodes().List()
 
 	budget := cp.defrag.maxMoves
 	var moves []defrag.Move

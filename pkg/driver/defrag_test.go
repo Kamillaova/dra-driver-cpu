@@ -690,3 +690,34 @@ func TestDefragPassReleasesApplyMuDuringTheRuntimeCall(t *testing.T) {
 	require.Len(t, d.updater.allCalls(), 1, "the move must actually reach the runtime")
 	require.True(t, lockWasFree.Load(), "applyMu was held across the runtime call")
 }
+
+func TestDefragPassMeasuresANodeWithNoClaims(t *testing.T) {
+	// An idle node has nothing to move but still has a shape. Reporting nothing
+	// for it would make the leading indicator vanish exactly when it is most
+	// favourable, and a gauge that disappears cannot be alerted on.
+	d := newDefragTestDriver(t, 2, 4)
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls())
+	require.InDelta(t, 0, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01)
+	require.InDelta(t, 4, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "0"}), 0.01,
+		"an empty node can take a whole cache")
+}
+
+func TestDefragPassMeasuresEveryNUMANodeNotOnlyOccupiedOnes(t *testing.T) {
+	// One claim on node 0 must not stop node 1 from being reported.
+	d := newDefragTestDriverTopo(t, 2, 2, 4)
+	// Two CPUs taken out of each of node 0's caches, so the largest aligned claim
+	// it could still take is two; node 1 is untouched and could take a whole cache.
+	d.placeClaim(t, "claim-1", cpuset.New(0, 1, 4, 5))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	d.defragPass(context.Background())
+
+	require.InDelta(t, 2, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "0"}), 0.01, "node 0's emptiest cache has two CPUs left")
+	require.InDelta(t, 4, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "1"}), 0.01, "node 1 holds no claims and must still be reported")
+}
