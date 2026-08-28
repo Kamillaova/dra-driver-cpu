@@ -412,8 +412,11 @@ func tryCreateClaimedTesterPodWithUID(ctx context.Context, fxt *fixture.Fixture,
 		return nil, "", err
 	}
 
-	pod := makeTesterPodWithExclusiveCPUClaim(fxt.Namespace.Name, image, created.Name, int64(numCPUs), nodeName,
-		cfg.PublishNodeAllocatableResourceMapping)
+	// Deliberately without a standard CPU request. Mirroring the claim's CPUs
+	// into requests is what the docs ask of a workload, but it makes the
+	// scheduler count them twice, and a test that fills a node with claims runs
+	// out of node-allocatable cpu long before it runs out of claimable CPUs.
+	pod := makeTesterPodWithExclusiveCPUClaimWithoutCPURequest(fxt.Namespace.Name, image, created.Name, nodeName)
 	pod, err = e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
 	if err != nil {
 		return nil, "", err

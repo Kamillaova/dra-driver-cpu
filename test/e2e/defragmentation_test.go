@@ -23,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
@@ -95,6 +96,22 @@ func (r placementsReport) plannedMoves() int {
 		}
 	}
 	return total
+}
+
+// freePerCache is the free CPU count of every cache on the node, ascending.
+func (r placementsReport) freePerCache() []int {
+	var free []int
+	for _, node := range r.NUMANodes {
+		for _, cache := range node.Caches {
+			cpus, err := cpuset.Parse(cache.FreeCPUs)
+			if err != nil {
+				continue
+			}
+			free = append(free, cpus.Size())
+		}
+	}
+	sort.Ints(free)
+	return free
 }
 
 // caches is how many uncore caches the driver can see across the node.
@@ -236,64 +253,92 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
 		ginkgo.DeferCleanup(fxt.Teardown)
 
-		// Fill the node with small claims, then release every other one. What is
-		// left is free space scattered across caches, which is the state a claim
-		// arriving next has to be placed into and the state defragmentation exists
-		// to repair.
-		ginkgo.By("fragmenting the node with small claims")
-		var pods []*v1.Pod
-		for i := range 6 {
-			pod, err := tryCreateClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, 1,
-				fmt.Sprintf("cpu-claim-frag-%d", i))
+		// Fragmenting a node takes arithmetic, not just a lot of claims. No single
+		// cache may have room for the next claim while the node as a whole still
+		// does, and that depends on how big the caches are, so the sizes come from
+		// the node's own geometry.
+		//
+		// Two CPUs are left free per cache and the split claim asks for three: no
+		// cache can hold it, and one CPU is still over afterwards. That last CPU
+		// matters -- a claim that would empty the shared pool while other
+		// containers are running is refused, since NRI cannot express an empty
+		// cpuset, so a tighter fit would be rejected rather than split.
+		const victimCPUs = 3
+		const leaveFreePerCache = 2
+		free := baseline.freePerCache()
+		fxt.Log.Info("cache geometry", "freePerCache", free)
+		if len(free) < 2 || free[0] <= leaveFreePerCache {
+			ginkgo.Skip(fmt.Sprintf("fragmenting needs at least two caches with more than %d free CPUs each, got %v",
+				leaveFreePerCache, free))
+		}
+
+		ginkgo.By("filling every cache down to two free CPUs, smallest cache first")
+		var fillers []*v1.Pod
+		for i, cacheFree := range free {
+			pod, err := tryCreateClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues,
+				cacheFree-leaveFreePerCache, fmt.Sprintf("cpu-claim-filler-%d", i))
 			if err != nil {
-				// The node ran out of allocatable CPUs, which is the point of
-				// filling it.
-				fxt.Log.Info("stopped filling the node", "claims", len(pods), "reason", err.Error())
+				fxt.Log.Info("stopped filling", "placed", len(fillers), "reason", err.Error())
 				break
 			}
-			pods = append(pods, pod)
+			fillers = append(fillers, pod)
 		}
-		if len(pods) < 4 {
-			ginkgo.Skip(fmt.Sprintf("need at least 4 single-CPU claims to fragment this node, could only place %d", len(pods)))
-		}
-
-		ginkgo.By("releasing every other claim")
-		for i := 0; i < len(pods); i += 2 {
-			gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, pods[i])).To(gomega.Succeed())
+		if len(fillers) < 2 {
+			ginkgo.Skip(fmt.Sprintf("could only place %d of %d fillers", len(fillers), len(free)))
 		}
 
-		ginkgo.By("placing a claim that needs more than one cache's worth of the remainder")
-		survivor, _ := createClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, 2, "cpu-claim-survivor")
-		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, survivor)
-		fxt.Log.Info("survivor placement", "cpus", before.CPUAssigned.String())
+		ginkgo.By("placing a claim that no single cache can hold")
+		victim, victimUID := createClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, victimCPUs, "cpu-claim-victim")
+		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, victim)
+		fxt.Log.Info("victim placement", "cpus", before.CPUAssigned.String())
+
+		// The whole point of the test. If the arrangement did not actually
+		// fragment anything there is nothing to consolidate, and passing here
+		// would assert only that an already-packed node stays packed.
+		ginkgo.By("verifying the node really is fragmented")
+		fragmented, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		if fragmented.totalExcess() == 0 {
+			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
+		}
+		gomega.Expect(before.CPUAssigned.Size()).To(gomega.Equal(victimCPUs))
+
+		ginkgo.By("releasing a filler, which gives the split claim somewhere to go")
+		gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, fillers[0])).To(gomega.Succeed())
 
 		ginkgo.By("waiting for the node to settle")
 		var settled placementsReport
 		gomega.Eventually(func(g gomega.Gomega) {
 			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, true)
 			g.Expect(err).ToNot(gomega.HaveOccurred())
-			// Settled means a pass would do nothing more, which is the fixed point
-			// the planner promises: no move it can make would improve the node.
+			// Settled means a pass would do nothing more: the fixed point the
+			// planner promises, where no move it can make would improve the node.
 			g.Expect(report.plannedMoves()).To(gomega.BeZero(), "a pass still wants to move claims: %+v", report.NUMANodes)
 			settled = report
 		}, 3*time.Minute, 5*time.Second).Should(gomega.Succeed())
 
-		ginkgo.By("verifying no claim is left avoidably split")
+		ginkgo.By("verifying the claim was actually moved and is no longer split")
 		gomega.Expect(settled.totalExcess()).To(gomega.BeZero(),
 			"claims still span more caches than their sizes require: %+v", settled.NUMANodes)
+		after, ok := settled.claimCPUs(victimUID)
+		gomega.Expect(ok).To(gomega.BeTrue(), "the victim claim vanished: %+v", settled.Claims)
+		gomega.Expect(after).ToNot(cpusetmatchers.Equal(before.CPUAssigned),
+			"the claim was never moved, so nothing was consolidated")
+		gomega.Expect(after).To(cpusetmatchers.HaveSize(before.CPUAssigned.Size()),
+			"a move must not change how many CPUs a claim has")
 
-		ginkgo.By("verifying the container kept running throughout and still holds its CPUs")
-		reread, err := fxt.K8SClientset.CoreV1().Pods(survivor.Namespace).Get(ctx, survivor.Name, metav1.GetOptions{})
+		ginkgo.By("verifying the container kept running throughout")
+		reread, err := fxt.K8SClientset.CoreV1().Pods(victim.Namespace).Get(ctx, victim.Name, metav1.GetOptions{})
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		gomega.Expect(reread.Status.ContainerStatuses).ToNot(gomega.BeEmpty())
 		gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero(),
 			"a move must not restart the container")
 
-		after := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread)
-		gomega.Expect(after.CPUAssigned).To(cpusetmatchers.HaveSize(before.CPUAssigned.Size()),
-			"a move must not change how many CPUs a claim has")
-		gomega.Expect(after.CPUAffinity.Equals(after.CPUAssigned)).To(gomega.BeTrue(),
-			"the kernel affinity %s does not match the cgroup cpuset %s", after.CPUAffinity.String(), after.CPUAssigned.String())
+		live := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread)
+		gomega.Expect(live.CPUAssigned).To(cpusetmatchers.Equal(after),
+			"the container is not on the CPUs the driver says its claim holds")
+		gomega.Expect(live.CPUAffinity.Equals(live.CPUAssigned)).To(gomega.BeTrue(),
+			"the kernel affinity %s does not match the cgroup cpuset %s", live.CPUAffinity.String(), live.CPUAssigned.String())
 
 		ginkgo.By("verifying the surviving claims never share a CPU")
 		held := cpuset.New()
