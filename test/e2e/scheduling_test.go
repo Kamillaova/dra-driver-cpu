@@ -77,6 +77,16 @@ func discoverFleet(ctx context.Context, cs kubernetes.Interface) []fleetDevice {
 	return fleet
 }
 
+// numaCEL pins a claim to one NUMA node's device. Only numanode grouping
+// publishes the attribute per device, so other modes get no selector and the
+// scenario spans the machine as it always did.
+func numaCEL(cfg driverConfigValues, numaID int) string {
+	if cfg.GroupBy != "numanode" {
+		return ""
+	}
+	return fmt.Sprintf(`device.attributes["dra.cpu"].numaNodeID == %d`, numaID)
+}
+
 func claimSpecWithSelector(cpus int, cel string) resourcev1.ResourceClaimSpec {
 	spec := makeResourceClaimSpec(cpus, true)
 	if cel != "" {
@@ -395,16 +405,23 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 		step := allocationStep(ctx, fxt.K8SClientset, target)
 		baseline, err := getPlacements(ctx, fxt.K8SClientset, target, false)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
-		free := baseline.freePerCache()
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
 		if len(free) < 2 || free[0] < 3*step {
 			ginkgo.Skip(fmt.Sprintf("fragmenting needs at least two caches with %d or more free CPUs each, got %v", 3*step, free))
 		}
+		scopeCEL := numaCEL(cfgValues, fragNUMA)
+		if cel != "" && scopeCEL != "" {
+			scopeCEL = cel + " && " + scopeCEL
+		} else if scopeCEL == "" {
+			scopeCEL = cel
+		}
 
-		ginkgo.By("checkerboarding the target node's caches with pinned fillers")
+		ginkgo.By(fmt.Sprintf("checkerboarding NUMA node %d of the target node with pinned fillers", fragNUMA))
 		var fillers []*v1.Pod
 		for i, cacheFree := range free {
-			pod, err := tryCreateClaimedTesterPod(ctx, fxt, dracpuTesterImage, target, cfgValues,
-				cacheFree-2*step, fmt.Sprintf("cpu-claim-bs-filler-%d", i))
+			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, target,
+				claimSpecWithSelector(cacheFree-2*step, scopeCEL), fmt.Sprintf("cpu-claim-bs-filler-%d", i))
 			if err != nil {
 				break
 			}
@@ -415,37 +432,64 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 		}
 
 		ginkgo.By("letting the scheduler place a claim no single cache can hold")
-		createClaimTemplate(ctx, fxt, "cpu-claim-bs-victim", claimSpecWithSelector(3*step, cel))
+		createClaimTemplate(ctx, fxt, "cpu-claim-bs-victim", claimSpecWithSelector(3*step, scopeCEL))
 		victim := makeUnpinnedClaimPod(fxt.Namespace.Name, dracpuTesterImage, "cpu-claim-bs-victim")
 		victim, err = e2epod.CreateSync(ctx, fxt.K8SClientset, victim)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		gomega.Expect(victim.Spec.NodeName).To(gomega.Equal(target),
 			"the claim was steered at the fragmented node and landed elsewhere")
 
+		// The gate must be the victim's own spread: total excess can belong to
+		// a straddling filler, which the driver may repair without touching the
+		// victim -- correctly, and this spec would have nothing to show.
+		var victimUID string
+		claims, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).List(ctx, metav1.ListOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		for _, claim := range claims.Items {
+			for _, ref := range claim.OwnerReferences {
+				if ref.UID == victim.UID {
+					victimUID = string(claim.UID)
+				}
+			}
+		}
+		gomega.Expect(victimUID).ToNot(gomega.BeEmpty(), "no claim owned by the victim pod")
+
 		fragmented, err := getPlacements(ctx, fxt.K8SClientset, target, false)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
-		if fragmented.totalExcess() == 0 {
-			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
+		before, ok := fragmented.claimCPUs(victimUID)
+		gomega.Expect(ok).To(gomega.BeTrue(), "the victim claim is not reported: %+v", fragmented.Claims)
+		if spreadOf(fragmented, before) < 2 {
+			ginkgo.Skip(fmt.Sprintf("the victim landed unsplit on %s; nothing to repair", before.String()))
 		}
-		pool := staticPoolOn(ctx, fxt.K8SClientset, cfgValues, target)
-		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, victim).CPUAssigned.Difference(pool)
 
 		ginkgo.By("releasing a filler and waiting for the repair the scheduler could not make")
 		gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, fillers[0])).To(gomega.Succeed())
+		var settled placementsReport
 		gomega.Eventually(func(g gomega.Gomega) {
 			report, err := getPlacements(ctx, fxt.K8SClientset, target, true)
 			g.Expect(err).ToNot(gomega.HaveOccurred())
 			g.Expect(report.plannedMoves()).To(gomega.BeZero())
 			g.Expect(report.totalExcess()).To(gomega.BeZero(),
 				"claims still span more caches than their sizes require: %+v", report.NUMANodes)
+			settled = report
 		}, 3*time.Minute, 5*time.Second).Should(gomega.Succeed())
 
-		ginkgo.By("verifying the repair moved the claim, kept its size, and restarted nothing")
+		ginkgo.By("verifying the repair unsplit the claim, kept its size, and restarted nothing")
+		after, ok := settled.claimCPUs(victimUID)
+		gomega.Expect(ok).To(gomega.BeTrue(), "the victim claim vanished: %+v", settled.Claims)
+		gomega.Expect(spreadOf(settled, after)).To(gomega.Equal(1), "the claim is still split: %s", after.String())
+		gomega.Expect(after).To(cpusetmatchers.HaveSize(before.Size()))
+		gomega.Expect(after).ToNot(cpusetmatchers.Equal(before), "an unsplit claim cannot keep its old scattered CPUs")
+
 		reread, err := fxt.K8SClientset.CoreV1().Pods(victim.Namespace).Get(ctx, victim.Name, metav1.GetOptions{})
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero())
-		after := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread).CPUAssigned.Difference(pool)
-		gomega.Expect(after).ToNot(cpusetmatchers.Equal(before), "the claim was never moved, so nothing was repaired")
-		gomega.Expect(after).To(cpusetmatchers.HaveSize(before.Size()))
+		pool := staticPoolOn(ctx, fxt.K8SClientset, cfgValues, target)
+		// The tester reports every five seconds, so the line right after the
+		// final commit can still show the pre-move cpuset.
+		gomega.Eventually(func(g gomega.Gomega) {
+			live := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread).CPUAssigned.Difference(pool)
+			g.Expect(live).To(cpusetmatchers.Equal(after), "the container is not on the CPUs the driver says its claim holds")
+		}, 30*time.Second, 5*time.Second).Should(gomega.Succeed())
 	})
 })

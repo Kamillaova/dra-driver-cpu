@@ -107,10 +107,15 @@ func (r placementsReport) plannedMoves() int {
 	return total
 }
 
-// freePerCache is the free CPU count of every cache on the node, ascending.
-func (r placementsReport) freePerCache() []int {
+// freePerCacheOn is freePerCache restricted to one NUMA node. Fragmentation
+// scenarios are built per NUMA node, because a move never crosses one: free
+// space elsewhere cannot repair a claim here.
+func (r placementsReport) freePerCacheOn(numaID int) []int {
 	var free []int
 	for _, node := range r.NUMANodes {
+		if node.NUMANodeID != numaID {
+			continue
+		}
 		for _, cache := range node.Caches {
 			cpus, err := cpuset.Parse(cache.FreeCPUs)
 			if err != nil {
@@ -121,6 +126,18 @@ func (r placementsReport) freePerCache() []int {
 	}
 	sort.Ints(free)
 	return free
+}
+
+// numaWithMostCaches is where a fragmentation scenario has the most room to
+// play out.
+func (r placementsReport) numaWithMostCaches() int {
+	best, caches := 0, -1
+	for _, node := range r.NUMANodes {
+		if len(node.Caches) > caches {
+			best, caches = node.NUMANodeID, len(node.Caches)
+		}
+	}
+	return best
 }
 
 // caches is how many uncore caches the driver can see across the node.
@@ -289,18 +306,22 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
 		victimCPUs := 3 * step
 		leaveFreePerCache := 2 * step
-		free := baseline.freePerCache()
-		fxt.Log.Info("cache geometry", "freePerCache", free, "allocationStep", step)
+		// Per NUMA node, not per machine: a move never crosses a NUMA node, so
+		// free space on another one cannot repair the victim, and a scenario
+		// spanning both would ask the driver for a repair it must not make.
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
+		fxt.Log.Info("cache geometry", "numaNode", fragNUMA, "freePerCache", free, "allocationStep", step)
 		if len(free) < 2 || free[0] < 3*step {
 			ginkgo.Skip(fmt.Sprintf("fragmenting needs at least two caches with %d or more free CPUs each, got %v",
 				3*step, free))
 		}
 
-		ginkgo.By("filling every cache down to two allocation steps free, smallest cache first")
+		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free, smallest cache first", fragNUMA))
 		var fillers []*v1.Pod
 		for i, cacheFree := range free {
-			pod, err := tryCreateClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues,
-				cacheFree-leaveFreePerCache, fmt.Sprintf("cpu-claim-filler-%d", i))
+			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+				claimSpecWithSelector(cacheFree-leaveFreePerCache, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-filler-%d", i))
 			if err != nil {
 				fxt.Log.Info("stopped filling", "placed", len(fillers), "reason", err.Error())
 				break
@@ -312,7 +333,9 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		}
 
 		ginkgo.By("placing a claim that no single cache can hold")
-		victim, victimUID := createClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, victimCPUs, "cpu-claim-victim")
+		victim, victimUID, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+			claimSpecWithSelector(victimCPUs, numaCEL(cfgValues, fragNUMA)), "cpu-claim-victim")
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, victim)
 		beforeClaim := before.CPUAssigned.Difference(staticPool)
 		fxt.Log.Info("victim placement", "cpus", beforeClaim.String())
@@ -387,16 +410,17 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		ginkgo.DeferCleanup(fxt.Teardown)
 
 		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
-		free := baseline.freePerCache()
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
 		if len(free) < 2 || free[0] < 3*step {
 			ginkgo.Skip(fmt.Sprintf("needs at least two caches with %d or more free CPUs each, got %v", 3*step, free))
 		}
 
-		ginkgo.By("filling every cache down to two allocation steps free")
+		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free", fragNUMA))
 		var fillers []*v1.Pod
 		for i, cacheFree := range free {
-			pod, err := tryCreateClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues,
-				cacheFree-2*step, fmt.Sprintf("cpu-claim-rs-filler-%d", i))
+			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+				claimSpecWithSelector(cacheFree-2*step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-rs-filler-%d", i))
 			if err != nil {
 				break
 			}
@@ -412,7 +436,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		claimTemplate := resourcev1.ResourceClaimTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: "cpu-claim-resize"},
 			Spec: resourcev1.ResourceClaimTemplateSpec{
-				Spec: makeResourceClaimSpec(3*step, cfgValues.CPUDeviceMode == "grouped"),
+				Spec: claimSpecWithSelector(3*step, numaCEL(cfgValues, fragNUMA)),
 			},
 		}
 		created, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &claimTemplate, metav1.CreateOptions{})
@@ -471,7 +495,8 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		ginkgo.DeferCleanup(fxt.Teardown)
 
 		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
-		free := baseline.freePerCache()
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
 		if len(free) < 2 || free[0] < 3*step {
 			ginkgo.Skip(fmt.Sprintf("needs at least two caches with %d or more free CPUs each, got %v", 3*step, free))
 		}
@@ -488,10 +513,11 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		}
 		claims := map[string]*trackedClaim{}
 		nextID := 0
-		tryCreate := func(sizeSteps int) bool {
+		tryCreate := func(sizeSteps int, cel string) bool {
 			name := fmt.Sprintf("cpu-claim-soak-%d", nextID)
 			nextID++
-			pod, uid, err := tryCreateClaimedTesterPodWithUID(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, sizeSteps*step, name)
+			pod, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+				claimSpecWithSelector(sizeSteps*step, cel), name)
 			if err != nil {
 				// A refused create is a legitimate outcome of churn: the pool may
 				// be too full, or too fragmented for the size. The soak's job is
@@ -547,12 +573,12 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 
 		ginkgo.By("phase 1: deterministic fragmentation and one guaranteed consolidation")
 		for _, cacheFree := range free {
-			if !tryCreate(cacheFree/step - 2) {
+			if !tryCreate(cacheFree/step-2, numaCEL(cfgValues, fragNUMA)) {
 				break
 			}
 		}
 		fragmented := false
-		if tryCreate(3) {
+		if tryCreate(3, numaCEL(cfgValues, fragNUMA)) {
 			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
 			gomega.Expect(err).ToNot(gomega.HaveOccurred())
 			fragmented = report.totalExcess() > 0
@@ -572,7 +598,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 				gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, claims[victim].pod)).To(gomega.Succeed())
 				delete(claims, victim)
 			}
-			tryCreate(1 + rng.IntN(3))
+			tryCreate(1+rng.IntN(3), "")
 			fxt.Log.Info("churn round complete", "round", round, "liveClaims", len(claims))
 			settle()
 			verifyInvariants()
@@ -609,7 +635,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		verifyInvariants()
 
 		ginkgo.By("phase 4: churn continues after the restart")
-		tryCreate(1 + rng.IntN(3))
+		tryCreate(1+rng.IntN(3), "")
 		settle()
 		verifyInvariants()
 
@@ -643,16 +669,17 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		ginkgo.DeferCleanup(fxt.Teardown)
 
 		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
-		free := baseline.freePerCache()
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
 		if len(free) < 2 || free[0] < 4*step {
 			ginkgo.Skip(fmt.Sprintf("needs at least two caches with %d or more free CPUs each, got %v", 4*step, free))
 		}
 
-		ginkgo.By("filling every cache down to two allocation steps free")
+		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free", fragNUMA))
 		var fillers []*v1.Pod
 		for i, cacheFree := range free {
-			pod, err := tryCreateClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues,
-				cacheFree-2*step, fmt.Sprintf("cpu-claim-un-filler-%d", i))
+			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+				claimSpecWithSelector(cacheFree-2*step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-un-filler-%d", i))
 			if err != nil {
 				break
 			}
@@ -668,7 +695,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			template := resourcev1.ResourceClaimTemplate{
 				ObjectMeta: metav1.ObjectMeta{Name: name},
 				Spec: resourcev1.ResourceClaimTemplateSpec{
-					Spec: makeResourceClaimSpec(cpus, cfgValues.CPUDeviceMode == "grouped"),
+					Spec: claimSpecWithSelector(cpus, numaCEL(cfgValues, fragNUMA)),
 				},
 			}
 			_, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &template, metav1.CreateOptions{})
