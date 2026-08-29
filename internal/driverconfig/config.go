@@ -117,6 +117,14 @@ type Config struct {
 	// cache offers nothing better -- whole-core allocation is what actually
 	// forbids that.
 	CachePlacementPolicy string `json:"cachePlacementPolicy,omitempty"`
+	// PublishFitAnnotation publishes the shape of each NUMA node's free CPUs
+	// -- per uncore cache, current and after the repack the defragmenter would
+	// actually perform -- as the dra.cpu/fit annotation on this driver's own
+	// Node. Device capacity is a scalar the scheduler cannot see shape in;
+	// the CCXAlign scheduler plugin scores nodes from this annotation.
+	// Requires the chart's nodes patch RBAC. Off by default: it is only worth
+	// the node-object writes when that scheduler is deployed.
+	PublishFitAnnotation bool `json:"publishFitAnnotation,omitempty"`
 	// Profiles are named per-node overrides for the fields that name CPUs.
 	// CPU numbering is a property of the node's hardware, so a fleet mixing
 	// node types cannot state one reservedCPUs or sharedPoolCPUs for all of
@@ -204,6 +212,7 @@ func (c Config) LogValues() []any {
 		"defragClaimCooldownSeconds", c.DefragClaimCooldownSeconds,
 		"sharedPoolCPUs", c.SharedPoolCPUs,
 		"cachePlacementPolicy", c.CachePlacementPolicy,
+		"publishFitAnnotation", c.PublishFitAnnotation,
 		"profiles", c.Profiles,
 	}
 }
@@ -231,6 +240,7 @@ type dumpConfig struct {
 	DefragClaimCooldownSeconds            int                `json:"defragClaimCooldownSeconds"`
 	SharedPoolCPUs                        string             `json:"sharedPoolCPUs"`
 	CachePlacementPolicy                  string             `json:"cachePlacementPolicy"`
+	PublishFitAnnotation                  bool               `json:"publishFitAnnotation"`
 	Profiles                              map[string]Profile `json:"profiles"`
 }
 
