@@ -92,6 +92,12 @@ honor these settings, where applicable.
   must not overlap `DRACPU_E2E_RESERVED_CPUS`, and under `DRACPU_E2E_FULL_PCPUS_ONLY` must be whole
   physical cores.
 
+- `DRACPU_E2E_PUBLISH_FIT`: (optional, default `false`): when `true`, *the Makefile* `ci-kind-setup`
+  target deploys the driver with `driverConfig.publishFitAnnotation: true`, and the **CCX-aligned
+  scheduling** specs run instead of skipping. They also need at least two nodes publishing `dra.cpu`
+  devices, and every spec but the annotation one needs a scheduler answering to `schedulerName: dracpu-scheduler` -- they probe for it by asking it to place a pod, and skip when nothing does. See
+  [CCX-aligned scheduling](../../docs/user/ccx-aligned-scheduling.md).
+
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.
