@@ -265,6 +265,27 @@
         "kubeconfig": {
           "type": "string"
         },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "reservedCPUs": {
+                "type": [
+                  "null",
+                  "string"
+                ]
+              },
+              "sharedPoolCPUs": {
+                "type": [
+                  "null",
+                  "string"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
         "publishNodeAllocatableResourceMapping": {
           "type": "boolean"
         },

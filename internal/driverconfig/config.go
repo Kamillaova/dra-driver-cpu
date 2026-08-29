@@ -18,6 +18,9 @@ package driverconfig
 
 import (
 	"fmt"
+	"maps"
+	"slices"
+	"strconv"
 
 	"sigs.k8s.io/yaml"
 )
@@ -103,6 +106,68 @@ type Config struct {
 	// state their cost, not to second-guess them. Empty (the default) keeps the
 	// dynamic shared pool: everything not claimed, resized as claims change.
 	SharedPoolCPUs string `json:"sharedPoolCPUs,omitempty"`
+	// Profiles are named per-node overrides for the fields that name CPUs.
+	// CPU numbering is a property of the node's hardware, so a fleet mixing
+	// node types cannot state one reservedCPUs or sharedPoolCPUs for all of
+	// them; every other field stays fleet-wide policy. A node selects its
+	// profile with the ProfileLabel label; without the label the fleet-wide
+	// values apply. Every profile is validated on every node, so a typo in
+	// any of them fails the whole fleet fast instead of one node quietly.
+	Profiles map[string]Profile `json:"profiles,omitempty"`
+}
+
+// Profile is one named per-node override set. A nil field inherits the
+// fleet-wide value; an explicit empty string clears it.
+type Profile struct {
+	ReservedCPUs   *string `json:"reservedCPUs,omitempty"`
+	SharedPoolCPUs *string `json:"sharedPoolCPUs,omitempty"`
+}
+
+// ProfileLabel is the node label whose value names the config profile the
+// node's driver applies at startup. Changing it takes effect on the next
+// driver restart, deliberately: the carve-outs it selects are the ground
+// truth under every current placement, not a value to swap live.
+const ProfileLabel = "dra.cpu/config"
+
+func (p Profile) String() string {
+	format := func(v *string) string {
+		if v == nil {
+			return "<inherit>"
+		}
+		return strconv.Quote(*v)
+	}
+	return fmt.Sprintf("{reservedCPUs: %s, sharedPoolCPUs: %s}", format(p.ReservedCPUs), format(p.SharedPoolCPUs))
+}
+
+func (c *Config) applyProfile(p Profile) {
+	if p.ReservedCPUs != nil {
+		c.ReservedCPUs = *p.ReservedCPUs
+	}
+	if p.SharedPoolCPUs != nil {
+		c.SharedPoolCPUs = *p.SharedPoolCPUs
+	}
+}
+
+// WithProfile returns the config with the named profile applied and the
+// result revalidated. An empty name means the node selects no profile and
+// the fleet-wide values stand. Naming a profile the config does not define
+// is an error, never a fallback: a typo must not run a node on the wrong
+// carve-outs.
+func (c Config) WithProfile(name string) (Config, error) {
+	if name == "" {
+		return c, nil
+	}
+	profile, ok := c.Profiles[name]
+	if !ok {
+		return Config{}, fmt.Errorf("the node's %s label selects config profile %q, but the config defines only %v",
+			ProfileLabel, name, slices.Sorted(maps.Keys(c.Profiles)))
+	}
+	c.applyProfile(profile)
+	c.Profiles = nil
+	if err := c.Validate(); err != nil {
+		return Config{}, fmt.Errorf("config profile %q does not validate: %w", name, err)
+	}
+	return c, nil
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -127,31 +192,33 @@ func (c Config) LogValues() []any {
 		"defragMinGain", c.DefragMinGain,
 		"defragClaimCooldownSeconds", c.DefragClaimCooldownSeconds,
 		"sharedPoolCPUs", c.SharedPoolCPUs,
+		"profiles", c.Profiles,
 	}
 }
 
 // dumpConfig mirrors Config field-for-field but drops the omitempty json
 // tags, so Dump also prints zero values (e.g. exposePCIeRoots=false).
 type dumpConfig struct {
-	Kubeconfig                            string `json:"kubeconfig"`
-	HostnameOverride                      string `json:"hostnameOverride"`
-	BindAddress                           string `json:"bindAddress"`
-	ReservedCPUs                          string `json:"reservedCPUs"`
-	CPUDeviceMode                         string `json:"cpuDeviceMode"`
-	GroupBy                               string `json:"groupBy"`
-	ExposePCIeRoots                       bool   `json:"exposePCIeRoots"`
-	SysFSOverlay                          string `json:"sysfsOverlay"`
-	KubeletRootDir                        string `json:"kubeletRootDir"`
-	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping"`
-	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly"`
-	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe"`
-	ReconcileSharedOnUnprepare            bool   `json:"reconcileSharedOnUnprepare"`
-	DefragEnabled                         bool   `json:"defragEnabled"`
-	DefragIntervalSeconds                 int    `json:"defragIntervalSeconds"`
-	DefragMaxMovesPerPass                 int    `json:"defragMaxMovesPerPass"`
-	DefragMinGain                         int    `json:"defragMinGain"`
-	DefragClaimCooldownSeconds            int    `json:"defragClaimCooldownSeconds"`
-	SharedPoolCPUs                        string `json:"sharedPoolCPUs"`
+	Kubeconfig                            string             `json:"kubeconfig"`
+	HostnameOverride                      string             `json:"hostnameOverride"`
+	BindAddress                           string             `json:"bindAddress"`
+	ReservedCPUs                          string             `json:"reservedCPUs"`
+	CPUDeviceMode                         string             `json:"cpuDeviceMode"`
+	GroupBy                               string             `json:"groupBy"`
+	ExposePCIeRoots                       bool               `json:"exposePCIeRoots"`
+	SysFSOverlay                          string             `json:"sysfsOverlay"`
+	KubeletRootDir                        string             `json:"kubeletRootDir"`
+	PublishNodeAllocatableResourceMapping bool               `json:"publishNodeAllocatableResourceMapping"`
+	FullPhysicalCPUsOnly                  bool               `json:"fullPhysicalCPUsOnly"`
+	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe"`
+	ReconcileSharedOnUnprepare            bool               `json:"reconcileSharedOnUnprepare"`
+	DefragEnabled                         bool               `json:"defragEnabled"`
+	DefragIntervalSeconds                 int                `json:"defragIntervalSeconds"`
+	DefragMaxMovesPerPass                 int                `json:"defragMaxMovesPerPass"`
+	DefragMinGain                         int                `json:"defragMinGain"`
+	DefragClaimCooldownSeconds            int                `json:"defragClaimCooldownSeconds"`
+	SharedPoolCPUs                        string             `json:"sharedPoolCPUs"`
+	Profiles                              map[string]Profile `json:"profiles"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
