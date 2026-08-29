@@ -123,6 +123,21 @@ func (c Config) Validate() error {
 		return fmt.Errorf("invalid fullPhysicalCPUsOnly: requires cpuDeviceMode %q, got %q",
 			device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
 	}
+	// The annotation describes each NUMA node's uncore caches over the CPUs
+	// this driver hands out, so it is only a truth the driver is in a position
+	// to tell where it is the one choosing them: in individual mode the
+	// scheduler names exact CPU devices, and with groupBy "machine" the cpuset
+	// comes from the claim's own opaque config.
+	if c.PublishFitAnnotation {
+		if c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
+			return fmt.Errorf("invalid publishFitAnnotation: requires cpuDeviceMode %q, got %q",
+				device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
+		}
+		if c.GroupBy != device.GROUP_BY_NUMA_NODE && c.GroupBy != device.GROUP_BY_SOCKET {
+			return fmt.Errorf("invalid publishFitAnnotation: requires groupBy %q or %q, got %q",
+				device.GROUP_BY_NUMA_NODE, device.GROUP_BY_SOCKET, c.GroupBy)
+		}
+	}
 	if err := c.validateDefrag(); err != nil {
 		return err
 	}
