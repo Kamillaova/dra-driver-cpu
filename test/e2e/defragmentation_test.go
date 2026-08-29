@@ -799,31 +799,58 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			return touched
 		}
 
-		ginkgo.By("marooning one one-core claim in every cache: a small, then a filler sealing its cache")
 		var smallUIDs []string
-		var fillers []*v1.Pod
-		for i := range free {
-			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
-			gomega.Expect(err).ToNot(gomega.HaveOccurred())
-			hole := minNonzeroFree(report)
-			if hole < 2*step {
-				break
+		if cfgValues.CachePlacementPolicy == "spread" {
+			// Under spread the confetti is not an accident of churn but the
+			// allocator's own preference: consecutive smalls land one per cache.
+			ginkgo.By("placing one one-core claim per cache, as spread does naturally")
+			for i := range free {
+				_, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+					claimSpecWithSelector(step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-small-%d", i))
+				if err != nil {
+					break
+				}
+				smallUIDs = append(smallUIDs, uid)
 			}
-			_, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-				claimSpecWithSelector(step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-small-%d", i))
-			if err != nil {
-				break
+		} else {
+			ginkgo.By("marooning one one-core claim in every cache: a small, then a filler sealing its cache")
+			var fillers []*v1.Pod
+			for i := range free {
+				report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+				hole := minNonzeroFree(report)
+				if hole < 2*step {
+					break
+				}
+				_, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+					claimSpecWithSelector(step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-small-%d", i))
+				if err != nil {
+					break
+				}
+				smallUIDs = append(smallUIDs, uid)
+				filler, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+					claimSpecWithSelector(hole-step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-filler-%d", i))
+				if err != nil {
+					break
+				}
+				fillers = append(fillers, filler)
 			}
-			smallUIDs = append(smallUIDs, uid)
-			filler, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-				claimSpecWithSelector(hole-step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-filler-%d", i))
-			if err != nil {
-				break
+			defer func() {
+				for _, filler := range fillers {
+					_ = e2epod.DeleteSync(ctx, fxt.K8SClientset, filler)
+				}
+			}()
+			if len(fillers) < len(smallUIDs) {
+				ginkgo.Skip(fmt.Sprintf("could not maroon enough smalls (%d smalls, %d fillers)", len(smallUIDs), len(fillers)))
 			}
-			fillers = append(fillers, filler)
+			ginkgo.By("releasing the fillers, leaving only the marooned smalls")
+			for _, filler := range fillers {
+				gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, filler)).To(gomega.Succeed())
+			}
+			fillers = nil
 		}
-		if len(smallUIDs) < 3 || len(fillers) < len(smallUIDs) {
-			ginkgo.Skip(fmt.Sprintf("could not maroon enough smalls (%d smalls, %d fillers)", len(smallUIDs), len(fillers)))
+		if len(smallUIDs) < 3 {
+			ginkgo.Skip(fmt.Sprintf("could not place enough smalls (%d)", len(smallUIDs)))
 		}
 
 		ginkgo.By("verifying the confetti actually formed: every small alone in a distinct cache")
@@ -842,15 +869,18 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			seen[touched[0]] = true
 		}
 		if !scattered {
+			gomega.Expect(cfgValues.CachePlacementPolicy).ToNot(gomega.Equal("spread"),
+				"under spread, one claim per cache is the allocator's own promise, not a scenario to construct")
 			ginkgo.Skip("the allocator did not scatter the smalls one per cache; the scenario cannot form on this geometry")
 		}
 
-		ginkgo.By("releasing the fillers, leaving only the marooned smalls")
-		for _, filler := range fillers {
-			gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, filler)).To(gomega.Succeed())
-		}
-
 		movesBefore := defragMovesCommitted(ctx, fxt.K8SClientset, targetNode.Name)
+		bystanders := map[string]cpuset.CPUSet{}
+		for _, uid := range smallUIDs {
+			cpus, ok := shape.claimCPUs(uid)
+			gomega.Expect(ok).To(gomega.BeTrue())
+			bystanders[uid] = cpus
+		}
 
 		ginkgo.By(fmt.Sprintf("requesting %d CPUs: two whole caches, while every cache hosts a small", bigSize))
 		bigPod, bigUID, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
@@ -894,13 +924,26 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			union = union.Union(cpus)
 		}
 
-		// The alignment cannot come for free: the big claim moved off its
-		// scattered placement, and the two caches it now owns each hosted a
-		// small that had to step aside -- the documented price of best-effort
-		// placement for the cheap tenants.
+		// The alignment cannot come for free -- the big claim moved and the two
+		// smalls in its way stepped aside -- but it must cost no more than that:
+		// three claims touched, at most four commits (the straddler may take an
+		// interim step, since it cannot land on CPUs a bystander still holds in
+		// the same pass), and every other small keeps its exact CPUs.
 		moves := defragMovesCommitted(ctx, fxt.K8SClientset, targetNode.Name) - movesBefore
 		gomega.Expect(moves).To(gomega.BeNumerically(">=", 3),
 			"aligning the big claim requires moving it plus at least the two smalls in its way")
+		gomega.Expect(moves).To(gomega.BeNumerically("<=", 4),
+			"the repair herded bystanders it did not need")
+		movedSmalls := 0
+		for uid, before := range bystanders {
+			cpus, ok := settled.claimCPUs(uid)
+			gomega.Expect(ok).To(gomega.BeTrue())
+			if !cpus.Equals(before) {
+				movedSmalls++
+			}
+		}
+		gomega.Expect(movedSmalls).To(gomega.BeNumerically("<=", 2),
+			"only the smalls inside the big claim's two target caches may move, %d did", movedSmalls)
 
 		ginkgo.By("verifying the container followed its claim without a restart")
 		reread, err := fxt.K8SClientset.CoreV1().Pods(bigPod.Namespace).Get(ctx, bigPod.Name, metav1.GetOptions{})
