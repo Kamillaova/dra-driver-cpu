@@ -332,3 +332,42 @@ func packingOrder(placements []Placement) []Placement {
 	})
 	return order
 }
+
+// Settle is the reachable end-state: the placements and free CPUs the node
+// converges to under repeated passes of PlanNode with these options. It is
+// what a claim arriving later can rely on eventually finding -- as opposed to
+// the ideal packing, which the options may forbid ever reaching -- so it is
+// the honest thing to advertise off-node.
+//
+// Pure and side-effect free: nothing is moved, the inputs are not modified.
+// Callers advertising the result should lift MaxMoves (a per-pass budget, not
+// a reachability constraint) and keep MinGain, KeepFreePoolNonEmpty, and any
+// permanent ineligibility, while dropping temporal ones like a cooldown.
+// PlanNode's own convergence argument bounds the passes; the cap is a
+// backstop, and hitting it returns the state reached so far, which moves are
+// monotonic toward, never past.
+func Settle(topo *Topology, placements []Placement, free cpuset.CPUSet, sel Selector, opts Options) ([]Placement, cpuset.CPUSet, error) {
+	current := append([]Placement(nil), placements...)
+	free = free.Intersection(topo.CPUs())
+
+	const passCap = 32
+	for range passCap {
+		plan, err := PlanNode(topo, current, free, sel, opts)
+		if err != nil {
+			return nil, cpuset.New(), err
+		}
+		if len(plan.Moves) == 0 {
+			break
+		}
+		byUID := make(map[types.UID]int, len(current))
+		for i, p := range current {
+			byUID[p.ClaimUID] = i
+		}
+		for _, move := range plan.Moves {
+			i := byUID[move.ClaimUID]
+			free = free.Union(current[i].CPUs).Difference(move.To)
+			current[i] = Placement{ClaimUID: move.ClaimUID, CPUs: move.To}
+		}
+	}
+	return current, free, nil
+}
