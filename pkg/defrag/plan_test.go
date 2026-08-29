@@ -720,3 +720,57 @@ func TestPlanNodeDisplacedClaimsFollowTheSpreadPolicy(t *testing.T) {
 		require.Equal(t, 1, n, "cache %d hosts %d smalls; with six caches and a two-cache claim, spread has room for one each", cache, n)
 	}
 }
+
+// TestSettleReachesTheConvergedStateWithoutMoving: the end-state matches what
+// pass-by-pass application converges to, the inputs are untouched, and the
+// options' permanent refusals are honored -- an ineligible claim stays where
+// it is even when the ideal wants its cache.
+func TestSettleReachesTheConvergedStateWithoutMoving(t *testing.T) {
+	topo := topologyOf([]int{8, 8, 8, 8})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	placements := []defrag.Placement{
+		placement("big", 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23),
+	}
+	for i := range 4 {
+		placements = append(placements, placement(types.UID(fmt.Sprintf("small-%d", i)), i*8, i*8+1))
+	}
+	free := topo.CPUDetails.CPUs().Difference(totalCPUs(placements))
+	inputCopy := append([]defrag.Placement(nil), placements...)
+
+	settled, settledFree, err := defrag.Settle(dtopo, placements, free, selectorFor(topo), defrag.Options{})
+	require.NoError(t, err)
+	require.Equal(t, 0, dtopo.Cost(settled), "the settled state must be aligned")
+	require.Equal(t, inputCopy, placements, "Settle must not modify its inputs")
+
+	// Pass-by-pass convergence lands on the same accounting.
+	passes, converged, convergedFree := converge(t, topo, dtopo, placements, free, defrag.Options{})
+	require.Positive(t, passes)
+	require.Equal(t, dtopo.Cost(converged), dtopo.Cost(settled))
+	require.True(t, settledFree.Equals(convergedFree),
+		"settled free %s != converged free %s", settledFree.String(), convergedFree.String())
+
+	// A permanently ineligible claim pins its CPUs: the end-state routes
+	// around it rather than promising its cache to anyone.
+	pinned := func(uid types.UID) bool { return uid != "small-0" }
+	settled, _, err = defrag.Settle(dtopo, placements, free, selectorFor(topo), defrag.Options{Eligible: pinned})
+	require.NoError(t, err)
+	for _, p := range settled {
+		if p.ClaimUID == "small-0" {
+			require.True(t, p.CPUs.Equals(cpuset.New(0, 1)), "ineligible claim moved to %s", p.CPUs.String())
+		}
+	}
+}
+
+// TestSettleHonoursMinGain: an improvement below the threshold is permanently
+// refused, so the end-state must keep it, not advertise it.
+func TestSettleHonoursMinGain(t *testing.T) {
+	topo := topologyOf([]int{4, 4, 4, 4})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+	placements := []defrag.Placement{placement("straddler", 2, 3, 6, 7)}
+	free := topo.CPUDetails.CPUs().Difference(totalCPUs(placements))
+
+	settled, _, err := defrag.Settle(dtopo, placements, free, selectorFor(topo), defrag.Options{MinGain: 2})
+	require.NoError(t, err)
+	require.Equal(t, 1, dtopo.Cost(settled), "a gain of 1 is below MinGain 2 and must not be advertised")
+}
