@@ -491,16 +491,16 @@ func createClaimedTesterPod(ctx context.Context, fxt *fixture.Fixture, image, no
 	return pod, claimUID
 }
 
-func tryCreateClaimedTesterPod(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, error) {
-	pod, _, err := tryCreateClaimedTesterPodWithUID(ctx, fxt, image, nodeName, cfg, numCPUs, claimTemplateName)
-	return pod, err
+func tryCreateClaimedTesterPodWithUID(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, string, error) {
+	return tryCreateClaimedTesterPodWithSpec(ctx, fxt, image, nodeName,
+		makeResourceClaimSpec(numCPUs, cfg.CPUDeviceMode == "grouped"), claimTemplateName)
 }
 
-func tryCreateClaimedTesterPodWithUID(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, string, error) {
+func tryCreateClaimedTesterPodWithSpec(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, spec resourcev1.ResourceClaimSpec, claimTemplateName string) (*v1.Pod, string, error) {
 	claimTemplate := resourcev1.ResourceClaimTemplate{
 		ObjectMeta: metav1.ObjectMeta{Name: claimTemplateName},
 		Spec: resourcev1.ResourceClaimTemplateSpec{
-			Spec: makeResourceClaimSpec(numCPUs, cfg.CPUDeviceMode == "grouped"),
+			Spec: spec,
 		},
 	}
 	created, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &claimTemplate, metav1.CreateOptions{})
