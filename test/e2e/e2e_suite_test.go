@@ -338,7 +338,17 @@ type driverConfigValues struct {
 	DefragEnabled              bool                     `json:"defragEnabled,omitempty"`
 	SharedPoolCPUs             string                   `json:"sharedPoolCPUs,omitempty"`
 	CachePlacementPolicy       string                   `json:"cachePlacementPolicy,omitempty"`
+	PublishFitAnnotation       bool                     `json:"publishFitAnnotation,omitempty"`
 	Profiles                   map[string]profileValues `json:"profiles,omitempty"`
+}
+
+// effectivePlacementPolicy is what the driver reports, which is the default
+// rather than the empty string a config file that omits it carries.
+func (v driverConfigValues) effectivePlacementPolicy() string {
+	if v.CachePlacementPolicy == "" {
+		return "pack"
+	}
+	return v.CachePlacementPolicy
 }
 
 type profileValues struct {
