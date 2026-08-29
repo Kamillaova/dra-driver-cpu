@@ -101,6 +101,12 @@ func (o Options) eligible(claimUID types.UID) bool {
 // step towards them when they are not, and only when that strictly improves the
 // claim by the measure moveScore describes. Because that measure cannot rise, a
 // node converges in a bounded number of passes instead of churning.
+//
+// The ideal is the destination only for claims that need one. A claim already
+// spread as little as its size allows is left where it is unless it occupies
+// CPUs the ideal owes to a claim that is actually misaligned, so a repair
+// relocates the straddling claim and the bystanders in its way, and nothing
+// else: the node ends aligned, not necessarily identical to the ideal layout.
 func PlanNode(topo *Topology, placements []Placement, free cpuset.CPUSet, sel Selector, opts Options) (Plan, error) {
 	plan := Plan{NUMANodeID: topo.NUMANodeID()}
 	for _, p := range placements {
@@ -218,6 +224,18 @@ func plannedMoves(topo *Topology, placements []Placement, ideal map[types.UID]cp
 	for _, cpus := range ideal {
 		allIdeal = allIdeal.Union(cpus)
 	}
+	// The ideal slots of the claims that are actually misaligned. A claim
+	// already spread as little as its size allows moves only to vacate these:
+	// the ideal is a demand for alignment, not for tidiness, and every move
+	// beyond that is churn some running workload pays for nothing. Without
+	// this, repairing one straddling claim would also herd every well-placed
+	// bystander into the ideal's preferred slots.
+	needy := cpuset.New()
+	for _, p := range placements {
+		if topo.ExcessSpread(p.CPUs) > 0 {
+			needy = needy.Union(ideal[p.ClaimUID])
+		}
+	}
 	// CPUs the ideal leaves over. A claim that cannot reach its own ideal slot is
 	// steered here rather than into another claim's, which is what makes stepping
 	// aside progress instead of passing the problem on.
@@ -231,6 +249,9 @@ func plannedMoves(topo *Topology, placements []Placement, ideal map[types.UID]cp
 	for _, p := range packingOrder(placements) {
 		wanted := ideal[p.ClaimUID]
 		if wanted.Equals(p.CPUs) {
+			continue
+		}
+		if topo.ExcessSpread(p.CPUs) == 0 && p.CPUs.Intersection(needy).IsEmpty() {
 			continue
 		}
 		othersIdeal := allIdeal.Difference(wanted)

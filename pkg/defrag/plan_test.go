@@ -620,3 +620,103 @@ func TestPlanNodeTakesACacheItsIdealPromisedToAnother(t *testing.T) {
 		require.Equal(t, 1, dtopo.Spread(p.CPUs), "claim %s should end in one cache", p.ClaimUID)
 	}
 }
+
+// TestPlanNodeMovesOnlyTheClaimsARepairNeeds: the confetti case. Every cache
+// holds one well-placed small claim, a straddling claim needs two of those
+// caches, and the repair may touch exactly the straddler and the two smalls in
+// its way. The ideal layout would also tidy the other smalls into its preferred
+// slots; tidiness is not worth a running workload's cpuset changing, so those
+// moves must not ride along in the passes the repair keeps the cost gate open.
+func TestPlanNodeMovesOnlyTheClaimsARepairNeeds(t *testing.T) {
+	topo := topologyOf([]int{8, 8, 8, 8, 8, 8, 8, 8})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	placements := []defrag.Placement{
+		placement("big", 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23),
+	}
+	for i := range 8 {
+		placements = append(placements, placement(types.UID(fmt.Sprintf("small-%d", i)), i*8, i*8+1))
+	}
+	free := topo.CPUDetails.CPUs().Difference(totalCPUs(placements))
+	require.Equal(t, 1, dtopo.Cost(placements), "the big claim spans three caches where two would do")
+
+	moved := map[types.UID]int{}
+	current := placements
+	for pass := 0; pass < 10; pass++ {
+		plan, err := defrag.PlanNode(dtopo, current, free, selectorFor(topo), defrag.Options{MaxMoves: 4})
+		require.NoError(t, err)
+		requireValidPlan(t, dtopo, current, free, plan)
+		if len(plan.Moves) == 0 {
+			break
+		}
+		for _, move := range plan.Moves {
+			moved[move.ClaimUID]++
+		}
+		current, free = applyPlan(current, free, plan)
+	}
+
+	require.Equal(t, 0, dtopo.Cost(current), "the node did not end aligned")
+	require.Positive(t, moved["big"], "the straddling claim is the repair's whole point")
+	for i := 2; i < 8; i++ {
+		uid := types.UID(fmt.Sprintf("small-%d", i))
+		require.Zero(t, moved[uid], "small-%d was not in the repair's way and must not move", i)
+	}
+	byUID := map[types.UID]cpuset.CPUSet{}
+	for _, p := range current {
+		byUID[p.ClaimUID] = p.CPUs
+	}
+	for i := 2; i < 8; i++ {
+		uid := types.UID(fmt.Sprintf("small-%d", i))
+		require.True(t, byUID[uid].Equals(cpuset.New(i*8, i*8+1)),
+			"small-%d must keep its exact CPUs, has %s", i, byUID[uid].String())
+	}
+}
+
+// TestPlanNodeDisplacedClaimsFollowTheSpreadPolicy: under the spread selector a
+// bystander evicted by a repair lands in the emptiest cache, so the one-tenant-
+// per-cache layout survives its own repair wherever there is room for it.
+func TestPlanNodeDisplacedClaimsFollowTheSpreadPolicy(t *testing.T) {
+	topo := topologyOf([]int{4, 4, 4, 4, 4, 4})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	spreadSel := func(available cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
+		return coreselect.TakeWholeCoresPolicy(topo, available, numCPUs, coreselect.Spread, cpuset.New())
+	}
+
+	placements := []defrag.Placement{
+		placement("big", 2, 3, 6, 7, 10, 11, 14, 15),
+		placement("small-1", 0, 1),
+		placement("small-2", 4, 5),
+		placement("small-3", 8, 9),
+		placement("small-4", 12, 13),
+	}
+	free := cpuset.New(16, 17, 18, 19, 20, 21, 22, 23)
+	require.Positive(t, dtopo.Cost(placements))
+
+	current := placements
+	for pass := 0; pass < 10; pass++ {
+		plan, err := defrag.PlanNode(dtopo, current, free, spreadSel, defrag.Options{})
+		require.NoError(t, err)
+		requireValidPlan(t, dtopo, current, free, plan)
+		if len(plan.Moves) == 0 {
+			break
+		}
+		current, free = applyPlan(current, free, plan)
+	}
+
+	require.Equal(t, 0, dtopo.Cost(current), "the node did not end aligned")
+	tenants := map[int]int{}
+	for _, p := range current {
+		if p.ClaimUID == "big" {
+			continue
+		}
+		require.Equal(t, 1, dtopo.Spread(p.CPUs), "small %s ended split", p.ClaimUID)
+		for _, cpu := range p.CPUs.List() {
+			tenants[topo.CPUDetails[cpu].UncoreCacheID]++
+			break
+		}
+	}
+	for cache, n := range tenants {
+		require.Equal(t, 1, n, "cache %d hosts %d smalls; with six caches and a two-cache claim, spread has room for one each", cache, n)
+	}
+}
