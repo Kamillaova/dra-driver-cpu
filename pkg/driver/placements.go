@@ -247,7 +247,7 @@ func (cp *CPUDriver) numaNodeReport(logger logr.Logger, nodeTopo *defrag.Topolog
 		MaxMoves:             cp.defrag.maxMoves,
 		MinGain:              cp.defrag.minGain,
 		Eligible:             cp.claimMovable,
-		KeepFreePoolNonEmpty: len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0,
+		KeepFreePoolNonEmpty: cp.keepFreePoolNonEmpty(),
 	})
 	if err != nil {
 		report.Plan = &planReport{Reason: "cannot plan: " + err.Error()}

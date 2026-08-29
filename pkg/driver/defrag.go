@@ -206,11 +206,7 @@ func (cp *CPUDriver) planDefragMoves(logger logr.Logger, online cpuset.CPUSet) (
 		free = topo.CPUDetails.CompleteCores(free)
 	}
 
-	// While a move is in flight its claim holds both its old and its new CPUs, so
-	// a round that took every free CPU would leave the shared pool momentarily
-	// empty, which NRI cannot express. A static pool is out of the claims'
-	// reach entirely, so there is nothing to protect.
-	keepFree := cp.sharedPool.IsEmpty() && len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
+	keepFree := cp.keepFreePoolNonEmpty()
 
 	placements := defrag.PlacementsByNUMANode(topo, cp.cpuAllocationStore.ResourceClaimAllocations())
 	// Every node the topology has, not only those holding a claim. A node with no
@@ -274,6 +270,15 @@ func (cp *CPUDriver) defragSelector(logger logr.Logger) defrag.Selector {
 	return func(available cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
 		return cp.takeCPUsForDevice(logger, cp.topology.cpuTopology, available, numCPUs)
 	}
+}
+
+// keepFreePoolNonEmpty reports whether a pass must leave a free CPU behind.
+// While a move is in flight its claim holds both its old and its new CPUs, so
+// a round that took every free CPU would leave the shared pool momentarily
+// empty, which NRI cannot express. A static pool is out of the claims' reach
+// entirely, so there is nothing to protect.
+func (cp *CPUDriver) keepFreePoolNonEmpty() bool {
+	return cp.sharedPool.IsEmpty() && len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
 }
 
 // claimMovable reports whether a claim may be moved now. Called with applyMu held.
