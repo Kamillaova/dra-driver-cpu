@@ -68,32 +68,46 @@ Fork-only symbols added to upstream files, which carry no marker of their own. A
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
 - `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`, `cdiSharedEnvVar`, `GetDeviceCPUSet`
-- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `lastMoved`, `pendingRound` and
-  `sharedPool` fields, the `Config.Defrag*` and `Config.SharedPoolCPUs` options, and
-  `validateSharedPool`
+
+- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `fit`, `sysfs`, `lastMoved`, `pendingRound` and
+  `sharedPool` fields, the `Config.Defrag*`, `Config.PublishFitAnnotation` and
+  `Config.SharedPoolCPUs` options, and `validateSharedPool`
+
 - `pkg/driver/nri_hooks.go` (additions): `sharedContainerCPUs`, `guaranteedContainerCPUs`,
   `localSharedPool`
+
 - `pkg/driver/dra_hooks.go` (additions): `claimEnvEdits`
+
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
+
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`
+
 - `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`,
   `ResourceClaimAllocations`
+
 - `pkg/store/claim_tracker.go`: `Owner`
+
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
-- `internal/driverconfig`: the `Defrag*` and `SharedPoolCPUs` fields, their defaults and
-  `validateDefrag`; the `Profiles` map, `Profile`, `ProfileLabel` and `WithProfile`
+
+- `internal/driverconfig`: the `Defrag*`, `SharedPoolCPUs` and `PublishFitAnnotation` fields, their
+  defaults and `validateDefrag`; the `Profiles` map, `Profile`, `ProfileLabel` and `WithProfile`
+
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
   behind them
+
 - `test/e2e`: the defragmentation, whole-core and static-shared-pool suites, the claim-pod and
   shared-pool helpers in `e2e_suite_test.go`, the
   `defragEnabled`/`fullPhysicalCPUsOnly`/`sharedPoolCPUs` config read-back, and the `env` field the
   tester image reports
+
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
 
+- `deployment/helm`: the `nodes` `patch` verb, granted only while `publishFitAnnotation` is set
+
 Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/driver/defrag.go`, `reconcile.go`,
-`placements.go`, `pkg/cpuinfo/coretopology.go`) are visible to `git diff --stat` on their own and are
-not repeated here.
+`placements.go`, `fit.go`, `pkg/cpuinfo/coretopology.go`) are visible to `git diff --stat` on their
+own and are not repeated here.
 
 `CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver only calls it to carry an
 environment edit over unchanged when rewriting a spec; placement itself comes from the annotation. It
@@ -151,6 +165,29 @@ behaviour) rather than silently adapting.
   `reservedSystemCPUs`: static carve-outs are stated, validated, and costed, not computed. The driver
   still validates the choice (unknown or offline CPUs, split cores under `fullPhysicalCPUsOnly`,
   overlap with `reservedCPUs`) and logs the caches the pool spoils for whole-cache claims.
+- **The cluster-wide half was pulled forward from v2, at the user's direction.** The design filed a
+  scheduler plugin as a later option to prototype only after measuring whether node-local
+  defragmentation sufficed. It does not suffice for the placement policy this fork is built for --
+  prefer a node with a free cache, and only then fall back to any node plus a repair -- which names
+  a cluster-wide chooser outright. So `publishFitAnnotation` and the `CCXAlign` plugin on a branch
+  of `kubernetes-sigs/scheduler-plugins` landed alongside v1 rather than after it.
+- **The annotation carries per-cache free CPUs, not the designed counts of claims that would fit.**
+  `fitsAligned: {"2": 7, "4": 4, ...}` answers only the questions whose sizes it was computed for,
+  and a reader has to subtract the claims it has already placed this scheduling cycle from
+  *somewhere*. Per-cache arrays answer both, cost the same handful of integers, and leak no
+  per-claim layout. They do oblige the reader to simulate a placement, which is why the node's
+  `cachePlacementPolicy` is published beside them.
+- **The published repacked shape is the settled state, not the ideal packing.** The planner
+  permanently honours its minimum gain and the shared-pool guard, so the ideal can be unreachable
+  forever; advertising it would promise consolidations that never come. `defrag.Settle` reports
+  where repeated passes actually converge, and the driver falls back to today's free CPUs whenever
+  even that cannot be said honestly -- defragmentation off, or a legacy claim holding half a
+  physical core.
+- **Recorded exit ramp.** If DRA gains what this works around, the annotation and the plugin should
+  both go. That needs per-cache subrequests the scheduler can allocate from directly (KEP-4815
+  shared counters with `FirstAvailable`) *and* cross-node preference, i.e. scoring over DRA devices.
+  Neither is usable today: the interplay of `ConsumesCounters` with `AllowMultipleAllocations` is
+  unverified, and no device-scoring extension point exists in the 1.35 or 1.37 allocator.
 - **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
   node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
   which needs a flag carried through `ContainerState`. Neither affects correctness — the first only
