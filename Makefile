@@ -127,6 +127,10 @@ DRACPU_E2E_FULL_PCPUS_ONLY ?= false
 # Set to a cpuset (e.g. "1,17") to have ci-kind-setup deploy the driver with a
 # static shared pool on those CPUs; empty keeps the dynamic pool.
 DRACPU_E2E_SHARED_POOL_CPUS ?=
+# Set to "true" to have ci-kind-setup deploy the driver publishing the
+# dra.cpu/fit node annotation, which the CCX-aligned scheduling specs read. The
+# chart grants the nodes patch verb only while this is set.
+DRACPU_E2E_PUBLISH_FIT ?= false
 comma := ,
 # Extra arguments passed to golangci-lint in the lint target.
 # For example, set GOLANGCI_LINT_EXTRA_ARGS=--fix to auto-fix issues.
@@ -228,6 +232,7 @@ endif
 		--set driverConfig.fullPhysicalCPUsOnly=$(DRACPU_E2E_FULL_PCPUS_ONLY) \
 		--set driverConfig.defragEnabled=$(DRACPU_E2E_DEFRAG) \
 		--set driverConfig.assumeUnsolicitedUpdatesSafe=$(DRACPU_E2E_DEFRAG) \
+		--set driverConfig.publishFitAnnotation=$(DRACPU_E2E_PUBLISH_FIT) \
 		--set-string 'driverConfig.sharedPoolCPUs=$(subst $(comma),\$(comma),$(DRACPU_E2E_SHARED_POOL_CPUS))'
 	hack/ci/wait-resourcelices.sh
 
