@@ -1,0 +1,15 @@
+include:
+  - project: cloud/ci/templates
+    ref: kamillaova/universal-templates
+    file:
+      - Docker.gitlab-ci.yml
+      - Helm.gitlab-ci.yml
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  PUBLISH_ALL_BRANCHES: "true"
+  CHART_DIR: deployment/helm/dra-driver-cpu
