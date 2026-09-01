@@ -24,6 +24,7 @@ import (
 	"slices"
 
 	"github.com/go-logr/logr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"k8s.io/utils/cpuset"
 )
@@ -159,6 +160,19 @@ func (c Config) validateDefrag() error {
 	}
 	if c.DefragClaimCooldownSeconds < 0 {
 		return fmt.Errorf("invalid defragClaimCooldownSeconds %d: must not be negative", c.DefragClaimCooldownSeconds)
+	}
+	switch coreselect.Policy(c.CachePlacementPolicy) {
+	case coreselect.Pack:
+	case coreselect.Spread:
+		// The policy governs which CPUs the driver picks, so it means nothing
+		// where the driver does not pick: in individual mode the scheduler
+		// names exact CPU devices.
+		if c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
+			return fmt.Errorf("invalid cachePlacementPolicy %q: requires cpuDeviceMode %q, got %q",
+				c.CachePlacementPolicy, device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
+		}
+	default:
+		return fmt.Errorf("invalid cachePlacementPolicy %q: must be %q or %q", c.CachePlacementPolicy, coreselect.Pack, coreselect.Spread)
 	}
 	if c.SharedPoolCPUs != "" {
 		pool, err := cpuset.Parse(c.SharedPoolCPUs)
