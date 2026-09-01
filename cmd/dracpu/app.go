@@ -33,6 +33,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/subcommands"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/driver"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
@@ -250,6 +251,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		ExposePCIeRoots:                       cfg.ExposePCIeRoots,
 		PublishNodeAllocatableResourceMapping: cfg.PublishNodeAllocatableResourceMapping,
 		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
+		CachePlacementPolicy:                  coreselect.Policy(cfg.CachePlacementPolicy),
 		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
 		ReconcileSharedOnUnprepare:            cfg.ReconcileSharedOnUnprepare,
 		DefragEnabled:                         cfg.DefragEnabled,
