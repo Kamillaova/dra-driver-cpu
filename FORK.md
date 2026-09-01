@@ -33,6 +33,19 @@ alignment lost to claim churn is recovered.
 - Commits follow upstream's conventions (`type:` / `component:` subjects, `Signed-off-by`) and are kept
   atomic so the upstreamable ones cherry-pick cleanly.
 
+### Divergence surface
+
+Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
+to an upstreamable piece (see below) are not repeated here: they leave with their PR.
+
+- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `GetDeviceCPUSet`
+
+- the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
+  they pin, rather than kept apart
+
+Wholly new files (`pkg/coreselect`, `reconcile.go`, `pkg/cpuinfo/coretopology.go`) are visible to
+`git diff --stat` on their own and are not repeated here.
+
 ## Upstreamable pieces
 
 These carry no fork-only code and are intended to be offered upstream as separate PRs:
