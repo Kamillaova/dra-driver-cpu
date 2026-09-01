@@ -229,7 +229,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		if !cfgValues.DefragEnabled {
 			ginkgo.Skip("defragmentation is not enabled in the driver configuration; set DRACPU_E2E_DEFRAG=true when creating the cluster")
 		}
-		staticPool = cfgValues.staticPool()
+		staticPool = cfgValues.effectiveFor(targetNode).staticPool()
 		if !staticPool.IsEmpty() {
 			infraFxt := rootFxt.WithPrefix("infra-defrag")
 			gomega.Expect(infraFxt.Setup(ctx)).To(gomega.Succeed())

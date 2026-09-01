@@ -82,7 +82,8 @@ honor these settings, where applicable.
 
 - The **cross-node scheduling** specs need no knob: they run whenever at least two nodes publish
   `dra.cpu` devices and skip themselves otherwise. On a heterogeneous fleet they exercise capacity
-  routing, geometry CEL selectors, burst races, and the scheduler's fragmentation blind spot.
+  routing, geometry CEL selectors, burst races, and the scheduler's fragmentation blind spot; the
+  suite resolves each node's effective config through its `dra.cpu/config` profile label.
 
 - `DRACPU_E2E_SHARED_POOL_CPUS`: (optional, default empty): when set to a cpuset (say `1,17`), *the
   Makefile* `ci-kind-setup` target deploys the driver with `driverConfig.sharedPoolCPUs` on those
