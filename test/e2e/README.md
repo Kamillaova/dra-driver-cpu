@@ -75,6 +75,11 @@ honor these settings, where applicable.
   `systemctl restart containerd` inside the node. The tests skip themselves anyway on a node whose CPUs the driver sees as one
   uncore cache, since there is no spread to recover there.
 
+- `DRACPU_E2E_FULL_PCPUS_ONLY`: (optional, default `false`): when `true`, *the Makefile*
+  `ci-kind-setup` target deploys the driver with `driverConfig.fullPhysicalCPUsOnly: true`, and the
+  whole-core tests run instead of skipping. They skip themselves on a node with SMT disabled, where
+  every core is a single thread and the option has no observable effect.
+
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.

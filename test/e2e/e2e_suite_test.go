@@ -319,6 +319,7 @@ type driverConfigValues struct {
 	GroupBy                               string `json:"groupBy,omitempty"`
 	ReservedCPUs                          string `json:"reservedCPUs,omitempty"`
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
+	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly,omitempty"`
 	DefragEnabled                         bool   `json:"defragEnabled,omitempty"`
 }
 
