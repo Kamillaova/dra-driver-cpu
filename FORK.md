@@ -81,6 +81,9 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `internal/driverconfig`: the `Defrag*` fields, their defaults and `validateDefrag`
 
+- `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
+  behind them
+
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
 
@@ -125,6 +128,8 @@ behaviour) rather than silently adapting.
 - **The defragmentation options are flat `defrag*` fields, not a nested block.** `Config` is flat
   throughout, its dump mirror is a field-for-field type conversion, and two reflection tests walk its
   fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
+- **One metric carries a `numa_node` label**, against the rule stated in `docs/user/metrics.md`. The
+  rule is amended there rather than quietly broken.
 - **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
   node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
   which needs a flag carried through `ContainerState`. Neither affects correctness — the first only
