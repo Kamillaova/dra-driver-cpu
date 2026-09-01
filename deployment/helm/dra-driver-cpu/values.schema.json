@@ -233,6 +233,21 @@
             "individual"
           ]
         },
+        "defragClaimCooldownSeconds": {
+          "type": "integer"
+        },
+        "defragEnabled": {
+          "type": "boolean"
+        },
+        "defragIntervalSeconds": {
+          "type": "integer"
+        },
+        "defragMaxMovesPerPass": {
+          "type": "integer"
+        },
+        "defragMinGain": {
+          "type": "integer"
+        },
         "fullPhysicalCPUsOnly": {
           "type": "boolean"
         },
