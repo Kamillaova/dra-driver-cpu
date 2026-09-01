@@ -21,9 +21,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
@@ -467,6 +470,180 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		}, 20*time.Second, 5*time.Second).Should(gomega.Succeed())
 	})
 
+	ginkgo.It("should preserve exclusivity through claim churn, moves, and a driver restart", func(ctx context.Context) {
+		// The scenario the feature exists for is not one tidy move but months of
+		// claims coming and going. This compresses that into minutes: a
+		// deterministic fragmentation first, then seeded-random churn, a driver
+		// restart in the middle, and a full drain at the end -- with the
+		// exclusivity invariants checked after every step, not only at the end.
+		fxt := rootFxt.WithPrefix("defrag-soak")
+		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(fxt.Teardown)
+
+		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
+		if len(free) < 2 || free[0] < 3*step {
+			ginkgo.Skip(fmt.Sprintf("needs at least two caches with %d or more free CPUs each, got %v", 3*step, free))
+		}
+		seed := ginkgo.GinkgoRandomSeed()
+		rng := rand.New(rand.NewPCG(uint64(seed), 0)) //nolint:gosec // reproducible via --ginkgo.seed
+		fxt.Log.Info("soak parameters", "seed", seed, "step", step, "freePerCache", free)
+
+		ginkgo.By("keeping one shared container running throughout")
+		sharedPod := mustCreateBestEffortPod(ctx, fxt, targetNode.Name, dracpuTesterImage)
+
+		type trackedClaim struct {
+			pod  *v1.Pod
+			size int
+		}
+		claims := map[string]*trackedClaim{}
+		nextID := 0
+		tryCreate := func(sizeSteps int, cel string) bool {
+			name := fmt.Sprintf("cpu-claim-soak-%d", nextID)
+			nextID++
+			pod, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+				claimSpecWithSelector(sizeSteps*step, cel), name)
+			if err != nil {
+				// A refused create is a legitimate outcome of churn: the pool may
+				// be too full, or too fragmented for the size. The soak's job is
+				// that whatever happens, no invariant breaks.
+				fxt.Log.Info("create refused", "cpus", sizeSteps*step, "reason", err.Error())
+				return false
+			}
+			claims[uid] = &trackedClaim{pod: pod, size: sizeSteps * step}
+			return true
+		}
+
+		settle := func() {
+			gomega.Eventually(func(g gomega.Gomega) {
+				report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, true)
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				g.Expect(report.plannedMoves()).To(gomega.BeZero())
+			}, 3*time.Minute, 5*time.Second).Should(gomega.Succeed())
+		}
+		verifyInvariants := func() {
+			ginkgo.GinkgoHelper()
+			gomega.Eventually(func(g gomega.Gomega) {
+				report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+
+				union := cpuset.New()
+				for uid, tracked := range claims {
+					cpus, ok := report.claimCPUs(uid)
+					g.Expect(ok).To(gomega.BeTrue(), "claim %s vanished from the driver", uid)
+					g.Expect(cpus.Size()).To(gomega.Equal(tracked.size), "claim %s changed size", uid)
+					g.Expect(cpus.Contains(0)).To(gomega.BeFalse(), "claim %s took the reserved CPU", uid)
+					g.Expect(union.Intersection(cpus).IsEmpty()).To(gomega.BeTrue(),
+						"claim %s on %s overlaps another claim", uid, cpus.String())
+					union = union.Union(cpus)
+				}
+				shared, err := cpuset.Parse(report.SharedCPUs)
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				g.Expect(union.Intersection(shared).IsEmpty()).To(gomega.BeTrue(),
+					"claimed CPUs leaked into the shared pool")
+
+				for uid, tracked := range claims {
+					cpus, _ := report.claimCPUs(uid)
+					alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, tracked.pod)
+					g.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(cpus),
+						"container of claim %s is not on its claim's CPUs", uid)
+					g.Expect(alloc.CPUAffinity).To(cpusetmatchers.Equal(cpus))
+				}
+				sharedAlloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, sharedPod)
+				g.Expect(sharedAlloc.CPUAssigned.Intersection(union).IsEmpty()).To(gomega.BeTrue(),
+					"the shared container holds a claimed CPU")
+			}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+		}
+
+		ginkgo.By("phase 1: deterministic fragmentation and one guaranteed consolidation")
+		for _, cacheFree := range free {
+			if !tryCreate(cacheFree/step-2, numaCEL(cfgValues, fragNUMA)) {
+				break
+			}
+		}
+		fragmented := false
+		if tryCreate(3, numaCEL(cfgValues, fragNUMA)) {
+			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			fragmented = report.totalExcess() > 0
+		}
+		settle()
+		verifyInvariants()
+
+		ginkgo.By("phase 2: seeded-random churn")
+		for round := range 5 {
+			uids := make([]string, 0, len(claims))
+			for uid := range claims {
+				uids = append(uids, uid)
+			}
+			sort.Strings(uids)
+			if len(uids) > 1 && rng.IntN(2) == 0 {
+				victim := uids[rng.IntN(len(uids))]
+				gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, claims[victim].pod)).To(gomega.Succeed())
+				delete(claims, victim)
+			}
+			tryCreate(1+rng.IntN(3), "")
+			fxt.Log.Info("churn round complete", "round", round, "liveClaims", len(claims))
+			settle()
+			verifyInvariants()
+		}
+
+		if fragmented {
+			ginkgo.By("verifying at least one move was committed while fragmented")
+			moves := defragMovesCommitted(ctx, fxt.K8SClientset, targetNode.Name)
+			gomega.Expect(moves).To(gomega.BeNumerically(">=", 1),
+				"the node fragmented and settled, yet no move was ever committed")
+		}
+
+		ginkgo.By("phase 3: restarting the driver under load")
+		byClaim := map[string]cpuset.CPUSet{}
+		report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		for uid := range claims {
+			cpus, ok := report.claimCPUs(uid)
+			gomega.Expect(ok).To(gomega.BeTrue())
+			byClaim[uid] = cpus
+		}
+		restartDriverOnNode(ctx, rootFxt, targetNode.Name)
+
+		ginkgo.By("verifying the restart moved nothing")
+		gomega.Eventually(func(g gomega.Gomega) {
+			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			for uid, want := range byClaim {
+				cpus, ok := report.claimCPUs(uid)
+				g.Expect(ok).To(gomega.BeTrue(), "claim %s was not adopted after the restart", uid)
+				g.Expect(cpus).To(cpusetmatchers.Equal(want), "the restart relocated claim %s", uid)
+			}
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+		verifyInvariants()
+
+		ginkgo.By("phase 4: churn continues after the restart")
+		tryCreate(1+rng.IntN(3), "")
+		settle()
+		verifyInvariants()
+
+		ginkgo.By("phase 5: draining every claim returns the node to a clean state")
+		for uid, tracked := range claims {
+			gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, tracked.pod)).To(gomega.Succeed())
+			delete(claims, uid)
+		}
+		gomega.Eventually(func(g gomega.Gomega) {
+			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(report.Claims).To(gomega.BeEmpty(), "claims outlived their pods: %+v", report.Claims)
+			g.Expect(report.totalExcess()).To(gomega.BeZero())
+			if getDriverConfig(ctx, fxt.K8SClientset).reconcilesSharedOnUnprepare() {
+				shared, err := cpuset.Parse(report.SharedCPUs)
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, sharedPod)
+				g.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(shared),
+					"the shared container was not widened back onto the drained pool")
+			}
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+	})
+
 	ginkgo.It("should recover a claim's placement when the driver restarts", func(ctx context.Context) {
 		fxt := rootFxt.WithPrefix("defrag-restart")
 		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
@@ -565,4 +742,23 @@ func currentCPULimit(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) 
 		return ""
 	}
 	return statuses[0].Resources.Limits.Cpu().String()
+}
+
+// defragMovesCommitted reads the driver's committed-move counter for the node.
+// The counter resets when the driver restarts, so read it before one.
+func defragMovesCommitted(ctx context.Context, cs kubernetes.Interface, nodeName string) int {
+	ginkgo.GinkgoHelper()
+	driverPod, err := e2epod.GetDRACPUPod(ctx, cs, nodeName)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	podIP, err := waitForPodIP(ctx, cs, driverPod.Name)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	raw, err := getMetricsFromPodIP(podIP)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	m := regexp.MustCompile(`dra_cpu_defrag_moves_total\{result="success"\} ([0-9]+)`).FindStringSubmatch(raw)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	return n
 }
