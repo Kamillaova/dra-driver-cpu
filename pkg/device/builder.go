@@ -48,8 +48,11 @@ func Build(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet, pcieRootMapp
 	return createCPUDeviceSlices(deviceInfos, pcieRootMapper, topo.SMTEnabled, nodeAllocatableResources), nameToID
 }
 
-func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs, reservedCPUSet cpuset.CPUSet, pcieRootMapper *store.PCIeRootMapper, nodeAllocatableResources bool) ([]resourceapi.Device, map[string]int) {
-	deviceInfos := groupedCPUDeviceInfos(groupBy, topo, onlineCPUs, reservedCPUSet)
+// BuildGrouped publishes one device per CPU group. wholeCoreStep is the whole-core
+// allocation step from WholeCoreStep, or 0 when whole-core allocation is off; the
+// caller decides it once so publication and allocation cannot disagree.
+func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs, reservedCPUSet cpuset.CPUSet, pcieRootMapper *store.PCIeRootMapper, nodeAllocatableResources bool, wholeCoreStep int) ([]resourceapi.Device, map[string]int) {
+	deviceInfos := groupedCPUDeviceInfos(groupBy, topo, onlineCPUs, reservedCPUSet, wholeCoreStep > 1)
 	nameToID := make(map[string]int)
 	for _, dev := range deviceInfos {
 		switch groupBy {
@@ -59,7 +62,7 @@ func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology,
 			nameToID[dev.name] = dev.numaNodeID
 		}
 	}
-	return createGroupedCPUDeviceSlices(logger, groupBy, deviceInfos, pcieRootMapper, topo, nodeAllocatableResources), nameToID
+	return createGroupedCPUDeviceSlices(logger, groupBy, deviceInfos, pcieRootMapper, topo, nodeAllocatableResources, wholeCoreStep), nameToID
 }
 
 func groupedCPUNodeAllocatable(enabled bool) map[v1.ResourceName]resourceapi.NodeAllocatableResource {
@@ -101,14 +104,23 @@ type cpuDeviceInfo struct {
 	cpu  cpuinfo.CPUInfo
 }
 
-func groupedCPUDeviceInfos(groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs, reservedCPUs cpuset.CPUSet) []groupedCPUDeviceInfo {
+func groupedCPUDeviceInfos(groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs, reservedCPUs cpuset.CPUSet, wholeCoresOnly bool) []groupedCPUDeviceInfo {
 	var devices []groupedCPUDeviceInfo
+	// Under whole-core allocation a core split by the reservation cannot back a
+	// claim, so its remaining threads are dropped here rather than published as
+	// capacity the allocator would refuse to hand out.
+	allocatable := func(cpus cpuset.CPUSet) cpuset.CPUSet {
+		if !wholeCoresOnly {
+			return cpus
+		}
+		return topo.CPUDetails.CompleteCores(cpus)
+	}
 
 	switch groupBy {
 	case GROUP_BY_SOCKET:
 		socketIDs := topo.CPUDetails.Sockets().List()
 		for _, socketID := range socketIDs {
-			allocatableCPUs := topo.CPUDetails.CPUsInSockets(socketID).Difference(reservedCPUs)
+			allocatableCPUs := allocatable(topo.CPUDetails.CPUsInSockets(socketID).Difference(reservedCPUs))
 			if allocatableCPUs.Size() == 0 {
 				continue
 			}
@@ -121,7 +133,7 @@ func groupedCPUDeviceInfos(groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs
 	case GROUP_BY_NUMA_NODE:
 		numaNodeIDs := topo.CPUDetails.NUMANodes().List()
 		for _, numaID := range numaNodeIDs {
-			allocatableCPUs := topo.CPUDetails.CPUsInNUMANodes(numaID).Difference(reservedCPUs)
+			allocatableCPUs := allocatable(topo.CPUDetails.CPUsInNUMANodes(numaID).Difference(reservedCPUs))
 			if allocatableCPUs.Size() == 0 {
 				continue
 			}
@@ -136,7 +148,7 @@ func groupedCPUDeviceInfos(groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs
 			})
 		}
 	case GROUP_BY_MACHINE:
-		allocatableCPUs := onlineCPUs.Difference(reservedCPUs)
+		allocatableCPUs := allocatable(onlineCPUs.Difference(reservedCPUs))
 		devices = append(devices, groupedCPUDeviceInfo{
 			name: CPUDeviceMachineGrouped,
 			cpus: allocatableCPUs,
@@ -211,7 +223,7 @@ func cpuDeviceInfos(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet) []c
 }
 
 // createGroupedCPUDeviceSlices creates Device objects based on the CPU topology, grouped by a specific criteria.
-func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfos []groupedCPUDeviceInfo, pcieRootMapper *store.PCIeRootMapper, topo *cpuinfo.CPUTopology, nodeAllocatableResources bool) []resourceapi.Device {
+func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfos []groupedCPUDeviceInfo, pcieRootMapper *store.PCIeRootMapper, topo *cpuinfo.CPUTopology, nodeAllocatableResources bool, wholeCoreStep int) []resourceapi.Device {
 	logger.V(4).Info("creating grouped CPU devices")
 	var devices []resourceapi.Device
 	smtEnabled := topo.SMTEnabled
@@ -219,7 +231,10 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 	for _, deviceInfo := range deviceInfos {
 		availableCPUs := int64(deviceInfo.cpus.Size())
 		deviceCapacity := map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
-			CPUResourceQualifiedName: {Value: *resource.NewQuantity(availableCPUs, resource.DecimalSI)},
+			CPUResourceQualifiedName: {
+				Value:         *resource.NewQuantity(availableCPUs, resource.DecimalSI),
+				RequestPolicy: wholeCoreRequestPolicy(availableCPUs, wholeCoreStep),
+			},
 		}
 
 		switch groupBy {
@@ -321,4 +336,63 @@ func addPCIeRootsAttribute(pcieRootMapper *store.PCIeRootMapper, attrs map[resou
 		return
 	}
 	attrs[deviceattribute.StandardDeviceAttributePCIeRoot] = resourceapi.DeviceAttribute{StringValues: pcieRoots}
+}
+
+// WholeCoreStep returns the allocation step in CPUs when whole-core allocation is
+// both requested and possible on this node, and 0 otherwise. Callers treat a step
+// above 1 as "whole-core allocation is in effect".
+//
+// The step is the node's thread-per-core count, so it only exists when every
+// allocatable core has the same number of threads. On a hybrid part, where
+// performance cores are SMT and efficiency cores are not, there is no single step
+// and the feature is disabled for the node.
+//
+// Disabling is deliberate rather than fatal: the driver config is usually
+// fleet-wide, so refusing to start would take out every node of a mixed pool
+// instead of the one option those nodes cannot honour.
+func WholeCoreStep(logger logr.Logger, topo *cpuinfo.CPUTopology, onlineCPUs, reservedCPUs cpuset.CPUSet, fullPhysicalCPUsOnly bool) int {
+	if !fullPhysicalCPUsOnly {
+		return 0
+	}
+	allocatable := onlineCPUs.Difference(reservedCPUs)
+	threadsPerCore := topo.CPUDetails.UniformThreadsPerCore(allocatable)
+	switch threadsPerCore {
+	case 0:
+		logger.Info("fullPhysicalCPUsOnly disabled on this node: allocatable cores do not all have the same thread count",
+			"allocatableCPUs", allocatable.String())
+		return 0
+	case 1:
+		// Nothing to keep together, so leave capacity and allocation untouched
+		// rather than publishing a request policy with a step of one CPU.
+		logger.V(2).Info("fullPhysicalCPUsOnly is a no-op on this node: every core has one thread")
+		return 0
+	}
+	return threadsPerCore
+}
+
+// wholeCoreRequestPolicy constrains a device's CPU capacity to whole-core
+// multiples, so the scheduler rounds a request up instead of allocating an amount
+// the driver would have to refuse.
+//
+// Default must be the full capacity, not the step: ValidRange requires a Default,
+// and a claim that omits a capacity request consumes it. Upstream semantics for an
+// omitted request are the whole device, so a Default of one core would silently
+// shrink such claims.
+//
+// This diverges from the kubelet CPU Manager, which rejects a request that is not
+// a whole-core multiple. DRA has no reject-unless-multiple primitive, and rounding
+// resolves at scheduling time and is recorded in ConsumedCapacity, rather than
+// failing admission once the pod is already bound.
+func wholeCoreRequestPolicy(capacityCPUs int64, threadsPerCore int) *resourceapi.CapacityRequestPolicy {
+	if threadsPerCore <= 1 || capacityCPUs <= 0 {
+		return nil
+	}
+	step := resource.NewQuantity(int64(threadsPerCore), resource.DecimalSI)
+	return &resourceapi.CapacityRequestPolicy{
+		Default: resource.NewQuantity(capacityCPUs, resource.DecimalSI),
+		ValidRange: &resourceapi.CapacityRequestPolicyRange{
+			Min:  step,
+			Step: step,
+		},
+	}
 }

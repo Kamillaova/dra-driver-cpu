@@ -77,17 +77,21 @@ type CPUInfoProvider interface {
 
 // CPUDriver is the structure that holds all the driver runtime information.
 type CPUDriver struct {
-	driverName              string
-	nodeName                string
-	kubeClient              kubernetes.Interface
-	draPlugin               KubeletPlugin
-	nriPlugin               stub.Stub
-	podConfigStore          *store.PodConfig
-	cpuAllocationStore      *store.CPUAllocation
-	cdiMgr                  cdiManager
-	topology                deviceTopology
-	cpuDeviceMode           string
-	cpuDeviceGroupBy        string
+	driverName         string
+	nodeName           string
+	kubeClient         kubernetes.Interface
+	draPlugin          KubeletPlugin
+	nriPlugin          stub.Stub
+	podConfigStore     *store.PodConfig
+	cpuAllocationStore *store.CPUAllocation
+	cdiMgr             cdiManager
+	topology           deviceTopology
+	cpuDeviceMode      string
+	cpuDeviceGroupBy   string
+	// wholeCoreStep is the allocation step in CPUs when whole-core allocation is
+	// in effect on this node, and 0 when it is off or the topology cannot support
+	// it. Decided once at startup so publication and allocation cannot disagree.
+	wholeCoreStep           int
 	claimTracker            *store.ClaimTracker
 	pcieRootMapper          *store.PCIeRootMapper
 	devicesPerResourceSlice int
@@ -153,6 +157,9 @@ type Config struct {
 	// PublishNodeAllocatableResourceMapping publishes KEP-5517 nodeAllocatableResources mappings in
 	// ResourceSlice devices. Requires the DRANodeAllocatableResources feature gate to be enabled in the cluster.
 	PublishNodeAllocatableResourceMapping bool
+	// FullPhysicalCPUsOnly allocates whole physical cores, so a core's SMT siblings are never split
+	// between two claims or between a claim and the shared pool. Grouped mode only.
+	FullPhysicalCPUsOnly bool
 }
 
 func (cfg Config) DevicesPerResourceSlice() int {
@@ -220,11 +227,14 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	plugin.refreshAllocationMetrics()
 	plugin.podConfigStore = store.NewPodConfig()
 
+	plugin.wholeCoreStep = device.WholeCoreStep(logger, plugin.topology.cpuTopology,
+		plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, config.FullPhysicalCPUsOnly)
+
 	var devices []resourceapi.Device
 
 	if plugin.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
 		var nameToID map[string]int
-		devices, nameToID = device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping)
+		devices, nameToID = device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping, plugin.wholeCoreStep)
 		switch plugin.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET:
 			plugin.topology.deviceNameToSocketID = nameToID
