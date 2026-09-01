@@ -61,6 +61,13 @@ Reference: [kubernetes 1.35.0](https://github.com/kubernetes/kubernetes/blob/v1.
 alignment lost to claim churn, without restarting its container. This is a fork-only feature; see
 [CPU Defragmentation](defragmentation.md).
 
+### CCX-aligned scheduling
+
+`publishFitAnnotation: true` publishes the shape of each NUMA node's free CPUs -- per uncore cache,
+now and after a repack -- on the node, so a scheduler can prefer a node that can align a claim rather
+than one that merely has the capacity for it. This is a fork-only feature; see
+[CCX-Aligned Scheduling](ccx-aligned-scheduling.md).
+
 ### Whole physical cores (FullPCPUsOnly)
 
 `fullPhysicalCPUsOnly: true` allocates whole physical cores, so a core's SMT siblings are never
