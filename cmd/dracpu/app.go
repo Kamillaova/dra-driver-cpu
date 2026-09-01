@@ -39,6 +39,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -139,15 +140,6 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	printVersion(logger)
 	logger.Info("configuration successfully loaded", "configuration", cfg.Dump())
 
-	reservedCPUSet, err := cpuset.Parse(cfg.ReservedCPUs)
-	if err != nil {
-		return fmt.Errorf("failed to parse reserved CPUs: %w", err)
-	}
-	sharedPoolCPUSet, err := cpuset.Parse(cfg.SharedPoolCPUs)
-	if err != nil {
-		return fmt.Errorf("failed to parse shared pool CPUs: %w", err)
-	}
-
 	sfs, err := newSysFS(logger, cfg.SysFSOverlay)
 	if err != nil {
 		return err
@@ -224,6 +216,30 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	ctx := ctxlog.NewContext(context.Background(), logger)
 	ctx, stop := signal.NotifyContext(ctx, unix.SIGINT, unix.SIGTERM)
 	defer stop()
+
+	// CCX-FORK: per-node config profiles, selected by a node label and applied
+	// before anything reads the CPU carve-outs.
+	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("can not read node %q to resolve its config profile: %w", nodeName, err)
+	}
+	cfg, err = cfg.WithProfile(node.Labels[driverconfig.ProfileLabel])
+	if err != nil {
+		return err
+	}
+	if profile := node.Labels[driverconfig.ProfileLabel]; profile != "" {
+		logger.Info("applied config profile from the node label", "label", driverconfig.ProfileLabel, "profile", profile,
+			"reservedCPUs", cfg.ReservedCPUs, "sharedPoolCPUs", cfg.SharedPoolCPUs)
+	}
+
+	reservedCPUSet, err := cpuset.Parse(cfg.ReservedCPUs)
+	if err != nil {
+		return fmt.Errorf("failed to parse reserved CPUs: %w", err)
+	}
+	sharedPoolCPUSet, err := cpuset.Parse(cfg.SharedPoolCPUs)
+	if err != nil {
+		return fmt.Errorf("failed to parse shared pool CPUs: %w", err)
+	}
 
 	driverConfig := driver.Config{
 		DriverName:                            driverName,
