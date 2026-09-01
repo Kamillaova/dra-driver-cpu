@@ -755,3 +755,158 @@ reconcileSharedOnUnprepare: false
 	assert.True(t, result.AssumeUnsolicitedUpdatesSafe)
 	assert.False(t, result.ReconcileSharedOnUnprepare)
 }
+
+// TestResolve_DefragDefaults: defragmentation is off, and its thresholds are set
+// even so, since a config dump should say what would happen if it were turned on.
+func TestResolve_DefragDefaults(t *testing.T) {
+	d := driverconfig.Default()
+	assert.False(t, d.DefragEnabled)
+	assert.Equal(t, 300, d.DefragIntervalSeconds)
+	assert.Equal(t, 4, d.DefragMaxMovesPerPass)
+	assert.Equal(t, 1, d.DefragMinGain)
+	assert.Equal(t, 600, d.DefragClaimCooldownSeconds)
+	assert.NoError(t, d.Validate())
+}
+
+// TestValidate_DefragRequirements: the modes where the driver does not choose a
+// claim's CPUs, and the runtime assertion a move depends on.
+func TestValidate_DefragRequirements(t *testing.T) {
+	testCases := []struct {
+		name          string
+		mutate        func(*driverconfig.Config)
+		expectedError string
+	}{
+		{
+			name:   "grouped by NUMA node with unsolicited updates permitted",
+			mutate: func(*driverconfig.Config) {},
+		},
+		{
+			name:   "grouped by socket",
+			mutate: func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_SOCKET },
+		},
+		{
+			// The scheduler picked the exact CPU devices, so their placement is
+			// not the driver's to change.
+			name:          "individual mode",
+			mutate:        func(c *driverconfig.Config) { c.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL },
+			expectedError: "requires cpuDeviceMode",
+		},
+		{
+			// The cpuset came from the claim's own opaque config.
+			name:          "grouped by machine",
+			mutate:        func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_MACHINE },
+			expectedError: "requires groupBy",
+		},
+		{
+			name:          "without the unsolicited update assertion",
+			mutate:        func(c *driverconfig.Config) { c.AssumeUnsolicitedUpdatesSafe = false },
+			expectedError: "requires assumeUnsolicitedUpdatesSafe",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			cfg.DefragEnabled = true
+			cfg.AssumeUnsolicitedUpdatesSafe = true
+			tc.mutate(&cfg)
+
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "defragEnabled")
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestValidate_DefragRequirementsAreInertWhenDisabled: an unusable combination
+// must not stop a driver that is not going to defragment anything.
+func TestValidate_DefragRequirementsAreInertWhenDisabled(t *testing.T) {
+	cfg := driverconfig.Default()
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+	assert.NoError(t, cfg.Validate())
+}
+
+// TestValidate_DefragThresholds: a threshold is checked whether or not the
+// feature is on, because a value like this is a typo either way.
+func TestValidate_DefragThresholds(t *testing.T) {
+	testCases := []struct {
+		name          string
+		mutate        func(*driverconfig.Config)
+		expectedError string
+	}{
+		{
+			name:          "zero interval",
+			mutate:        func(c *driverconfig.Config) { c.DefragIntervalSeconds = 0 },
+			expectedError: "invalid defragIntervalSeconds 0",
+		},
+		{
+			name:          "negative interval",
+			mutate:        func(c *driverconfig.Config) { c.DefragIntervalSeconds = -1 },
+			expectedError: "invalid defragIntervalSeconds -1",
+		},
+		{
+			name:          "a pass that may move nothing",
+			mutate:        func(c *driverconfig.Config) { c.DefragMaxMovesPerPass = 0 },
+			expectedError: "invalid defragMaxMovesPerPass 0",
+		},
+		{
+			// Zero would move claims for no improvement at all.
+			name:          "zero minimum gain",
+			mutate:        func(c *driverconfig.Config) { c.DefragMinGain = 0 },
+			expectedError: "invalid defragMinGain 0",
+		},
+		{
+			name:          "negative cooldown",
+			mutate:        func(c *driverconfig.Config) { c.DefragClaimCooldownSeconds = -1 },
+			expectedError: "invalid defragClaimCooldownSeconds -1",
+		},
+		{
+			name:   "no cooldown at all is a choice",
+			mutate: func(c *driverconfig.Config) { c.DefragClaimCooldownSeconds = 0 },
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			tc.mutate(&cfg)
+
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestResolve_DefragOptionsFromFile: every option is settable from a config file.
+func TestResolve_DefragOptionsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+assumeUnsolicitedUpdatesSafe: true
+defragEnabled: true
+defragIntervalSeconds: 30
+defragMaxMovesPerPass: 2
+defragMinGain: 3
+defragClaimCooldownSeconds: 0
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.NoError(t, err)
+	assert.True(t, result.DefragEnabled)
+	assert.Equal(t, 30, result.DefragIntervalSeconds)
+	assert.Equal(t, 2, result.DefragMaxMovesPerPass)
+	assert.Equal(t, 3, result.DefragMinGain)
+	assert.Equal(t, 0, result.DefragClaimCooldownSeconds)
+}
