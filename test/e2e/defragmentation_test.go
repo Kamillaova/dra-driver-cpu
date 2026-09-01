@@ -644,6 +644,87 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
 	})
 
+	ginkgo.It("should keep a container on the union of its claims when one of them moves", func(ctx context.Context) {
+		// A container may hold several claims, and a move touches one of them.
+		// The update that carries the move must pin the container to the union of
+		// everything it holds: pinning only the moved claim would take the other
+		// claim's CPUs away from a running workload.
+		fxt := rootFxt.WithPrefix("defrag-union")
+		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(fxt.Teardown)
+
+		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
+		if len(free) < 2 || free[0] < 4*step {
+			ginkgo.Skip(fmt.Sprintf("needs at least two caches with %d or more free CPUs each, got %v", 4*step, free))
+		}
+
+		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free", fragNUMA))
+		var fillers []*v1.Pod
+		for i, cacheFree := range free {
+			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+				claimSpecWithSelector(cacheFree-2*step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-un-filler-%d", i))
+			if err != nil {
+				break
+			}
+			fillers = append(fillers, pod)
+		}
+		if len(fillers) < 2 {
+			ginkgo.Skip(fmt.Sprintf("could only place %d of %d fillers", len(fillers), len(free)))
+		}
+
+		ginkgo.By("placing one pod holding a small claim and a straddling claim")
+		smallSize, bigSize := 1*step, 3*step
+		for name, cpus := range map[string]int{"cpu-claim-un-small": smallSize, "cpu-claim-un-big": bigSize} {
+			template := resourcev1.ResourceClaimTemplate{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: resourcev1.ResourceClaimTemplateSpec{
+					Spec: claimSpecWithSelector(cpus, numaCEL(cfgValues, fragNUMA)),
+				},
+			}
+			_, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &template, metav1.CreateOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		}
+		pod := makeTesterPodWithTwoClaims(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, "cpu-claim-un-small", "cpu-claim-un-big")
+		pod, err := e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+		smallUID, bigUID := claimUIDsBySize(ctx, fxt, pod, smallSize, bigSize)
+		report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		if report.totalExcess() == 0 {
+			ginkgo.Skip(fmt.Sprintf("the big claim did not straddle: %+v", report.NUMANodes))
+		}
+		smallBefore, _ := report.claimCPUs(smallUID)
+
+		ginkgo.By("releasing the fillers so the straddling claim can move")
+		for _, filler := range fillers {
+			gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, filler)).To(gomega.Succeed())
+		}
+
+		ginkgo.By("verifying the container ends on the union, the small claim untouched")
+		gomega.Eventually(func(g gomega.Gomega) {
+			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			big, ok := report.claimCPUs(bigUID)
+			g.Expect(ok).To(gomega.BeTrue())
+			g.Expect(spreadOf(report, big)).To(gomega.Equal(1), "the big claim is still split: %s", big.String())
+			small, ok := report.claimCPUs(smallUID)
+			g.Expect(ok).To(gomega.BeTrue())
+			g.Expect(small).To(cpusetmatchers.Equal(smallBefore), "the small claim had no reason to move")
+
+			alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod)
+			g.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(small.Union(big)),
+				"the container must hold the union of both its claims")
+			g.Expect(alloc.CPUAffinity).To(cpusetmatchers.Equal(small.Union(big)))
+		}, 3*time.Minute, 5*time.Second).Should(gomega.Succeed())
+
+		reread, err := fxt.K8SClientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero())
+	})
+
 	ginkgo.It("should recover a claim's placement when the driver restarts", func(ctx context.Context) {
 		fxt := rootFxt.WithPrefix("defrag-restart")
 		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
@@ -761,4 +842,81 @@ func defragMovesCommitted(ctx context.Context, cs kubernetes.Interface, nodeName
 	n, err := strconv.Atoi(m[1])
 	gomega.Expect(err).ToNot(gomega.HaveOccurred())
 	return n
+}
+
+// spreadOf counts the uncore caches a cpuset touches, using the geometry the
+// report itself carries.
+func spreadOf(report placementsReport, cpus cpuset.CPUSet) int {
+	touched := 0
+	for _, node := range report.NUMANodes {
+		for _, cache := range node.Caches {
+			inCache, err := cpuset.Parse(cache.CPUs)
+			if err != nil {
+				continue
+			}
+			if !cpus.Intersection(inCache).IsEmpty() {
+				touched++
+			}
+		}
+	}
+	return touched
+}
+
+// makeTesterPodWithTwoClaims builds a pod whose single container consumes two
+// separate CPU claims, which the driver must pin to their union.
+func makeTesterPodWithTwoClaims(ns, image, nodeName, templateA, templateB string) *v1.Pod {
+	memory := resource.MustParse("64Mi")
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "tester-pod-two-claims-", Namespace: ns},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{
+				Name:    "tester-container-1",
+				Image:   image,
+				Command: []string{"/dracputester"},
+				Resources: v1.ResourceRequirements{
+					Requests: v1.ResourceList{v1.ResourceMemory: memory},
+					Limits:   v1.ResourceList{v1.ResourceMemory: memory},
+					Claims:   []v1.ResourceClaim{{Name: "cpu-a"}, {Name: "cpu-b"}},
+				},
+			}},
+			ResourceClaims: []v1.PodResourceClaim{
+				{Name: "cpu-a", ResourceClaimTemplateName: &templateA},
+				{Name: "cpu-b", ResourceClaimTemplateName: &templateB},
+			},
+			RestartPolicy: v1.RestartPolicyNever,
+		},
+	}
+	return e2epod.PinToNode(pod, nodeName)
+}
+
+// claimUIDsBySize resolves the pod's two generated claims to their UIDs by the
+// capacity each one requested.
+func claimUIDsBySize(ctx context.Context, fxt *fixture.Fixture, pod *v1.Pod, smallSize, bigSize int) (string, string) {
+	ginkgo.GinkgoHelper()
+	var smallUID, bigUID string
+	gomega.Eventually(func(g gomega.Gomega) {
+		list, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).List(ctx, metav1.ListOptions{})
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		for _, claim := range list.Items {
+			owned := false
+			for _, ref := range claim.OwnerReferences {
+				if ref.UID == pod.UID {
+					owned = true
+				}
+			}
+			if !owned {
+				continue
+			}
+			quantity := claim.Spec.Devices.Requests[0].Exactly.Capacity.Requests["dra.cpu/cpu"]
+			switch int(quantity.Value()) {
+			case smallSize:
+				smallUID = string(claim.UID)
+			case bigSize:
+				bigUID = string(claim.UID)
+			}
+		}
+		g.Expect(smallUID).ToNot(gomega.BeEmpty(), "no claim of %d CPUs owned by the pod", smallSize)
+		g.Expect(bigUID).ToNot(gomega.BeEmpty(), "no claim of %d CPUs owned by the pod", bigSize)
+	}, time.Minute, 2*time.Second).Should(gomega.Succeed())
+	return smallUID, bigUID
 }
