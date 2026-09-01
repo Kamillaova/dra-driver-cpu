@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
@@ -43,12 +44,30 @@ func (cp *CPUDriver) runReconcileWorker(ctx context.Context) {
 	logger.V(2).Info("reconcile worker started")
 	defer logger.V(2).Info("reconcile worker stopped")
 
+	// CCX-FORK: the worker also runs defragmentation passes, on the same trigger
+	// plus a ticker for a node nothing else disturbs.
+	var tick <-chan time.Time
+	if cp.defrag.enabled && cp.defrag.interval > 0 {
+		ticker := time.NewTicker(cp.defrag.interval)
+		defer ticker.Stop()
+		tick = ticker.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-cp.reconcileTrigger:
-			cp.reconcileSharedContainers(ctx)
+			// A pass narrows shared containers off the CPUs it is moving claims
+			// onto, so it needs them widened again once the claims those CPUs
+			// belonged to have vacated. That makes the widening part of finishing
+			// a move, not only a service the unprepare reconcile offers.
+			if cp.reconcileSharedOnUnprepare || cp.defrag.enabled {
+				cp.reconcileSharedContainers(ctx)
+			}
+			cp.defragPass(ctx)
+		case <-tick:
+			cp.defragPass(ctx)
 		}
 	}
 }
