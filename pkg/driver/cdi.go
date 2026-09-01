@@ -40,6 +40,21 @@ const (
 	// so the driver can rewrite them at will. The injected env var cannot serve
 	// this purpose, since a running container's environment is fixed at creation.
 	cdiCPUSetAnnotation = "dra.cpu/cpuset"
+
+	// cdiEnvDynamicValue stands in for a cpuset in the injected variable when a
+	// claim's placement may change while its container runs.
+	//
+	// The variable is fixed when the container is created and cannot be corrected
+	// afterwards, so any cpuset it named would become a lie the first time the
+	// claim moved. This says as much, and the claim UID in the variable's name --
+	// the part the driver actually needs -- is unaffected.
+	//
+	// It is also the value an upstream driver does least harm with, should one
+	// take over these specs: it cannot parse it, so it passes the container over
+	// and leaves its cpuset alone. A stale-looking cpuset would instead have it
+	// reject the claim and, finding the container holding none, pin a guaranteed
+	// container to the shared pool.
+	cdiEnvDynamicValue = "dynamic"
 )
 
 // CdiManager handles the lifecycle of CDI allocations for the driver.

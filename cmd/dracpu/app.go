@@ -219,6 +219,11 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
 		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
 		ReconcileSharedOnUnprepare:            cfg.ReconcileSharedOnUnprepare,
+		DefragEnabled:                         cfg.DefragEnabled,
+		DefragInterval:                        time.Duration(cfg.DefragIntervalSeconds) * time.Second,
+		DefragMaxMovesPerPass:                 cfg.DefragMaxMovesPerPass,
+		DefragMinGain:                         cfg.DefragMinGain,
+		DefragClaimCooldown:                   time.Duration(cfg.DefragClaimCooldownSeconds) * time.Second,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 	}
