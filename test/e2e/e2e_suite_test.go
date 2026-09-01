@@ -324,6 +324,7 @@ type driverConfigValues struct {
 	// file that does not mention it leaves it on: absent must read as true,
 	// which a plain bool cannot express.
 	ReconcileSharedOnUnprepare *bool `json:"reconcileSharedOnUnprepare,omitempty"`
+	DefragEnabled              bool  `json:"defragEnabled,omitempty"`
 }
 
 // reconcilesSharedOnUnprepare reports whether the driver widens shared
@@ -397,6 +398,68 @@ func makeTesterPodWithNamedClaim(ns, image, claimName string, nodeName string, n
 	return e2epod.PinToNode(pod, nodeName)
 }
 
+// createClaimedTesterPod places a pod holding one exclusive claim of numCPUs and
+// returns it along with the claim's UID, which is how /placements names it.
+func createClaimedTesterPod(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, string) {
+	ginkgo.GinkgoHelper()
+	pod, claimUID, err := tryCreateClaimedTesterPodWithUID(ctx, fxt, image, nodeName, cfg, numCPUs, claimTemplateName)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	return pod, claimUID
+}
+
+func tryCreateClaimedTesterPodWithUID(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, string, error) {
+	return tryCreateClaimedTesterPodWithSpec(ctx, fxt, image, nodeName,
+		makeResourceClaimSpec(numCPUs, cfg.CPUDeviceMode == "grouped"), claimTemplateName)
+}
+
+func tryCreateClaimedTesterPodWithSpec(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, spec resourcev1.ResourceClaimSpec, claimTemplateName string) (*v1.Pod, string, error) {
+	claimTemplate := resourcev1.ResourceClaimTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: claimTemplateName},
+		Spec: resourcev1.ResourceClaimTemplateSpec{
+			Spec: spec,
+		},
+	}
+	created, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &claimTemplate, metav1.CreateOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Deliberately without a standard CPU request. Mirroring the claim's CPUs
+	// into requests is what the docs ask of a workload, but it makes the
+	// scheduler count them twice, and a test that fills a node with claims runs
+	// out of node-allocatable cpu long before it runs out of claimable CPUs.
+	pod := makeTesterPodWithExclusiveCPUClaimWithoutCPURequest(fxt.Namespace.Name, image, created.Name, nodeName)
+	pod, err = fxt.K8SClientset.CoreV1().Pods(fxt.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	if err := e2epod.WaitToBeRunning(ctx, fxt.K8SClientset, pod.Namespace, pod.Name); err != nil {
+		// A refusal is a legitimate outcome for callers that fill a node -- but a
+		// pod left behind Pending is not: it would be admitted the moment the
+		// caller deletes something, and haunt the rest of the test with a claim
+		// nobody is tracking.
+		if deleteErr := e2epod.DeleteSync(ctx, fxt.K8SClientset, pod); deleteErr != nil {
+			return nil, "", fmt.Errorf("pod %s was refused (%w) and could not be cleaned up: %w", pod.Name, err, deleteErr)
+		}
+		return nil, "", err
+	}
+
+	// The generated claim carries the pod's own name, and its UID is what the
+	// driver knows it by.
+	claims, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	for _, claim := range claims.Items {
+		for _, ref := range claim.OwnerReferences {
+			if ref.UID == pod.UID {
+				return pod, string(claim.UID), nil
+			}
+		}
+	}
+	return nil, "", fmt.Errorf("no resource claim found for pod %s/%s", pod.Namespace, pod.Name)
+}
+
 func makeResourceClaimSpec(cpus int, isConsumable bool) resourcev1.ResourceClaimSpec {
 	if !isConsumable {
 		return resourcev1.ResourceClaimSpec{
@@ -430,6 +493,26 @@ func makeResourceClaimSpec(cpus int, isConsumable bool) resourcev1.ResourceClaim
 			},
 		},
 	}
+}
+
+func claimSpecWithSelector(cpus int, cel string) resourcev1.ResourceClaimSpec {
+	spec := makeResourceClaimSpec(cpus, true)
+	if cel != "" {
+		spec.Devices.Requests[0].Exactly.Selectors = []resourcev1.DeviceSelector{
+			{CEL: &resourcev1.CELDeviceSelector{Expression: cel}},
+		}
+	}
+	return spec
+}
+
+// numaCEL pins a claim to one NUMA node's device. Only numanode grouping
+// publishes the attribute per device, so other modes get no selector and the
+// scenario spans the machine as it always did.
+func numaCEL(cfg driverConfigValues, numaID int) string {
+	if cfg.GroupBy != "numanode" {
+		return ""
+	}
+	return fmt.Sprintf(`device.attributes["dra.cpu"].numaNodeID == %d`, numaID)
 }
 
 func makeResourceClaimSpecWithOpaqueConfig(cpus int, isConsumable bool, cpusetStr string) resourcev1.ResourceClaimSpec {
