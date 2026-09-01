@@ -403,10 +403,14 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 				createdPod, err := e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
 				gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
-				fixture.By("verifying the pod got 2 distinct CPUs with no overlap")
+				// Each request rounds up to the device's allocation step on its
+				// own, so under whole-core allocation the two 1-CPU requests
+				// yield one core each.
+				step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
+				fixture.By("verifying the pod got %d distinct CPUs with no overlap", 2*step)
 				alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, createdPod)
 				fxt.Log.Info("multi-request claim allocation", "cpuAssigned", alloc.CPUAssigned.String())
-				gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.HaveSize(2), "expected 2 distinct CPUs allocated")
+				gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.HaveSize(2*step), "expected %d distinct CPUs allocated", 2*step)
 				gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.BeSubsetOf(availableCPUs), "allocated CPUs must be within available set")
 
 			})
