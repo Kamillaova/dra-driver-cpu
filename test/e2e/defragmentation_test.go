@@ -33,7 +33,10 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/cpuset"
 )
@@ -379,6 +382,91 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		}
 	})
 
+	ginkgo.It("should keep a moved claim's cpuset across an in-place pod resize", func(ctx context.Context) {
+		// KEP-1287 resizes reach the runtime as UpdateContainerResources, the
+		// same CRI call a move uses. The failure this guards against is the
+		// runtime rebuilding the container's resources from its create-time
+		// state: a resize after a move would then drag the container back onto
+		// CPUs its claim no longer holds, silently, with nothing restarted.
+		fxt := rootFxt.WithPrefix("defrag-resize")
+		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(fxt.Teardown)
+
+		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
+		if len(free) < 2 || free[0] < 3*step {
+			ginkgo.Skip(fmt.Sprintf("needs at least two caches with %d or more free CPUs each, got %v", 3*step, free))
+		}
+
+		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free", fragNUMA))
+		var fillers []*v1.Pod
+		for i, cacheFree := range free {
+			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+				claimSpecWithSelector(cacheFree-2*step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-rs-filler-%d", i))
+			if err != nil {
+				break
+			}
+			fillers = append(fillers, pod)
+		}
+		if len(fillers) < 2 {
+			ginkgo.Skip(fmt.Sprintf("could only place %d of %d fillers", len(fillers), len(free)))
+		}
+
+		// The victim carries a real cpu request, because that is what a resize
+		// changes; the claim pods elsewhere in this suite deliberately have none.
+		ginkgo.By("placing a resizable claim that no single cache can hold")
+		claimTemplate := resourcev1.ResourceClaimTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "cpu-claim-resize"},
+			Spec: resourcev1.ResourceClaimTemplateSpec{
+				Spec: claimSpecWithSelector(3*step, numaCEL(cfgValues, fragNUMA)),
+			},
+		}
+		created, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &claimTemplate, metav1.CreateOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		small := v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m"), v1.ResourceMemory: resource.MustParse("64Mi")}
+		victim := makeTesterPodWithExclusiveCPUClaimResources(fxt.Namespace.Name, dracpuTesterImage, created.Name, targetNode.Name, small, small)
+		victim, err = e2epod.CreateSync(ctx, fxt.K8SClientset, victim)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, victim)
+
+		report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		if report.totalExcess() == 0 {
+			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", report.NUMANodes))
+		}
+
+		ginkgo.By("releasing a filler and waiting for the claim to be moved")
+		gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, fillers[len(fillers)-1])).To(gomega.Succeed())
+		var moved cpuset.CPUSet
+		gomega.Eventually(func(g gomega.Gomega) {
+			alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, victim)
+			g.Expect(alloc.CPUAssigned).ToNot(cpusetmatchers.Equal(before.CPUAssigned), "the claim has not been moved yet")
+			moved = alloc.CPUAssigned
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+
+		ginkgo.By("resizing the pod in place")
+		limitBefore := currentCPULimit(ctx, fxt.K8SClientset, victim)
+		patch := []byte(`{"spec":{"containers":[{"name":"tester-container-1","resources":{"requests":{"cpu":"200m","memory":"64Mi"},"limits":{"cpu":"200m","memory":"64Mi"}}}]}}`)
+		_, err = fxt.K8SClientset.CoreV1().Pods(victim.Namespace).Patch(ctx, victim.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "resize")
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+		ginkgo.By("verifying the resize applied without touching the moved cpuset")
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(currentCPULimit(ctx, fxt.K8SClientset, victim)).ToNot(gomega.Equal(limitBefore), "the resize has not been actuated yet")
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+
+		reread, err := fxt.K8SClientset.CoreV1().Pods(victim.Namespace).Get(ctx, victim.Name, metav1.GetOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero(), "an in-place resize must not restart the container")
+		gomega.Consistently(func(g gomega.Gomega) {
+			alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread)
+			g.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(moved),
+				"the resize dragged the container off the CPUs its claim holds")
+			g.Expect(alloc.CPUAffinity).To(cpusetmatchers.Equal(moved))
+		}, 20*time.Second, 5*time.Second).Should(gomega.Succeed())
+	})
+
 	ginkgo.It("should recover a claim's placement when the driver restarts", func(ctx context.Context) {
 		fxt := rootFxt.WithPrefix("defrag-restart")
 		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
@@ -464,4 +552,17 @@ func allocationStep(ctx context.Context, cs kubernetes.Interface, nodeName strin
 		}
 	}
 	return 1
+}
+
+// currentCPULimit is the cpu limit the kubelet reports as actuated for the
+// pod's first container, which is how a resize's completion is observed.
+func currentCPULimit(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) string {
+	ginkgo.GinkgoHelper()
+	reread, err := cs.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	statuses := reread.Status.ContainerStatuses
+	if len(statuses) == 0 || statuses[0].Resources == nil {
+		return ""
+	}
+	return statuses[0].Resources.Limits.Cpu().String()
 }
