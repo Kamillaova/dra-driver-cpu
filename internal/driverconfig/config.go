@@ -65,6 +65,30 @@ type Config struct {
 	// narrower cpuset until their next lifecycle event. Requires
 	// AssumeUnsolicitedUpdatesSafe, and is inert without it. Defaults to true.
 	ReconcileSharedOnUnprepare bool `json:"reconcileSharedOnUnprepare,omitempty"`
+	// DefragEnabled lets the driver move a running claim onto different CPUs to
+	// recover uncore cache alignment lost to claim churn, without restarting its
+	// container. The claim keeps its CPU count; only which CPUs back it change.
+	//
+	// Requires cpuDeviceMode "grouped" with groupBy "numanode" or "socket", since
+	// the driver only chooses a claim's CPUs in those modes, and
+	// AssumeUnsolicitedUpdatesSafe, since a move is pushed to the runtime
+	// unprompted. Defaults to false.
+	DefragEnabled bool `json:"defragEnabled,omitempty"`
+	// DefragIntervalSeconds is how often a defragmentation pass runs. Preparing
+	// or releasing a claim also triggers one, so this is the backstop for a node
+	// nothing else disturbs. Defaults to 300.
+	DefragIntervalSeconds int `json:"defragIntervalSeconds,omitempty"`
+	// DefragMaxMovesPerPass caps how many claims one pass moves. A pass that
+	// reaches the cap leaves the rest to the next one. Defaults to 4.
+	DefragMaxMovesPerPass int `json:"defragMaxMovesPerPass,omitempty"`
+	// DefragMinGain is the smallest improvement worth moving anything for,
+	// counted in uncore caches needlessly spanned across the node's claims.
+	// Raising it trades alignment for fewer moves. Defaults to 1.
+	DefragMinGain int `json:"defragMinGain,omitempty"`
+	// DefragClaimCooldownSeconds is how long a claim is left alone after it has
+	// been moved, so a workload is not re-homed repeatedly while it settles.
+	// Defaults to 600.
+	DefragClaimCooldownSeconds int `json:"defragClaimCooldownSeconds,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -83,6 +107,11 @@ func (c Config) LogValues() []any {
 		"fullPhysicalCPUsOnly", c.FullPhysicalCPUsOnly,
 		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
 		"reconcileSharedOnUnprepare", c.ReconcileSharedOnUnprepare,
+		"defragEnabled", c.DefragEnabled,
+		"defragIntervalSeconds", c.DefragIntervalSeconds,
+		"defragMaxMovesPerPass", c.DefragMaxMovesPerPass,
+		"defragMinGain", c.DefragMinGain,
+		"defragClaimCooldownSeconds", c.DefragClaimCooldownSeconds,
 	}
 }
 
@@ -102,6 +131,11 @@ type dumpConfig struct {
 	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly"`
 	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe"`
 	ReconcileSharedOnUnprepare            bool   `json:"reconcileSharedOnUnprepare"`
+	DefragEnabled                         bool   `json:"defragEnabled"`
+	DefragIntervalSeconds                 int    `json:"defragIntervalSeconds"`
+	DefragMaxMovesPerPass                 int    `json:"defragMaxMovesPerPass"`
+	DefragMinGain                         int    `json:"defragMinGain"`
+	DefragClaimCooldownSeconds            int    `json:"defragClaimCooldownSeconds"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
