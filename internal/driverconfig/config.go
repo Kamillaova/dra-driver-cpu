@@ -56,6 +56,21 @@ type Config struct {
 	// FullPCPUsOnly policy option. Defaults to false, leaving single-thread
 	// allocations possible; it is a no-op where SMT is disabled.
 	FullPhysicalCPUsOnly bool `json:"fullPhysicalCPUsOnly,omitempty"`
+	// AssumeUnsolicitedUpdatesSafe permits the driver to push container updates
+	// the runtime did not ask for. Every such feature requires it.
+	//
+	// It is an operator assertion rather than something the driver can detect:
+	// unsolicited updates deadlock runtimes whose vendored NRI predates
+	// containerd/nri#301, and the NRI Configure handshake reports the runtime
+	// version but not its NRI version, so no reliable check exists. containerd
+	// carries the fix from NRI v0.12.1, released in containerd v2.4.0-beta.0;
+	// containerd v2.3.4 and CRI-O v1.36 do not. Defaults to false.
+	AssumeUnsolicitedUpdatesSafe bool `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+	// ReconcileSharedOnUnprepare widens shared containers onto the CPUs a claim
+	// released as soon as it is unprepared, instead of leaving them on the
+	// narrower cpuset until their next lifecycle event. Requires
+	// AssumeUnsolicitedUpdatesSafe, and is inert without it. Defaults to true.
+	ReconcileSharedOnUnprepare bool `json:"reconcileSharedOnUnprepare,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -73,6 +88,8 @@ func (c Config) LogValues() []any {
 		"publishNodeAllocatableResourceMapping", c.PublishNodeAllocatableResourceMapping,
 		"allocator", c.Allocator,
 		"fullPhysicalCPUsOnly", c.FullPhysicalCPUsOnly,
+		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
+		"reconcileSharedOnUnprepare", c.ReconcileSharedOnUnprepare,
 	}
 }
 
@@ -91,6 +108,8 @@ type dumpConfig struct {
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping"`
 	Allocator                             string `json:"allocator"`
 	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly"`
+	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe"`
+	ReconcileSharedOnUnprepare            bool   `json:"reconcileSharedOnUnprepare"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
