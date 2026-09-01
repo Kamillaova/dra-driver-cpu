@@ -107,7 +107,7 @@ var _ = ginkgo.Describe("Metrics", ginkgo.Serial, func() {
 			}
 			availableCPUs, err := discoverAvailableCPUs(ctx, metricsFxt, targetNode.Name, dracpuTesterImage, reservedCPUs)
 			gomega.Expect(err).ToNot(gomega.HaveOccurred())
-			availableCPUs = availableCPUs.Difference(cfgValues.staticPool())
+			availableCPUs = availableCPUs.Difference(cfgValues.effectiveFor(targetNode).staticPool())
 			if availableCPUs.Size() == 0 {
 				ginkgo.Skip(fmt.Sprintf("no allocatable CPUs left on node %q", targetNode.Name))
 			}

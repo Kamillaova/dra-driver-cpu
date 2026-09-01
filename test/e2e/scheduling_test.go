@@ -112,6 +112,13 @@ func createClaimTemplate(ctx context.Context, fxt *fixture.Fixture, name string,
 	gomega.Expect(err).ToNot(gomega.HaveOccurred())
 }
 
+func staticPoolOn(ctx context.Context, cs kubernetes.Interface, cfg driverConfigValues, nodeName string) cpuset.CPUSet {
+	ginkgo.GinkgoHelper()
+	node, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	return cfg.effectiveFor(node).staticPool()
+}
+
 func roundUpTo(n, step int) int {
 	if step <= 1 {
 		return n
@@ -124,7 +131,6 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 		rootFxt           *fixture.Fixture
 		dracpuTesterImage string
 		cfgValues         driverConfigValues
-		staticPool        cpuset.CPUSet
 		fleet             []fleetDevice
 		nodes             []string
 	)
@@ -138,7 +144,6 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create fixture")
 
 		cfgValues = getDriverConfig(ctx, rootFxt.K8SClientset)
-		staticPool = cfgValues.staticPool()
 
 		fleet = discoverFleet(ctx, rootFxt.K8SClientset)
 		seen := map[string]bool{}
@@ -201,7 +206,8 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 
 		ginkgo.By("verifying the container actually holds that many CPUs")
 		alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod)
-		gomega.Expect(alloc.CPUAssigned.Difference(staticPool)).To(cpusetmatchers.HaveSize(roundUpTo(size, big.step)))
+		pool := staticPoolOn(ctx, fxt.K8SClientset, cfgValues, pod.Spec.NodeName)
+		gomega.Expect(alloc.CPUAssigned.Difference(pool)).To(cpusetmatchers.HaveSize(roundUpTo(size, big.step)))
 	})
 
 	ginkgo.It("should leave a claim no device can hold Pending, not misplace it", ginkgo.Label("negative"), func(ctx context.Context) {
@@ -333,9 +339,10 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 			"more claims than the node's capacity ended up Running")
 
 		ginkgo.By("verifying not one CPU was promised twice")
+		pool := staticPoolOn(ctx, fxt.K8SClientset, cfgValues, target)
 		union := cpuset.New()
 		for _, pod := range running() {
-			cpus := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod).CPUAssigned.Difference(staticPool)
+			cpus := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod).CPUAssigned.Difference(pool)
 			gomega.Expect(cpus).To(cpusetmatchers.HaveSize(size))
 			gomega.Expect(cpus).To(cpusetmatchers.HaveNoOverlapWith(union),
 				"pod %s overlaps another claim's CPUs", pod.Name)
@@ -457,10 +464,11 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 		reread, err := fxt.K8SClientset.CoreV1().Pods(victim.Namespace).Get(ctx, victim.Name, metav1.GetOptions{})
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero())
+		pool := staticPoolOn(ctx, fxt.K8SClientset, cfgValues, target)
 		// The tester reports every five seconds, so the line right after the
 		// final commit can still show the pre-move cpuset.
 		gomega.Eventually(func(g gomega.Gomega) {
-			live := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread).CPUAssigned.Difference(staticPool)
+			live := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread).CPUAssigned.Difference(pool)
 			g.Expect(live).To(cpusetmatchers.Equal(after), "the container is not on the CPUs the driver says its claim holds")
 		}, 30*time.Second, 5*time.Second).Should(gomega.Succeed())
 	})
