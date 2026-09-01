@@ -302,6 +302,9 @@
             "additionalProperties": false
           }
         },
+        "publishFitAnnotation": {
+          "type": "boolean"
+        },
         "publishNodeAllocatableResourceMapping": {
           "type": "boolean"
         },
