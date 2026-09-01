@@ -379,7 +379,65 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		}
 	})
 
+	ginkgo.It("should recover a claim's placement when the driver restarts", func(ctx context.Context) {
+		fxt := rootFxt.WithPrefix("defrag-restart")
+		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(fxt.Teardown)
+
+		ginkgo.By("placing a claim")
+		pod, claimUID := createClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, 2, "cpu-claim-restart")
+		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod)
+
+		ginkgo.By("restarting the driver on the target node")
+		restartDriverOnNode(ctx, rootFxt, targetNode.Name)
+
+		ginkgo.By("verifying the driver rebuilt the same placement from the specs on disk")
+		gomega.Eventually(func(g gomega.Gomega) {
+			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+
+			cpus, ok := report.claimCPUs(claimUID)
+			g.Expect(ok).To(gomega.BeTrue(), "claim %s was not adopted after the restart: %+v", claimUID, report.Claims)
+			g.Expect(cpus.Size()).To(gomega.Equal(before.CPUAssigned.Size()),
+				"the claim's CPU count changed across the restart")
+
+			shared, err := cpuset.Parse(report.SharedCPUs)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(cpus.Intersection(shared).IsEmpty()).To(gomega.BeTrue(),
+				"the claim's CPUs %s were handed back to the shared pool %s", cpus.String(), shared.String())
+		}, pollTimeoutRule, pollIntervalRule).Should(gomega.Succeed())
+
+		ginkgo.By("verifying the container is still pinned and was not restarted")
+		reread, err := fxt.K8SClientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero())
+		after := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread)
+		gomega.Expect(after.CPUAssigned).To(cpusetmatchers.HaveSize(before.CPUAssigned.Size()))
+	})
 })
+
+// restartDriverOnNode deletes the driver pod on a node and waits for the
+// DaemonSet's replacement to be running, which is how a restart looks to the
+// claims already on that node.
+func restartDriverOnNode(ctx context.Context, fxt *fixture.Fixture, nodeName string) {
+	ginkgo.GinkgoHelper()
+
+	old, err := e2epod.GetDRACPUPod(ctx, fxt.K8SClientset, nodeName)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot find the driver pod on %s", nodeName)
+	gomega.Expect(fxt.K8SClientset.CoreV1().Pods(old.Namespace).Delete(ctx, old.Name, metav1.DeleteOptions{})).To(gomega.Succeed())
+
+	gomega.Eventually(func(g gomega.Gomega) {
+		current, err := e2epod.GetDRACPUPod(ctx, fxt.K8SClientset, nodeName)
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		g.Expect(current.UID).ToNot(gomega.Equal(old.UID), "the driver pod has not been replaced yet")
+		g.Expect(current.Status.Phase).To(gomega.Equal(v1.PodRunning))
+		for _, condition := range current.Status.Conditions {
+			if condition.Type == v1.PodReady {
+				g.Expect(condition.Status).To(gomega.Equal(v1.ConditionTrue), "the new driver pod is not ready")
+			}
+		}
+	}, pollTimeoutRule, pollIntervalRule).Should(gomega.Succeed(), "the driver did not come back on %s", nodeName)
+}
 
 // allocationStep is the CPU granularity the scheduler will round a capacity
 // request to, taken from the request policy the driver publishes on its device.
