@@ -228,6 +228,19 @@ func (s *CPUAllocation) GetResourceClaimAllocation(claimUID types.UID) (cpuset.C
 	return allocation, ok
 }
 
+// ResourceClaimAllocations returns every prepared claim and the CPUs it holds.
+// A claim with a rebind in flight reads as being on its target, as it does
+// through GetResourceClaimAllocation.
+func (s *CPUAllocation) ResourceClaimAllocations() map[types.UID]cpuset.CPUSet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocations := make(map[types.UID]cpuset.CPUSet, len(s.resourceClaimAllocations))
+	for claimUID, cpus := range s.resourceClaimAllocations {
+		allocations[claimUID] = cpus
+	}
+	return allocations
+}
+
 // GetReservedCPUs returns the set of reserved CPUs.
 func (s *CPUAllocation) GetReservedCPUs() cpuset.CPUSet {
 	s.mu.RLock()
