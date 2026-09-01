@@ -116,6 +116,11 @@ DRACPU_E2E_RESERVED_CPUS ?= 0
 # Also requires a cluster (KIND_K8S_VERSION node image) with the
 # DRANodeAllocatableResources feature gate enabled.
 DRACPU_E2E_NODE_ALLOCATABLE_MAPPING ?= false
+# Set to "true" to have ci-kind-setup deploy the driver with defragmentation of
+# running claims enabled. Implies assumeUnsolicitedUpdatesSafe, which the option
+# requires; only do this on containerd, whose vendored NRI carries the fix from
+# containerd/nri#301 (see docs/user/defragmentation.md).
+DRACPU_E2E_DEFRAG ?= false
 # Extra arguments passed to golangci-lint in the lint target.
 # For example, set GOLANGCI_LINT_EXTRA_ARGS=--fix to auto-fix issues.
 GOLANGCI_LINT_EXTRA_ARGS ?=
@@ -212,7 +217,9 @@ endif
 		--set args.groupBy=${DRACPU_E2E_CPU_GROUP_BY} \
 		--set-string args.reservedCPUs=${DRACPU_E2E_RESERVED_CPUS} \
 		--set args.exposePCIeRoots=true \
-		--set driverConfig.publishNodeAllocatableResourceMapping=$(DRACPU_E2E_NODE_ALLOCATABLE_MAPPING)
+		--set driverConfig.publishNodeAllocatableResourceMapping=$(DRACPU_E2E_NODE_ALLOCATABLE_MAPPING) \
+		--set driverConfig.defragEnabled=$(DRACPU_E2E_DEFRAG) \
+		--set driverConfig.assumeUnsolicitedUpdatesSafe=$(DRACPU_E2E_DEFRAG)
 	hack/ci/wait-resourcelices.sh
 
 build-test-image: ## build tests image
