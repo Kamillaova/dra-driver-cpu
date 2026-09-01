@@ -337,6 +337,7 @@ type driverConfigValues struct {
 	ReconcileSharedOnUnprepare *bool                    `json:"reconcileSharedOnUnprepare,omitempty"`
 	DefragEnabled              bool                     `json:"defragEnabled,omitempty"`
 	SharedPoolCPUs             string                   `json:"sharedPoolCPUs,omitempty"`
+	CachePlacementPolicy       string                   `json:"cachePlacementPolicy,omitempty"`
 	Profiles                   map[string]profileValues `json:"profiles,omitempty"`
 }
 
