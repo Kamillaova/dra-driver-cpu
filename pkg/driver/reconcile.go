@@ -23,6 +23,7 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 // containerUpdater pushes container updates the runtime did not ask for. It is
@@ -53,6 +54,28 @@ func (cp *CPUDriver) runReconcileWorker(ctx context.Context) {
 		tick = ticker.C
 	}
 
+	// CCX-FORK: and it publishes the node's shape, which every branch above can
+	// change. Debounced, because a pod's claims are prepared one at a time and
+	// only the shape they leave behind is worth a write; resynced on top of
+	// that, because a write is not the only way the annotation can change.
+	publisher := &fitPublisher{driver: cp}
+	var resync <-chan time.Time
+	var resyncTimer *time.Timer
+	var debounce <-chan time.Time
+	var debounceTimer *time.Timer
+	if cp.fit.enabled && cp.fit.resync > 0 {
+		resyncTimer = time.NewTimer(wait.Jitter(cp.fit.resync, fitResyncJitter))
+		defer resyncTimer.Stop()
+		resync = resyncTimer.C
+	}
+	armPublish := func() {
+		if !cp.fit.enabled || debounceTimer != nil {
+			return
+		}
+		debounceTimer = time.NewTimer(cp.fit.debounce)
+		debounce = debounceTimer.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -66,8 +89,16 @@ func (cp *CPUDriver) runReconcileWorker(ctx context.Context) {
 				cp.reconcileSharedContainers(ctx)
 			}
 			cp.defragPass(ctx)
+			armPublish()
 		case <-tick:
 			cp.defragPass(ctx)
+			armPublish()
+		case <-debounce:
+			debounceTimer, debounce = nil, nil
+			publisher.publish(ctx, false)
+		case <-resync:
+			publisher.publish(ctx, true)
+			resyncTimer.Reset(wait.Jitter(cp.fit.resync, fitResyncJitter))
 		}
 	}
 }
