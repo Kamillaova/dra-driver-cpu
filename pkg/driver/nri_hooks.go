@@ -60,8 +60,6 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 			}
 			containerUID := types.UID(container.GetId())
 			var claimUIDs []types.UID
-			allGuaranteedCPUs := cpuset.New()
-			validatedClaimAllocations := make(map[types.UID]cpuset.CPUSet)
 			reportedCDIDevices := runtimeCDIDevices(container)
 			for uid, cpus := range claimAllocations {
 				caLogger := cLogger.WithValues("claimUID", uid)
@@ -103,10 +101,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				if err := cpuAllocationStore.ReserveResourceClaimAllocation(caLogger, uid, desired, false); err != nil {
 					return nil, err
 				}
-
-				allGuaranteedCPUs = allGuaranteedCPUs.Union(desired)
 				claimUIDs = append(claimUIDs, uid)
-				validatedClaimAllocations[uid] = desired
 			}
 
 			var state *store.ContainerState
@@ -116,7 +111,8 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, claimUIDs...); err != nil {
 					return nil, err
 				}
-				if err := cpuAllocationStore.ValidateResourceClaimAllocations(validatedClaimAllocations); err != nil {
+				allGuaranteedCPUs, err := cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
+				if err != nil {
 					return nil, err
 				}
 				cLogger.V(2).Info("found guaranteed CPUs", "cpus", allGuaranteedCPUs.String())
@@ -275,23 +271,28 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		logger.V(2).Info("no guaranteed CPUs found, using shared CPUs", "sharedCPUs", sharedCPUs.String())
 		adjust.SetLinuxCPUSetCPUs(sharedCPUs.String())
 	} else {
-		// NRI invokes CreateContainer for all containers. Only trust DRA env
-		// entries that match a claim prepared by this driver.
-		guaranteedCPUs := cpuset.New()
+		// CCX-FORK: upstream pins the container to the cpuset parsed out of its
+		// env, after checking that value against the store for equality.
+		//
+		// NRI invokes CreateContainer for all containers. The DRA env only names
+		// which claims the container holds; where each one is placed comes from
+		// the store, so a claim moved between Prepare and CreateContainer is
+		// applied at its current placement rather than at the stale one the
+		// container's immutable environment carries.
 		claimUIDs := []types.UID{}
 		reportedCDIDevices := runtimeCDIDevices(ctr)
-		for uid, cpus := range claimAllocations {
+		for uid := range claimAllocations {
 			if !claimInjectedByRuntime(reportedCDIDevices, uid) {
 				return nil, nil, fmt.Errorf("container claims %q but the runtime injected no CDI device for it", uid)
 			}
-			guaranteedCPUs = guaranteedCPUs.Union(cpus)
 			claimUIDs = append(claimUIDs, uid)
 		}
 		newOwners, err := cp.claimTracker.SetOwner(logger, podUID, ctr.Name, claimUIDs...)
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := cp.cpuAllocationStore.ValidateResourceClaimAllocations(claimAllocations); err != nil {
+		guaranteedCPUs, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
+		if err != nil {
 			cp.claimTracker.Cleanup(newOwners...)
 			return nil, nil, err
 		}
