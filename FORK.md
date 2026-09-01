@@ -144,6 +144,15 @@ behaviour) rather than silently adapting.
   fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
 - **One metric carries a `numa_node` label**, against the rule stated in `docs/user/metrics.md`. The
   rule is amended there rather than quietly broken.
+- **Allocation-time cache placement is a policy, not a constant.** The design held that upstream's
+  packed order "needs no improvement" because it preserves whole caches for future large claims. The
+  platform wants the opposite for its small tenants -- one VM per cache while there is slack, L3
+  isolation first, with defragmentation consolidating the small tenants when a whole-cache claim
+  actually arrives instead of caches being hoarded against its possible arrival. That is
+  `cachePlacementPolicy: spread`; `pack` stays the default and upstream-identical. The same decision
+  reshaped the planner: the ideal packing is a repair target for misaligned claims only, and a claim
+  already spread as little as its size allows is never herded into the ideal's preferred slots for
+  tidiness (watched on hardware: six moves where three were needed, one of them intra-cache).
 - **The static shared pool is configured only as an explicit cpuset**, not as the designed
   `sharedPoolCoresPerNUMA` count with a cpuset escape hatch. A count means the driver picks the cores,
   and whichever caches those cores land in can never again serve a whole-cache claim -- a fleet cost an
