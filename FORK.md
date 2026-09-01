@@ -74,13 +74,14 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/nri_hooks.go` (additions): `sharedContainerCPUs`, `guaranteedContainerCPUs`,
   `localSharedPool`
 - `pkg/driver/dra_hooks.go` (additions): `claimEnvEdits`
+- `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`
 - `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`,
   `ResourceClaimAllocations`
 - `pkg/store/claim_tracker.go`: `Owner`
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
 - `internal/driverconfig`: the `Defrag*` and `SharedPoolCPUs` fields, their defaults and
-  `validateDefrag`
+  `validateDefrag`; the `Profiles` map, `Profile`, `ProfileLabel` and `WithProfile`
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
   behind them
 - `test/e2e`: the defragmentation, whole-core and static-shared-pool suites, the claim-pod and

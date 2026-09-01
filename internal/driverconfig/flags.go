@@ -19,7 +19,9 @@ package driverconfig
 import (
 	"flag"
 	"fmt"
+	"maps"
 	"path/filepath"
+	"slices"
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
@@ -179,6 +181,14 @@ func (c Config) validateDefrag() error {
 				return fmt.Errorf("invalid sharedPoolCPUs %q: overlaps reservedCPUs %q on %s -- a CPU cannot both host shared workloads and be reserved away from them",
 					c.SharedPoolCPUs, c.ReservedCPUs, pool.Intersection(reserved).String())
 			}
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(c.Profiles)) {
+		merged := c
+		merged.Profiles = nil
+		merged.applyProfile(c.Profiles[name])
+		if err := merged.Validate(); err != nil {
+			return fmt.Errorf("config profile %q does not validate: %w", name, err)
 		}
 	}
 	if !c.DefragEnabled {
