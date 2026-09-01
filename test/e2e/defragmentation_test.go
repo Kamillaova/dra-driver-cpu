@@ -51,6 +51,7 @@ const placementsPath = "/placements"
 // tests read are declared.
 type placementsReport struct {
 	DefragEnabled  bool   `json:"defragEnabled"`
+	ReservedCPUs   string `json:"reservedCPUs"`
 	SharedPoolCPUs string `json:"sharedPoolCPUs"`
 	SharedCPUs     string `json:"sharedCPUs"`
 	Claims         []struct {
