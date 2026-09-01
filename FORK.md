@@ -65,7 +65,12 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/driver.go`: the `applyMu` field
 
-- `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`
+- `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`,
+  `ResourceClaimAllocations`
+
+- `pkg/store/claim_tracker.go`: `Owner`
+
+- `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
 
 - `internal/driverconfig`: the `Defrag*` fields, their defaults and `validateDefrag`
 
