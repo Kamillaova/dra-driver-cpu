@@ -33,6 +33,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 )
 
 // newFlagSet creates a FlagSet with cfg registered and args parsed.
@@ -973,4 +974,94 @@ sharedPoolCPUs: "2-3,18-19"
 	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{driverconfig.FromFile(cfgFile)})
 	require.NoError(t, err)
 	assert.Equal(t, "2-3,18-19", result.SharedPoolCPUs)
+}
+
+// TestValidate_ProfilesValidateEverywhere: every profile is checked on every
+// node, so a typo in the epyc profile fails a fleet's x3d nodes too -- the
+// operator learns at rollout, not when the one epyc node reboots.
+func TestValidate_ProfilesValidateEverywhere(t *testing.T) {
+	testCases := []struct {
+		name          string
+		profile       driverconfig.Profile
+		expectedError string
+	}{
+		{
+			name:    "a valid override",
+			profile: driverconfig.Profile{SharedPoolCPUs: ptr.To("2-3,18-19")},
+		},
+		{
+			name:    "clearing the pool explicitly",
+			profile: driverconfig.Profile{SharedPoolCPUs: ptr.To("")},
+		},
+		{
+			name:          "an unparseable pool",
+			profile:       driverconfig.Profile{SharedPoolCPUs: ptr.To("a-b")},
+			expectedError: `config profile "under-test" does not validate`,
+		},
+		{
+			name: "a pool overlapping the profile's own reserved set",
+			profile: driverconfig.Profile{
+				ReservedCPUs:   ptr.To("0-1"),
+				SharedPoolCPUs: ptr.To("1,17"),
+			},
+			expectedError: "overlaps reservedCPUs",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			cfg.Profiles = map[string]driverconfig.Profile{"under-test": tc.profile}
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestWithProfile: the label value picks the profile; nothing picked keeps the
+// fleet-wide values; a name the config does not define is an error, never a
+// fallback onto the wrong carve-outs.
+func TestWithProfile(t *testing.T) {
+	base := driverconfig.Default()
+	base.ReservedCPUs = "0"
+	base.SharedPoolCPUs = "1,17"
+	base.Profiles = map[string]driverconfig.Profile{
+		"epyc": {SharedPoolCPUs: ptr.To("1,65,129,193")},
+		"bare": {ReservedCPUs: ptr.To(""), SharedPoolCPUs: ptr.To("")},
+	}
+
+	t.Run("no label keeps the fleet-wide values", func(t *testing.T) {
+		cfg, err := base.WithProfile("")
+		require.NoError(t, err)
+		assert.Equal(t, "0", cfg.ReservedCPUs)
+		assert.Equal(t, "1,17", cfg.SharedPoolCPUs)
+	})
+
+	t.Run("a profile overrides only what it names", func(t *testing.T) {
+		cfg, err := base.WithProfile("epyc")
+		require.NoError(t, err)
+		assert.Equal(t, "0", cfg.ReservedCPUs, "reservedCPUs is not named by the profile and must be inherited")
+		assert.Equal(t, "1,65,129,193", cfg.SharedPoolCPUs)
+	})
+
+	t.Run("an explicit empty string clears", func(t *testing.T) {
+		cfg, err := base.WithProfile("bare")
+		require.NoError(t, err)
+		assert.Empty(t, cfg.ReservedCPUs)
+		assert.Empty(t, cfg.SharedPoolCPUs)
+	})
+
+	t.Run("an unknown profile is an error", func(t *testing.T) {
+		_, err := base.WithProfile("tpyo")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"tpyo"`)
+		assert.Contains(t, err.Error(), driverconfig.ProfileLabel)
+		assert.Contains(t, err.Error(), "bare")
+		assert.Contains(t, err.Error(), "epyc")
+	})
 }
