@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	"k8s.io/utils/cpuset"
 )
 
 type FlagSource struct {
@@ -156,6 +157,29 @@ func (c Config) validateDefrag() error {
 	}
 	if c.DefragClaimCooldownSeconds < 0 {
 		return fmt.Errorf("invalid defragClaimCooldownSeconds %d: must not be negative", c.DefragClaimCooldownSeconds)
+	}
+	if c.SharedPoolCPUs != "" {
+		pool, err := cpuset.Parse(c.SharedPoolCPUs)
+		if err != nil {
+			return fmt.Errorf("invalid sharedPoolCPUs %q: %w", c.SharedPoolCPUs, err)
+		}
+		if pool.IsEmpty() {
+			return fmt.Errorf("invalid sharedPoolCPUs %q: names no CPUs", c.SharedPoolCPUs)
+		}
+		// The pool only makes sense where the driver chooses which CPUs back a
+		// claim: in individual mode the scheduler picks exact CPU devices and
+		// would happily pick the pool's.
+		if c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
+			return fmt.Errorf("invalid sharedPoolCPUs: requires cpuDeviceMode %q, got %q",
+				device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
+		}
+		if c.ReservedCPUs != "" {
+			reserved, err := cpuset.Parse(c.ReservedCPUs)
+			if err == nil && !pool.Intersection(reserved).IsEmpty() {
+				return fmt.Errorf("invalid sharedPoolCPUs %q: overlaps reservedCPUs %q on %s -- a CPU cannot both host shared workloads and be reserved away from them",
+					c.SharedPoolCPUs, c.ReservedCPUs, pool.Intersection(reserved).String())
+			}
+		}
 	}
 	if !c.DefragEnabled {
 		return nil
