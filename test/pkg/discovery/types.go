@@ -35,6 +35,10 @@ type DRACPURuntimeinfo struct {
 	CPUAffinity string `json:"affinity"`
 }
 
+type DRACPUEnv struct {
+	SharedCPUs string `json:"sharedCPUs"`
+}
+
 type DRACPUInfo struct {
 	Buildinfo DRACPUBuildinfo   `json:"buildinfo"`
 	CPUs      []cpuinfo.CPUInfo `json:"cpus"`
@@ -44,6 +48,7 @@ type DRACPUTester struct {
 	Buildinfo   DRACPUBuildinfo   `json:"buildinfo"`
 	Allocation  DRACPUAllocation  `json:"allocation"`
 	Runtimeinfo DRACPURuntimeinfo `json:"runtimeinfo"`
+	Env         DRACPUEnv         `json:"env"`
 }
 
 func NewBuildinfo() DRACPUBuildinfo {
