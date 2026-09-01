@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -47,12 +48,19 @@ type defragTestDriver struct {
 
 func newDefragTestDriver(t *testing.T, caches, cpusPerCache int) *defragTestDriver {
 	t.Helper()
+	return newDefragTestDriverTopo(t, 1, caches, cpusPerCache)
+}
+
+// newDefragTestDriverTopo spreads the caches over numaNodes NUMA nodes.
+func newDefragTestDriverTopo(t *testing.T, numaNodes, cachesPerNode, cpusPerCache int) *defragTestDriver {
+	t.Helper()
 	logger := testr.New(t)
 
+	cpusPerNode := cachesPerNode * cpusPerCache
 	var infos []cpuinfo.CPUInfo
-	for cpu := range caches * cpusPerCache {
+	for cpu := range numaNodes * cpusPerNode {
 		infos = append(infos, cpuinfo.CPUInfo{
-			CpuID: cpu, CoreID: cpu, SocketID: 0, NUMANodeID: 0,
+			CpuID: cpu, CoreID: cpu, SocketID: 0, NUMANodeID: cpu / cpusPerNode,
 			UncoreCacheID: cpu / cpusPerCache,
 		})
 	}
@@ -448,6 +456,241 @@ func TestDefragPassRecordsBlockedMoves(t *testing.T) {
 	require.Positive(t, metricValue(t, d.metrics, "dra_cpu_defrag_blocked_moves_total", nil))
 }
 
+func TestDefragPassNeverTargetsOfflineCPUs(t *testing.T) {
+	// The whole of cache 0 fits this claim, but half of that cache went offline
+	// after startup. The pass must re-read the online set and place around the
+	// hole: a cpuset naming an offline CPU is rejected by the kernel outright.
+	d := newDefragTestDriver(t, 2, 4)
+	d.sysfs = fstest.MapFS{
+		"devices/system/cpu/online": &fstest.MapFile{Data: []byte("0-1,4-7\n")},
+	}
+	d.placeClaim(t, "claim-1", cpuset.New(0, 1, 4, 5))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	d.defragPass(context.Background())
+
+	cpus, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(4, 5, 6, 7), cpus,
+		"the only whole cache the claim fits in without the offline CPUs")
+	require.True(t, cpus.Intersection(cpuset.New(2, 3)).IsEmpty(), "moved onto offline CPUs")
+	require.Equal(t, cpuset.New(4, 5, 6, 7), d.recordedPlacement(t, "claim-1"))
+}
+
+func TestDefragPassCommitsAMoveWhoseContainerWasReplaced(t *testing.T) {
+	// The container restarted while the round was at the runtime: the update for
+	// the old container failed, but its replacement was pinned from the store,
+	// which already holds the target. That is convergence, not refusal -- an
+	// abort here would put the claim where the new container is not.
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.updater.failed = []*api.ContainerUpdate{{ContainerId: "ctr-uid-1"}}
+	d.updater.onUpdate = func([]*api.ContainerUpdate) {
+		d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-2", "claim-1")
+	}
+
+	d.defragPass(context.Background())
+
+	cpus, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 1), cpus, "the move must commit")
+	require.Equal(t, cpuset.New(0, 1), d.recordedPlacement(t, "claim-1"))
+	_, inFlight := d.cpuAllocationStore.GetRebindOrigin("claim-1")
+	require.False(t, inFlight)
+}
+
+func TestDefragPassCommitsAMoveWhoseContainerIsGone(t *testing.T) {
+	// The container stopped while the round was at the runtime. Nothing runs on
+	// either half, and whatever starts next is pinned from the store, so the
+	// recorded target is the right place to end up.
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.updater.failed = []*api.ContainerUpdate{{ContainerId: "ctr-uid-1"}}
+	d.updater.onUpdate = func([]*api.ContainerUpdate) {
+		d.podConfigStore.RemoveContainerState("pod-1", "ctr-1", "ctr-uid-1")
+	}
+
+	d.defragPass(context.Background())
+
+	cpus, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 1), cpus)
+	_, inFlight := d.cpuAllocationStore.GetRebindOrigin("claim-1")
+	require.False(t, inFlight)
+}
+
+func TestDefragPassAbortsAMoveItCannotRecord(t *testing.T) {
+	// The spec on disk is what a restart rebuilds from, so a move that cannot be
+	// recorded must not happen: undo the reservation and tell the runtime
+	// nothing.
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.cdi.addError = errors.New("no space left on device")
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls(), "an unrecorded move must not reach the runtime")
+	cpus, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 4), cpus)
+	require.Equal(t, cpuset.New(0, 4), d.recordedPlacement(t, "claim-1"))
+	_, inFlight := d.cpuAllocationStore.GetRebindOrigin("claim-1")
+	require.False(t, inFlight)
+	require.Equal(t, d.allCPUs.Difference(cpuset.New(0, 4)), d.cpuAllocationStore.GetSharedCPUs())
+
+	// The failure was transient, so the next pass completes the move.
+	d.cdi.addError = nil
+	d.defragPass(context.Background())
+	cpus, _ = d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 1), cpus)
+}
+
+func TestDefragPassAbandonsARoundItCannotBuildUpdatesFor(t *testing.T) {
+	// The container claims something the store has no placement for, which means
+	// this driver's view of it is inconsistent -- an unprepare raced, or worse.
+	// Pinning it to a partial union would take CPUs away from a running
+	// workload, so the whole round is undone instead: reservations, specs, and
+	// nothing sent.
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1", "claim-ghost")
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls())
+	cpus, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 4), cpus)
+	require.Equal(t, cpuset.New(0, 4), d.recordedPlacement(t, "claim-1"))
+	_, inFlight := d.cpuAllocationStore.GetRebindOrigin("claim-1")
+	require.False(t, inFlight)
+}
+
+func TestDefragPassSharesTheMoveBudgetAcrossNUMANodes(t *testing.T) {
+	// One split claim per NUMA node and a budget of one move per pass: each pass
+	// fixes one node and leaves the rest for the next, rather than giving every
+	// node its own budget.
+	d := newDefragTestDriverTopo(t, 2, 2, 4)
+	d.defrag.maxMoves = 1
+	d.placeClaim(t, "claim-n0", cpuset.New(0, 4))
+	d.runContainer(t, "pod-0", "ctr-0", "ctr-uid-0", "claim-n0")
+	d.placeClaim(t, "claim-n1", cpuset.New(8, 12))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-n1")
+
+	d.defragPass(context.Background())
+
+	// Nodes are planned in order, so node 0 wins the single slot.
+	moved, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-n0")
+	require.Equal(t, 1, cpuinfoSpread(d.CPUDriver, moved))
+	waiting, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-n1")
+	require.Equal(t, cpuset.New(8, 12), waiting, "the budget must be shared, not per node")
+
+	d.defragPass(context.Background())
+	moved, _ = d.cpuAllocationStore.GetResourceClaimAllocation("claim-n1")
+	require.Equal(t, 1, cpuinfoSpread(d.CPUDriver, moved))
+
+	calls := d.updater.allCalls()
+	require.Len(t, calls, 2)
+	require.Len(t, calls[0], 1, "one move per pass means one container per round")
+	require.Len(t, calls[1], 1)
+}
+
+func TestDefragPassMovesWholeCores(t *testing.T) {
+	// SMT topology: core c is CPUs {c, c+4}; cores 0-1 share cache 0, cores 2-3
+	// cache 1. With whole-core allocation on, a move may never split a core, and
+	// only whole free cores count as free.
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 8 {
+		core := cpu % 4
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID: cpu, CoreID: core, SocketID: 0, NUMANodeID: 0,
+			UncoreCacheID: core / 2, SiblingCPUID: (cpu + 4) % 8,
+		})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	updater := &fakeContainerUpdater{}
+	cdi := newMockCdiMgr()
+	d := &defragTestDriver{
+		CPUDriver: &CPUDriver{
+			topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New(), onlineCPUs: topo.CPUDetails.CPUs()},
+			cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+			podConfigStore:     store.NewPodConfig(),
+			claimTracker:       store.NewClaimTracker(),
+			cdiMgr:             cdi,
+			containerUpdater:   updater,
+			reconcileTrigger:   make(chan struct{}, 1),
+			lastMoved:          make(map[types.UID]time.Time),
+			wholeCoreStep:      2,
+			sysfs: fstest.MapFS{
+				"devices/system/cpu/online": &fstest.MapFile{Data: []byte("0-7\n")},
+			},
+			defrag: defragOptions{enabled: true, maxMoves: 4, minGain: 1},
+		},
+		updater: updater,
+		cdi:     cdi,
+		allCPUs: topo.CPUDetails.CPUs(),
+	}
+	// Cores 0 and 2, one per cache; cores 1 and 3 are free.
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4, 2, 6))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	d.defragPass(context.Background())
+
+	cpus, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpus, topo.CPUDetails.CompleteCores(cpus), "a move split a physical core")
+	require.Equal(t, 1, cpuinfoSpread(d.CPUDriver, cpus), "the claim must end inside one cache")
+	require.Equal(t, 4, cpus.Size())
+}
+
+func TestReconcileWorkerRunsTimedPasses(t *testing.T) {
+	// A node nothing disturbs still converges: the ticker is the only trigger
+	// this test allows.
+	d := newDefragTestDriver(t, 2, 4)
+	d.defrag.interval = 20 * time.Millisecond
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		d.runReconcileWorker(ctx)
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		cpus, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+		return ok && cpuinfoSpread(d.CPUDriver, cpus) == 1
+	}, 2*time.Second, 5*time.Millisecond, "no pass ran without an explicit trigger")
+
+	cancel()
+	<-done
+}
+
+func TestDefragPassReleasesApplyMuDuringTheRuntimeCall(t *testing.T) {
+	// The rule the pass's whole shape exists for: applyMu must not be held
+	// across the call into the runtime, because the runtime may be holding, on
+	// behalf of an inbound hook of ours, the lock our call needs. A fake updater
+	// cannot deadlock, so assert the contract directly from inside the call.
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	var lockWasFree atomic.Bool
+	d.updater.onUpdate = func([]*api.ContainerUpdate) {
+		if d.applyMu.TryLock() {
+			d.applyMu.Unlock()
+			lockWasFree.Store(true)
+		}
+	}
+
+	d.defragPass(context.Background())
+
+	require.Len(t, d.updater.allCalls(), 1, "the move must actually reach the runtime")
+	require.True(t, lockWasFree.Load(), "applyMu was held across the runtime call")
+}
+
 func TestDefragPassMeasuresANodeWithNoClaims(t *testing.T) {
 	// An idle node has nothing to move but still has a shape. Reporting nothing
 	// for it would make the leading indicator vanish exactly when it is most
@@ -461,6 +704,22 @@ func TestDefragPassMeasuresANodeWithNoClaims(t *testing.T) {
 	require.InDelta(t, 4, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
 		map[string]string{"numa_node": "0"}), 0.01,
 		"an empty node can take a whole cache")
+}
+
+func TestDefragPassMeasuresEveryNUMANodeNotOnlyOccupiedOnes(t *testing.T) {
+	// One claim on node 0 must not stop node 1 from being reported.
+	d := newDefragTestDriverTopo(t, 2, 2, 4)
+	// Two CPUs taken out of each of node 0's caches, so the largest aligned claim
+	// it could still take is two; node 1 is untouched and could take a whole cache.
+	d.placeClaim(t, "claim-1", cpuset.New(0, 1, 4, 5))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	d.defragPass(context.Background())
+
+	require.InDelta(t, 2, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "0"}), 0.01, "node 0's emptiest cache has two CPUs left")
+	require.InDelta(t, 4, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "1"}), 0.01, "node 1 holds no claims and must still be reported")
 }
 
 func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
