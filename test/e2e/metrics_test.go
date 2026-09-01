@@ -117,6 +117,11 @@ var _ = ginkgo.Describe("Metrics", ginkgo.Serial, func() {
 			claimSpec = makeResourceClaimSpec(1, cpuDeviceMode == "grouped")
 		}
 
+		// A 1-CPU request is deliberate -- it is the interesting case under
+		// whole-core allocation, where the scheduler rounds it up to the
+		// device's allocation step and the driver allocates that many.
+		step := allocationStep(ctx, metricsFxt.K8SClientset, targetNode.Name)
+
 		baseline, err := getDriverAllocationMetrics(ctx, metricsFxt.K8SClientset, targetNode.Name)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get baseline allocation metrics")
 		expectBasicMetricPropertiesNow(baseline)
@@ -145,8 +150,8 @@ var _ = ginkgo.Describe("Metrics", ginkgo.Serial, func() {
 			g.Expect(err).ToNot(gomega.HaveOccurred())
 			expectBasicMetricProperties(g, snapshot)
 			g.Expect(snapshot.TotalCPUs()).To(gomega.Equal(baseline.TotalCPUs()))
-			g.Expect(snapshot.AllocatedCPUs).To(gomega.Equal(baseline.AllocatedCPUs + 1))
-			g.Expect(snapshot.AvailableCPUs).To(gomega.Equal(baseline.AvailableCPUs - 1))
+			g.Expect(snapshot.AllocatedCPUs).To(gomega.Equal(baseline.AllocatedCPUs + step))
+			g.Expect(snapshot.AvailableCPUs).To(gomega.Equal(baseline.AvailableCPUs - step))
 			g.Expect(snapshot.ReservedCPUs).To(gomega.Equal(baseline.ReservedCPUs))
 			g.Expect(snapshot.ActiveResourceClaims).To(gomega.Equal(baseline.ActiveResourceClaims + 1))
 		}).WithTimeout(driverPodPollTimeout).WithPolling(driverPodPollInterval).Should(gomega.Succeed())
@@ -169,8 +174,8 @@ var _ = ginkgo.Describe("Metrics", ginkgo.Serial, func() {
 			g.Expect(err).ToNot(gomega.HaveOccurred())
 			expectBasicMetricProperties(g, snapshot)
 			g.Expect(snapshot.TotalCPUs()).To(gomega.Equal(baseline.TotalCPUs()))
-			g.Expect(snapshot.AllocatedCPUs).To(gomega.Equal(baseline.AllocatedCPUs + 1))
-			g.Expect(snapshot.AvailableCPUs).To(gomega.Equal(baseline.AvailableCPUs - 1))
+			g.Expect(snapshot.AllocatedCPUs).To(gomega.Equal(baseline.AllocatedCPUs + step))
+			g.Expect(snapshot.AvailableCPUs).To(gomega.Equal(baseline.AvailableCPUs - step))
 			g.Expect(snapshot.ReservedCPUs).To(gomega.Equal(baseline.ReservedCPUs))
 			g.Expect(snapshot.ActiveResourceClaims).To(gomega.Equal(baseline.ActiveResourceClaims + 1))
 		}).WithTimeout(driverPodPollTimeout).WithPolling(driverPodPollInterval).Should(gomega.Succeed())
