@@ -30,5 +30,9 @@ func Default() Config {
 		GroupBy:        device.GROUP_BY_NUMA_NODE,
 		KubeletRootDir: DefaultKubeletRootDir,
 		Allocator:      AllocatorCPUManager,
+		// On by default but inert until unsolicited updates are permitted, so
+		// enabling that one option gets the prompt reconcile without a second
+		// switch.
+		ReconcileSharedOnUnprepare: true,
 	}
 }
