@@ -124,6 +124,10 @@ DRACPU_E2E_DEFRAG ?= false
 # Set to "true" to have ci-kind-setup deploy the driver with whole physical core
 # allocation. Has observable effects only where the nodes have SMT enabled.
 DRACPU_E2E_FULL_PCPUS_ONLY ?= false
+# Set to a cpuset (e.g. "1,17") to have ci-kind-setup deploy the driver with a
+# static shared pool on those CPUs; empty keeps the dynamic pool.
+DRACPU_E2E_SHARED_POOL_CPUS ?=
+comma := ,
 # Extra arguments passed to golangci-lint in the lint target.
 # For example, set GOLANGCI_LINT_EXTRA_ARGS=--fix to auto-fix issues.
 GOLANGCI_LINT_EXTRA_ARGS ?=
@@ -223,7 +227,8 @@ endif
 		--set driverConfig.publishNodeAllocatableResourceMapping=$(DRACPU_E2E_NODE_ALLOCATABLE_MAPPING) \
 		--set driverConfig.fullPhysicalCPUsOnly=$(DRACPU_E2E_FULL_PCPUS_ONLY) \
 		--set driverConfig.defragEnabled=$(DRACPU_E2E_DEFRAG) \
-		--set driverConfig.assumeUnsolicitedUpdatesSafe=$(DRACPU_E2E_DEFRAG)
+		--set driverConfig.assumeUnsolicitedUpdatesSafe=$(DRACPU_E2E_DEFRAG) \
+		--set-string 'driverConfig.sharedPoolCPUs=$(subst $(comma),\$(comma),$(DRACPU_E2E_SHARED_POOL_CPUS))'
 	hack/ci/wait-resourcelices.sh
 
 build-test-image: ## build tests image

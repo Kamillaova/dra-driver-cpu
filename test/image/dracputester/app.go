@@ -109,6 +109,11 @@ func main() {
 			Runtimeinfo: discovery.DRACPURuntimeinfo{
 				CPUAffinity: cpuAff.String(),
 			},
+			// Literal, not the driver's constant: report what a workload
+			// following the documented contract sees.
+			Env: discovery.DRACPUEnv{
+				SharedCPUs: os.Getenv("DRA_SHARED_CPUS"),
+			},
 		}
 		err = json.NewEncoder(os.Stdout).Encode(info)
 		if err != nil {

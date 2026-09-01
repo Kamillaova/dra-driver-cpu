@@ -91,9 +91,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
   behind them
 
-- `test/e2e`: the defragmentation and whole-core suites, the claim-pod and shared-pool helpers in
-  `e2e_suite_test.go`, and the `defragEnabled`/`fullPhysicalCPUsOnly`/`sharedPoolCPUs` config
-  read-back
+- `test/e2e`: the defragmentation, whole-core and static-shared-pool suites, the claim-pod and
+  shared-pool helpers in `e2e_suite_test.go`, the
+  `defragEnabled`/`fullPhysicalCPUsOnly`/`sharedPoolCPUs` config read-back, and the `env` field the
+  tester image reports
 
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
