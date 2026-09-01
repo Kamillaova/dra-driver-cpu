@@ -50,6 +50,12 @@ type Config struct {
 	// feature gate in the cluster. Defaults to false.
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
 	Allocator                             string `json:"allocator,omitempty"`
+	// FullPhysicalCPUsOnly allocates whole physical cores, so a core's SMT
+	// siblings are never split between two claims or between a claim and the
+	// shared pool. This is the equivalent of the kubelet CPU Manager's
+	// FullPCPUsOnly policy option. Defaults to false, leaving single-thread
+	// allocations possible; it is a no-op where SMT is disabled.
+	FullPhysicalCPUsOnly bool `json:"fullPhysicalCPUsOnly,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -66,6 +72,7 @@ func (c Config) LogValues() []any {
 		"kubeletRootDir", c.KubeletRootDir,
 		"publishNodeAllocatableResourceMapping", c.PublishNodeAllocatableResourceMapping,
 		"allocator", c.Allocator,
+		"fullPhysicalCPUsOnly", c.FullPhysicalCPUsOnly,
 	}
 }
 
@@ -83,6 +90,7 @@ type dumpConfig struct {
 	KubeletRootDir                        string `json:"kubeletRootDir"`
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping"`
 	Allocator                             string `json:"allocator"`
+	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
