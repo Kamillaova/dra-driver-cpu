@@ -75,6 +75,12 @@ cannot track a claim that moves. With `defragEnabled` its value is the literal s
 than a cpuset, so a workload that parses it fails loudly instead of quietly pinning itself to CPUs its
 claim has left.
 
+With [`sharedPoolCPUs`](configuration.md#driver-configuration) configured, the driver also injects
+`DRA_SHARED_CPUS`: the static pool CPUs of the claim's NUMA nodes, which the container has appended to
+its cpuset for its auxiliary threads. That variable **is** safe to read — the pool is static and a
+move preserves the claim's NUMA footprint, so it cannot go stale. A workload's exclusive CPUs are then
+`sched_getaffinity(2)` minus `DRA_SHARED_CPUS`.
+
 Read the current CPUs from the kernel instead:
 
 - `sched_getaffinity(2)`, which the kernel keeps current through a move; or
@@ -130,6 +136,14 @@ A `plan.reason` of `all N moves towards the ideal are blocked` means the claims 
 themselves pinned, under cooldown, or there is no slack to move them through. A `movableIn` on a claim
 is its cooldown. A `movingFrom` is a move still in flight: the claim holds both sets of CPUs until the
 runtime confirms it.
+
+## Worked example
+
+[`hack/examples/qemu-ccx-vm/`](../../hack/examples/qemu-ccx-vm/) carries a complete pair of QEMU VM
+classes against this driver -- a whole-cache VM selected onto capable nodes via
+`largestUncoreCacheCPUs`, and a flexible small VM the defragmenter may re-home -- together with the
+in-pod launcher that implements the workload contract above: live CPUs from the cgroup, per-vCPU
+pinning over QMP, and inotify-driven re-pinning on every move.
 
 ## Rolling out
 
