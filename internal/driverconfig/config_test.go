@@ -1088,3 +1088,58 @@ func TestValidate_CachePlacementPolicy(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `"sprinkle"`)
 }
+
+func TestValidate_PublishFitAnnotationRequirements(t *testing.T) {
+	testCases := []struct {
+		name          string
+		mutate        func(*driverconfig.Config)
+		expectedError string
+	}{
+		{
+			name:   "grouped by NUMA node",
+			mutate: func(*driverconfig.Config) {},
+		},
+		{
+			name:   "grouped by socket",
+			mutate: func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_SOCKET },
+		},
+		{
+			// The scheduler named the exact CPU devices, so their shape is not
+			// the driver's to describe.
+			name:          "individual mode",
+			mutate:        func(c *driverconfig.Config) { c.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL },
+			expectedError: "requires cpuDeviceMode",
+		},
+		{
+			// The cpuset came from the claim's own opaque config.
+			name:          "grouped by machine",
+			mutate:        func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_MACHINE },
+			expectedError: "requires groupBy",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			cfg.PublishFitAnnotation = true
+			tc.mutate(&cfg)
+
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "publishFitAnnotation")
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestValidate_PublishFitAnnotationIsInertWhenDisabled: a mode that cannot
+// carry the annotation must not stop a driver that is not publishing one.
+func TestValidate_PublishFitAnnotationIsInertWhenDisabled(t *testing.T) {
+	cfg := driverconfig.Default()
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+	assert.NoError(t, cfg.Validate())
+}
