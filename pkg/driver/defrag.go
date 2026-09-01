@@ -19,7 +19,6 @@ package driver
 import (
 	"context"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -27,6 +26,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
@@ -39,6 +39,14 @@ type defragOptions struct {
 	maxMoves      int
 	minGain       int
 	claimCooldown time.Duration
+}
+
+// defragObservation is what a pass measured while planning, whether or not it
+// went on to move anything.
+type defragObservation struct {
+	excessUncoreCaches       int
+	blockedMoves             int
+	largestAlignableFreeCPUs map[int]int
 }
 
 // defragRound is one set of moves that has been reserved and written to disk and
@@ -71,20 +79,30 @@ func (cp *CPUDriver) defragPass(ctx context.Context) {
 		return
 	}
 
-	round := cp.beginDefragRound(logger, online)
+	start := time.Now()
+	round, observed := cp.beginDefragRound(logger, online)
+	if observed != nil {
+		cp.metricsRecorder().SetDefragState(cpumetrics.DefragState{
+			ExcessUncoreCaches:       observed.excessUncoreCaches,
+			LargestAlignableFreeCPUs: observed.largestAlignableFreeCPUs,
+		})
+		cp.metricsRecorder().RecordDefragBlockedMoves(observed.blockedMoves)
+	}
 	if round == nil {
+		cp.metricsRecorder().RecordDefragPass(cpumetrics.ResultSuccess, time.Since(start))
 		return
 	}
 
 	logger.V(2).Info("applying defragmentation moves", "numMoves", len(round.moves), "numUpdates", len(round.updates))
-	if len(round.updates) == 0 {
-		// Nothing is running on the CPUs involved, so the store and the specs are
-		// the whole of the move and there is nothing to ask the runtime.
-		cp.finishDefragRound(logger, round, nil, nil)
-		return
+	var failed []*api.ContainerUpdate
+	var updateErr error
+	if len(round.updates) > 0 {
+		failed, updateErr = cp.containerUpdater.UpdateContainers(round.updates)
 	}
-	failed, err := cp.containerUpdater.UpdateContainers(round.updates)
-	cp.finishDefragRound(logger, round, failed, err)
+	// An empty round means nothing is running on the CPUs involved, so the store
+	// and the specs are the whole of the move.
+	result := cp.finishDefragRound(logger, round, failed, updateErr)
+	cp.metricsRecorder().RecordDefragPass(result, time.Since(start))
 }
 
 func (cp *CPUDriver) currentOnlineCPUs(logger logr.Logger) (cpuset.CPUSet, error) {
@@ -96,7 +114,7 @@ func (cp *CPUDriver) currentOnlineCPUs(logger logr.Logger) (cpuset.CPUSet, error
 
 // beginDefragRound plans the moves, reserves them, and records each claim's new
 // placement in its CDI spec. It returns nil when there is nothing to do.
-func (cp *CPUDriver) beginDefragRound(logger logr.Logger, online cpuset.CPUSet) *defragRound {
+func (cp *CPUDriver) beginDefragRound(logger logr.Logger, online cpuset.CPUSet) (*defragRound, *defragObservation) {
 	cp.applyMu.Lock()
 	defer cp.applyMu.Unlock()
 
@@ -111,12 +129,12 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, online cpuset.CPUSet) 
 	}
 
 	if round := cp.takePendingRound(logger); round != nil {
-		return round
+		return round, nil
 	}
 
-	moves := cp.planDefragMoves(logger, online)
+	moves, observed := cp.planDefragMoves(logger, online)
 	if len(moves) == 0 {
-		return nil
+		return nil, &observed
 	}
 
 	round := &defragRound{store: cp.cpuAllocationStore}
@@ -139,7 +157,7 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, online cpuset.CPUSet) 
 		round.moves = append(round.moves, move)
 	}
 	if len(round.moves) == 0 {
-		return nil
+		return nil, &observed
 	}
 
 	updates, err := cp.roundUpdates(logger, round.moves)
@@ -149,10 +167,10 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, online cpuset.CPUSet) 
 		// holds.
 		logger.Error(err, "abandoning defragmentation round", "numMoves", len(round.moves))
 		cp.abortMoves(logger, round.moves)
-		return nil
+		return nil, &observed
 	}
 	round.updates = updates
-	return round
+	return round, &observed
 }
 
 // takePendingRound returns the round a previous pass could not confirm, so it can
@@ -177,7 +195,7 @@ func (cp *CPUDriver) takePendingRound(logger logr.Logger) *defragRound {
 
 // planDefragMoves plans each NUMA node in turn, sharing one move budget between
 // them. Called with applyMu held.
-func (cp *CPUDriver) planDefragMoves(logger logr.Logger, online cpuset.CPUSet) []defrag.Move {
+func (cp *CPUDriver) planDefragMoves(logger logr.Logger, online cpuset.CPUSet) ([]defrag.Move, defragObservation) {
 	topo := cp.topology.cpuTopology
 	allocatable := online.Intersection(topo.CPUDetails.CPUs()).Difference(cp.topology.reservedCPUs)
 
@@ -194,26 +212,28 @@ func (cp *CPUDriver) planDefragMoves(logger logr.Logger, online cpuset.CPUSet) [
 	keepFree := len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
 
 	placements := defrag.PlacementsByNUMANode(topo, cp.cpuAllocationStore.ResourceClaimAllocations())
-	numaNodeIDs := make([]int, 0, len(placements))
-	for numaNodeID := range placements {
-		numaNodeIDs = append(numaNodeIDs, numaNodeID)
-	}
-	sort.Ints(numaNodeIDs)
+	// Every node the topology has, not only those holding a claim. A node with no
+	// claims has nothing to move, but it still has a shape worth reporting: how
+	// large a claim it could take aligned is most interesting precisely when it is
+	// empty, and a gauge that disappears as a node drains cannot be alerted on.
+	numaNodeIDs := topo.CPUDetails.NUMANodes().List()
 
 	budget := cp.defrag.maxMoves
 	var moves []defrag.Move
+	observed := defragObservation{largestAlignableFreeCPUs: map[int]int{}}
 	for _, numaNodeID := range numaNodeIDs {
-		if budget <= 0 {
-			break
-		}
 		nLogger := logger.WithValues("numaNode", numaNodeID)
 		nodeTopo, err := defrag.NewTopology(topo, numaNodeID, allocatable)
 		if err != nil {
 			nLogger.V(2).Info("node cannot be defragmented", "reason", err.Error())
 			continue
 		}
+		observed.largestAlignableFreeCPUs[numaNodeID] = largestAlignableFreeCPUs(nodeTopo, free)
+
+		// Planning continues past an exhausted budget: the cost it reports is
+		// what a pass is watching for, and it costs nothing to ask.
 		plan, err := defrag.PlanNode(nodeTopo, placements[numaNodeID], free, cp.defragSelector(nLogger), defrag.Options{
-			MaxMoves:             budget,
+			MaxMoves:             max(budget, 0),
 			MinGain:              cp.defrag.minGain,
 			Eligible:             cp.claimMovable,
 			KeepFreePoolNonEmpty: keepFree,
@@ -224,10 +244,27 @@ func (cp *CPUDriver) planDefragMoves(logger logr.Logger, online cpuset.CPUSet) [
 		}
 		nLogger.V(4).Info("planned defragmentation", "numMoves", len(plan.Moves), "blocked", plan.Blocked,
 			"currentCost", plan.CurrentCost, "idealCost", plan.IdealCost, "reason", plan.Reason)
+		observed.excessUncoreCaches += plan.CurrentCost
+		observed.blockedMoves += plan.Blocked
+		if budget <= 0 {
+			continue
+		}
 		moves = append(moves, plan.Moves...)
 		budget -= len(plan.Moves)
 	}
-	return moves
+	return moves, observed
+}
+
+// largestAlignableFreeCPUs is the most CPUs still free inside a single uncore
+// cache of a node, which is the largest claim it could take without splitting it.
+func largestAlignableFreeCPUs(nodeTopo *defrag.Topology, free cpuset.CPUSet) int {
+	largest := 0
+	for _, cacheID := range nodeTopo.Caches() {
+		if inCache := nodeTopo.CPUsInCache(cacheID).Intersection(free).Size(); inCache > largest {
+			largest = inCache
+		}
+	}
+	return largest
 }
 
 // defragSelector is the allocator Prepare places a new claim with, so a move can
@@ -314,7 +351,7 @@ func (cp *CPUDriver) roundUpdates(logger logr.Logger, moves []defrag.Move) ([]*a
 
 // finishDefragRound settles every move in a round according to what the runtime
 // reported.
-func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, failed []*api.ContainerUpdate, updateErr error) {
+func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, failed []*api.ContainerUpdate, updateErr error) cpumetrics.Result {
 	cp.applyMu.Lock()
 	defer cp.applyMu.Unlock()
 
@@ -324,7 +361,7 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		// Synchronize converges their containers itself.
 		logger.V(2).Info("defragmentation round outlived its stores", "numMoves", len(round.moves))
 		cp.pendingRound = nil
-		return
+		return cpumetrics.ResultSuccess
 	}
 	if updateErr != nil {
 		// Nothing can be concluded from a failed call: some of the batch may have
@@ -332,7 +369,7 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		// round again rather than release CPUs a container may now be running on.
 		logger.Error(updateErr, "defragmentation round unconfirmed, will retry", "numMoves", len(round.moves))
 		cp.pendingRound = round
-		return
+		return cpumetrics.ResultError
 	}
 	cp.pendingRound = nil
 
@@ -341,12 +378,13 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		refused[types.UID(update.GetContainerId())] = struct{}{}
 	}
 
-	committed := 0
+	committed, reverted := 0, 0
 	for _, move := range round.moves {
 		mLogger := logger.WithValues("claimUID", move.ClaimUID)
 		if cp.moveWasRefused(move, refused) {
 			mLogger.Info("runtime refused a move, leaving the claim where it is",
 				"from", move.From.String(), "to", move.To.String())
+			reverted++
 			if err := cp.cpuAllocationStore.AbortRebind(mLogger, move.ClaimUID); err != nil {
 				mLogger.Error(err, "cannot undo the reservation")
 				continue
@@ -358,17 +396,24 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		}
 		if err := cp.cpuAllocationStore.CommitRebind(mLogger, move.ClaimUID); err != nil {
 			mLogger.Error(err, "cannot complete the move")
+			reverted++
 			continue
 		}
 		cp.lastMoved[move.ClaimUID] = time.Now()
 		committed++
 	}
+	cp.metricsRecorder().RecordDefragMoves(cpumetrics.ResultSuccess, committed)
+	cp.metricsRecorder().RecordDefragMoves(cpumetrics.ResultError, reverted)
 
 	if committed > 0 {
 		// The CPUs the moved claims left are back in the pool; the shared
 		// containers entitled to them are still on the narrower mask.
 		cp.requestReconcile()
 	}
+	if reverted > 0 {
+		return cpumetrics.ResultError
+	}
+	return cpumetrics.ResultSuccess
 }
 
 // moveWasRefused reports whether the runtime declined to move a claim's
