@@ -232,6 +232,9 @@
             "v1alpha1"
           ]
         },
+        "assumeUnsolicitedUpdatesSafe": {
+          "type": "boolean"
+        },
         "cpuDeviceMode": {
           "type": "string",
           "enum": [
@@ -257,6 +260,9 @@
           "type": "string"
         },
         "publishNodeAllocatableResourceMapping": {
+          "type": "boolean"
+        },
+        "reconcileSharedOnUnprepare": {
           "type": "boolean"
         },
         "reservedCPUs": {
