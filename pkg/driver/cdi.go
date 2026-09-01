@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	"k8s.io/utils/cpuset"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 	cdiSpec "tags.cncf.io/container-device-interface/specs-go"
@@ -30,6 +31,15 @@ const (
 	cdiClass        = "cpu"
 	cdiEnvVarPrefix = "DRA_CPUSET"
 	cdiSpecDir      = "/var/run/cdi"
+
+	// cdiCPUSetAnnotation records the CPUs a claim is currently pinned to.
+	//
+	// It lives in the CDI spec's device annotations rather than in its container
+	// edits because CDI annotations are, per the specification, "CDI-specific and
+	// do not affect container metadata": nothing is injected into the container,
+	// so the driver can rewrite them at will. The injected env var cannot serve
+	// this purpose, since a running container's environment is fixed at creation.
+	cdiCPUSetAnnotation = "dra.cpu/cpuset"
 )
 
 // CdiManager handles the lifecycle of CDI allocations for the driver.
@@ -66,8 +76,15 @@ func (c *CdiManager) getSpecName(deviceName string) string {
 	return cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, deviceName) + ".json"
 }
 
-// AddDevice writes a dedicated CDI spec file for a single device allocation.
-func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar string) error {
+// AddDevice writes a dedicated CDI spec file for a single device allocation,
+// recording cpus as the device's current placement and injecting envVar into the
+// container.
+//
+// The spec is written atomically by the CDI cache, so a concurrent reader sees
+// either the previous placement or this one, never a mixture.
+//
+// CCX-FORK: upstream takes no cpus argument and records no placement.
+func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar string, cpus cpuset.CPUSet) error {
 	specName := c.getSpecName(deviceName)
 
 	spec := &cdiSpec.Spec{
@@ -76,6 +93,9 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 		Devices: []cdiSpec.Device{
 			{
 				Name: deviceName,
+				Annotations: map[string]string{
+					cdiCPUSetAnnotation: cpus.String(),
+				},
 				ContainerEdits: cdiSpec.ContainerEdits{
 					Env: []string{envVar},
 				},
@@ -87,8 +107,38 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 		return fmt.Errorf("failed to write CDI spec %q: %w", specName, err)
 	}
 
-	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVar)
+	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVar, "cpus", cpus.String())
 	return nil
+}
+
+// GetDeviceCPUSet returns the CPUs recorded for a device allocation. Call Refresh
+// before lookup to load the latest on-disk specs.
+//
+// Specs written before the driver recorded placement in an annotation carry it
+// only in the injected env var, so fall back to parsing that. The spec file is
+// driver-owned, so unlike a container's environment its env value is current.
+func (c *CdiManager) GetDeviceCPUSet(deviceName string) (cpuset.CPUSet, error) {
+	device := c.cache.GetDevice(cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName))
+	if device == nil {
+		return cpuset.CPUSet{}, fmt.Errorf("failed to find CDI device %q", deviceName)
+	}
+
+	if recorded, ok := device.Annotations[cdiCPUSetAnnotation]; ok {
+		cpus, err := cpuset.Parse(recorded)
+		if err != nil {
+			return cpuset.CPUSet{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiCPUSetAnnotation, recorded, deviceName, err)
+		}
+		return cpus, nil
+	}
+
+	allocations, err := parseDRAEnvToClaimAllocations(logr.Discard(), device.ContainerEdits.Env)
+	if err != nil {
+		return cpuset.CPUSet{}, fmt.Errorf("failed to parse CDI device %q: %w", deviceName, err)
+	}
+	for _, cpus := range allocations {
+		return cpus, nil
+	}
+	return cpuset.CPUSet{}, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
 }
 
 // Refresh reloads the CDI specs managed by the cache.
