@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
@@ -96,6 +97,7 @@ type CPUDriver struct {
 	// in effect on this node, and 0 when it is off or the topology cannot support
 	// it. Decided once at startup so publication and allocation cannot disagree.
 	wholeCoreStep           int
+	placementPolicy         coreselect.Policy
 	claimTracker            *store.ClaimTracker
 	pcieRootMapper          *store.PCIeRootMapper
 	devicesPerResourceSlice int
@@ -200,6 +202,9 @@ type Config struct {
 	// FullPhysicalCPUsOnly allocates whole physical cores, so a core's SMT siblings are never split
 	// between two claims or between a claim and the shared pool. Grouped mode only.
 	FullPhysicalCPUsOnly bool
+	// CachePlacementPolicy is how a claim choosing among caches that fit it
+	// picks one; empty means coreselect.Pack.
+	CachePlacementPolicy coreselect.Policy
 	// AssumeUnsolicitedUpdatesSafe permits pushing container updates the runtime did not ask for.
 	// Required by every feature that reacts without waiting for a container lifecycle event.
 	AssumeUnsolicitedUpdatesSafe bool
@@ -307,6 +312,10 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 
 	plugin.wholeCoreStep = device.WholeCoreStep(logger, plugin.topology.cpuTopology,
 		plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, config.FullPhysicalCPUsOnly)
+	plugin.placementPolicy = config.CachePlacementPolicy
+	if plugin.placementPolicy == "" {
+		plugin.placementPolicy = coreselect.Pack
+	}
 
 	// Unsolicited updates deadlock runtimes with a pre-nri#301 Adaptation, and
 	// the driver cannot tell from the handshake, so the operator asserts it.
