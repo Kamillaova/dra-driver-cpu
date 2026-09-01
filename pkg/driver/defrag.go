@@ -206,10 +206,7 @@ func (cp *CPUDriver) planDefragMoves(logger logr.Logger, online cpuset.CPUSet) (
 		free = topo.CPUDetails.CompleteCores(free)
 	}
 
-	// While a move is in flight its claim holds both its old and its new CPUs, so
-	// a round that took every free CPU would leave the shared pool momentarily
-	// empty, which NRI cannot express.
-	keepFree := len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
+	keepFree := cp.keepFreePoolNonEmpty()
 
 	placements := defrag.PlacementsByNUMANode(topo, cp.cpuAllocationStore.ResourceClaimAllocations())
 	// Every node the topology has, not only those holding a claim. A node with no
@@ -275,6 +272,15 @@ func (cp *CPUDriver) defragSelector(logger logr.Logger) defrag.Selector {
 	}
 }
 
+// keepFreePoolNonEmpty reports whether a pass must leave a free CPU behind.
+// While a move is in flight its claim holds both its old and its new CPUs, so
+// a round that took every free CPU would leave the shared pool momentarily
+// empty, which NRI cannot express. A static pool is out of the claims' reach
+// entirely, so there is nothing to protect.
+func (cp *CPUDriver) keepFreePoolNonEmpty() bool {
+	return cp.sharedPool.IsEmpty() && len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
+}
+
 // claimMovable reports whether a claim may be moved now. Called with applyMu held.
 func (cp *CPUDriver) claimMovable(claimUID types.UID) bool {
 	if _, inFlight := cp.cpuAllocationStore.GetRebindOrigin(claimUID); inFlight {
@@ -335,13 +341,18 @@ func (cp *CPUDriver) roundUpdates(logger logr.Logger, moves []defrag.Move) ([]*a
 			return nil, fmt.Errorf("cannot determine CPUs for container %q: %w", containerUID, err)
 		}
 		update := &api.ContainerUpdate{ContainerId: string(containerUID)}
-		update.SetLinuxCPUSetCPUs(cpus.String())
+		update.SetLinuxCPUSetCPUs(cp.guaranteedContainerCPUs(cpus).String())
 		updates = append(updates, update)
 	}
 
-	// The pool is already narrowed by the reservations, so this moves shared
-	// containers off the targets in the same batch. They are widened again once
-	// the moves commit and the origins return to the pool.
+	// With a static pool the shared mask never changes, so the batch carries
+	// only the guaranteed containers. Otherwise the pool is already narrowed by
+	// the reservations, and this moves shared containers off the targets in the
+	// same batch; they are widened again once the moves commit and the origins
+	// return to the pool.
+	if !cp.sharedPool.IsEmpty() {
+		return updates, nil
+	}
 	shared, err := cp.getSharedContainerUpdates(logger, types.UID(""))
 	if err != nil {
 		return nil, err
@@ -405,9 +416,10 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 	cp.metricsRecorder().RecordDefragMoves(cpumetrics.ResultSuccess, committed)
 	cp.metricsRecorder().RecordDefragMoves(cpumetrics.ResultError, reverted)
 
-	if committed > 0 {
+	if committed > 0 && cp.sharedPool.IsEmpty() {
 		// The CPUs the moved claims left are back in the pool; the shared
-		// containers entitled to them are still on the narrower mask.
+		// containers entitled to them are still on the narrower mask. A static
+		// pool never narrowed, so there is nothing to widen.
 		cp.requestReconcile()
 	}
 	if reverted > 0 {

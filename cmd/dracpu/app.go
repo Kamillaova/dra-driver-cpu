@@ -143,6 +143,10 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse reserved CPUs: %w", err)
 	}
+	sharedPoolCPUSet, err := cpuset.Parse(cfg.SharedPoolCPUs)
+	if err != nil {
+		return fmt.Errorf("failed to parse shared pool CPUs: %w", err)
+	}
 
 	sfs, err := newSysFS(logger, cfg.SysFSOverlay)
 	if err != nil {
@@ -237,6 +241,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		DefragMaxMovesPerPass:                 cfg.DefragMaxMovesPerPass,
 		DefragMinGain:                         cfg.DefragMinGain,
 		DefragClaimCooldown:                   time.Duration(cfg.DefragClaimCooldownSeconds) * time.Second,
+		SharedPoolCPUs:                        sharedPoolCPUSet,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 	}
