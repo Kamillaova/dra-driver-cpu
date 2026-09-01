@@ -81,7 +81,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
 
-- `internal/driverconfig`: the `Defrag*` fields, their defaults and `validateDefrag`
+- `internal/driverconfig`: the `Defrag*` and `SharedPoolCPUs` fields, their defaults and
+  `validateDefrag`
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
   behind them
@@ -135,6 +136,11 @@ behaviour) rather than silently adapting.
   fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
 - **One metric carries a `numa_node` label**, against the rule stated in `docs/user/metrics.md`. The
   rule is amended there rather than quietly broken.
+- **The static shared pool is configured only as an explicit cpuset**, not as the designed
+  `sharedPoolCoresPerNUMA` count with a cpuset escape hatch. A count means the driver picks the cores,
+  and whichever caches those cores land in can never again serve a whole-cache claim -- a fleet cost an
+  operator should choose knowingly, not discover in a log line. The precedent is the kubelet's
+  `reservedSystemCPUs`: static carve-outs are stated, validated, and costed, not computed.
 - **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
   node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
   which needs a flag carried through `ContainerState`. Neither affects correctness — the first only
