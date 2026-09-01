@@ -64,16 +64,32 @@ DaemonSet.
 
 ### Divergence surface
 
-Symbols the fork adds to an upstream file, which carry no marker of their own:
+Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
+to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
-- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `GetDeviceCPUSet`
+- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`, `GetDeviceCPUSet`
+- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `lastMoved` and `pendingRound` fields, and
+  the `Config.Defrag*` options
+- `pkg/driver/nri_hooks.go`: `draEnvEntry`
 - `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`,
   `ResourceClaimAllocations`
 - `pkg/store/claim_tracker.go`: `Owner`
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
+- `internal/driverconfig`: the `Defrag*` fields, their defaults and `validateDefrag`
+- `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
+  behind them
+- `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
+  `e2e_suite_test.go`, and the `defragEnabled`/`fullPhysicalCPUsOnly` config read-back
+- the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
+  they pin, rather than kept apart
 
-`CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
-placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
+Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/driver/defrag.go`, `reconcile.go`,
+`placements.go`, `pkg/cpuinfo/coretopology.go`) are visible to `git diff --stat` on their own and are
+not repeated here.
+
+`CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver only calls it to carry an
+environment edit over unchanged when rewriting a spec; placement itself comes from the annotation. It
+stays on the `cdiManager` interface to keep the diff small.
 
 ## Upstreamable pieces
 
@@ -93,4 +109,26 @@ running container's cpuset is a semantic upstream has not sanctioned.
 Record here any place where reality contradicted the design (renamed upstream API, different observed
 behaviour) rather than silently adapting.
 
-- _none yet_
+- **The planner's progress rule is not distance to the ideal packing.** That rule deadlocks. A node
+  whose free CPUs are scattered one per cache has no claim that can reach its ideal in a single step,
+  and a small claim sitting in the cache a large one needs gets no closer to its own ideal by stepping
+  aside, so nothing is ever emitted. A pass instead ranks a placement by wasted caches first and by
+  CPUs occupied that the ideal owes to another claim second, and moves a claim only when that strictly
+  falls. Tests cover both deadlocks: removing either term of the measure makes them fail.
+- **A move can leave its own claim worse placed, so that is checked separately.** The ideal minimises
+  the node's total cost, which does not minimise every claim's: a claim sitting neatly inside one
+  cache can be dealt an awkward remnant once larger claims are packed first. Such a move is skipped.
+- **`BeginRebind` validates only the claim's CPU count**, plus the overlap and state-machine invariants
+  the store owns. Preserving the per-NUMA footprint and taking whole cores are properties of the
+  target, enforced where the target is chosen; duplicating them in the store would give the same
+  policy two homes.
+- **The defragmentation options are flat `defrag*` fields, not a nested block.** `Config` is flat
+  throughout, its dump mirror is a field-for-field type conversion, and two reflection tests walk its
+  fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
+- **One metric carries a `numa_node` label**, against the rule stated in `docs/user/metrics.md`. The
+  rule is amended there rather than quietly broken.
+- **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
+  node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
+  which needs a flag carried through `ContainerState`. Neither affects correctness — the first only
+  lets a pass do avoidable work on a node about to be emptied, and the cooldown covers the churn the
+  second would.
