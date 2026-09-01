@@ -2344,3 +2344,117 @@ func addExpectedUncoreAttrs(attrs map[string]resourceapi.DeviceAttribute, groupC
 	attrs[string(devattr.AttributeLargestUncoreCacheCPUs)] = resourceapi.DeviceAttribute{IntValue: new(int64(largest))}
 	attrs[string(devattr.AttributeUncoreCachesInGroup)] = resourceapi.DeviceAttribute{IntValue: new(int64(len(cpusPerCache)))}
 }
+
+// mockCPUInfos_SingleSocket_2Caches_HT is 16 CPUs on one socket and NUMA node:
+// 8 two-thread cores across 2 uncore caches, the smallest shape with more than
+// one cache per NUMA node. Thread 1 of core c is CPU c+8.
+//
+//	cache 0: cores 0-3 -> CPUs 0-3, 8-11
+//	cache 1: cores 4-7 -> CPUs 4-7, 12-15
+func mockCPUInfos_SingleSocket_2Caches_HT() []cpuinfo.CPUInfo {
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 16 {
+		core := cpu % 8
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        core,
+			SocketID:      0,
+			NUMANodeID:    0,
+			UncoreCacheID: core / 4,
+			SiblingCPUID:  (cpu + 8) % 16,
+			CoreType:      cpuinfo.CoreTypePerformance,
+		})
+	}
+	return infos
+}
+
+func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
+	infos := mockCPUInfos_SingleSocket_2Caches_HT()
+	logger := testr.New(t)
+
+	newClaim := func(uid string, cpus int64) *resourceapi.ResourceClaim {
+		return &resourceapi.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: uid, Namespace: "ns", UID: types.UID(uid)},
+			Status: resourceapi.ResourceClaimStatus{
+				Allocation: &resourceapi.AllocationResult{
+					Devices: resourceapi.DeviceAllocationResult{
+						Results: []resourceapi.DeviceRequestAllocationResult{{
+							Request: "cpus",
+							Driver:  testDriverName,
+							Pool:    testNodeName,
+							Device:  devattr.CPUDeviceNUMAGroupedPrefix + "0",
+							ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{
+								devattr.CPUResourceQualifiedName: *resource.NewQuantity(cpus, resource.DecimalSI),
+							},
+						}},
+					},
+				},
+			},
+		}
+	}
+
+	siblingsOf := func(d *CPUDriver, cpus cpuset.CPUSet) cpuset.CPUSet {
+		return d.topology.cpuTopology.CPUDetails.CompleteCores(cpus)
+	}
+
+	t.Run("allocation never splits a core", func(t *testing.T) {
+		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
+		d.wholeCoreStep = 2
+
+		result := d.prepareGroupedResourceClaim(logger, newClaim("claim-4", 4))
+		require.NoError(t, result.Err)
+
+		got, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-4")
+		require.True(t, ok)
+		require.Equal(t, 4, got.Size())
+		require.Equal(t, got, siblingsOf(d, got), "result %s splits a core", got.String())
+	})
+
+	t.Run("a claim that fits one cache stays in one cache", func(t *testing.T) {
+		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
+		d.wholeCoreStep = 2
+
+		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-8", 8)).Err)
+		got, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-8")
+
+		caches := map[int]struct{}{}
+		for _, cpu := range got.List() {
+			caches[d.topology.cpuTopology.CPUDetails[cpu].UncoreCacheID] = struct{}{}
+		}
+		require.Len(t, caches, 1, "8 CPUs fit one cache but landed in %d: %s", len(caches), got.String())
+	})
+
+	t.Run("an unpairable thread is never handed out", func(t *testing.T) {
+		// Reserving CPU 0 leaves CPU 8 without a sibling. It stays in the
+		// shared pool but must not back a claim.
+		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(0), newMockCdiMgr())
+		d.wholeCoreStep = 2
+
+		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-14", 14)).Err)
+		got, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-14")
+
+		require.Equal(t, 14, got.Size())
+		require.False(t, got.Contains(8), "CPU 8's sibling is reserved, so it is unpairable: %s", got.String())
+		require.Equal(t, got, siblingsOf(d, got))
+	})
+
+	t.Run("an odd consumed amount names the likely cause", func(t *testing.T) {
+		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
+		d.wholeCoreStep = 2
+
+		result := d.prepareGroupedResourceClaim(logger, newClaim("claim-odd", 3))
+		require.Error(t, result.Err)
+		require.Contains(t, result.Err.Error(), "not a multiple of the 2-CPU core size")
+		require.Contains(t, result.Err.Error(), "DRAConsumableCapacity")
+	})
+
+	t.Run("disabled keeps CPU-granular allocation", func(t *testing.T) {
+		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
+		d.wholeCoreStep = 0
+
+		// An odd count is allowed and satisfied exactly, as upstream does.
+		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-3", 3)).Err)
+		got, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-3")
+		require.Equal(t, 3, got.Size())
+	})
+}
