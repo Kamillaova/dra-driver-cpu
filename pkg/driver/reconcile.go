@@ -102,6 +102,11 @@ func (cp *CPUDriver) reconcileSharedContainers(ctx context.Context) {
 	if cp.containerUpdater == nil {
 		return
 	}
+	// A static pool never changes, so there is never anything to converge onto:
+	// shared containers were pinned to it at creation and stay there.
+	if !cp.sharedPool.IsEmpty() {
+		return
+	}
 
 	// Read the pool under the lock and let go of it before calling out: holding
 	// it across the update is the deadlock applyMu's contract forbids.
