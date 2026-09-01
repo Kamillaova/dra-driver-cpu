@@ -705,3 +705,26 @@ reservedCPUs: "0-3"
 	assert.True(t, result.ExposePCIeRoots)
 	assert.Equal(t, "0-3", result.ReservedCPUs)
 }
+
+// TestResolve_FullPhysicalCPUsOnlyDefaultsOff: the option is opt-in, so an
+// untouched config keeps upstream's single-thread allocation behaviour.
+func TestResolve_FullPhysicalCPUsOnlyDefaultsOff(t *testing.T) {
+	assert.False(t, driverconfig.Default().FullPhysicalCPUsOnly)
+}
+
+// TestValidate_FullPhysicalCPUsOnlyRequiresGroupedMode: in individual mode the
+// scheduler picks exact per-CPU devices, so the driver cannot hold a core's
+// siblings together and the option must be refused rather than ignored.
+func TestValidate_FullPhysicalCPUsOnlyRequiresGroupedMode(t *testing.T) {
+	cfg := driverconfig.Default()
+	cfg.FullPhysicalCPUsOnly = true
+
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_GROUPED
+	assert.NoError(t, cfg.Validate())
+
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fullPhysicalCPUsOnly")
+	assert.Contains(t, err.Error(), "requires cpuDeviceMode")
+}

@@ -230,6 +230,9 @@
             "individual"
           ]
         },
+        "fullPhysicalCPUsOnly": {
+          "type": "boolean"
+        },
         "groupBy": {
           "type": "string",
           "enum": [

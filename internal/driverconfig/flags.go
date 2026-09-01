@@ -111,6 +111,14 @@ func (c Config) Validate() error {
 				c.GroupBy, device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_MACHINE)
 		}
 	}
+	// Whole-core allocation is only the driver's to enforce when the driver
+	// chooses which CPUs back a claim. In individual mode the scheduler picks
+	// exact per-CPU devices, so the driver cannot keep a core's siblings
+	// together and silently ignoring the option would be worse than refusing it.
+	if c.FullPhysicalCPUsOnly && c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
+		return fmt.Errorf("invalid fullPhysicalCPUsOnly: requires cpuDeviceMode %q, got %q",
+			device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
+	}
 	// The kubelet root becomes socket and mount locations, so a relative path
 	// would resolve against the working directory and silently break
 	// registration.
