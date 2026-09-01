@@ -728,3 +728,30 @@ func TestValidate_FullPhysicalCPUsOnlyRequiresGroupedMode(t *testing.T) {
 	assert.Contains(t, err.Error(), "fullPhysicalCPUsOnly")
 	assert.Contains(t, err.Error(), "requires cpuDeviceMode")
 }
+
+// TestResolve_UnsolicitedUpdateDefaults: pushing updates the runtime did not ask
+// for is opt-in, because it deadlocks runtimes with a pre-#301 NRI. The reconcile
+// that depends on it defaults on, so one option is enough to enable it.
+func TestResolve_UnsolicitedUpdateDefaults(t *testing.T) {
+	d := driverconfig.Default()
+	assert.False(t, d.AssumeUnsolicitedUpdatesSafe, "must be an explicit operator assertion")
+	assert.True(t, d.ReconcileSharedOnUnprepare, "inert until the assertion is made")
+}
+
+// TestResolve_UnsolicitedUpdateOptionsFromFile: both options are settable from a
+// config file, including turning the reconcile off against its default.
+func TestResolve_UnsolicitedUpdateOptionsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+assumeUnsolicitedUpdatesSafe: true
+reconcileSharedOnUnprepare: false
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.NoError(t, err)
+	assert.True(t, result.AssumeUnsolicitedUpdatesSafe)
+	assert.False(t, result.ReconcileSharedOnUnprepare)
+}
