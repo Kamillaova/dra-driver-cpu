@@ -26,6 +26,10 @@ driverConfig:
 - **It does not change a claim's size.** A claim allocated 4 CPUs always has 4.
 - **It does not move a claim between NUMA nodes.** The driver never sets `cpuset.mems`, so a claim's
   memory locality is exactly its CPUs' NUMA footprint, and a move preserves it.
+- **It coexists with in-place pod resize (KEP-1287).** A resize reaches the runtime as the same CRI
+  call a move uses, and applies against the container's current state: a claim's cpuset survives a
+  resize, including a resize issued after the claim has been moved. Verified on containerd
+  v2.4.0-beta.0, and pinned by an e2e spec.
 - **It is invisible to the scheduler.** A move changes neither a device's `capacity` nor any claim's
   `consumedCapacity`, so no `ResourceSlice` is republished, no scheduler cache is invalidated, and no
   write reaches the API server.
