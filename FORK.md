@@ -63,6 +63,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `GetDeviceCPUSet`
 
+- `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`
+
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
 
@@ -90,4 +92,7 @@ running container's cpuset is a semantic upstream has not sanctioned.
 Record here any place where reality contradicted the design (renamed upstream API, different observed
 behaviour) rather than silently adapting.
 
-- _none yet_
+- **`BeginRebind` validates only the claim's CPU count**, plus the overlap and state-machine invariants
+  the store owns. Preserving the per-NUMA footprint and taking whole cores are properties of the
+  target, enforced where the target is chosen; duplicating them in the store would give the same
+  policy two homes.
