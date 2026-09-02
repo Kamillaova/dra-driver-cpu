@@ -219,7 +219,7 @@ on - is configured through other Helm values, not through this file.
 - Publish the shape of each NUMA node's free CPUs — per uncore cache, current and after the repack
   the defragmenter would actually perform — as the `dra.cpu/fit` annotation on this driver's own
   Node. The scheduler's view of a device is a free-capacity scalar that carries no shape, so this is
-  what the CCXAlign scheduler plugin scores nodes from. Updates are debounced
+  what the [CCXAlign scheduler plugin](ccx-aligned-scheduling.md) scores nodes from. Updates are debounced
   and skipped when unchanged; the chart grants `nodes` `patch` when this is enabled. Off by default:
   the node-object writes are only worth it when that scheduler is deployed.
 
