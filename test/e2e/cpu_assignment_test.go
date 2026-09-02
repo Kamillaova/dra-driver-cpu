@@ -66,6 +66,7 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 		targetNode                    *v1.Node
 		targetNodeCPUInfo             discovery.DRACPUInfo
 		availableCPUs                 cpuset.CPUSet
+		staticPool                    cpuset.CPUSet
 		dracpuTesterImage             string
 		reservedCPUs                  cpuset.CPUSet
 		cpuDeviceMode                 string
@@ -110,6 +111,7 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 		rootFxt.Log.Info("daemonset --cpu-device-mode configuration", "mode", cpuDeviceMode, "groupBy", groupBy)
 		driverConfig := getDriverConfig(ctx, rootFxt.K8SClientset)
 		publishNodeAllocatableMapping = driverConfig.PublishNodeAllocatableResourceMapping
+		staticPool = driverConfig.staticPool()
 		rootFxt.Log.Info("driver node allocatable mapping", "enabled", publishNodeAllocatableMapping)
 
 		targetNode, err = e2enode.PickWorker(ctx, rootFxt.K8SClientset, 5*time.Second, 1*time.Minute, rootFxt.Log)
@@ -210,10 +212,13 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 				for i, pod := range exclPods {
 					alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod)
 					fxt.Log.Info("Checking exclusive CPU allocation", "pod", e2epod.Identify(pod), "cpuAllocated", alloc.CPUAssigned.String())
-					gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.HaveSize(cpusPerClaim), "Pod %d did not get %d CPUs", i, cpusPerClaim)
-					gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.BeSubsetOf(availableCPUs), "Pod %d got CPUs outside available set", i)
-					gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.HaveNoOverlapWith(allAllocatedCPUs), "Pod %d has overlapping CPUs", i)
-					allAllocatedCPUs = allAllocatedCPUs.Union(alloc.CPUAssigned)
+					// The claims' share of the container: a static pool rides
+					// along in every guaranteed container and is shared by design.
+					claimOnly := alloc.CPUAssigned.Difference(staticPool)
+					gomega.Expect(claimOnly).To(cpusetmatchers.HaveSize(cpusPerClaim), "Pod %d did not get %d CPUs", i, cpusPerClaim)
+					gomega.Expect(claimOnly).To(cpusetmatchers.BeSubsetOf(availableCPUs), "Pod %d got CPUs outside available set", i)
+					gomega.Expect(claimOnly).To(cpusetmatchers.HaveNoOverlapWith(allAllocatedCPUs), "Pod %d has overlapping CPUs", i)
+					allAllocatedCPUs = allAllocatedCPUs.Union(claimOnly)
 					// The scheduler reports the claim's CPUs in the pod status when the
 					// driver publishes node allocatable mappings; the field must be absent
 					// otherwise.
@@ -223,7 +228,7 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 				rootFxt.Log.Info("All exclusive allocation", "pod", "exclusive CPUs", allAllocatedCPUs.String(), "expected Shared CPUs", availableCPUs.Difference(allAllocatedCPUs).String())
 
 				fixture.By("checking the shared pool does not include anymore the exclusively allocated CPUs")
-				expectedSharedCPUs := availableCPUs.Difference(allAllocatedCPUs)
+				expectedSharedCPUs := sharedPoolExpectation(staticPool, availableCPUs.Difference(allAllocatedCPUs))
 
 				fixture.By("creating a second best-effort reference pod")
 				shrPod2 := mustCreateBestEffortPod(ctx, fxt, targetNode.Name, dracpuTesterImage)
@@ -238,16 +243,22 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 				}
 
 				// What a shared container holds after the release depends on the
-				// configuration, and both behaviours are documented: with
+				// configuration, and all three behaviours are documented: a
+				// static pool never followed the claims to begin with; with
 				// unsolicited updates permitted and the unprepare reconcile on,
 				// the driver widens the containers onto the released CPUs at
 				// once; otherwise they keep the narrower cpuset until their next
 				// CreateContainer or a driver restart.
-				if getDriverConfig(ctx, fxt.K8SClientset).reconcilesSharedOnUnprepare() {
+				switch {
+				case !staticPool.IsEmpty():
+					ginkgo.By("checking a static pool never followed the claims at all")
+					verifySharedPoolMatches(ctx, fxt, shrPod1, staticPool)
+					verifySharedPoolMatches(ctx, fxt, shrPod2, staticPool)
+				case getDriverConfig(ctx, fxt.K8SClientset).reconcilesSharedOnUnprepare():
 					ginkgo.By("checking shared containers are widened onto the released CPUs at once")
 					verifySharedPoolMatches(ctx, fxt, shrPod1, availableCPUs)
 					verifySharedPoolMatches(ctx, fxt, shrPod2, availableCPUs)
-				} else {
+				default:
 					ginkgo.By("checking existing shared containers keep their last cpuset until the next CreateContainer or Synchronize")
 					verifySharedPoolMatches(ctx, fxt, shrPod1, expectedSharedCPUs)
 					verifySharedPoolMatches(ctx, fxt, shrPod2, expectedSharedCPUs)
@@ -260,6 +271,9 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 				}
 				if availableCPUs.IsEmpty() {
 					ginkgo.Skip("need at least one driver-managed CPU for this test")
+				}
+				if !staticPool.IsEmpty() {
+					ginkgo.Skip("a static shared pool is carved out of device capacity, so no claim can exhaust it")
 				}
 				if publishNodeAllocatableMapping {
 					ginkgo.Skip("skipping this test with node allocatable mapping enabled: scheduler-side accounting prevents exhausting the shared pool")
@@ -410,8 +424,9 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 				fixture.By("verifying the pod got %d distinct CPUs with no overlap", 2*step)
 				alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, createdPod)
 				fxt.Log.Info("multi-request claim allocation", "cpuAssigned", alloc.CPUAssigned.String())
-				gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.HaveSize(2*step), "expected %d distinct CPUs allocated", 2*step)
-				gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.BeSubsetOf(availableCPUs), "allocated CPUs must be within available set")
+				claimOnly := alloc.CPUAssigned.Difference(staticPool)
+				gomega.Expect(claimOnly).To(cpusetmatchers.HaveSize(2*step), "expected %d distinct CPUs allocated", 2*step)
+				gomega.Expect(claimOnly).To(cpusetmatchers.BeSubsetOf(availableCPUs), "allocated CPUs must be within available set")
 
 			})
 
@@ -419,20 +434,20 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 				if cpuDeviceMode != "grouped" || groupBy != "machine" {
 					ginkgo.Skip("this test only applies to grouped CPU device mode with machine grouping")
 				}
-				if availableCPUs.Size() < 3 {
-					ginkgo.Skip("need at least 3 available CPUs for this test")
+				if availableCPUs.Difference(staticPool).Size() < 3 {
+					ginkgo.Skip("need at least 3 available CPUs outside the static pool for this test")
 				}
 
-				availableList := availableCPUs.UnsortedList()
+				availableList := availableCPUs.Difference(staticPool).UnsortedList()
 				claim1CPUs := cpuset.New(availableList[0])
 				claim2CPUs := cpuset.New(availableList[1])
 
 				claimCPUs := claim1CPUs.Union(claim2CPUs)
-				expectedSharedCPUs := availableCPUs.Difference(claimCPUs)
+				expectedSharedCPUs := sharedPoolExpectation(staticPool, availableCPUs.Difference(claimCPUs))
 
 				fixture.By("creating a best-effort pod")
 				shrPod1 := mustCreateBestEffortPod(ctx, fxt, targetNode.Name, dracpuTesterImage)
-				verifySharedPoolMatches(ctx, fxt, shrPod1, availableCPUs)
+				verifySharedPoolMatches(ctx, fxt, shrPod1, sharedPoolExpectation(staticPool, availableCPUs))
 
 				claimsAndCPUSets := []struct {
 					name   string
@@ -468,7 +483,7 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 					alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod)
 					expectedSet := claimsAndCPUSets[i].cpuset
 					fxt.Log.Info("pod allocation verification", "pod", pod.Name, "assigned", alloc.CPUAssigned.String(), "expected", expectedSet.String())
-					gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(expectedSet))
+					gomega.Expect(alloc.CPUAssigned.Difference(staticPool)).To(cpusetmatchers.Equal(expectedSet))
 				}
 
 				fixture.By("creating a second best-effort pod")
@@ -484,16 +499,22 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 				}
 
 				// What a shared container holds after the release depends on the
-				// configuration, and both behaviours are documented: with
+				// configuration, and all three behaviours are documented: a
+				// static pool never followed the claims to begin with; with
 				// unsolicited updates permitted and the unprepare reconcile on,
 				// the driver widens the containers onto the released CPUs at
 				// once; otherwise they keep the narrower cpuset until their next
 				// CreateContainer or a driver restart.
-				if getDriverConfig(ctx, fxt.K8SClientset).reconcilesSharedOnUnprepare() {
+				switch {
+				case !staticPool.IsEmpty():
+					ginkgo.By("checking a static pool never followed the claims at all")
+					verifySharedPoolMatches(ctx, fxt, shrPod1, staticPool)
+					verifySharedPoolMatches(ctx, fxt, shrPod2, staticPool)
+				case getDriverConfig(ctx, fxt.K8SClientset).reconcilesSharedOnUnprepare():
 					ginkgo.By("checking shared containers are widened onto the released CPUs at once")
 					verifySharedPoolMatches(ctx, fxt, shrPod1, availableCPUs)
 					verifySharedPoolMatches(ctx, fxt, shrPod2, availableCPUs)
-				} else {
+				default:
 					ginkgo.By("checking existing shared containers keep their last cpuset until the next CreateContainer or Synchronize")
 					verifySharedPoolMatches(ctx, fxt, shrPod1, expectedSharedCPUs)
 					verifySharedPoolMatches(ctx, fxt, shrPod2, expectedSharedCPUs)

@@ -69,10 +69,12 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`, `GetDeviceCPUSet`
 
-- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `lastMoved` and `pendingRound` fields, and
-  the `Config.Defrag*` options
+- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `lastMoved`, `pendingRound` and
+  `sharedPool` fields, the `Config.Defrag*` and `Config.SharedPoolCPUs` options, and
+  `validateSharedPool`
 
-- `pkg/driver/nri_hooks.go`: `draEnvEntry`
+- `pkg/driver/nri_hooks.go`: `draEnvEntry`, `sharedContainerCPUs`, `guaranteedContainerCPUs`,
+  `localSharedPool`
 
 - `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`,
   `ResourceClaimAllocations`
@@ -87,8 +89,9 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
   behind them
 
-- `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
-  `e2e_suite_test.go`, and the `defragEnabled`/`fullPhysicalCPUsOnly` config read-back
+- `test/e2e`: the defragmentation and whole-core suites, the claim-pod and shared-pool helpers in
+  `e2e_suite_test.go`, and the `defragEnabled`/`fullPhysicalCPUsOnly`/`sharedPoolCPUs` config
+  read-back
 
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
@@ -140,7 +143,9 @@ behaviour) rather than silently adapting.
   `sharedPoolCoresPerNUMA` count with a cpuset escape hatch. A count means the driver picks the cores,
   and whichever caches those cores land in can never again serve a whole-cache claim -- a fleet cost an
   operator should choose knowingly, not discover in a log line. The precedent is the kubelet's
-  `reservedSystemCPUs`: static carve-outs are stated, validated, and costed, not computed.
+  `reservedSystemCPUs`: static carve-outs are stated, validated, and costed, not computed. The driver
+  still validates the choice (unknown or offline CPUs, split cores under `fullPhysicalCPUsOnly`,
+  overlap with `reservedCPUs`) and logs the caches the pool spoils for whole-cache claims.
 - **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
   node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
   which needs a flag carried through `ContainerState`. Neither affects correctness — the first only
