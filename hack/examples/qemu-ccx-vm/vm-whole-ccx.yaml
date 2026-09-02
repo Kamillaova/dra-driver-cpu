@@ -1,0 +1,98 @@
+# A VM class whose vCPUs get one whole uncore cache (an AMD CCX / one slice of
+# a split L3) to themselves.
+#
+# With the driver's static shared pool configured (sharedPoolCPUs), the claim is
+# sized to the vCPUs alone: the driver appends the pool CPUs of the claim's NUMA
+# nodes to the container and names them in DRA_SHARED_CPUS, and the launcher
+# sends QEMU's own threads -- main loop, iothreads, vhost workers -- there, for
+# the kernel scheduler to balance. Without a pool, set CONTROL_CPUS instead and
+# size the claim vCPUs + one core: the launcher then carves the control core out
+# of the claim itself.
+#
+# The CEL selector keeps the pod off nodes whose caches are too small to ever
+# hold the vCPU set aligned. On a 7950X3D one CCX is 8 cores / 16 CPUs --
+# adjust the capacity and the selector to your parts.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: vm-whole-ccx-cpus
+spec:
+  spec:
+    devices:
+      requests:
+      - name: vcpus
+        exactly:
+          deviceClassName: dra.cpu
+          capacity:
+            requests:
+              dra.cpu/cpu: "16"
+          selectors:
+          - cel:
+              # Only nodes where a single uncore cache can hold the whole claim.
+              # dra.cpu/uncoreCachesInGroup is also published, for spreading
+              # across a known number of caches instead.
+              expression: device.attributes["dra.cpu"].largestUncoreCacheCPUs >= 16
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vm-whole-ccx
+spec:
+  restartPolicy: Never
+  containers:
+  - name: qemu
+    # Any image carrying qemu-system-x86_64, python3 and inotify-tools.
+    image: your-registry/qemu-launcher:latest
+    command: ["/scripts/launch-qemu.sh"]
+    env:
+    # NOTE: DRA_CPUSET_<claimUID> is injected automatically. Do NOT parse it:
+    # with defragmentation enabled its value is the literal string "dynamic",
+    # and with it disabled it is only where the claim was when this container
+    # started. The launcher reads the live set from the cgroup instead.
+    - name: VM_MEMORY_MB
+      value: "16384"
+    # Fallback when no sharedPoolCPUs is configured on the driver: carve one
+    # control core out of the claim itself (then size the claim 18, not 16).
+    # With a pool, DRA_SHARED_CPUS is injected by the driver and wins.
+    - name: CONTROL_CPUS
+      value: "0"
+    resources:
+      # KEP-5517 mode (publishNodeAllocatableResourceMapping: true): the claim's
+      # CPUs are accounted by the scheduler and added to the cgroup limits by
+      # the kubelet -- do not mirror them here, that counts them twice.
+      # Without the mapping, follow docs/user/workload-requirements.md and
+      # mirror the claim size into cpu requests/limits instead.
+      requests:
+        memory: 2Gi
+        hugepages-2Mi: 16Gi
+      limits:
+        memory: 2Gi
+        hugepages-2Mi: 16Gi
+      claims:
+      - name: vcpus
+    volumeMounts:
+    - name: scripts
+      mountPath: /scripts
+    - name: hugepages
+      mountPath: /dev/hugepages
+    - name: kvm
+      mountPath: /dev/kvm
+    securityContext:
+      # For brevity. Production should grant /dev/kvm through a device plugin
+      # (e.g. the KubeVirt one) instead of privilege.
+      privileged: true
+  resourceClaims:
+  - name: vcpus
+    resourceClaimTemplateName: vm-whole-ccx-cpus
+  volumes:
+  - name: scripts
+    configMap:
+      name: qemu-launcher
+      defaultMode: 0755
+  - name: hugepages
+    emptyDir:
+      medium: HugePages-2Mi
+  - name: kvm
+    hostPath:
+      path: /dev/kvm
+      type: CharDevice
