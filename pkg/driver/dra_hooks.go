@@ -314,9 +314,21 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	return result
 }
 
+// cdiEnvValue is what the injected variable says about a claim's placement: the
+// cpuset while placement is fixed for the claim's lifetime, and cdiEnvDynamicValue
+// once a pass may move it.
+//
+// CCX-FORK: upstream always writes the cpuset.
+func (cp *CPUDriver) cdiEnvValue(cpus cpuset.CPUSet) string {
+	if cp.defrag.enabled {
+		return cdiEnvDynamicValue
+	}
+	return cpus.String()
+}
+
 func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, claimCPUSet cpuset.CPUSet) kubeletplugin.PrepareResult {
 	deviceName := getCDIDeviceName(claim.UID)
-	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, claimCPUSet.String())
+	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, cp.cdiEnvValue(claimCPUSet))
 	// CCX-FORK: the cpuset argument is the fork's placement record.
 	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar, claimCPUSet); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
