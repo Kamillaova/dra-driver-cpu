@@ -2255,27 +2255,29 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 	case devattr.GROUP_BY_SOCKET:
 		var socketID int
 		_, _ = fmt.Sscanf(deviceName, devattr.CPUDeviceSocketGroupedPrefix+"%d", &socketID)
-		var numCPUs int64
+		var groupCPUs []cpuinfo.CPUInfo
 		for _, ci := range cpuInfos {
 			if ci.SocketID == socketID && !reservedCPUs.Contains(ci.CpuID) {
-				numCPUs++
+				groupCPUs = append(groupCPUs, ci)
 			}
 		}
 		attrs[string(devattr.AttributeSocketID)] = resourceapi.DeviceAttribute{IntValue: new(int64(socketID))}
-		attrs[string(devattr.AttributeNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(numCPUs)}
+		attrs[string(devattr.AttributeNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(int64(len(groupCPUs)))}
 		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(smtEnabled)}
+		addExpectedUncoreAttrs(attrs, groupCPUs)
 
 	case devattr.GROUP_BY_NUMA_NODE:
 		var numaID int
 		_, _ = fmt.Sscanf(deviceName, devattr.CPUDeviceNUMAGroupedPrefix+"%d", &numaID)
-		var numCPUs int64
+		var groupCPUs []cpuinfo.CPUInfo
 		var socketID int
 		for _, ci := range cpuInfos {
 			if ci.NUMANodeID == numaID && !reservedCPUs.Contains(ci.CpuID) {
-				numCPUs++
+				groupCPUs = append(groupCPUs, ci)
 				socketID = ci.SocketID
 			}
 		}
+		numCPUs := int64(len(groupCPUs))
 		// DRA standard attributes first
 		attrs[string(deviceattribute.StandardDeviceAttributeNUMANode)] = resourceapi.DeviceAttribute{IntValue: new(int64(numaID))}
 		// Driver specific attributes next
@@ -2284,16 +2286,18 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(smtEnabled)}
 		attrs["dra.net/numaNode"] = resourceapi.DeviceAttribute{IntValue: new(int64(numaID))}
 		attrs["dra.cpu/numaNodeID"] = resourceapi.DeviceAttribute{IntValue: new(int64(numaID))}
+		addExpectedUncoreAttrs(attrs, groupCPUs)
 
 	case devattr.GROUP_BY_MACHINE:
-		var numCPUs int64
+		var groupCPUs []cpuinfo.CPUInfo
 		for _, ci := range cpuInfos {
 			if !reservedCPUs.Contains(ci.CpuID) {
-				numCPUs++
+				groupCPUs = append(groupCPUs, ci)
 			}
 		}
-		attrs[string(devattr.AttributeNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(numCPUs)}
+		attrs[string(devattr.AttributeNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(int64(len(groupCPUs)))}
 		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(smtEnabled)}
+		addExpectedUncoreAttrs(attrs, groupCPUs)
 	}
 
 	if allocatedCPUs > 0 {
@@ -2301,4 +2305,27 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 	}
 
 	return &kubeletplugin.DeviceMetadata{Attributes: attrs}
+}
+
+// addExpectedUncoreAttrs mirrors the uncore cache geometry the builder publishes
+// on grouped devices, computed independently from the group's CPUs.
+func addExpectedUncoreAttrs(attrs map[string]resourceapi.DeviceAttribute, groupCPUs []cpuinfo.CPUInfo) {
+	cpusPerCache := map[int]int{}
+	for _, ci := range groupCPUs {
+		if ci.UncoreCacheID == -1 {
+			return
+		}
+		cpusPerCache[ci.UncoreCacheID]++
+	}
+	if len(cpusPerCache) == 0 {
+		return
+	}
+	largest := 0
+	for _, n := range cpusPerCache {
+		if n > largest {
+			largest = n
+		}
+	}
+	attrs[string(devattr.AttributeLargestUncoreCacheCPUs)] = resourceapi.DeviceAttribute{IntValue: new(int64(largest))}
+	attrs[string(devattr.AttributeUncoreCachesInGroup)] = resourceapi.DeviceAttribute{IntValue: new(int64(len(cpusPerCache)))}
 }
