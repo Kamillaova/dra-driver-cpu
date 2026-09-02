@@ -68,7 +68,7 @@ type cdiManager interface {
 	AddDevice(logger logr.Logger, deviceName string, envVar string, cpus cpuset.CPUSet) error
 	Refresh() error
 	GetDeviceEnv(deviceName string) ([]string, error)
-	// CCX-FORK: added.
+	// CCX-FORK: added; GetDeviceEnv is upstream's and now unused by the driver.
 	GetDeviceCPUSet(deviceName string) (cpuset.CPUSet, error)
 	// CCX-FORK: added, seeds the allocation store from disk before Start registers with the kubelet.
 	PreparedClaimAllocations(logger logr.Logger) map[types.UID]cpuset.CPUSet
