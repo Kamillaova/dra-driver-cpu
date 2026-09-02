@@ -66,7 +66,7 @@ type KubeletPlugin interface {
 }
 
 type cdiManager interface {
-	AddDevice(logger logr.Logger, deviceName string, envVar string, cpus cpuset.CPUSet) error
+	AddDevice(logger logr.Logger, deviceName string, envVars []string, cpus cpuset.CPUSet) error
 	Refresh() error
 	GetDeviceEnv(deviceName string) ([]string, error)
 	// CCX-FORK: added; GetDeviceEnv is upstream's and now unused by the driver.

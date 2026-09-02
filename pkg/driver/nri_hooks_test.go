@@ -962,7 +962,7 @@ func TestStopContainerKeepsClaimOutOfSharedPoolUntilUnprepare(t *testing.T) {
 		claimTracker:       store.NewClaimTracker(),
 		topology:           deviceTopology{cpuTopology: topo},
 	}
-	driver.cdiMgr.(*mockCdiMgr).devices[getCDIDeviceName(claimUID)] = fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, claimedCPUs.String())
+	driver.cdiMgr.(*mockCdiMgr).devices[getCDIDeviceName(claimUID)] = []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, claimedCPUs.String())}
 	_, err := driver.claimTracker.SetOwner(logger, types.UID(guaranteedPod.Uid), guaranteedCtr.Name, claimUID)
 	require.NoError(t, err)
 	driver.podConfigStore.SetContainerState(types.UID(guaranteedPod.Uid),
@@ -1084,7 +1084,7 @@ func TestSynchronizeAdoptsAClaimWithADynamicEnv(t *testing.T) {
 		cdiMgr:             newMockCdiMgr(),
 	}
 	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
-		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue), cpuset.New(2, 3)))
+		[]string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue)}, cpuset.New(2, 3)))
 
 	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
 	ctr := &api.Container{
