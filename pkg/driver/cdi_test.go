@@ -82,7 +82,7 @@ func TestAddDevice(t *testing.T) {
 			expectedSpecName := mgr.getSpecName(tc.deviceName)
 			expectedFilePath := filepath.Join(tempCDIDir, expectedSpecName)
 
-			err = mgr.AddDevice(logger, tc.deviceName, tc.envVar, cpuset.New(0, 1))
+			err = mgr.AddDevice(logger, tc.deviceName, []string{tc.envVar}, cpuset.New(0, 1))
 
 			if tc.expectedError != "" {
 				require.Error(t, err)
@@ -162,7 +162,7 @@ func TestRemoveDevice(t *testing.T) {
 			expectedFilePath := filepath.Join(tempCDIDir, expectedSpecName)
 
 			if !tc.simulateErr {
-				err = mgr.AddDevice(logger, tc.deviceName, tc.envVar, cpuset.New(0, 1))
+				err = mgr.AddDevice(logger, tc.deviceName, []string{tc.envVar}, cpuset.New(0, 1))
 				require.NoError(t, err)
 			}
 
@@ -202,7 +202,7 @@ func TestAddDeviceOverwrite(t *testing.T) {
 		require.Len(t, files, expected)
 	}
 
-	err = mgr.AddDevice(logger, deviceName, "CPU=0,1", cpuset.New(0, 1))
+	err = mgr.AddDevice(logger, deviceName, []string{"CPU=0,1"}, cpuset.New(0, 1))
 	require.NoError(t, err)
 	assertFileCount(1)
 
@@ -212,7 +212,7 @@ func TestAddDeviceOverwrite(t *testing.T) {
 	require.Equal(t, []string{"CPU=0,1"}, spec1.Devices[0].ContainerEdits.Env)
 
 	// Call AddDevice again with the same deviceName and same data
-	err = mgr.AddDevice(logger, deviceName, "CPU=0,1", cpuset.New(0, 1))
+	err = mgr.AddDevice(logger, deviceName, []string{"CPU=0,1"}, cpuset.New(0, 1))
 	require.NoError(t, err)
 	// Verify that we do not create a new file
 	assertFileCount(1)
@@ -227,7 +227,7 @@ func TestGetDeviceEnv(t *testing.T) {
 
 	deviceName := "claim-cpu-get-env"
 	expectedEnv := "DRA_CPUSET_claim-cpu-get-env=0,1"
-	err = mgr.AddDevice(logger, deviceName, expectedEnv, cpuset.New(0, 1))
+	err = mgr.AddDevice(logger, deviceName, []string{expectedEnv}, cpuset.New(0, 1))
 	require.NoError(t, err)
 	err = mgr.Refresh()
 	require.NoError(t, err)
@@ -246,7 +246,7 @@ func TestRefreshKeepsValidDevicesWhenAnotherSpecIsInvalid(t *testing.T) {
 
 	deviceName := "claim-cpu-valid"
 	expectedEnv := "DRA_CPUSET_claim-cpu-valid=0,1"
-	err = mgr.AddDevice(logger, deviceName, expectedEnv, cpuset.New(0, 1))
+	err = mgr.AddDevice(logger, deviceName, []string{expectedEnv}, cpuset.New(0, 1))
 	require.NoError(t, err)
 
 	err = os.WriteFile(filepath.Join(tempCDIDir, "unrelated-invalid.json"), []byte("{"), 0600)
@@ -277,7 +277,7 @@ func TestGetDeviceCPUSet(t *testing.T) {
 
 	deviceName := "claim-cpu-placement"
 	require.NoError(t, mgr.AddDevice(logger, deviceName,
-		"DRA_CPUSET_claim-cpu-placement=2-3", cpuset.New(2, 3)))
+		[]string{"DRA_CPUSET_claim-cpu-placement=2-3"}, cpuset.New(2, 3)))
 	require.NoError(t, mgr.Refresh())
 
 	got, err := mgr.GetDeviceCPUSet(deviceName)
@@ -287,7 +287,7 @@ func TestGetDeviceCPUSet(t *testing.T) {
 	// Rewriting the spec must move the recorded placement, since this is what
 	// makes a claim's CPUs mutable while its container runs.
 	require.NoError(t, mgr.AddDevice(logger, deviceName,
-		"DRA_CPUSET_claim-cpu-placement=2-3", cpuset.New(6, 7)))
+		[]string{"DRA_CPUSET_claim-cpu-placement=2-3"}, cpuset.New(6, 7)))
 	require.NoError(t, mgr.Refresh())
 
 	got, err = mgr.GetDeviceCPUSet(deviceName)

@@ -123,7 +123,7 @@ func TestSharedPoolSurvivesSynchronize(t *testing.T) {
 	d := newSharedPoolTestDriver(t)
 	logger := testr.New(t)
 	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName("claim-1"),
-		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-1", cdiEnvDynamicValue), cpuset.New(0, 8)))
+		[]string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-1", cdiEnvDynamicValue)}, cpuset.New(0, 8)))
 
 	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
 	guaranteed := &api.Container{
@@ -245,6 +245,55 @@ func TestNewRefusesABadSharedPool(t *testing.T) {
 	d, err := New(logger, providers("0-15"), cfg)
 	require.NoError(t, err, "without whole-core allocation a split core is the operator's trade")
 	require.Equal(t, cpuset.New(1), d.sharedPool)
+}
+
+func TestSharedPoolEnvNamesTheLocalPoolAndSurvivesAMove(t *testing.T) {
+	// DRA_SHARED_CPUS is the one placement fact safe to put in the environment:
+	// the pool is static and a move preserves the claim's NUMA footprint, so
+	// the value written at prepare stays true for the claim's lifetime -- and a
+	// move rewriting the spec must carry it over intact.
+	d := newSharedPoolTestDriver(t)
+	d.wholeCoreStep = 2
+
+	envs := d.claimEnvEdits("claim-1", cpuset.New(0, 8, 2, 10))
+	require.Equal(t, []string{
+		"DRA_CPUSET_claim-1=dynamic",
+		"DRA_SHARED_CPUS=1,9",
+	}, envs, "a claim on NUMA node 0 is told node 0's pool")
+	require.Equal(t, []string{
+		"DRA_CPUSET_claim-2=dynamic",
+		"DRA_SHARED_CPUS=5,13",
+	}, d.claimEnvEdits("claim-2", cpuset.New(4, 12)), "a claim on NUMA node 1 is told node 1's pool")
+
+	logger := testr.New(t)
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-1", cpuset.New(0, 8, 2, 10), false))
+	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName("claim-1"), envs, cpuset.New(0, 8, 2, 10)))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	d.defragPass(context.Background())
+
+	moved, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, 1, cpuinfoSpread(d.CPUDriver, moved), "precondition: the claim was consolidated")
+	require.Equal(t, envs, d.cdi.devices[getCDIDeviceName("claim-1")],
+		"the rewritten spec must carry both variables, values unchanged")
+}
+
+func TestSharedPoolEnvIsAbsentWithoutAPool(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	require.Equal(t, []string{"DRA_CPUSET_claim-1=dynamic"},
+		d.claimEnvEdits("claim-1", cpuset.New(0, 1)))
+}
+
+func TestSharedPoolEnvIsNotMistakenForAClaim(t *testing.T) {
+	// The NRI hooks derive claim identity from DRA_CPUSET_*; the shared
+	// variable must never parse as one.
+	entries, err := parseDRAEnv(testr.New(t), []string{
+		"DRA_CPUSET_claim-1=dynamic",
+		"DRA_SHARED_CPUS=1,9",
+	})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, types.UID("claim-1"), entries[0].claimUID)
 }
 
 func TestSharedPoolIsReportedDistinctFromReserved(t *testing.T) {
