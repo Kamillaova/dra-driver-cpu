@@ -89,6 +89,20 @@ type Config struct {
 	// been moved, so a workload is not re-homed repeatedly while it settles.
 	// Defaults to 600.
 	DefragClaimCooldownSeconds int `json:"defragClaimCooldownSeconds,omitempty"`
+	// SharedPoolCPUs dedicates an explicit, static set of CPUs (Linux cpuset
+	// syntax, like ReservedCPUs) as the shared pool. Containers without a claim
+	// are pinned to it and never re-pinned as claims come and go; containers
+	// with claims get the pool CPUs of their claims' NUMA nodes appended, so
+	// their auxiliary threads can be left to the kernel scheduler inside the
+	// pool; and the pool is excluded from device capacity, so no claim is ever
+	// placed on it.
+	//
+	// Explicit rather than driver-chosen, exactly like ReservedCPUs and the
+	// kubelet's reservedSystemCPUs: static CPU carve-outs are fleet decisions an
+	// operator makes per node pool, and the driver's job is to validate them and
+	// state their cost, not to second-guess them. Empty (the default) keeps the
+	// dynamic shared pool: everything not claimed, resized as claims change.
+	SharedPoolCPUs string `json:"sharedPoolCPUs,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -112,6 +126,7 @@ func (c Config) LogValues() []any {
 		"defragMaxMovesPerPass", c.DefragMaxMovesPerPass,
 		"defragMinGain", c.DefragMinGain,
 		"defragClaimCooldownSeconds", c.DefragClaimCooldownSeconds,
+		"sharedPoolCPUs", c.SharedPoolCPUs,
 	}
 }
 
@@ -136,6 +151,7 @@ type dumpConfig struct {
 	DefragMaxMovesPerPass                 int    `json:"defragMaxMovesPerPass"`
 	DefragMinGain                         int    `json:"defragMinGain"`
 	DefragClaimCooldownSeconds            int    `json:"defragClaimCooldownSeconds"`
+	SharedPoolCPUs                        string `json:"sharedPoolCPUs"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of

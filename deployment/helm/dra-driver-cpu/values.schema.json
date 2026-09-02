@@ -283,6 +283,9 @@
         "reservedCPUs": {
           "type": "string"
         },
+        "sharedPoolCPUs": {
+          "type": "string"
+        },
         "sysfsOverlay": {
           "type": "string"
         }
