@@ -25,7 +25,25 @@ CPU group, `individual` one device per CPU.
 | `dra.cpu/socketID`                | int     | CPU socket of the group (published when grouping by NUMA node or socket)                                       |
 | `dra.cpu/numCPUs`                 | int     | CPUs available in the group                                                                                    |
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                             |
+| `dra.cpu/largestUncoreCacheCPUs`  | int     | Allocatable CPUs in the group's largest uncore (L3/CCX) cache — the biggest claim it can align to one cache    |
+| `dra.cpu/uncoreCachesInGroup`     | int     | How many uncore caches contribute allocatable CPUs to the group                                                |
 | `resource.kubernetes.io/pcieRoot` | strings | PCIe roots local to the group's CPUs; needs `--expose-pcie-roots` and the `DRAListTypeAttributes` feature gate |
+
+The two uncore cache attributes describe the group's cache geometry, which the driver cannot
+change and a claim cannot otherwise discover. They matter on heterogeneous clusters: the driver
+picks which CPUs back a grouped claim and prefers to keep them within one cache, but it cannot
+align a claim larger than any single cache, and that limit varies by node type. A claim that
+needs cache-aligned CPUs can therefore restrict itself to nodes where alignment is possible:
+
+```yaml
+selectors:
+- cel:
+    expression: device.attributes["dra.cpu"].largestUncoreCacheCPUs >= 8
+```
+
+Both are counts of *allocatable* CPUs, so CPUs excluded by `reservedCPUs` are not included — a
+cache half-consumed by the reservation cannot host a full-size claim. Both are omitted entirely
+when the node reports no uncore cache information.
 
 #### Legacy attributes (deprecated)
 
@@ -37,8 +55,9 @@ These compatibility attributes will be removed in a future version:
 | `dra.net/numaNode`   | int  | Cross-driver NUMA alignment attribute (NUMA grouping) |
 
 Grouped devices also expose the consumable capacity `dra.cpu/cpu` — the number of CPUs
-claimable from the group. With `groupBy: machine`, only `numCPUs`, `smtEnabled`, and — when
-`--expose-pcie-roots` is enabled — `resource.kubernetes.io/pcieRoot` are published.
+claimable from the group. With `groupBy: machine`, only `numCPUs`, `smtEnabled`, the uncore cache
+attributes, and — when `--expose-pcie-roots` is enabled — `resource.kubernetes.io/pcieRoot` are
+published.
 
 ### Individual mode
 
