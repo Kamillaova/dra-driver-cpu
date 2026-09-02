@@ -671,3 +671,52 @@ func TestPlanNodeMovesOnlyTheClaimsARepairNeeds(t *testing.T) {
 			"small-%d must keep its exact CPUs, has %s", i, byUID[uid].String())
 	}
 }
+
+// TestPlanNodeDisplacedClaimsFollowTheSpreadPolicy: under the spread selector a
+// bystander evicted by a repair lands in the emptiest cache, so the one-tenant-
+// per-cache layout survives its own repair wherever there is room for it.
+func TestPlanNodeDisplacedClaimsFollowTheSpreadPolicy(t *testing.T) {
+	topo := topologyOf([]int{4, 4, 4, 4, 4, 4})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	spreadSel := func(available cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
+		return coreselect.TakeWholeCoresPolicy(topo, available, numCPUs, coreselect.Spread, cpuset.New())
+	}
+
+	placements := []defrag.Placement{
+		placement("big", 2, 3, 6, 7, 10, 11, 14, 15),
+		placement("small-1", 0, 1),
+		placement("small-2", 4, 5),
+		placement("small-3", 8, 9),
+		placement("small-4", 12, 13),
+	}
+	free := cpuset.New(16, 17, 18, 19, 20, 21, 22, 23)
+	require.Positive(t, dtopo.Cost(placements))
+
+	current := placements
+	for pass := 0; pass < 10; pass++ {
+		plan, err := defrag.PlanNode(dtopo, current, free, spreadSel, defrag.Options{})
+		require.NoError(t, err)
+		requireValidPlan(t, dtopo, current, free, plan)
+		if len(plan.Moves) == 0 {
+			break
+		}
+		current, free = applyPlan(current, free, plan)
+	}
+
+	require.Equal(t, 0, dtopo.Cost(current), "the node did not end aligned")
+	tenants := map[int]int{}
+	for _, p := range current {
+		if p.ClaimUID == "big" {
+			continue
+		}
+		require.Equal(t, 1, dtopo.Spread(p.CPUs), "small %s ended split", p.ClaimUID)
+		for _, cpu := range p.CPUs.List() {
+			tenants[topo.CPUDetails[cpu].UncoreCacheID]++
+			break
+		}
+	}
+	for cache, n := range tenants {
+		require.Equal(t, 1, n, "cache %d hosts %d smalls; with six caches and a two-cache claim, spread has room for one each", cache, n)
+	}
+}
