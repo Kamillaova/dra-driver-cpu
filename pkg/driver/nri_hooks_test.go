@@ -863,7 +863,12 @@ func TestNRISynchronize(t *testing.T) {
 			expectedRefreshCalls: 1,
 		},
 		{
-			name: "runtime DRA env that mismatches driver-owned CDI spec is ignored",
+			// A container whose env names CPUs other than the driver's record is
+			// one that was moved after it started: its environment was frozen at
+			// creation and cannot be corrected. The claim must be carried to the
+			// recorded placement, not dropped, or its CPUs leak into the shared
+			// pool while the container still runs on them.
+			name: "container on a stale cpuset is converged, not dropped",
 			driver: &CPUDriver{
 				podConfigStore:     store.NewPodConfig(),
 				cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
@@ -875,12 +880,12 @@ func TestNRISynchronize(t *testing.T) {
 			},
 			runtimePods: []*api.PodSandbox{pod1},
 			runtimeCtrs: []*api.Container{
-				{Id: "p1-invalid", PodSandboxId: pod1.Id, Name: "invalid-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+				{Id: "p1-stale", PodSandboxId: pod1.Id, Name: "stale-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
 			},
 			expectedUpdates: []*api.ContainerUpdate{
 				{
-					ContainerId: "p1-invalid",
-					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-7"}}},
+					ContainerId: "p1-stale",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "2-3"}}},
 				},
 			},
 			expectedRefreshCalls: 1,
@@ -959,4 +964,51 @@ func TestStopContainerKeepsClaimOutOfSharedPoolUntilUnprepare(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, unprepared[claimUID])
 	require.True(t, driver.cpuAllocationStore.GetSharedCPUs().Equals(allCPUs))
+}
+
+func TestSynchronizeKeepsStaleContainersClaimCPUsReserved(t *testing.T) {
+	// The failure this guards against: a claim moved after its container started
+	// has a frozen, now-wrong env var. Dropping it on that basis would return
+	// CPUs the container is still pinned to into the shared pool, so two
+	// workloads would end up on the same "exclusive" CPUs.
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 8 {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpu, CoreID: cpu, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-moved")
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
+	ctr := &api.Container{
+		Id:           "ctr-1",
+		PodSandboxId: pod.Id,
+		Name:         "ctr",
+		// Frozen at creation: the claim was on 0-1 back then.
+		Env: []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-1")},
+	}
+
+	// The driver's own record says it has since moved to 4-5.
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: cpuset.New(4, 5)}),
+	}
+
+	updates, err := d.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr})
+	require.NoError(t, err)
+
+	// The recorded placement is reserved, so it stays out of the shared pool.
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
+	require.True(t, ok, "claim must be adopted, not dropped")
+	require.Equal(t, cpuset.New(4, 5), got)
+	require.Equal(t, cpuset.New(0, 1, 2, 3, 6, 7), d.cpuAllocationStore.GetSharedCPUs())
+
+	// And the container is carried to it.
+	require.Len(t, updates, 1)
+	require.Equal(t, "ctr-1", updates[0].GetContainerId())
+	require.Equal(t, "4-5", updates[0].GetLinux().GetResources().GetCpu().GetCpus())
 }

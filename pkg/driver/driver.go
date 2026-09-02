@@ -67,7 +67,7 @@ type cdiManager interface {
 	AddDevice(logger logr.Logger, deviceName string, envVar string, cpus cpuset.CPUSet) error
 	Refresh() error
 	GetDeviceEnv(deviceName string) ([]string, error)
-	// CCX-FORK: added.
+	// CCX-FORK: added; GetDeviceEnv is upstream's and now unused by the driver.
 	GetDeviceCPUSet(deviceName string) (cpuset.CPUSet, error)
 	RemoveDevice(logger logr.Logger, deviceName string) error
 }
