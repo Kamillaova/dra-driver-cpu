@@ -28,7 +28,9 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
@@ -40,6 +42,7 @@ type defragTestDriver struct {
 	*CPUDriver
 	updater *fakeContainerUpdater
 	cdi     *mockCdiMgr
+	metrics *prometheus.Registry
 	allCPUs cpuset.CPUSet
 }
 
@@ -67,7 +70,9 @@ func newDefragTestDriverTopo(t *testing.T, numaNodes, cachesPerNode, cpusPerCach
 	allCPUs := topo.CPUDetails.CPUs()
 	updater := &fakeContainerUpdater{}
 	cdi := newMockCdiMgr()
+	reg := prometheus.NewRegistry()
 	d := &CPUDriver{
+		metrics:            cpumetrics.New(reg),
 		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New(), onlineCPUs: allCPUs},
 		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 		podConfigStore:     store.NewPodConfig(),
@@ -81,7 +86,7 @@ func newDefragTestDriverTopo(t *testing.T, numaNodes, cachesPerNode, cpusPerCach
 		},
 		defrag: defragOptions{enabled: true, maxMoves: 4, minGain: 1},
 	}
-	return &defragTestDriver{CPUDriver: d, updater: updater, cdi: cdi, allCPUs: allCPUs}
+	return &defragTestDriver{CPUDriver: d, updater: updater, cdi: cdi, metrics: reg, allCPUs: allCPUs}
 }
 
 // errUpdateFailed stands in for a runtime that could not be reached.
@@ -392,6 +397,65 @@ func TestDefragPassKeepsTheDynamicEnvWhenItMovesAClaim(t *testing.T) {
 	require.Equal(t, []string{envVar}, envs)
 }
 
+func TestDefragPassRecordsWhatItSaw(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	// Before the pass: the claim spans two caches where one would do, and the
+	// largest claim this node could still take unsplit is three CPUs.
+	d.defragPass(context.Background())
+
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01)
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_moves_total",
+		map[string]string{"result": "success"}), 0.01)
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_passes_total",
+		map[string]string{"result": "success"}), 0.01)
+	require.InDelta(t, 3, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "0"}), 0.01)
+
+	// After it, the node reports itself packed, and the cache the claim left is
+	// free whole.
+	d.defragPass(context.Background())
+	require.InDelta(t, 0, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01)
+	require.InDelta(t, 4, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "0"}), 0.01)
+	require.InDelta(t, 2, metricValue(t, d.metrics, "dra_cpu_defrag_passes_total",
+		map[string]string{"result": "success"}), 0.01)
+}
+
+func TestDefragPassRecordsARefusedMoveAsAnError(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.updater.failed = []*api.ContainerUpdate{{ContainerId: "ctr-uid-1"}}
+
+	d.defragPass(context.Background())
+
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_moves_total",
+		map[string]string{"result": "error"}), 0.01)
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_passes_total",
+		map[string]string{"result": "error"}), 0.01)
+	require.InDelta(t, 0, metricValue(t, d.metrics, "dra_cpu_defrag_moves_total",
+		map[string]string{"result": "success"}), 0.01)
+}
+
+func TestDefragPassRecordsBlockedMoves(t *testing.T) {
+	// Two claims each sitting exactly where the other belongs, with no free CPU
+	// to stage a swap through: a better placement exists and no move can reach it.
+	d := newDefragTestDriver(t, 2, 2)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 3))
+	d.placeClaim(t, "claim-2", cpuset.New(1, 2))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.runContainer(t, "pod-2", "ctr-2", "ctr-uid-2", "claim-2")
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls())
+	require.InDelta(t, 2, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01)
+	require.Positive(t, metricValue(t, d.metrics, "dra_cpu_defrag_blocked_moves_total", nil))
+}
+
 func TestDefragPassNeverTargetsOfflineCPUs(t *testing.T) {
 	// The whole of cache 0 fits this claim, but half of that cache went offline
 	// after startup. The pass must re-read the online set and place around the
@@ -625,6 +689,37 @@ func TestDefragPassReleasesApplyMuDuringTheRuntimeCall(t *testing.T) {
 
 	require.Len(t, d.updater.allCalls(), 1, "the move must actually reach the runtime")
 	require.True(t, lockWasFree.Load(), "applyMu was held across the runtime call")
+}
+
+func TestDefragPassMeasuresANodeWithNoClaims(t *testing.T) {
+	// An idle node has nothing to move but still has a shape. Reporting nothing
+	// for it would make the leading indicator vanish exactly when it is most
+	// favourable, and a gauge that disappears cannot be alerted on.
+	d := newDefragTestDriver(t, 2, 4)
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls())
+	require.InDelta(t, 0, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01)
+	require.InDelta(t, 4, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "0"}), 0.01,
+		"an empty node can take a whole cache")
+}
+
+func TestDefragPassMeasuresEveryNUMANodeNotOnlyOccupiedOnes(t *testing.T) {
+	// One claim on node 0 must not stop node 1 from being reported.
+	d := newDefragTestDriverTopo(t, 2, 2, 4)
+	// Two CPUs taken out of each of node 0's caches, so the largest aligned claim
+	// it could still take is two; node 1 is untouched and could take a whole cache.
+	d.placeClaim(t, "claim-1", cpuset.New(0, 1, 4, 5))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	d.defragPass(context.Background())
+
+	require.InDelta(t, 2, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "0"}), 0.01, "node 0's emptiest cache has two CPUs left")
+	require.InDelta(t, 4, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "1"}), 0.01, "node 1 holds no claims and must still be reported")
 }
 
 func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
