@@ -326,9 +326,34 @@ type driverConfigValues struct {
 	// ReconcileSharedOnUnprepare defaults to true in the driver, so a config
 	// file that does not mention it leaves it on: absent must read as true,
 	// which a plain bool cannot express.
-	ReconcileSharedOnUnprepare *bool  `json:"reconcileSharedOnUnprepare,omitempty"`
-	DefragEnabled              bool   `json:"defragEnabled,omitempty"`
-	SharedPoolCPUs             string `json:"sharedPoolCPUs,omitempty"`
+	ReconcileSharedOnUnprepare *bool                    `json:"reconcileSharedOnUnprepare,omitempty"`
+	DefragEnabled              bool                     `json:"defragEnabled,omitempty"`
+	SharedPoolCPUs             string                   `json:"sharedPoolCPUs,omitempty"`
+	Profiles                   map[string]profileValues `json:"profiles,omitempty"`
+}
+
+type profileValues struct {
+	ReservedCPUs   *string `json:"reservedCPUs,omitempty"`
+	SharedPoolCPUs *string `json:"sharedPoolCPUs,omitempty"`
+}
+
+// effectiveFor mirrors the driver's config-profile resolution: the node's
+// dra.cpu/config label picks a profile that overrides the fields naming CPUs.
+func (v driverConfigValues) effectiveFor(node *v1.Node) driverConfigValues {
+	ginkgo.GinkgoHelper()
+	name := node.Labels["dra.cpu/config"]
+	if name == "" {
+		return v
+	}
+	profile, ok := v.Profiles[name]
+	gomega.Expect(ok).To(gomega.BeTrue(), "node %s selects config profile %q, which the driver config does not define", node.Name, name)
+	if profile.ReservedCPUs != nil {
+		v.ReservedCPUs = *profile.ReservedCPUs
+	}
+	if profile.SharedPoolCPUs != nil {
+		v.SharedPoolCPUs = *profile.SharedPoolCPUs
+	}
+	return v
 }
 
 // staticPool is the configured static shared pool, empty when the pool is

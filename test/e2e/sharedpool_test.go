@@ -55,7 +55,7 @@ var _ = ginkgo.Describe("Static shared pool", ginkgo.Serial, ginkgo.Ordered, gin
 		rootFxt.Log.Info("using worker node", "nodeName", targetNode.Name)
 
 		cfgValues = getDriverConfig(ctx, rootFxt.K8SClientset)
-		staticPool = cfgValues.staticPool()
+		staticPool = cfgValues.effectiveFor(targetNode).staticPool()
 		if staticPool.IsEmpty() {
 			ginkgo.Skip("no static shared pool is configured in the driver; set DRACPU_E2E_SHARED_POOL_CPUS when creating the cluster")
 		}

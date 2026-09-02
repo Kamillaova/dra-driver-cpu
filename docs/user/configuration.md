@@ -197,6 +197,36 @@ on - is configured through other Helm values, not through this file.
 - Requires `cpuDeviceMode: grouped`. Empty keeps the dynamic pool: everything not claimed, resized as
   claims change, with `reconcileSharedOnUnprepare` governing promptness.
 
+`profiles` (map of string to profile, default: empty)
+
+- Named per-node overrides for the two fields that name CPUs: `reservedCPUs` and `sharedPoolCPUs`.
+  CPU numbering is a property of the node's hardware, so a fleet mixing node types cannot state one
+  cpuset for all of them — `"1,17"` is a whole core on one part and two half cores on another. Every
+  other field stays fleet-wide policy.
+- A node selects its profile with the **`dra.cpu/config` node label**; the driver reads it at startup.
+  No label means the fleet-wide values apply. Naming a profile the config does not define fails that
+  node's driver loudly — a typo must not run a node on the wrong carve-outs. Changing the label takes
+  effect on the next driver restart, deliberately: the carve-outs are the ground truth under every
+  current placement, not a value to swap live.
+- Inside a profile, an omitted field inherits the fleet-wide value and an explicit `""` clears it.
+  Every profile is validated on every node at startup, so a broken profile fails the fleet at rollout
+  rather than one node type at its next reboot.
+
+```yaml
+driverConfig:
+  reservedCPUs: "0"          # fleet-wide
+  profiles:
+    x3d:
+      sharedPoolCPUs: "1,17"
+    epyc:
+      sharedPoolCPUs: "1,65,129,193"
+```
+
+```console
+kubectl label node worker-a dra.cpu/config=x3d
+kubectl label node --selector=node.kubernetes.io/instance-type=epyc-bare dra.cpu/config=epyc
+```
+
 #### Example
 
 ```yaml
