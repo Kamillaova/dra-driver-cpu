@@ -171,6 +171,7 @@ when filing an issue — it collects the CPU topology and driver configuration n
 - [Workload Configuration Requirements](docs/user/workload-requirements.md) - how to set pod/container CPU requests alongside DRA claims.
 - [Custom Opaque CPUSet Allocation Overrides](docs/user/opaque-cpuset-overrides.md) - explicit core assignment for `groupBy: machine` mode.
 - [CPU Defragmentation](docs/user/defragmentation.md) - recovering uncore cache alignment of running claims (this fork only).
+- [CCX-Aligned Scheduling](docs/user/ccx-aligned-scheduling.md) - publishing each node's free-CPU shape so a scheduler can prefer nodes that can align a claim (this fork only).
 - [Metrics](docs/user/metrics.md) - Prometheus metrics exposed by the driver.
 - [Device Attributes and Selectors](docs/user/device-attributes.md) - selectable device attributes, CEL selector examples, and sample `ResourceSlice` output in each mode.
 - [Troubleshooting & Diagnostics](docs/user/troubleshooting.md) - the `dracpu gatherinfo` diagnostic tool.

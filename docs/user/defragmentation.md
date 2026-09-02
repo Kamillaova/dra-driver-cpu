@@ -35,7 +35,9 @@ driverConfig:
   write reaches the API server.
 - **It cannot fix a bad node choice.** The scheduler sees only how many CPUs are free on a node, never
   their shape, so it can bind a large claim to a node that genuinely cannot free a cache while a
-  neighbour could. A bound claim cannot move to another node.
+  neighbour could. A bound claim cannot move to another node. Publishing that shape for a scheduler
+  to prefer on is a separate feature: see
+  [CCX-aligned scheduling](ccx-aligned-scheduling.md).
 - **It is a no-op on nodes with one uncore cache per NUMA node**, where there is no spread to recover.
   A NUMA node whose CPUs report no uncore cache ID cannot be reasoned about at all; `/placements`
   lists it under `unmeasurableNUMANodes` rather than failing.
