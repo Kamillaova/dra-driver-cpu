@@ -19,6 +19,7 @@ package metrics
 import (
 	"encoding/json"
 	"io"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -65,12 +66,31 @@ type AllocationState struct {
 	ActiveResourceClaims int
 }
 
+// DefragState is the fragmentation a defragmentation pass observed.
+type DefragState struct {
+	// ExcessUncoreCaches is how many uncore caches the node's claims span beyond
+	// the fewest their sizes allow. Zero means every claim is as well placed as
+	// it can be.
+	ExcessUncoreCaches int
+	// LargestAlignableFreeCPUs is, per NUMA node, the most CPUs still free inside
+	// a single uncore cache: the largest claim that node could take without
+	// splitting it. It leads the excess count, since it says whether the next
+	// claim will land aligned rather than whether the last ones did.
+	LargestAlignableFreeCPUs map[int]int
+}
+
 // Recorder records driver metrics.
 type Recorder interface {
 	SetAllocationState(AllocationState)
 	RecordPrepare(result Result, duration time.Duration)
 	RecordUnprepare(result Result)
 	RecordClaimAllocatedCPUs(cpus int)
+	// CCX-FORK: upstream's Recorder ends above; the defragmentation methods and
+	// everything serving them in this file are the fork's.
+	SetDefragState(DefragState)
+	RecordDefragPass(result Result, duration time.Duration)
+	RecordDefragMoves(result Result, count int)
+	RecordDefragBlockedMoves(count int)
 }
 
 // Metrics owns all custom Prometheus collectors for the CPU driver.
@@ -83,6 +103,13 @@ type Metrics struct {
 	unprepareClaims      *prometheus.CounterVec
 	prepareClaimDuration prometheus.Histogram
 	claimAllocatedCPUs   prometheus.Histogram
+
+	defragExcessUncoreCaches      prometheus.Gauge
+	defragAlignableFreeCPUs       *prometheus.GaugeVec
+	defragPasses                  *prometheus.CounterVec
+	defragMoves                   *prometheus.CounterVec
+	defragBlockedMoves            prometheus.Counter
+	defragPassDurationSecondsHist prometheus.Histogram
 }
 
 type metricKind string
@@ -146,6 +173,40 @@ var (
 		help:    "Number of CPUs allocated for each newly successful claim allocation.",
 		buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024},
 	}
+	defragExcessUncoreCachesSpec = metricSpec{
+		name: "dra_cpu_defrag_excess_uncore_caches",
+		kind: metricGauge,
+		help: "Number of uncore caches the node's claims span beyond the fewest their sizes allow.",
+	}
+	defragAlignableFreeCPUsSpec = metricSpec{
+		name:   "dra_cpu_defrag_largest_alignable_free_cpus",
+		kind:   metricGauge,
+		help:   "Most CPUs still free within a single uncore cache of a NUMA node, which is the largest claim it can take unsplit.",
+		labels: []string{"numa_node"},
+	}
+	defragPassesSpec = metricSpec{
+		name:   "dra_cpu_defrag_passes_total",
+		kind:   metricCounter,
+		help:   "Total number of defragmentation passes by result.",
+		labels: []string{"result"},
+	}
+	defragMovesSpec = metricSpec{
+		name:   "dra_cpu_defrag_moves_total",
+		kind:   metricCounter,
+		help:   "Total number of claim moves attempted by result, where an error is a move the runtime refused and the driver reverted.",
+		labels: []string{"result"},
+	}
+	defragBlockedMovesSpec = metricSpec{
+		name: "dra_cpu_defrag_blocked_moves_total",
+		kind: metricCounter,
+		help: "Total number of moves a better placement called for that a pass could not make, usually because another claim is in the way.",
+	}
+	defragPassDurationSpec = metricSpec{
+		name:    "dra_cpu_defrag_pass_duration_seconds",
+		kind:    metricHistogram,
+		help:    "Duration of defragmentation passes in seconds.",
+		buckets: prometheus.DefBuckets,
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -157,6 +218,12 @@ var metricSpecs = []metricSpec{
 	unprepareClaimsSpec,
 	prepareClaimDurationSpec,
 	claimAllocatedCPUsSpec,
+	defragExcessUncoreCachesSpec,
+	defragAlignableFreeCPUsSpec,
+	defragPassesSpec,
+	defragMovesSpec,
+	defragBlockedMovesSpec,
+	defragPassDurationSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -196,6 +263,13 @@ func New(reg prometheus.Registerer) *Metrics {
 		unprepareClaims:      newCounterVec(unprepareClaimsSpec),
 		prepareClaimDuration: newHistogram(prepareClaimDurationSpec),
 		claimAllocatedCPUs:   newHistogram(claimAllocatedCPUsSpec),
+
+		defragExcessUncoreCaches:      newGauge(defragExcessUncoreCachesSpec),
+		defragAlignableFreeCPUs:       newGaugeVec(defragAlignableFreeCPUsSpec),
+		defragPasses:                  newCounterVec(defragPassesSpec),
+		defragMoves:                   newCounterVec(defragMovesSpec),
+		defragBlockedMoves:            newCounter(defragBlockedMovesSpec),
+		defragPassDurationSecondsHist: newHistogram(defragPassDurationSpec),
 	}
 
 	reg.MustRegister(
@@ -207,16 +281,38 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.unprepareClaims,
 		m.prepareClaimDuration,
 		m.claimAllocatedCPUs,
+		m.defragExcessUncoreCaches,
+		m.defragAlignableFreeCPUs,
+		m.defragPasses,
+		m.defragMoves,
+		m.defragBlockedMoves,
+		m.defragPassDurationSecondsHist,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
 		m.unprepareClaims.WithLabelValues(result.String())
+		m.defragPasses.WithLabelValues(result.String())
+		m.defragMoves.WithLabelValues(result.String())
 	}
 	return m
 }
 
 func newGauge(spec metricSpec) prometheus.Gauge {
 	return prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: spec.name,
+		Help: spec.help,
+	})
+}
+
+func newGaugeVec(spec metricSpec) *prometheus.GaugeVec {
+	return prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: spec.name,
+		Help: spec.help,
+	}, spec.labels)
+}
+
+func newCounter(spec metricSpec) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{
 		Name: spec.name,
 		Help: spec.help,
 	})
@@ -257,6 +353,35 @@ func (m *Metrics) RecordClaimAllocatedCPUs(cpus int) {
 	m.claimAllocatedCPUs.Observe(float64(cpus))
 }
 
+// SetDefragState replaces the per-NUMA-node series wholesale, so a node a pass
+// could not measure this time reports nothing rather than its last value.
+func (m *Metrics) SetDefragState(state DefragState) {
+	m.defragExcessUncoreCaches.Set(float64(state.ExcessUncoreCaches))
+	m.defragAlignableFreeCPUs.Reset()
+	for numaNodeID, cpus := range state.LargestAlignableFreeCPUs {
+		m.defragAlignableFreeCPUs.WithLabelValues(strconv.Itoa(numaNodeID)).Set(float64(cpus))
+	}
+}
+
+func (m *Metrics) RecordDefragPass(result Result, duration time.Duration) {
+	m.defragPasses.WithLabelValues(result.String()).Inc()
+	m.defragPassDurationSecondsHist.Observe(duration.Seconds())
+}
+
+func (m *Metrics) RecordDefragMoves(result Result, count int) {
+	if count <= 0 {
+		return
+	}
+	m.defragMoves.WithLabelValues(result.String()).Add(float64(count))
+}
+
+func (m *Metrics) RecordDefragBlockedMoves(count int) {
+	if count <= 0 {
+		return
+	}
+	m.defragBlockedMoves.Add(float64(count))
+}
+
 type noopRecorder struct{}
 
 // Noop returns a recorder that discards all metric observations.
@@ -264,7 +389,11 @@ func Noop() Recorder {
 	return noopRecorder{}
 }
 
-func (noopRecorder) SetAllocationState(AllocationState)  {}
-func (noopRecorder) RecordPrepare(Result, time.Duration) {}
-func (noopRecorder) RecordUnprepare(Result)              {}
-func (noopRecorder) RecordClaimAllocatedCPUs(int)        {}
+func (noopRecorder) SetAllocationState(AllocationState)     {}
+func (noopRecorder) RecordPrepare(Result, time.Duration)    {}
+func (noopRecorder) RecordUnprepare(Result)                 {}
+func (noopRecorder) RecordClaimAllocatedCPUs(int)           {}
+func (noopRecorder) SetDefragState(DefragState)             {}
+func (noopRecorder) RecordDefragPass(Result, time.Duration) {}
+func (noopRecorder) RecordDefragMoves(Result, int)          {}
+func (noopRecorder) RecordDefragBlockedMoves(int)           {}

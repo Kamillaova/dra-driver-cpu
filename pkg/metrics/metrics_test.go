@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 8)
+	require.Len(t, descriptors, 14)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -49,9 +49,18 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_unprepare_claims_total",
 		"dra_cpu_prepare_claim_duration_seconds",
 		"dra_cpu_claim_allocated_cpus",
+		"dra_cpu_defrag_excess_uncore_caches",
+		"dra_cpu_defrag_largest_alignable_free_cpus",
+		"dra_cpu_defrag_passes_total",
+		"dra_cpu_defrag_moves_total",
+		"dra_cpu_defrag_blocked_moves_total",
+		"dra_cpu_defrag_pass_duration_seconds",
 	}, names)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
+	require.Equal(t, []string{"numa_node"}, descriptors[9].Labels)
+	require.Equal(t, []string{"result"}, descriptors[10].Labels)
+	require.Equal(t, []string{"result"}, descriptors[11].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -77,10 +86,18 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 	}
 	slices.Sort(names)
 
+	// The per-NUMA-node gauge has no series until a pass reports one, so it has
+	// no family to gather yet, unlike the result counters whose label values are
+	// all known in advance and created here.
 	require.Equal(t, []string{
 		"dra_cpu_allocated_cpus",
 		"dra_cpu_available_cpus",
 		"dra_cpu_claim_allocated_cpus",
+		"dra_cpu_defrag_blocked_moves_total",
+		"dra_cpu_defrag_excess_uncore_caches",
+		"dra_cpu_defrag_moves_total",
+		"dra_cpu_defrag_pass_duration_seconds",
+		"dra_cpu_defrag_passes_total",
 		"dra_cpu_prepare_claim_duration_seconds",
 		"dra_cpu_prepare_claims_total",
 		"dra_cpu_reserved_cpus",
@@ -128,6 +145,10 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordUnprepare(ResultSuccess)
 	m.RecordUnprepare(ResultError)
 	m.RecordClaimAllocatedCPUs(1)
+	m.SetDefragState(DefragState{LargestAlignableFreeCPUs: map[int]int{0: 4}})
+	m.RecordDefragPass(ResultSuccess, time.Second)
+	m.RecordDefragMoves(ResultSuccess, 1)
+	m.RecordDefragBlockedMoves(1)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -164,6 +185,10 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.RecordPrepare(ResultSuccess, time.Second)
 		recorder.RecordUnprepare(ResultError)
 		recorder.RecordClaimAllocatedCPUs(4)
+		recorder.SetDefragState(DefragState{LargestAlignableFreeCPUs: map[int]int{0: 4}})
+		recorder.RecordDefragPass(ResultSuccess, time.Second)
+		recorder.RecordDefragMoves(ResultError, 2)
+		recorder.RecordDefragBlockedMoves(3)
 	})
 }
 
@@ -182,4 +207,40 @@ func requireMetricLabelValueAbsent(t *testing.T, reg *prometheus.Registry, metri
 			}
 		}
 	}
+}
+
+func TestDefragMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	m.SetDefragState(DefragState{
+		ExcessUncoreCaches:       3,
+		LargestAlignableFreeCPUs: map[int]int{0: 8, 1: 2},
+	})
+	m.RecordDefragPass(ResultSuccess, 40*time.Millisecond)
+	m.RecordDefragMoves(ResultSuccess, 2)
+	m.RecordDefragMoves(ResultError, 1)
+	m.RecordDefragBlockedMoves(4)
+
+	require.InDelta(t, 3, testutil.ToFloat64(m.defragExcessUncoreCaches), 0.01)
+	require.InDelta(t, 8, testutil.ToFloat64(m.defragAlignableFreeCPUs.WithLabelValues("0")), 0.01)
+	require.InDelta(t, 2, testutil.ToFloat64(m.defragAlignableFreeCPUs.WithLabelValues("1")), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.defragPasses.WithLabelValues(ResultSuccess.String())), 0.01)
+	require.InDelta(t, 2, testutil.ToFloat64(m.defragMoves.WithLabelValues(ResultSuccess.String())), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.defragMoves.WithLabelValues(ResultError.String())), 0.01)
+	require.InDelta(t, 4, testutil.ToFloat64(m.defragBlockedMoves), 0.01)
+	require.Equal(t, 1, testutil.CollectAndCount(m.defragPassDurationSecondsHist))
+
+	// A pass that could not measure a node must not leave its last reading
+	// standing, or an alert would keep firing on a number nothing is producing.
+	m.SetDefragState(DefragState{LargestAlignableFreeCPUs: map[int]int{0: 4}})
+	require.InDelta(t, 4, testutil.ToFloat64(m.defragAlignableFreeCPUs.WithLabelValues("0")), 0.01)
+	require.Equal(t, 1, testutil.CollectAndCount(m.defragAlignableFreeCPUs))
+
+	// Counters are only touched when there is something to count, so an idle
+	// pass does not make a zero look like an observation.
+	m.RecordDefragMoves(ResultSuccess, 0)
+	m.RecordDefragBlockedMoves(0)
+	require.InDelta(t, 2, testutil.ToFloat64(m.defragMoves.WithLabelValues(ResultSuccess.String())), 0.01)
+	require.InDelta(t, 4, testutil.ToFloat64(m.defragBlockedMoves), 0.01)
 }
