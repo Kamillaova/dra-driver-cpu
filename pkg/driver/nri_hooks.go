@@ -58,7 +58,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 			}
 			cLogger := pLogger.WithValues("container", container.Name)
 
-			claimAllocations, err := parseDRAEnvToClaimAllocations(cLogger, container.Env)
+			entries, err := parseDRAEnv(cLogger, container.Env)
 			if err != nil {
 				cLogger.Error(err, "ignoring container with malformed DRA env during synchronize")
 				continue
@@ -66,7 +66,8 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 			containerUID := types.UID(container.GetId())
 			var claimUIDs []types.UID
 			reportedCDIDevices := runtimeCDIDevices(container)
-			for uid, cpus := range claimAllocations {
+			for _, entry := range entries {
+				uid := entry.claimUID
 				caLogger := cLogger.WithValues("claimUID", uid)
 				if !claimInjectedByRuntime(reportedCDIDevices, uid) {
 					caLogger.Info("ignoring claim the runtime injected no CDI device for during synchronize")
@@ -93,13 +94,13 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					caLogger.Error(err, "ignoring claim not prepared by this driver during synchronize")
 					continue
 				}
-				if !desired.Equals(cpus) {
+				if !entry.dynamic && !desired.Equals(entry.cpus) {
 					// Expected whenever the claim was moved after its container
 					// started. The ContainerUpdate below carries the container to
 					// the desired set, so log and converge rather than dropping
 					// the claim and leaking its CPUs into the shared pool.
 					caLogger.V(2).Info("container was created for a cpuset the claim has since left, converging",
-						"createdWithCPUs", cpus.String(), "desiredCPUs", desired.String())
+						"createdWithCPUs", entry.cpus.String(), "desiredCPUs", desired.String())
 				}
 				// Synchronize restores an allocation that already exists in the runtime;
 				// the shared-pool guard applies only to new reservations.
@@ -185,33 +186,67 @@ func claimInjectedByRuntime(reported map[string]struct{}, claimUID types.UID) bo
 	return ok
 }
 
-func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types.UID]cpuset.CPUSet, error) {
-	allocations := make(map[types.UID]cpuset.CPUSet)
+// draEnvEntry is one DRA_CPUSET_* variable a container carries.
+type draEnvEntry struct {
+	claimUID types.UID
+	// cpus is the placement the value named, and is unset when dynamic is true:
+	// a claim whose placement may change has none to name.
+	cpus    cpuset.CPUSet
+	dynamic bool
+}
+
+// parseDRAEnv returns the claims a container's environment names.
+//
+// CCX-FORK: upstream returns only claim-to-cpuset pairs, since to it the value is
+// the placement. Here the name is what matters and the value may say "dynamic".
+func parseDRAEnv(logger logr.Logger, envs []string) ([]draEnvEntry, error) {
+	var entries []draEnvEntry
 	for _, env := range envs {
 		if !strings.HasPrefix(env, cdiEnvVarPrefix) {
 			continue
 		}
 		logger.V(4).Info("parsing DRA env entry", "env", env)
-		parts := strings.SplitN(env, "=", 2)
-		if len(parts) != 2 {
+		key, value, found := strings.Cut(env, "=")
+		if !found {
 			return nil, fmt.Errorf("malformed DRA env entry %q", env)
 		}
-		key, value := parts[0], parts[1]
-		var claimUID types.UID
-		if after, ok := strings.CutPrefix(key, cdiEnvVarPrefix+"_"); ok {
-			uidStr := after
-			claimUID = types.UID(uidStr)
-		} else {
+		uidStr, ok := strings.CutPrefix(key, cdiEnvVarPrefix+"_")
+		if !ok {
 			continue
 		}
 
-		parsedSet, err := cpuset.Parse(value)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse cpuset value %q from env %q: %w", value, env, err)
+		entry := draEnvEntry{claimUID: types.UID(uidStr)}
+		if value == cdiEnvDynamicValue {
+			entry.dynamic = true
+		} else {
+			cpus, err := cpuset.Parse(value)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse cpuset value %q from env %q: %w", value, env, err)
+			}
+			entry.cpus = cpus
 		}
-		allocations[claimUID] = parsedSet
+		entries = append(entries, entry)
 	}
 
+	return entries, nil
+}
+
+// parseDRAEnvToClaimAllocations returns the placements recorded by the
+// environment edits of a driver-owned CDI spec, which unlike a container's
+// environment is rewritten whenever a placement changes. Entries that name no
+// placement are left out.
+func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types.UID]cpuset.CPUSet, error) {
+	entries, err := parseDRAEnv(logger, envs)
+	if err != nil {
+		return nil, err
+	}
+	allocations := make(map[types.UID]cpuset.CPUSet, len(entries))
+	for _, entry := range entries {
+		if entry.dynamic {
+			continue
+		}
+		allocations[entry.claimUID] = entry.cpus
+	}
 	return allocations, nil
 }
 
@@ -256,7 +291,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	adjust := &api.ContainerAdjustment{}
 	var updates []*api.ContainerUpdate
 
-	claimAllocations, err := parseDRAEnvToClaimAllocations(logger, ctr.Env)
+	entries, err := parseDRAEnv(logger, ctr.Env)
 	if err != nil {
 		logger.Error(err, "error parsing DRA env for container")
 		return nil, nil, err
@@ -265,7 +300,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	containerId := types.UID(ctr.GetId())
 	podUID := types.UID(pod.GetUid())
 
-	if len(claimAllocations) == 0 {
+	if len(entries) == 0 {
 		// This is a shared container.
 		sharedCPUs := cp.cpuAllocationStore.GetSharedCPUs()
 		if sharedCPUs.IsEmpty() && !cp.cpuAllocationStore.GetPreparedCPUs().IsEmpty() {
@@ -289,11 +324,11 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		// container's immutable environment carries.
 		claimUIDs := []types.UID{}
 		reportedCDIDevices := runtimeCDIDevices(ctr)
-		for uid := range claimAllocations {
-			if !claimInjectedByRuntime(reportedCDIDevices, uid) {
-				return nil, nil, fmt.Errorf("container claims %q but the runtime injected no CDI device for it", uid)
+		for _, entry := range entries {
+			if !claimInjectedByRuntime(reportedCDIDevices, entry.claimUID) {
+				return nil, nil, fmt.Errorf("container claims %q but the runtime injected no CDI device for it", entry.claimUID)
 			}
-			claimUIDs = append(claimUIDs, uid)
+			claimUIDs = append(claimUIDs, entry.claimUID)
 		}
 		newOwners, err := cp.claimTracker.SetOwner(logger, podUID, ctr.Name, claimUIDs...)
 		if err != nil {
