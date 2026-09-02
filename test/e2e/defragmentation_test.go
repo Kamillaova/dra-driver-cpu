@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/discovery"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
 	cpusetmatchers "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/matchers/cpuset"
 	e2enode "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/node"
@@ -49,9 +50,10 @@ const placementsPath = "/placements"
 // placementsReport mirrors the driver's /placements payload. Only the fields the
 // tests read are declared.
 type placementsReport struct {
-	DefragEnabled bool   `json:"defragEnabled"`
-	SharedCPUs    string `json:"sharedCPUs"`
-	Claims        []struct {
+	DefragEnabled  bool   `json:"defragEnabled"`
+	SharedPoolCPUs string `json:"sharedPoolCPUs"`
+	SharedCPUs     string `json:"sharedCPUs"`
+	Claims         []struct {
 		ClaimUID   string `json:"claimUID"`
 		CPUs       string `json:"cpus"`
 		MovingFrom string `json:"movingFrom"`
@@ -206,6 +208,8 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		dracpuTesterImage string
 		cfgValues         driverConfigValues
 		baseline          placementsReport
+		staticPool        cpuset.CPUSet
+		nodeCPUInfo       discovery.DRACPUInfo
 	)
 
 	ginkgo.BeforeAll(func(ctx context.Context) {
@@ -223,6 +227,13 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		cfgValues = getDriverConfig(ctx, rootFxt.K8SClientset)
 		if !cfgValues.DefragEnabled {
 			ginkgo.Skip("defragmentation is not enabled in the driver configuration; set DRACPU_E2E_DEFRAG=true when creating the cluster")
+		}
+		staticPool = cfgValues.staticPool()
+		if !staticPool.IsEmpty() {
+			infraFxt := rootFxt.WithPrefix("infra-defrag")
+			gomega.Expect(infraFxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(infraFxt.Teardown)
+			nodeCPUInfo = discoverNodeCPUInfo(ctx, infraFxt, targetNode.Name, dracpuTesterImage)
 		}
 
 		baseline, err = getPlacements(ctx, rootFxt.K8SClientset, targetNode.Name, true)
@@ -247,7 +258,8 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		ginkgo.By("creating a pod with an exclusive claim")
 		pod, _ := createClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, 2, "cpu-claim-placements")
 		alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod)
-		gomega.Expect(alloc.CPUAssigned).To(cpusetmatchers.HaveSize(2))
+		claimHeld := alloc.CPUAssigned.Difference(staticPool)
+		gomega.Expect(claimHeld).To(cpusetmatchers.HaveSize(2))
 
 		ginkgo.By("checking the driver reports those very CPUs")
 		gomega.Eventually(func(g gomega.Gomega) {
@@ -261,8 +273,8 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 				g.Expect(err).ToNot(gomega.HaveOccurred())
 				held = held.Union(cpus)
 			}
-			g.Expect(alloc.CPUAssigned.IsSubsetOf(held)).To(gomega.BeTrue(),
-				"the pod runs on %s, which the driver does not report as claimed (%s)", alloc.CPUAssigned.String(), held.String())
+			g.Expect(claimHeld.IsSubsetOf(held)).To(gomega.BeTrue(),
+				"the pod runs on %s, which the driver does not report as claimed (%s)", claimHeld.String(), held.String())
 
 			shared, err := cpuset.Parse(report.SharedCPUs)
 			g.Expect(err).ToNot(gomega.HaveOccurred())
@@ -324,7 +336,8 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			claimSpecWithSelector(victimCPUs, numaCEL(cfgValues, fragNUMA)), "cpu-claim-victim")
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, victim)
-		fxt.Log.Info("victim placement", "cpus", before.CPUAssigned.String())
+		beforeClaim := before.CPUAssigned.Difference(staticPool)
+		fxt.Log.Info("victim placement", "cpus", beforeClaim.String())
 
 		// The whole point of the test. If the arrangement did not actually
 		// fragment anything there is nothing to consolidate, and passing here
@@ -335,7 +348,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		if fragmented.totalExcess() == 0 {
 			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
 		}
-		gomega.Expect(before.CPUAssigned.Size()).To(gomega.Equal(victimCPUs))
+		gomega.Expect(beforeClaim.Size()).To(gomega.Equal(victimCPUs))
 
 		ginkgo.By("releasing a filler, which gives the split claim somewhere to go")
 		gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, fillers[0])).To(gomega.Succeed())
@@ -356,9 +369,9 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			"claims still span more caches than their sizes require: %+v", settled.NUMANodes)
 		after, ok := settled.claimCPUs(victimUID)
 		gomega.Expect(ok).To(gomega.BeTrue(), "the victim claim vanished: %+v", settled.Claims)
-		gomega.Expect(after).ToNot(cpusetmatchers.Equal(before.CPUAssigned),
+		gomega.Expect(after).ToNot(cpusetmatchers.Equal(beforeClaim),
 			"the claim was never moved, so nothing was consolidated")
-		gomega.Expect(after).To(cpusetmatchers.HaveSize(before.CPUAssigned.Size()),
+		gomega.Expect(after).To(cpusetmatchers.HaveSize(beforeClaim.Size()),
 			"a move must not change how many CPUs a claim has")
 
 		ginkgo.By("verifying the container kept running throughout")
@@ -369,7 +382,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			"a move must not restart the container")
 
 		live := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread)
-		gomega.Expect(live.CPUAssigned).To(cpusetmatchers.Equal(after),
+		gomega.Expect(live.CPUAssigned).To(cpusetmatchers.Equal(after.Union(numaLocalPool(nodeCPUInfo, staticPool, after))),
 			"the container is not on the CPUs the driver says its claim holds")
 		gomega.Expect(live.CPUAffinity.Equals(live.CPUAssigned)).To(gomega.BeTrue(),
 			"the kernel affinity %s does not match the cgroup cpuset %s", live.CPUAffinity.String(), live.CPUAssigned.String())
@@ -545,10 +558,11 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 
 				for uid, tracked := range claims {
 					cpus, _ := report.claimCPUs(uid)
+					want := cpus.Union(numaLocalPool(nodeCPUInfo, staticPool, cpus))
 					alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, tracked.pod)
-					g.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(cpus),
+					g.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(want),
 						"container of claim %s is not on its claim's CPUs", uid)
-					g.Expect(alloc.CPUAffinity).To(cpusetmatchers.Equal(cpus))
+					g.Expect(alloc.CPUAffinity).To(cpusetmatchers.Equal(want))
 				}
 				sharedAlloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, sharedPod)
 				g.Expect(sharedAlloc.CPUAssigned.Intersection(union).IsEmpty()).To(gomega.BeTrue(),
@@ -634,7 +648,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			g.Expect(err).ToNot(gomega.HaveOccurred())
 			g.Expect(report.Claims).To(gomega.BeEmpty(), "claims outlived their pods: %+v", report.Claims)
 			g.Expect(report.totalExcess()).To(gomega.BeZero())
-			if getDriverConfig(ctx, fxt.K8SClientset).reconcilesSharedOnUnprepare() {
+			if !staticPool.IsEmpty() || getDriverConfig(ctx, fxt.K8SClientset).reconcilesSharedOnUnprepare() {
 				shared, err := cpuset.Parse(report.SharedCPUs)
 				g.Expect(err).ToNot(gomega.HaveOccurred())
 				alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, sharedPod)
@@ -714,10 +728,12 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			g.Expect(ok).To(gomega.BeTrue())
 			g.Expect(small).To(cpusetmatchers.Equal(smallBefore), "the small claim had no reason to move")
 
+			want := small.Union(big)
+			want = want.Union(numaLocalPool(nodeCPUInfo, staticPool, want))
 			alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod)
-			g.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(small.Union(big)),
+			g.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(want),
 				"the container must hold the union of both its claims")
-			g.Expect(alloc.CPUAffinity).To(cpusetmatchers.Equal(small.Union(big)))
+			g.Expect(alloc.CPUAffinity).To(cpusetmatchers.Equal(want))
 		}, 3*time.Minute, 5*time.Second).Should(gomega.Succeed())
 
 		reread, err := fxt.K8SClientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
@@ -744,7 +760,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 
 			cpus, ok := report.claimCPUs(claimUID)
 			g.Expect(ok).To(gomega.BeTrue(), "claim %s was not adopted after the restart: %+v", claimUID, report.Claims)
-			g.Expect(cpus.Size()).To(gomega.Equal(before.CPUAssigned.Size()),
+			g.Expect(cpus.Size()).To(gomega.Equal(before.CPUAssigned.Difference(staticPool).Size()),
 				"the claim's CPU count changed across the restart")
 
 			shared, err := cpuset.Parse(report.SharedCPUs)

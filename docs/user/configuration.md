@@ -179,6 +179,22 @@ on - is configured through other Helm values, not through this file.
 - How long a claim is left alone after being moved, so a workload is not re-homed
   repeatedly while it settles. `0` disables the cooldown.
 
+`sharedPoolCPUs` (string, default: empty)
+
+- Dedicate an explicit, **static** set of CPUs (Linux cpuset syntax, like `reservedCPUs`) as the
+  shared pool. Containers without a claim are pinned to it and never re-pinned as claims come and go;
+  containers *with* claims get the pool CPUs of their claims' NUMA nodes appended, so a workload's
+  auxiliary threads (a VM's iothreads, vhost workers) can be left to the kernel scheduler inside the
+  pool. The pool is excluded from device capacity, so no claim is ever placed on it.
+- Explicit rather than driver-chosen, like `reservedCPUs` and the kubelet's `reservedSystemCPUs`:
+  which CPUs to sacrifice is a per-node-pool fleet decision. The driver validates and states the cost
+  — it refuses CPUs that do not exist, are offline, or overlap `reservedCPUs`; refuses a pool that
+  splits a physical core when `fullPhysicalCPUsOnly` is on (and warns otherwise); and logs how many
+  uncore caches the pool spoils for whole-cache claims. Placing the pool in the same cache as
+  `reservedCPUs` keeps that cost to one service cache per node.
+- Requires `cpuDeviceMode: grouped`. Empty keeps the dynamic pool: everything not claimed, resized as
+  claims change, with `reconcileSharedOnUnprepare` governing promptness.
+
 #### Example
 
 ```yaml
