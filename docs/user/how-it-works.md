@@ -52,4 +52,4 @@ The two components in detail:
     [`assumeUnsolicitedUpdatesSafe`](configuration.md#driver-configuration) and
     `reconcileSharedOnUnprepare` enabled, the driver widens them straight away; otherwise each
     container picks up the wider cpuset at its next container creation or driver restart.
-  - On restart, the NRI plugin can synchronize its state by inspecting existing containers and their environment variables to rebuild the current CPU allocations.
+  - On restart, the NRI plugin can synchronize its state by inspecting existing containers and their environment variables to rebuild the current CPU allocations. The environment supplies the claim UIDs and the CDI specs on disk supply their placement, so a container found on CPUs its claim has since left is moved onto them rather than dropped.
