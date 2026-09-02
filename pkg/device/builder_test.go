@@ -136,3 +136,67 @@ func TestDeviceBuilderNodeAllocatableResourceMapping(t *testing.T) {
 		})
 	}
 }
+
+// fakeCacheTopology returns an 8-CPU single-socket, single-NUMA topology with
+// two uncore caches of unequal allocatable size once CPU 0 is reserved:
+// cache 0 keeps CPUs 1-3, cache 1 keeps CPUs 4-7.
+func fakeCacheTopology() *cpuinfo.CPUTopology {
+	details := cpuinfo.CPUDetails{}
+	for cpu := range 8 {
+		details[cpu] = cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        cpu,
+			SocketID:      0,
+			NUMANodeID:    0,
+			UncoreCacheID: cpu / 4,
+			SiblingCPUID:  -1,
+		}
+	}
+	return &cpuinfo.CPUTopology{
+		NumCPUs: 8, NumCores: 8, NumSockets: 1, NumNUMANodes: 1, NumUncoreCache: 2,
+		SMTEnabled: false, CPUDetails: details,
+	}
+}
+
+func TestGroupedUncoreCacheAttributes(t *testing.T) {
+	topo := fakeCacheTopology()
+	online := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+
+	devices, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+		cpuset.New(0), store.NewPCIeRootMapper(), false)
+	require.Len(t, devices, 1)
+	attrs := devices[0].Attributes
+
+	// Reserving CPU 0 shrinks cache 0 to three allocatable CPUs, so the largest
+	// single-cache claim the group can align is four, the whole of cache 1.
+	require.Contains(t, attrs, device.AttributeLargestUncoreCacheCPUs)
+	require.EqualValues(t, 4, *attrs[device.AttributeLargestUncoreCacheCPUs].IntValue)
+	require.Contains(t, attrs, device.AttributeUncoreCachesInGroup)
+	require.EqualValues(t, 2, *attrs[device.AttributeUncoreCachesInGroup].IntValue)
+}
+
+func TestGroupedUncoreCacheAttributesOmittedWhenUnknown(t *testing.T) {
+	topo := fakeCacheTopology()
+	// A single CPU with no cache information must suppress both attributes
+	// rather than yield a count derived from the remaining CPUs.
+	info := topo.CPUDetails[5]
+	info.UncoreCacheID = -1
+	topo.CPUDetails[5] = info
+
+	devices, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
+		cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New(), store.NewPCIeRootMapper(), false)
+	require.Len(t, devices, 1)
+
+	require.NotContains(t, devices[0].Attributes, device.AttributeLargestUncoreCacheCPUs)
+	require.NotContains(t, devices[0].Attributes, device.AttributeUncoreCachesInGroup)
+}
+
+func TestIndividualDevicesHaveNoGroupCacheAttributes(t *testing.T) {
+	devices, _ := device.Build(fakeCacheTopology(), cpuset.New(), store.NewPCIeRootMapper(), false)
+	require.NotEmpty(t, devices)
+	for _, dev := range devices {
+		require.NotContains(t, dev.Attributes, device.AttributeLargestUncoreCacheCPUs,
+			"device %q: group geometry is meaningless for a single CPU", dev.Name)
+		require.NotContains(t, dev.Attributes, device.AttributeUncoreCachesInGroup, dev.Name)
+	}
+}
