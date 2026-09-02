@@ -68,8 +68,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
 
-Wholly new files (`pkg/coreselect`, `reconcile.go`, `pkg/cpuinfo/coretopology.go`) are visible to
-`git diff --stat` on their own and are not repeated here.
+Wholly new files (`pkg/defrag`, `pkg/coreselect`, `reconcile.go`, `pkg/cpuinfo/coretopology.go`) are
+visible to `git diff --stat` on their own and are not repeated here.
 
 `CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
 placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
