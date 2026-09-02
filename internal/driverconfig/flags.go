@@ -19,7 +19,9 @@ package driverconfig
 import (
 	"flag"
 	"fmt"
+	"maps"
 	"path/filepath"
+	"slices"
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
@@ -126,6 +128,9 @@ func (c Config) Validate() error {
 	if err := c.validateSharedPool(); err != nil {
 		return err
 	}
+	if err := c.validateProfiles(); err != nil {
+		return err
+	}
 	// The kubelet root becomes socket and mount locations, so a relative path
 	// would resolve against the working directory and silently break
 	// registration.
@@ -206,6 +211,18 @@ func (c Config) validateSharedPool() error {
 				return fmt.Errorf("invalid sharedPoolCPUs %q: overlaps reservedCPUs %q on %s -- a CPU cannot both host shared workloads and be reserved away from them",
 					c.SharedPoolCPUs, c.ReservedCPUs, pool.Intersection(reserved).String())
 			}
+		}
+	}
+	return nil
+}
+
+func (c Config) validateProfiles() error {
+	for _, name := range slices.Sorted(maps.Keys(c.Profiles)) {
+		merged := c
+		merged.Profiles = nil
+		merged.applyProfile(c.Profiles[name])
+		if err := merged.Validate(); err != nil {
+			return fmt.Errorf("config profile %q does not validate: %w", name, err)
 		}
 	}
 	return nil
