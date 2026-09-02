@@ -28,9 +28,23 @@ alignment lost to claim churn is recovered.
   `pkg/cpuinfo`). Touch points inside existing files are single thin calls rather than inline logic.
 - **Every upstream declaration or block the fork changes carries a `// CCX-FORK:` comment** naming what
   upstream does instead, so `git grep 'CCX-FORK:'` enumerates every point a rebase has to reconcile. A
-  symbol the fork *adds* needs no marker: there is nothing upstream to reconcile it against.
+  symbol the fork *adds* needs no marker: there is nothing upstream to reconcile it against; the
+  divergence surface below lists them.
 - Commits follow upstream's conventions (`type:` / `component:` subjects, `Signed-off-by`) and are kept
   atomic so the upstreamable ones cherry-pick cleanly.
+
+### Divergence surface
+
+Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
+to an upstreamable piece (see below) are not repeated here: they leave with their PR.
+
+- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `GetDeviceCPUSet`
+
+- the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
+  they pin, rather than kept apart
+
+Wholly new files (`pkg/coreselect`, `reconcile.go`, `pkg/cpuinfo/coretopology.go`) are visible to
+`git diff --stat` on their own and are not repeated here.
 
 ## Upstreamable pieces
 
