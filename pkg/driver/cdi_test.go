@@ -24,6 +24,7 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
+	"k8s.io/utils/cpuset"
 	cdiSpec "tags.cncf.io/container-device-interface/specs-go"
 )
 
@@ -81,7 +82,7 @@ func TestAddDevice(t *testing.T) {
 			expectedSpecName := mgr.getSpecName(tc.deviceName)
 			expectedFilePath := filepath.Join(tempCDIDir, expectedSpecName)
 
-			err = mgr.AddDevice(logger, tc.deviceName, tc.envVar)
+			err = mgr.AddDevice(logger, tc.deviceName, tc.envVar, cpuset.New(0, 1))
 
 			if tc.expectedError != "" {
 				require.Error(t, err)
@@ -100,6 +101,10 @@ func TestAddDevice(t *testing.T) {
 				Devices: []cdiSpec.Device{
 					{
 						Name: tc.deviceName,
+						// Placement is recorded in a CDI annotation, which is
+						// not injected into the container and so can be
+						// rewritten while it runs.
+						Annotations: map[string]string{cdiCPUSetAnnotation: "0-1"},
 						ContainerEdits: cdiSpec.ContainerEdits{
 							Env: []string{tc.envVar},
 						},
@@ -157,7 +162,7 @@ func TestRemoveDevice(t *testing.T) {
 			expectedFilePath := filepath.Join(tempCDIDir, expectedSpecName)
 
 			if !tc.simulateErr {
-				err = mgr.AddDevice(logger, tc.deviceName, tc.envVar)
+				err = mgr.AddDevice(logger, tc.deviceName, tc.envVar, cpuset.New(0, 1))
 				require.NoError(t, err)
 			}
 
@@ -197,7 +202,7 @@ func TestAddDeviceOverwrite(t *testing.T) {
 		require.Len(t, files, expected)
 	}
 
-	err = mgr.AddDevice(logger, deviceName, "CPU=0,1")
+	err = mgr.AddDevice(logger, deviceName, "CPU=0,1", cpuset.New(0, 1))
 	require.NoError(t, err)
 	assertFileCount(1)
 
@@ -207,7 +212,7 @@ func TestAddDeviceOverwrite(t *testing.T) {
 	require.Equal(t, []string{"CPU=0,1"}, spec1.Devices[0].ContainerEdits.Env)
 
 	// Call AddDevice again with the same deviceName and same data
-	err = mgr.AddDevice(logger, deviceName, "CPU=0,1")
+	err = mgr.AddDevice(logger, deviceName, "CPU=0,1", cpuset.New(0, 1))
 	require.NoError(t, err)
 	// Verify that we do not create a new file
 	assertFileCount(1)
@@ -222,7 +227,7 @@ func TestGetDeviceEnv(t *testing.T) {
 
 	deviceName := "claim-cpu-get-env"
 	expectedEnv := "DRA_CPUSET_claim-cpu-get-env=0,1"
-	err = mgr.AddDevice(logger, deviceName, expectedEnv)
+	err = mgr.AddDevice(logger, deviceName, expectedEnv, cpuset.New(0, 1))
 	require.NoError(t, err)
 	err = mgr.Refresh()
 	require.NoError(t, err)
@@ -241,7 +246,7 @@ func TestRefreshKeepsValidDevicesWhenAnotherSpecIsInvalid(t *testing.T) {
 
 	deviceName := "claim-cpu-valid"
 	expectedEnv := "DRA_CPUSET_claim-cpu-valid=0,1"
-	err = mgr.AddDevice(logger, deviceName, expectedEnv)
+	err = mgr.AddDevice(logger, deviceName, expectedEnv, cpuset.New(0, 1))
 	require.NoError(t, err)
 
 	err = os.WriteFile(filepath.Join(tempCDIDir, "unrelated-invalid.json"), []byte("{"), 0600)
@@ -263,4 +268,96 @@ func TestGetDeviceEnvMissingDevice(t *testing.T) {
 	_, err = mgr.GetDeviceEnv("missing-device")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), `failed to find CDI device "missing-device"`)
+}
+
+func TestGetDeviceCPUSet(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-cpu-placement"
+	require.NoError(t, mgr.AddDevice(logger, deviceName,
+		"DRA_CPUSET_claim-cpu-placement=2-3", cpuset.New(2, 3)))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceCPUSet(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(2, 3), got)
+
+	// Rewriting the spec must move the recorded placement, since this is what
+	// makes a claim's CPUs mutable while its container runs.
+	require.NoError(t, mgr.AddDevice(logger, deviceName,
+		"DRA_CPUSET_claim-cpu-placement=2-3", cpuset.New(6, 7)))
+	require.NoError(t, mgr.Refresh())
+
+	got, err = mgr.GetDeviceCPUSet(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(6, 7), got, "the annotation, not the env var, is the record")
+}
+
+func TestGetDeviceCPUSetFallsBackToEnv(t *testing.T) {
+	logger := testr.New(t)
+	tempCDIDir := t.TempDir()
+	mgr, err := NewCdiManager(logger, testDriverName, tempCDIDir)
+	require.NoError(t, err)
+
+	// A spec written before the driver recorded placement in an annotation: the
+	// env var is the only record, and unlike a container's environment the
+	// driver-owned spec file's value is current.
+	deviceName := "claim-cpu-legacy"
+	legacy := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name: deviceName,
+			ContainerEdits: cdiSpec.ContainerEdits{
+				Env: []string{"DRA_CPUSET_claim-cpu-legacy=4,5"},
+			},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(legacy, mgr.getSpecName(deviceName)))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceCPUSet(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(4, 5), got)
+}
+
+func TestGetDeviceCPUSetMissingDevice(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	_, err = mgr.GetDeviceCPUSet("claim-cpu-absent")
+	require.Error(t, err)
+}
+
+func TestGetDeviceCPUSetMalformedAnnotation(t *testing.T) {
+	// The annotation is driver-written, so a value that does not parse means the
+	// spec was corrupted or hand-edited. The claim's placement is then unknown,
+	// which must surface as an error rather than as an empty cpuset a caller
+	// would treat as "no CPUs".
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-cpu-corrupt"
+	spec := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name:        deviceName,
+			Annotations: map[string]string{cdiCPUSetAnnotation: "not-a-cpuset"},
+			ContainerEdits: cdiSpec.ContainerEdits{
+				Env: []string{"DRA_CPUSET_claim-cpu-corrupt=0-1"},
+			},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(spec, mgr.getSpecName(deviceName)))
+	require.NoError(t, mgr.Refresh())
+
+	_, err = mgr.GetDeviceCPUSet(deviceName)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to parse")
+	require.Contains(t, err.Error(), cdiCPUSetAnnotation)
 }
