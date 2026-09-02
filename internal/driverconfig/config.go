@@ -92,6 +92,17 @@ type Config struct {
 	// been moved, so a workload is not re-homed repeatedly while it settles.
 	// Defaults to 600.
 	DefragClaimCooldownSeconds int `json:"defragClaimCooldownSeconds,omitempty"`
+	// CachePlacementPolicy is how a claim that fits inside one uncore cache
+	// chooses among the caches that can hold it. "pack" (the default) fills
+	// the fullest cache that fits, keeping clean caches whole for larger
+	// claims; "spread" fills the emptiest, giving each claim a cache of its
+	// own while there is slack and relying on defragmentation to consolidate
+	// the small tenants when a whole-cache claim actually arrives. Without
+	// fullPhysicalCPUsOnly, spread still avoids splitting a physical core
+	// where it can, but two claims may end up on one core's siblings once a
+	// cache offers nothing better -- whole-core allocation is what actually
+	// forbids that.
+	CachePlacementPolicy string `json:"cachePlacementPolicy,omitempty"`
 	// Profiles are named per-node overrides for the fields that name CPUs.
 	// CPU numbering is a property of the node's hardware, so a fleet mixing
 	// node types cannot state one reservedCPUs for all of them; every other
@@ -173,6 +184,7 @@ func (c Config) LogValues() []any {
 		"defragMaxMovesPerPass", c.DefragMaxMovesPerPass,
 		"defragMinGain", c.DefragMinGain,
 		"defragClaimCooldownSeconds", c.DefragClaimCooldownSeconds,
+		"cachePlacementPolicy", c.CachePlacementPolicy,
 		"profiles", c.Profiles,
 	}
 }
@@ -198,6 +210,7 @@ type dumpConfig struct {
 	DefragMaxMovesPerPass                 int                `json:"defragMaxMovesPerPass"`
 	DefragMinGain                         int                `json:"defragMinGain"`
 	DefragClaimCooldownSeconds            int                `json:"defragClaimCooldownSeconds"`
+	CachePlacementPolicy                  string             `json:"cachePlacementPolicy"`
 	Profiles                              map[string]Profile `json:"profiles"`
 }
 

@@ -24,6 +24,7 @@ import (
 	"slices"
 
 	"github.com/go-logr/logr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 )
 
@@ -124,6 +125,9 @@ func (c Config) Validate() error {
 	if err := c.validateDefrag(); err != nil {
 		return err
 	}
+	if err := c.validateCachePlacementPolicy(); err != nil {
+		return err
+	}
 	if err := c.validateProfiles(); err != nil {
 		return err
 	}
@@ -181,6 +185,23 @@ func (c Config) validateDefrag() error {
 	// what that option asserts is safe here.
 	if !c.AssumeUnsolicitedUpdatesSafe {
 		return fmt.Errorf("invalid defragEnabled: requires assumeUnsolicitedUpdatesSafe")
+	}
+	return nil
+}
+
+func (c Config) validateCachePlacementPolicy() error {
+	switch coreselect.Policy(c.CachePlacementPolicy) {
+	case coreselect.Pack:
+	case coreselect.Spread:
+		// The policy governs which CPUs the driver picks, so it means nothing
+		// where the driver does not pick: in individual mode the scheduler
+		// names exact CPU devices.
+		if c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
+			return fmt.Errorf("invalid cachePlacementPolicy %q: requires cpuDeviceMode %q, got %q",
+				c.CachePlacementPolicy, device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
+		}
+	default:
+		return fmt.Errorf("invalid cachePlacementPolicy %q: must be %q or %q", c.CachePlacementPolicy, coreselect.Pack, coreselect.Spread)
 	}
 	return nil
 }

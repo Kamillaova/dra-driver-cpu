@@ -22,6 +22,7 @@ import (
 	"slices"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 )
 
@@ -37,8 +38,9 @@ var schemaExcludedFields = map[string]string{
 // schemaEnums are the allowed values for fields whose Go type (string) can't
 // express them on its own.
 var schemaEnums = map[string][]any{
-	"cpuDeviceMode": {device.CPU_DEVICE_MODE_GROUPED, device.CPU_DEVICE_MODE_INDIVIDUAL},
-	"groupBy":       {device.GROUP_BY_NUMA_NODE, device.GROUP_BY_SOCKET, device.GROUP_BY_MACHINE},
+	"cachePlacementPolicy": {string(coreselect.Pack), string(coreselect.Spread)},
+	"cpuDeviceMode":        {device.CPU_DEVICE_MODE_GROUPED, device.CPU_DEVICE_MODE_INDIVIDUAL},
+	"groupBy":              {device.GROUP_BY_NUMA_NODE, device.GROUP_BY_SOCKET, device.GROUP_BY_MACHINE},
 }
 
 // driverConfigSchemaComment is the generated schema's top-level "$comment".
