@@ -2484,3 +2484,15 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		require.Equal(t, 3, got.Size())
 	})
 }
+
+func TestPreparedEnvSaysDynamicOnlyWhenPlacementCanChange(t *testing.T) {
+	// The variable cannot be rewritten once the container exists, so while the
+	// driver may move the claim it must not name a cpuset. With defragmentation
+	// off the placement is fixed for the claim's lifetime and the cpuset is the
+	// truth.
+	d := &CPUDriver{defrag: defragOptions{enabled: true}}
+	require.Equal(t, "dynamic", d.cdiEnvValue(cpuset.New(0, 1)))
+
+	d.defrag.enabled = false
+	require.Equal(t, "0-1", d.cdiEnvValue(cpuset.New(0, 1)))
+}
