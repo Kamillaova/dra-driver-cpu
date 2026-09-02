@@ -67,11 +67,13 @@ DaemonSet.
 Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
-- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`, `GetDeviceCPUSet`
+- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`, `cdiSharedEnvVar`, `GetDeviceCPUSet`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `lastMoved`, `pendingRound` and
   `sharedPool` fields, the `Config.Defrag*` and `Config.SharedPoolCPUs` options, and
   `validateSharedPool`
+
+- `pkg/driver/dra_hooks.go`: `claimEnvEdits`
 
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`, `sharedContainerCPUs`, `guaranteedContainerCPUs`,
   `localSharedPool`

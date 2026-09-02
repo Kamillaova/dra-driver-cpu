@@ -185,7 +185,9 @@ on - is configured through other Helm values, not through this file.
   shared pool. Containers without a claim are pinned to it and never re-pinned as claims come and go;
   containers *with* claims get the pool CPUs of their claims' NUMA nodes appended, so a workload's
   auxiliary threads (a VM's iothreads, vhost workers) can be left to the kernel scheduler inside the
-  pool. The pool is excluded from device capacity, so no claim is ever placed on it.
+  pool — the driver also injects `DRA_SHARED_CPUS` naming that per-claim share, safe to read from the
+  environment precisely because the pool is static. The pool is excluded from device capacity, so no
+  claim is ever placed on it.
 - Explicit rather than driver-chosen, like `reservedCPUs` and the kubelet's `reservedSystemCPUs`:
   which CPUs to sacrifice is a per-node-pool fleet decision. The driver validates and states the cost
   — it refuses CPUs that do not exist, are offline, or overlap `reservedCPUs`; refuses a pool that
