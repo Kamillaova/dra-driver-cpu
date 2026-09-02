@@ -226,6 +226,13 @@
         "assumeUnsolicitedUpdatesSafe": {
           "type": "boolean"
         },
+        "cachePlacementPolicy": {
+          "type": "string",
+          "enum": [
+            "pack",
+            "spread"
+          ]
+        },
         "cpuDeviceMode": {
           "type": "string",
           "enum": [
