@@ -98,7 +98,7 @@ func (d *defragTestDriver) placeClaim(t *testing.T, claimUID types.UID, cpus cpu
 	logger := testr.New(t)
 	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpus, false))
 	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
-		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cpus.String()), cpus))
+		[]string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cpus.String())}, cpus))
 }
 
 // runContainer binds claims to a running container, as CreateContainer would.
@@ -386,7 +386,7 @@ func TestDefragPassKeepsTheDynamicEnvWhenItMovesAClaim(t *testing.T) {
 	claimUID := types.UID("claim-1")
 	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue)
 	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpuset.New(0, 4), false))
-	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), envVar, cpuset.New(0, 4)))
+	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), []string{envVar}, cpuset.New(0, 4)))
 	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", claimUID)
 
 	d.defragPass(context.Background())
@@ -737,7 +737,7 @@ func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
 	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpuset.New(0, 4), false))
 	// Exactly as Prepare writes it, with no Refresh afterwards.
 	require.NoError(t, realCDI.AddDevice(logger, getCDIDeviceName(claimUID),
-		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue), cpuset.New(0, 4)))
+		[]string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue)}, cpuset.New(0, 4)))
 	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", claimUID)
 
 	d.defragPass(context.Background())
