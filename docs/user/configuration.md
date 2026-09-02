@@ -214,6 +214,15 @@ on - is configured through other Helm values, not through this file.
   both. Requires `cpuDeviceMode: grouped`: in individual mode the scheduler names exact CPU devices
   and the driver picks nothing.
 
+`publishFitAnnotation` (bool, default: `false`)
+
+- Publish the shape of each NUMA node's free CPUs — per uncore cache, current and after the repack
+  the defragmenter would actually perform — as the `dra.cpu/fit` annotation on this driver's own
+  Node. The scheduler's view of a device is a free-capacity scalar that carries no shape, so this is
+  what the CCXAlign scheduler plugin scores nodes from. Updates are debounced
+  and skipped when unchanged; the chart grants `nodes` `patch` when this is enabled. Off by default:
+  the node-object writes are only worth it when that scheduler is deployed.
+
 `profiles` (map of string to profile, default: empty)
 
 - Named per-node overrides for the two fields that name CPUs: `reservedCPUs` and `sharedPoolCPUs`.
