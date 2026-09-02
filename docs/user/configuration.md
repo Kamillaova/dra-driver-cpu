@@ -139,6 +139,46 @@ on - is configured through other Helm values, not through this file.
 - Requires `assumeUnsolicitedUpdatesSafe` and is inert without it, so enabling that one
   option is enough.
 
+`defragEnabled` (bool, default: `false`)
+
+- Let the driver move a running claim onto different CPUs to recover uncore cache (CCX/L3)
+  alignment lost to claim churn, without restarting its container. A claim keeps its CPU
+  count and its NUMA footprint; only which CPUs back it change.
+- Requires `cpuDeviceMode: grouped` with `groupBy: numanode` or `socket`, because those
+  are the modes where the driver chooses a claim's CPUs in the first place: `individual`
+  mode has the scheduler pick exact per-CPU devices, and `groupBy: machine` takes the
+  cpuset from the claim's own opaque config.
+- Requires `assumeUnsolicitedUpdatesSafe`, since a move is pushed to the runtime
+  unprompted.
+- A structural no-op on nodes with one cache per NUMA node, where there is no spread to
+  recover.
+- Workloads must not read their CPUs from the `DRA_CPUSET_*` environment variable, whose
+  value is fixed when the container starts. With this option on, the variable's value is
+  the literal string `dynamic` instead of a cpuset, so a workload that parses it fails
+  loudly rather than pinning itself to CPUs its claim has left. Read
+  `sched_getaffinity(2)` or the container's own `cpuset.cpus.effective` instead. See
+  [How it Works](how-it-works.md).
+
+`defragIntervalSeconds` (int, default: `300`)
+
+- How often a defragmentation pass runs. Preparing or releasing a claim also triggers one,
+  so this is the backstop for a node nothing else disturbs.
+
+`defragMaxMovesPerPass` (int, default: `4`)
+
+- How many claims one pass may move, bounding how much of a node is disturbed at once. A
+  pass that reaches the cap leaves the rest to the next one.
+
+`defragMinGain` (int, default: `1`)
+
+- The smallest improvement worth moving anything for, counted in uncore caches needlessly
+  spanned across a node's claims. Raising it trades alignment for fewer moves.
+
+`defragClaimCooldownSeconds` (int, default: `600`)
+
+- How long a claim is left alone after being moved, so a workload is not re-homed
+  repeatedly while it settles. `0` disables the cooldown.
+
 #### Example
 
 ```yaml
