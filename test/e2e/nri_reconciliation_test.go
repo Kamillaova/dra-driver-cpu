@@ -120,7 +120,7 @@ var _ = ginkgo.Describe("NRI Reconciliation on Restart", ginkgo.Serial, ginkgo.O
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
 		driverConfig := getDriverConfig(ctx, fxt.K8SClientset)
-		staticPool := driverConfig.staticPool()
+		staticPool := driverConfig.effectiveFor(targetNode).staticPool()
 		pod1 := makeTesterPodWithExclusiveCPUClaim(fxt.Namespace.Name, dracpuTesterImage, createdClaimTemplate.Name, 2, targetNode.Name, driverConfig.PublishNodeAllocatableResourceMapping)
 		createdPod1, err := e2epod.CreateSync(ctx, fxt.K8SClientset, pod1)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
