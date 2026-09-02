@@ -88,8 +88,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   they pin, rather than kept apart
 
 Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/driver/defrag.go`, `reconcile.go`,
-`pkg/cpuinfo/coretopology.go`) are visible to `git diff --stat` on their own and are not repeated
-here.
+`placements.go`, `pkg/cpuinfo/coretopology.go`) are visible to `git diff --stat` on their own and
+are not repeated here.
 
 `CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
 placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
