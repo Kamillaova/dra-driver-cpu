@@ -1,0 +1,75 @@
+# The flexible, best-effort-placement VM class: a couple of whole cores, no
+# cache selector. The driver packs these into partially-used caches to keep
+# clean caches free for whole-cache claims, and the defragmenter may re-home
+# them while they run -- which the launcher handles by watching its own cpuset.
+# That mobility is this class's documented contract; workloads that cannot
+# tolerate it belong in the whole-cache class.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: vm-small-cpus
+spec:
+  spec:
+    devices:
+      requests:
+      - name: vcpus
+        exactly:
+          deviceClassName: dra.cpu
+          capacity:
+            requests:
+              # With fullPhysicalCPUsOnly the device publishes a requestPolicy
+              # whose step is the core size, so an odd request is rounded up by
+              # the scheduler: asking for 3 here would consume 4.
+              dra.cpu/cpu: "4"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vm-small
+spec:
+  restartPolicy: Never
+  containers:
+  - name: qemu
+    image: your-registry/qemu-launcher:latest
+    command: ["/scripts/launch-qemu.sh"]
+    env:
+    - name: VM_MEMORY_MB
+      value: "4096"
+    # No control carve-out: on a two-core VM a whole control core costs more
+    # than the jitter it removes, so QEMU's own threads share the vCPU CPUs.
+    # That trade is this class's to make; the whole-cache class pays the core.
+    - name: CONTROL_CPUS
+      value: "0"
+    resources:
+      requests:
+        memory: 1Gi
+        hugepages-2Mi: 4Gi
+      limits:
+        memory: 1Gi
+        hugepages-2Mi: 4Gi
+      claims:
+      - name: vcpus
+    volumeMounts:
+    - name: scripts
+      mountPath: /scripts
+    - name: hugepages
+      mountPath: /dev/hugepages
+    - name: kvm
+      mountPath: /dev/kvm
+    securityContext:
+      privileged: true
+  resourceClaims:
+  - name: vcpus
+    resourceClaimTemplateName: vm-small-cpus
+  volumes:
+  - name: scripts
+    configMap:
+      name: qemu-launcher
+      defaultMode: 0755
+  - name: hugepages
+    emptyDir:
+      medium: HugePages-2Mi
+  - name: kvm
+    hostPath:
+      path: /dev/kvm
+      type: CharDevice
