@@ -100,6 +100,7 @@ func (m *mockKubeletPlugin) Stop() {}
 
 type mockCdiMgr struct {
 	devices      map[string]string
+	cpusets      map[string]cpuset.CPUSet
 	addError     error
 	refreshError error
 	getError     error
@@ -110,6 +111,7 @@ type mockCdiMgr struct {
 func newMockCdiMgr() *mockCdiMgr {
 	return &mockCdiMgr{
 		devices: make(map[string]string),
+		cpusets: make(map[string]cpuset.CPUSet),
 	}
 }
 
@@ -121,12 +123,35 @@ func newMockCdiMgrWithAllocations(allocations map[types.UID]cpuset.CPUSet) *mock
 	return mgr
 }
 
-func (m *mockCdiMgr) AddDevice(_ logr.Logger, deviceName, envVar string) error {
+func (m *mockCdiMgr) AddDevice(_ logr.Logger, deviceName, envVar string, cpus cpuset.CPUSet) error {
 	if m.addError != nil {
 		return m.addError
 	}
 	m.devices[deviceName] = envVar
+	m.cpusets[deviceName] = cpus
 	return nil
+}
+
+func (m *mockCdiMgr) GetDeviceCPUSet(deviceName string) (cpuset.CPUSet, error) {
+	if m.getError != nil {
+		return cpuset.CPUSet{}, m.getError
+	}
+	if cpus, ok := m.cpusets[deviceName]; ok {
+		return cpus, nil
+	}
+	// Mirror the real manager's fallback for specs that predate the annotation.
+	env, ok := m.devices[deviceName]
+	if !ok {
+		return cpuset.CPUSet{}, fmt.Errorf("device %q not found", deviceName)
+	}
+	allocations, err := parseDRAEnvToClaimAllocations(logr.Discard(), []string{env})
+	if err != nil {
+		return cpuset.CPUSet{}, err
+	}
+	for _, cpus := range allocations {
+		return cpus, nil
+	}
+	return cpuset.CPUSet{}, fmt.Errorf("device %q records no placement", deviceName)
 }
 
 func (m *mockCdiMgr) Refresh() error {
@@ -150,6 +175,7 @@ func (m *mockCdiMgr) RemoveDevice(_ logr.Logger, deviceName string) error {
 		return m.removeError
 	}
 	delete(m.devices, deviceName)
+	delete(m.cpusets, deviceName)
 	return nil
 }
 
