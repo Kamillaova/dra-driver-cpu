@@ -169,9 +169,12 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		WriteTimeout:      10 * time.Second,
 	}
 
+	// A bind/serve failure here must be fatal, not merely logged, or the
+	// process silently serves nothing on this port until the next restart.
+	httpErr := make(chan error, 1)
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error(err, "HTTP server failed")
+			httpErr <- err
 		}
 	}()
 
@@ -235,6 +238,10 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	ready.Store(true)
 	logger.Info("driver started")
 
+	return waitForShutdown(ctx, stop, logger, server, asyncErr, httpErr)
+}
+
+func waitForShutdown(ctx context.Context, stop context.CancelFunc, logger logr.Logger, server *http.Server, asyncErr, httpErr <-chan error) error {
 	var fatalErr error
 
 	select {
@@ -246,6 +253,9 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	case err := <-asyncErr:
 		stop()
 		fatalErr = fmt.Errorf("NRI driver error: %w", err)
+	case err := <-httpErr:
+		stop()
+		fatalErr = fmt.Errorf("HTTP server error: %w", err)
 	}
 
 	// Gracefully shutdown HTTP server
