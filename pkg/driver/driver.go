@@ -349,7 +349,7 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	cp.nriPlugin = stub
 
 	go func() {
-		if err := runNRIPluginWithRetry(ctx, cp.nriPlugin, maxAttempts); err != nil && ctx.Err() == nil {
+		if err := runNRIPluginWithRetry(ctx, cp.nriPlugin, maxAttempts, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration); err != nil && ctx.Err() == nil {
 			logger.Error(err, "NRI plugin failed to be restarted", "maxAttempts", maxAttempts)
 			asyncErr <- err
 		}
@@ -430,19 +430,51 @@ type nriRunner interface {
 	Run(context.Context) error
 }
 
-func runNRIPluginWithRetry(ctx context.Context, plugin nriRunner, maxAttempts int) error {
+const (
+	nriRetryInitialBackoff     = 1 * time.Second
+	nriRetryMaxBackoff         = 30 * time.Second
+	nriRetryHealthyRunDuration = nriRetryMaxBackoff
+)
+
+// runNRIPluginWithRetry keeps plugin connected, backing off between attempts
+// so a down socket cannot burn through maxAttempts in microseconds. backoff
+// doubles on each failure up to maxBackoff; a connection lasting at least
+// healthyRunDuration resets both, so a past crash loop does not spend the
+// budget a fresh failure needs.
+func runNRIPluginWithRetry(ctx context.Context, plugin nriRunner, maxAttempts int, initialBackoff, maxBackoff, healthyRunDuration time.Duration) error {
 	logger := ctxlog.FromContext(ctx)
-	for i := range maxAttempts {
+	backoff := initialBackoff
+	attempts := 0
+	for {
+		started := time.Now()
 		err := plugin.Run(ctx)
 		if ctx.Err() != nil {
 			logger.Info("NRI plugin stopped", "reason", "context cancelled")
 			return ctx.Err()
 		}
+		if time.Since(started) >= healthyRunDuration {
+			attempts = 0
+			backoff = initialBackoff
+		}
+		attempts++
 		if err != nil {
-			logger.Error(err, "NRI plugin failed, restarting", "attempt", i+1, "maxAttempts", maxAttempts)
+			logger.Error(err, "NRI plugin failed, restarting", "attempt", attempts, "maxAttempts", maxAttempts, "backoff", backoff)
+		}
+		if attempts >= maxAttempts {
+			return fmt.Errorf("NRI plugin failed %d times within %s, giving up", attempts, healthyRunDuration)
+		}
+
+		select {
+		case <-ctx.Done():
+			logger.Info("NRI plugin stopped", "reason", "context cancelled")
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
 		}
 	}
-	return fmt.Errorf("NRI plugin failed for %d times to be restarted", maxAttempts)
 }
 
 // generateShortID generates a non-crypto safe unique ID in cases on which a full UUID would be a overkill.
