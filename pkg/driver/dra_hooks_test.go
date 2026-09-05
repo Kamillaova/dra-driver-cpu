@@ -658,6 +658,9 @@ func TestPrepareResourceClaimsSucceedsBeforePublishResources(t *testing.T) {
 
 			_, ok := driver.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
 			require.True(t, ok)
+
+			_, recorded := driver.claimTracker.ReservedFor(claimUID, "any-pod")
+			require.True(t, recorded, "a successfully prepared claim must record its reservation")
 		})
 	}
 }
@@ -980,6 +983,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 			},
 			cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 			podConfigStore:     store.NewPodConfig(),
+			claimTracker:       store.NewClaimTracker(),
 		}
 		if withExistingAllocation {
 			requirePreparedResourceClaim(t, logger, driver.cpuAllocationStore, claimUID, existingCPUs)
@@ -1002,6 +1006,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 			},
 			cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 			podConfigStore:     store.NewPodConfig(),
+			claimTracker:       store.NewClaimTracker(),
 		}
 		if withExistingAllocation {
 			requirePreparedResourceClaim(t, logger, driver.cpuAllocationStore, claimUID, existingCPUs)
@@ -1085,6 +1090,9 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 				require.True(t, tc.expectedExistingAllocation.Equals(gotCPUs), "claim cpus: got %s, want %s", gotCPUs, tc.expectedExistingAllocation)
 			}
 			require.True(t, tc.expectedSharedCPUs.Equals(tc.driver.cpuAllocationStore.GetSharedCPUs()), "shared cpus: got %s, want %s", tc.driver.cpuAllocationStore.GetSharedCPUs(), tc.expectedSharedCPUs)
+
+			_, recorded := tc.driver.claimTracker.ReservedFor(claimUID, "irrelevant-pod")
+			require.False(t, recorded, "a claim whose prepare failed must not leak a reservedFor record")
 		})
 	}
 }
@@ -1645,6 +1653,7 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 			cpuAllocationStore: cpuStore,
 			cdiMgr:             cdiMgr,
 			podConfigStore:     store.NewPodConfig(),
+			claimTracker:       store.NewClaimTracker(),
 		}, cpuStore, cdiMgr
 	}
 	makeNUMADriver := func(logger logr.Logger) (*CPUDriver, *store.CPUAllocation, *mockCdiMgr) {
@@ -1664,6 +1673,7 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 			cpuAllocationStore: cpuStore,
 			cdiMgr:             cdiMgr,
 			podConfigStore:     store.NewPodConfig(),
+			claimTracker:       store.NewClaimTracker(),
 		}, cpuStore, cdiMgr
 	}
 
@@ -2263,6 +2273,7 @@ func createCPUDriverForTest(t *testing.T, groupBy string, cpuInfos []cpuinfo.CPU
 	driver.topology.onlineCPUs = driver.topology.cpuTopology.CPUDetails.CPUs()
 	driver.cpuAllocationStore = store.NewCPUAllocation(driver.topology.cpuTopology, reservedCPUs)
 	driver.podConfigStore = store.NewPodConfig()
+	driver.claimTracker = store.NewClaimTracker()
 	for claimUID, cpus := range initialAllocations {
 		requirePreparedResourceClaim(t, logger, driver.cpuAllocationStore, claimUID, cpus)
 	}

@@ -117,6 +117,13 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, claimUIDs...); err != nil {
 					return nil, err
 				}
+				// This container is exactly as trustworthy a source as a fresh
+				// Prepare: CreateContainer's CRI-O fallback reads this to
+				// authenticate a container recreated after this driver
+				// restarts, on a runtime that never reports CDI devices.
+				for _, uid := range claimUIDs {
+					claimTracker.SetReservedFor(uid, []types.UID{types.UID(pod.Uid)})
+				}
 				allGuaranteedCPUs, err := cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
 				if err != nil {
 					return nil, err
@@ -374,6 +381,14 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		for _, entry := range entries {
 			if !claimInjectedByRuntime(reportedCDIDevices, entry.claimUID) {
 				return nil, nil, fmt.Errorf("container claims %q but the runtime injected no CDI device for it", entry.claimUID)
+			}
+			if reportedCDIDevices == nil {
+				// The runtime reports no CDI devices at all (CRI-O today); fall
+				// back to the claim's own API-server reservation, which a pod
+				// spec cannot forge the way it can a DRA_CPUSET_* env value.
+				if reserved, recorded := cp.claimTracker.ReservedFor(entry.claimUID, podUID); !reserved || !recorded {
+					return nil, nil, fmt.Errorf("container claims %q but the pod is not in its reservation", entry.claimUID)
+				}
 			}
 			claimUIDs = append(claimUIDs, entry.claimUID)
 		}

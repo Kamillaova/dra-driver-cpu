@@ -103,6 +103,11 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 		prepareResult := cpumetrics.ResultSuccess
 		if result[claim.UID].Err != nil {
 			prepareResult = cpumetrics.ResultError
+		} else {
+			// The API server's reservation cannot be forged by a pod spec the
+			// way a DRA_CPUSET_* env var can; CreateContainer falls back to
+			// this when the runtime reports no CDI devices at all.
+			cp.claimTracker.SetReservedFor(claim.UID, reservedForPodUIDs(claim))
 		}
 		cp.metricsRecorder().RecordPrepare(prepareResult, time.Since(start))
 		// CCX-FORK: a claim that just landed split across caches is exactly what a
@@ -126,6 +131,20 @@ func getCDIDeviceName(uid types.UID) string {
 func claimUIDFromDeviceName(name string) (types.UID, bool) {
 	uid, ok := strings.CutPrefix(name, "claim-")
 	return types.UID(uid), ok
+}
+
+// reservedForPodUIDs returns the pod UIDs claim.Status.ReservedFor names,
+// ignoring any non-pod consumer reference: this driver only ever compares
+// against a requesting pod's own UID.
+func reservedForPodUIDs(claim *resourceapi.ResourceClaim) []types.UID {
+	var podUIDs []types.UID
+	for _, consumer := range claim.Status.ReservedFor {
+		if consumer.Resource != "pods" {
+			continue
+		}
+		podUIDs = append(podUIDs, consumer.UID)
+	}
+	return podUIDs
 }
 
 // reserveResourceClaimAllocation records a new claim allocation while applying
