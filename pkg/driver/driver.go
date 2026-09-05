@@ -37,6 +37,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	drametadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
@@ -114,6 +115,15 @@ type CPUDriver struct {
 	reconcileSharedOnUnprepare bool
 	// defrag configures the defragmentation pass, and is zero when it is off.
 	defrag defragOptions
+	// sysfs is kept so a defragmentation pass can re-read which CPUs are online;
+	// the set read in New is only true of startup.
+	sysfs sysfs.FS
+	// lastMoved is when each claim was last moved, for the cooldown. Guarded by
+	// applyMu.
+	lastMoved map[types.UID]time.Time
+	// pendingRound is a set of moves the runtime never confirmed, held so the
+	// next pass can send it again. Guarded by applyMu.
+	pendingRound *defragRound
 	// applyMu serializes the work that decides which CPUs back a claim: the DRA
 	// prepare and unprepare hooks, the NRI hooks that read a placement or record
 	// container state, and the background worker's local phases. It also covers
@@ -258,6 +268,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		kubeletRootDir:          config.KubeletRootDir,
 	}
 	sfs := providers.EnsureSysFS()
+	plugin.sysfs = sfs
 
 	onlineCPUs, err := cpuinfo.OnlineCPUs(logger, sfs)
 	if err != nil {
@@ -305,7 +316,10 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 			minGain:       config.DefragMinGain,
 			claimCooldown: config.DefragClaimCooldown,
 		}
-		if plugin.reconcileSharedOnUnprepare {
+		if plugin.defrag.enabled {
+			plugin.lastMoved = make(map[types.UID]time.Time)
+		}
+		if plugin.reconcileSharedOnUnprepare || plugin.defrag.enabled {
 			plugin.reconcileTrigger = make(chan struct{}, 1)
 		}
 	} else {
