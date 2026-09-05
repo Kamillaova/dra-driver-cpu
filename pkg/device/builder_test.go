@@ -17,6 +17,8 @@ limitations under the License.
 package device_test
 
 import (
+	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -43,6 +45,7 @@ func fakeTopology() *cpuinfo.CPUTopology {
 			NUMANodeID:     socket,
 			NumaNodeCPUSet: cpuset.New(socket*2, socket*2+1),
 			SiblingCPUID:   -1,
+			SiblingCPUSet:  cpuset.New(cpu),
 		}
 	}
 	return &cpuinfo.CPUTopology{
@@ -135,4 +138,111 @@ func TestDeviceBuilderNodeAllocatableResourceMapping(t *testing.T) {
 			}
 		})
 	}
+}
+
+// wideSMTTopology returns a single-socket, single-NUMA topology of coresPerNode
+// cores with threadsPerCore threads each, numbered the way the kernel numbers a
+// real multi-way SMT part: thread t of core c is CPU c+t*coresPerNode (the AMD
+// EPYC n<->n+128 pattern generalised to more than two threads).
+func wideSMTTopology(coresPerNode, threadsPerCore int) *cpuinfo.CPUTopology {
+	details := cpuinfo.CPUDetails{}
+	for core := range coresPerNode {
+		siblings := make([]int, threadsPerCore)
+		for t := range threadsPerCore {
+			siblings[t] = core + t*coresPerNode
+		}
+		siblingSet := cpuset.New(siblings...)
+		for _, cpu := range siblings {
+			details[cpu] = cpuinfo.CPUInfo{
+				CpuID:         cpu,
+				CoreID:        core,
+				SocketID:      0,
+				NUMANodeID:    0,
+				SiblingCPUID:  -1,
+				SiblingCPUSet: siblingSet,
+			}
+		}
+	}
+	return &cpuinfo.CPUTopology{
+		NumCPUs: coresPerNode * threadsPerCore, NumCores: coresPerNode, NumSockets: 1, NumNUMANodes: 1,
+		SMTEnabled: threadsPerCore > 1, CPUDetails: details,
+	}
+}
+
+// devicesByCPU maps each published individual device to the CPU ID it names,
+// for asserting device-ID adjacency independent of publication order.
+func devicesByCPU(t *testing.T, devices []resourceapi.Device, cpuIDByDevice map[string]int) map[int]resourceapi.Device {
+	t.Helper()
+	byCPU := make(map[int]resourceapi.Device, len(devices))
+	for _, dev := range devices {
+		cpuID, ok := cpuIDByDevice[dev.Name]
+		require.True(t, ok, "device %q has no entry in the name-to-CPU map", dev.Name)
+		byCPU[cpuID] = dev
+	}
+	return byCPU
+}
+
+// deviceNum extracts the trailing "%03d" ordinal from a cpudevNNN device name.
+func deviceNum(t *testing.T, name string) int {
+	t.Helper()
+	var n int
+	_, err := fmt.Sscanf(name, device.CPUDevicePrefix+"%03d", &n)
+	require.NoError(t, err, "device name %q does not match %s%%03d", name, device.CPUDevicePrefix)
+	return n
+}
+
+func TestIndividualModeGroupsAllSiblingsOfAPhysicalCore(t *testing.T) {
+	tests := []struct {
+		name           string
+		threadsPerCore int
+	}{
+		{name: "SMT2", threadsPerCore: 2},
+		{name: "SMT4", threadsPerCore: 4},
+		{name: "SMT8 (POWER)", threadsPerCore: 8},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			topo := wideSMTTopology(2, tc.threadsPerCore)
+			devices, cpuIDByDevice := device.Build(topo, cpuset.New(), store.NewPCIeRootMapper(), false)
+			require.Len(t, devices, topo.NumCPUs)
+
+			byCPU := devicesByCPU(t, devices, cpuIDByDevice)
+			for core := range 2 {
+				var nums []int
+				for thread := range tc.threadsPerCore {
+					cpuID := core + thread*2
+					dev, ok := byCPU[cpuID]
+					require.True(t, ok, "no device published for CPU %d", cpuID)
+					nums = append(nums, deviceNum(t, dev.Name))
+				}
+				sort.Ints(nums)
+				for i := 1; i < len(nums); i++ {
+					require.Equal(t, nums[0]+i, nums[i],
+						"core %d's %d threads must get %d consecutive device IDs, got %v", core, tc.threadsPerCore, tc.threadsPerCore, nums)
+				}
+			}
+		})
+	}
+}
+
+func TestIndividualModeReservedSiblingLeavesRestOfCoreGrouped(t *testing.T) {
+	// A 4-way core with one thread reserved: the remaining three siblings must
+	// still get consecutive device IDs among themselves.
+	topo := wideSMTTopology(1, 4)
+	reserved := cpuset.New(0)
+
+	devices, cpuIDByDevice := device.Build(topo, reserved, store.NewPCIeRootMapper(), false)
+	require.Len(t, devices, 3)
+
+	byCPU := devicesByCPU(t, devices, cpuIDByDevice)
+	var nums []int
+	for _, cpuID := range []int{1, 2, 3} {
+		dev, ok := byCPU[cpuID]
+		require.True(t, ok, "no device published for CPU %d", cpuID)
+		nums = append(nums, deviceNum(t, dev.Name))
+	}
+	sort.Ints(nums)
+	require.Equal(t, []int{nums[0], nums[0] + 1, nums[0] + 2}, nums,
+		"the three unreserved siblings must still get consecutive device IDs, got %v", nums)
 }
