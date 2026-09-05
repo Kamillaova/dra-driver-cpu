@@ -262,6 +262,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		DefragMaxMovesPerPass:                 cfg.DefragMaxMovesPerPass,
 		DefragMinGain:                         cfg.DefragMinGain,
 		DefragClaimCooldown:                   time.Duration(cfg.DefragClaimCooldownSeconds) * time.Second,
+		PublishFitAnnotation:                  cfg.PublishFitAnnotation,
 		SharedPoolCPUs:                        sharedPoolCPUSet,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,

@@ -119,6 +119,8 @@ type CPUDriver struct {
 	reconcileSharedOnUnprepare bool
 	// defrag configures the defragmentation pass, and is zero when it is off.
 	defrag defragOptions
+	// fit configures publishing the node's free-CPU shape for a scheduler.
+	fit fitOptions
 	// sharedPool is the static shared pool, empty when the pool is dynamic. Its
 	// CPUs are folded into topology.reservedCPUs, so capacity, allocation and
 	// defragmentation all exclude them without knowing the pool exists; only
@@ -240,6 +242,10 @@ type Config struct {
 	DefragMinGain int
 	// DefragClaimCooldown is how long a claim is left alone after being moved.
 	DefragClaimCooldown time.Duration
+	// PublishFitAnnotation publishes the shape of each NUMA node's free CPUs as
+	// the dra.cpu/fit annotation on this driver's own Node, for a scheduler
+	// that aligns claims to uncore caches. Needs patch on nodes.
+	PublishFitAnnotation bool
 	// SharedPoolCPUs is the static shared pool, already parsed. Empty keeps the
 	// dynamic pool. Grouped mode only; disjointness from ReservedCPUs is checked
 	// by driverconfig, the topology-dependent checks by New.
@@ -353,9 +359,6 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		if plugin.defrag.enabled {
 			plugin.lastMoved = make(map[types.UID]time.Time)
 		}
-		if plugin.reconcileSharedOnUnprepare || plugin.defrag.enabled {
-			plugin.reconcileTrigger = make(chan struct{}, 1)
-		}
 	} else {
 		if config.ReconcileSharedOnUnprepare {
 			logger.V(2).Info("shared container reconcile is inert: set assumeUnsolicitedUpdatesSafe to enable it")
@@ -363,6 +366,18 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		if config.DefragEnabled {
 			logger.Info("defragmentation is inert: set assumeUnsolicitedUpdatesSafe to enable it")
 		}
+	}
+	// CCX-FORK: publishing is outside that assertion. It writes a node
+	// annotation and asks the runtime for nothing, so the hazard the assertion
+	// covers -- an update the runtime did not ask for -- does not arise. It
+	// does need the worker the other two run on.
+	plugin.fit = fitOptions{
+		enabled:  config.PublishFitAnnotation,
+		debounce: fitPublishDebounce,
+		resync:   fitResyncInterval,
+	}
+	if plugin.reconcileSharedOnUnprepare || plugin.defrag.enabled || plugin.fit.enabled {
+		plugin.reconcileTrigger = make(chan struct{}, 1)
 	}
 
 	var devices []resourceapi.Device
@@ -584,8 +599,17 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	}
 	cp.nriPlugin = stub
 	if cp.reconcileTrigger != nil {
-		cp.containerUpdater = stub
+		// CCX-FORK: only the features that push updates the runtime did not ask
+		// for get a handle to push them with.
+		if cp.reconcileSharedOnUnprepare || cp.defrag.enabled {
+			cp.containerUpdater = stub
+		}
 		go cp.runReconcileWorker(ctx)
+	}
+	// CCX-FORK: an annotation this driver is no longer keeping true is worse
+	// than none, and nothing else is going to notice it is there.
+	if !cp.fit.enabled {
+		go cp.clearFitAnnotation(ctx)
 	}
 
 	go func() {

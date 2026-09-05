@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+{{- $driverConfig := include "dra-driver-cpu.effectiveDriverConfig" . | fromYaml }}
 {{- if .Values.rbac.create }}
 ---
 kind: ClusterRole
@@ -26,6 +27,14 @@ rules:
       - nodes
     verbs:
       - get
+      {{- /* The fit annotation goes on the driver's own Node, and removing a
+             stale one needs the same verb. Granted only while it is being
+             published: otherwise every cluster running this driver hands a
+             node agent write access to every Node object for a feature it is
+             not using. */ -}}
+      {{- if ($driverConfig).publishFitAnnotation }}
+      - patch
+      {{- end }}
   - apiGroups:
       - resource.k8s.io
     resources:

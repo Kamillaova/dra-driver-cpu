@@ -158,6 +158,19 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	cp.cpuAllocationStore = cpuAllocationStore
 	cp.claimTracker = claimTracker
 	cp.refreshAllocationMetrics()
+	// CCX-FORK: only now does the store describe what is actually running.
+	// Published from the empty store the driver starts with, the fit annotation
+	// would advertise every CPU on a busy node as free.
+	//
+	// Poking the worker is what gets the first one out: nothing else would, on
+	// a node whose claims are not changing, until the resync fires a minute
+	// later -- and a node that has just joined, or one whose claims were
+	// released while its driver was down, would be described wrongly for that
+	// whole minute. Non-blocking, so holding the lock here is safe.
+	cp.fit.synchronized = true
+	if cp.fit.enabled {
+		cp.requestReconcile()
+	}
 
 	// Reconcile container CPU masks to handle cases where the NRI plugin might have crashed
 	// or restarted and missed updating the cgroup settings.
