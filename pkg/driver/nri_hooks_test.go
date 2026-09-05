@@ -1043,6 +1043,48 @@ func TestNRISynchronize(t *testing.T) {
 	}
 }
 
+func TestSynchronizeRestoresClaimReservationsForCreateContainer(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}
+	topo, _ := mockProvider.GetCPUTopology(logger)
+
+	pod := &api.PodSandbox{Id: "pod-id-1", Name: "my-pod", Namespace: "my-ns", Uid: "pod-uid-1"}
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+			"claim-A": cpuset.New(0, 1),
+		}),
+		topology: deviceTopology{cpuTopology: topo},
+	}
+	runtimeCtrs := []*api.Container{
+		{Id: "p1-guaranteed", PodSandboxId: pod.Id, Name: "guaranteed-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+	}
+
+	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod}, runtimeCtrs)
+	require.NoError(t, err)
+
+	// This is what CreateContainer's CRI-O fallback (nil reportedCDIDevices)
+	// reads, on a container recreated after a driver restart with no fresh
+	// Prepare in between.
+	reserved, recorded := driver.claimTracker.ReservedFor("claim-A", types.UID(pod.Uid))
+	require.True(t, recorded)
+	require.True(t, reserved)
+
+	reserved, recorded = driver.claimTracker.ReservedFor("claim-A", types.UID("some-other-pod"))
+	require.True(t, recorded)
+	require.False(t, reserved)
+
+	_, recorded = driver.claimTracker.ReservedFor("claim-never-seen", types.UID(pod.Uid))
+	require.False(t, recorded)
+}
+
 func TestStopContainerKeepsClaimOutOfSharedPoolUntilUnprepare(t *testing.T) {
 	logger := testr.New(t)
 	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)

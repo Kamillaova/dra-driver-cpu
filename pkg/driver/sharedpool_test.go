@@ -107,6 +107,7 @@ func TestSharedPoolPinsClaimlessContainersConstantly(t *testing.T) {
 func TestSharedPoolAppendsOnlyTheClaimsNUMANodesPool(t *testing.T) {
 	d := newSharedPoolTestDriver(t)
 	d.placeClaim(t, "claim-1", cpuset.New(0, 8))
+	d.claimTracker.SetReservedFor("claim-1", []types.UID{"pod-uid-g"})
 	pod := &api.PodSandbox{Id: "pod-g", Uid: "pod-uid-g", Name: "vm", Namespace: "ns"}
 	ctr := &api.Container{
 		Id: "ctr-g", PodSandboxId: pod.Id, Name: "vm-ctr",
