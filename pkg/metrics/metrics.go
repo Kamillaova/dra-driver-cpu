@@ -91,6 +91,7 @@ type Recorder interface {
 	RecordDefragPass(result Result, duration time.Duration)
 	RecordDefragMoves(result Result, count int)
 	RecordDefragBlockedMoves(count int)
+	RecordSynchronizeSkippedClaim()
 }
 
 // Metrics owns all custom Prometheus collectors for the CPU driver.
@@ -110,6 +111,8 @@ type Metrics struct {
 	defragMoves                   *prometheus.CounterVec
 	defragBlockedMoves            prometheus.Counter
 	defragPassDurationSecondsHist prometheus.Histogram
+
+	synchronizeSkippedClaims prometheus.Counter
 }
 
 type metricKind string
@@ -207,6 +210,11 @@ var (
 		help:    "Duration of defragmentation passes in seconds.",
 		buckets: prometheus.DefBuckets,
 	}
+	synchronizeSkippedClaimsSpec = metricSpec{
+		name: "dra_cpu_synchronize_skipped_claims_total",
+		kind: metricCounter,
+		help: "Total number of claims or containers Synchronize could not adopt from the runtime's reported state, skipped rather than aborting the whole call.",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -224,6 +232,7 @@ var metricSpecs = []metricSpec{
 	defragMovesSpec,
 	defragBlockedMovesSpec,
 	defragPassDurationSpec,
+	synchronizeSkippedClaimsSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -270,6 +279,8 @@ func New(reg prometheus.Registerer) *Metrics {
 		defragMoves:                   newCounterVec(defragMovesSpec),
 		defragBlockedMoves:            newCounter(defragBlockedMovesSpec),
 		defragPassDurationSecondsHist: newHistogram(defragPassDurationSpec),
+
+		synchronizeSkippedClaims: newCounter(synchronizeSkippedClaimsSpec),
 	}
 
 	reg.MustRegister(
@@ -287,6 +298,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragMoves,
 		m.defragBlockedMoves,
 		m.defragPassDurationSecondsHist,
+		m.synchronizeSkippedClaims,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -382,6 +394,10 @@ func (m *Metrics) RecordDefragBlockedMoves(count int) {
 	m.defragBlockedMoves.Add(float64(count))
 }
 
+func (m *Metrics) RecordSynchronizeSkippedClaim() {
+	m.synchronizeSkippedClaims.Inc()
+}
+
 type noopRecorder struct{}
 
 // Noop returns a recorder that discards all metric observations.
@@ -397,3 +413,4 @@ func (noopRecorder) SetDefragState(DefragState)             {}
 func (noopRecorder) RecordDefragPass(Result, time.Duration) {}
 func (noopRecorder) RecordDefragMoves(Result, int)          {}
 func (noopRecorder) RecordDefragBlockedMoves(int)           {}
+func (noopRecorder) RecordSynchronizeSkippedClaim()         {}

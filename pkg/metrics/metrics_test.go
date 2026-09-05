@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 14)
+	require.Len(t, descriptors, 15)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -55,12 +55,14 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_moves_total",
 		"dra_cpu_defrag_blocked_moves_total",
 		"dra_cpu_defrag_pass_duration_seconds",
+		"dra_cpu_synchronize_skipped_claims_total",
 	}, names)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
 	require.Equal(t, []string{"numa_node"}, descriptors[9].Labels)
 	require.Equal(t, []string{"result"}, descriptors[10].Labels)
 	require.Equal(t, []string{"result"}, descriptors[11].Labels)
+	require.Empty(t, descriptors[14].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -102,6 +104,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_prepare_claims_total",
 		"dra_cpu_reserved_cpus",
 		"dra_cpu_resource_claims_active",
+		"dra_cpu_synchronize_skipped_claims_total",
 		"dra_cpu_unprepare_claims_total",
 	}, names)
 }
@@ -149,6 +152,7 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordDefragPass(ResultSuccess, time.Second)
 	m.RecordDefragMoves(ResultSuccess, 1)
 	m.RecordDefragBlockedMoves(1)
+	m.RecordSynchronizeSkippedClaim()
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -189,6 +193,7 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.RecordDefragPass(ResultSuccess, time.Second)
 		recorder.RecordDefragMoves(ResultError, 2)
 		recorder.RecordDefragBlockedMoves(3)
+		recorder.RecordSynchronizeSkippedClaim()
 	})
 }
 
@@ -243,4 +248,16 @@ func TestDefragMetrics(t *testing.T) {
 	m.RecordDefragBlockedMoves(0)
 	require.InDelta(t, 2, testutil.ToFloat64(m.defragMoves.WithLabelValues(ResultSuccess.String())), 0.01)
 	require.InDelta(t, 4, testutil.ToFloat64(m.defragBlockedMoves), 0.01)
+}
+
+func TestSynchronizeSkippedClaimsMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	require.InDelta(t, 0, testutil.ToFloat64(m.synchronizeSkippedClaims), 0.01)
+
+	m.RecordSynchronizeSkippedClaim()
+	m.RecordSynchronizeSkippedClaim()
+
+	require.InDelta(t, 2, testutil.ToFloat64(m.synchronizeSkippedClaims), 0.01)
 }

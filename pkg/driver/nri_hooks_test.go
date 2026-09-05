@@ -956,6 +956,74 @@ func TestNRISynchronize(t *testing.T) {
 			},
 			expectedRefreshCalls: 1,
 		},
+		{
+			// Two distinct claims whose driver-owned CDI specs record the same
+			// CPUs: an inconsistency in the runtime's reported state, not
+			// something that should cost every other pod and container a
+			// driver until the runtime gives up retrying the whole call.
+			name: "a claim overlapping an earlier one during synchronize is skipped, not fatal",
+			driver: &CPUDriver{
+				podConfigStore:     store.NewPodConfig(),
+				cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+				claimTracker:       store.NewClaimTracker(),
+				cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+					"claim-A": cpuset.New(0, 1),
+					"claim-B": cpuset.New(0, 1),
+				}),
+				topology: deviceTopology{cpuTopology: topo},
+			},
+			runtimePods: []*api.PodSandbox{pod1, pod2},
+			runtimeCtrs: []*api.Container{
+				{Id: "p1-guaranteed", PodSandboxId: pod1.Id, Name: "guaranteed-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+				{Id: "p2-guaranteed", PodSandboxId: pod2.Id, Name: "guaranteed-ctr", Env: []string{fmt.Sprintf("%s_claim-B=%s", cdiEnvVarPrefix, "0,1")}},
+			},
+			expectedUpdates: []*api.ContainerUpdate{
+				{
+					ContainerId: "p1-guaranteed",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1"}}},
+				},
+				{
+					// claim-B lost the race for 0-1 and is skipped, so its
+					// container is treated as unclaimed and falls back to the
+					// shared pool rather than the call failing outright.
+					ContainerId: "p2-guaranteed",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "2-7"}}},
+				},
+			},
+			expectedRefreshCalls: 1,
+		},
+		{
+			// The same claim named by two different containers: whichever is
+			// processed second loses claimTracker's ownership check. Also an
+			// inconsistency in the runtime's reported state, and also must not
+			// fail every other pod and container being synchronized.
+			name: "a claim already owned by a different container during synchronize is skipped, not fatal",
+			driver: &CPUDriver{
+				podConfigStore:     store.NewPodConfig(),
+				cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+				claimTracker:       store.NewClaimTracker(),
+				cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+					"claim-A": cpuset.New(0, 1),
+				}),
+				topology: deviceTopology{cpuTopology: topo},
+			},
+			runtimePods: []*api.PodSandbox{pod1, pod2},
+			runtimeCtrs: []*api.Container{
+				{Id: "p1-first-owner", PodSandboxId: pod1.Id, Name: "first-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+				{Id: "p2-second-owner", PodSandboxId: pod2.Id, Name: "second-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+			},
+			expectedUpdates: []*api.ContainerUpdate{
+				{
+					ContainerId: "p1-first-owner",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1"}}},
+				},
+				{
+					ContainerId: "p2-second-owner",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "2-7"}}},
+				},
+			},
+			expectedRefreshCalls: 1,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1015,6 +1083,48 @@ func TestSynchronizeRestoresClaimReservationsForCreateContainer(t *testing.T) {
 
 	_, recorded = driver.claimTracker.ReservedFor("claim-never-seen", types.UID(pod.Uid))
 	require.False(t, recorded)
+}
+
+func TestSynchronizeDoesNotReserveForAContainerThatLosesTheOwnershipRace(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}
+	topo, _ := mockProvider.GetCPUTopology(logger)
+
+	pod1 := &api.PodSandbox{Id: "pod-id-1", Name: "my-pod-1", Namespace: "my-ns", Uid: "pod-uid-1"}
+	pod2 := &api.PodSandbox{Id: "pod-id-2", Name: "my-pod-2", Namespace: "my-ns", Uid: "pod-uid-2"}
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+			"claim-A": cpuset.New(0, 1),
+		}),
+		topology: deviceTopology{cpuTopology: topo},
+	}
+	runtimeCtrs := []*api.Container{
+		{Id: "p1-first-owner", PodSandboxId: pod1.Id, Name: "first-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+		{Id: "p2-second-owner", PodSandboxId: pod2.Id, Name: "second-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+	}
+
+	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod1, pod2}, runtimeCtrs)
+	require.NoError(t, err)
+
+	reserved, recorded := driver.claimTracker.ReservedFor("claim-A", types.UID(pod1.Uid))
+	require.True(t, recorded)
+	require.True(t, reserved)
+
+	// pod2's container named the same claim but lost the ownership race, so it
+	// must not be credited as a reserved consumer -- or a runtime that reports
+	// no CDI devices at all would let it authenticate against a claim it never
+	// legitimately held.
+	reserved, recorded = driver.claimTracker.ReservedFor("claim-A", types.UID(pod2.Uid))
+	require.True(t, recorded)
+	require.False(t, reserved)
 }
 
 func TestStopContainerKeepsClaimOutOfSharedPoolUntilUnprepare(t *testing.T) {

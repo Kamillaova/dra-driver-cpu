@@ -102,28 +102,40 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					caLogger.V(2).Info("container was created for a cpuset the claim has since left, converging",
 						"createdWithCPUs", entry.cpus.String(), "desiredCPUs", desired.String())
 				}
-				// Synchronize restores an allocation that already exists in the runtime;
-				// the shared-pool guard applies only to new reservations.
+				// An overlapping claim rebuilt earlier in this call must not fail
+				// the whole synchronize; skip it instead of leaving every other pod
+				// and container on the node without a driver.
 				if err := cpuAllocationStore.ReserveResourceClaimAllocation(caLogger, uid, desired, false); err != nil {
-					return nil, err
+					caLogger.Error(err, "skipping claim with an allocation inconsistent with an earlier one during synchronize")
+					cp.metricsRecorder().RecordSynchronizeSkippedClaim()
+					continue
 				}
 				claimUIDs = append(claimUIDs, uid)
+			}
+
+			if len(claimUIDs) > 0 {
+				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, claimUIDs...); err != nil {
+					// An inconsistency in the runtime's own reported state, not a
+					// reason to fail every other pod and container being
+					// synchronized: treat this container as unclaimed instead.
+					cLogger.Error(err, "treating container as unclaimed: its claim ownership conflicts with an earlier one during synchronize")
+					cp.metricsRecorder().RecordSynchronizeSkippedClaim()
+					claimUIDs = nil
+				} else {
+					// This container is exactly as trustworthy a source as a fresh
+					// Prepare: CreateContainer's CRI-O fallback reads this to
+					// authenticate a container recreated after this driver
+					// restarts, on a runtime that never reports CDI devices.
+					for _, uid := range claimUIDs {
+						claimTracker.SetReservedFor(uid, []types.UID{types.UID(pod.Uid)})
+					}
+				}
 			}
 
 			var state *store.ContainerState
 			if len(claimUIDs) == 0 {
 				state = store.NewContainerState(container.GetName(), containerUID)
 			} else {
-				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, claimUIDs...); err != nil {
-					return nil, err
-				}
-				// This container is exactly as trustworthy a source as a fresh
-				// Prepare: CreateContainer's CRI-O fallback reads this to
-				// authenticate a container recreated after this driver
-				// restarts, on a runtime that never reports CDI devices.
-				for _, uid := range claimUIDs {
-					claimTracker.SetReservedFor(uid, []types.UID{types.UID(pod.Uid)})
-				}
 				allGuaranteedCPUs, err := cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
 				if err != nil {
 					return nil, err
