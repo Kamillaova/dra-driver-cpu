@@ -99,6 +99,16 @@ type CPUDriver struct {
 	devicesPerResourceSlice int
 	metrics                 cpumetrics.Recorder
 	health                  healthTracker
+	// containerUpdater pushes unsolicited container updates. Nil until Start
+	// registers the NRI plugin, and left nil when the operator has not asserted
+	// the runtime tolerates such updates.
+	containerUpdater containerUpdater
+	// reconcileTrigger carries coalesced reconcile requests to the worker
+	// goroutine. Nil when no feature needs it.
+	reconcileTrigger chan struct{}
+	// reconcileSharedOnUnprepare widens shared containers as soon as a claim is
+	// released rather than at their next lifecycle event.
+	reconcileSharedOnUnprepare bool
 
 	kubeletRootDir string
 }
@@ -174,6 +184,12 @@ type Config struct {
 	// FullPhysicalCPUsOnly allocates whole physical cores, so a core's SMT siblings are never split
 	// between two claims or between a claim and the shared pool. Grouped mode only.
 	FullPhysicalCPUsOnly bool
+	// AssumeUnsolicitedUpdatesSafe permits pushing container updates the runtime did not ask for.
+	// Required by every feature that reacts without waiting for a container lifecycle event.
+	AssumeUnsolicitedUpdatesSafe bool
+	// ReconcileSharedOnUnprepare widens shared containers onto released CPUs immediately.
+	// Requires AssumeUnsolicitedUpdatesSafe.
+	ReconcileSharedOnUnprepare bool
 }
 
 func (cfg Config) DevicesPerResourceSlice() int {
@@ -246,6 +262,17 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		if err := validateReservedCPUsAlignment(topo, config.ReservedCPUs); err != nil {
 			return nil, err
 		}
+	}
+
+	// Unsolicited updates deadlock runtimes with a pre-nri#301 Adaptation, and
+	// the driver cannot tell from the handshake, so the operator asserts it.
+	if config.AssumeUnsolicitedUpdatesSafe {
+		plugin.reconcileSharedOnUnprepare = config.ReconcileSharedOnUnprepare
+		if plugin.reconcileSharedOnUnprepare {
+			plugin.reconcileTrigger = make(chan struct{}, 1)
+		}
+	} else if config.ReconcileSharedOnUnprepare {
+		logger.V(2).Info("shared container reconcile is inert: set assumeUnsolicitedUpdatesSafe to enable it")
 	}
 
 	var devices []resourceapi.Device
@@ -412,6 +439,10 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, fmt.Errorf("failed to create plugin stub: %w", err)
 	}
 	cp.nriPlugin = stub
+	if cp.reconcileTrigger != nil {
+		cp.containerUpdater = stub
+		go cp.runReconcileWorker(ctx)
+	}
 
 	go func() {
 		if err := runNRIPluginWithRetry(ctx, cp.nriPlugin, maxAttempts); err != nil && ctx.Err() == nil {
