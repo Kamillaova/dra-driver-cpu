@@ -147,7 +147,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				guaranteedUpdate := &api.ContainerUpdate{
 					ContainerId: container.GetId(),
 				}
-				guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
+				guaranteedUpdate.SetLinuxCPUSetCPUs(cp.guaranteedContainerCPUs(allGuaranteedCPUs).String())
 				containerUpdates = append(containerUpdates, guaranteedUpdate)
 			}
 			podConfigStore.SetContainerState(types.UID(pod.GetUid()), state)
@@ -269,16 +269,50 @@ func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types
 	return allocations, nil
 }
 
+// sharedContainerCPUs is the mask a container without a claim is confined to:
+// the static pool when one is configured, otherwise whatever the claims have
+// left over.
+//
+// CCX-FORK: upstream has only the dynamic pool.
+func (cp *CPUDriver) sharedContainerCPUs() cpuset.CPUSet {
+	if !cp.sharedPool.IsEmpty() {
+		return cp.sharedPool
+	}
+	return cp.cpuAllocationStore.GetSharedCPUs()
+}
+
+// guaranteedContainerCPUs is the mask a container holding claims is pinned to:
+// the claims' CPUs plus, when a static pool is configured, the pool CPUs of the
+// NUMA nodes those claims occupy -- so the workload's auxiliary threads can be
+// left to the kernel scheduler in the local pool while its pinned threads keep
+// the exclusive CPUs. A move preserves a claim's per-NUMA footprint, so this
+// share is stable for the claim's lifetime.
+//
+// CCX-FORK: upstream pins to the claims' CPUs alone.
+func (cp *CPUDriver) guaranteedContainerCPUs(claimCPUs cpuset.CPUSet) cpuset.CPUSet {
+	return claimCPUs.Union(cp.localSharedPool(claimCPUs))
+}
+
+// localSharedPool is the static pool restricted to the NUMA nodes cpus occupy.
+func (cp *CPUDriver) localSharedPool(cpus cpuset.CPUSet) cpuset.CPUSet {
+	if cp.sharedPool.IsEmpty() {
+		return cp.sharedPool
+	}
+	details := cp.topology.cpuTopology.CPUDetails
+	return cp.sharedPool.Intersection(details.CPUsInNUMANodes(details.KeepOnly(cpus).NUMANodes().List()...))
+}
+
 func (cp *CPUDriver) getSharedContainerUpdates(logger logr.Logger, excludeID types.UID) ([]*api.ContainerUpdate, error) {
 	updates := []*api.ContainerUpdate{}
-	sharedCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+	sharedCPUs := cp.sharedContainerCPUs()
 	preparedCPUs := cp.cpuAllocationStore.GetPreparedCPUs()
 	sharedCPUContainers := cp.podConfigStore.GetContainersWithSharedCPUs()
 	// An empty CPUSet is serialized by NRI as Cpus="", which means "do not
 	// change the current CPUSet" rather than "clear the CPUSet". Never emit
 	// that update while a prepared DRA allocation has exhausted the pool and
 	// shared containers still exist. An empty pool with no prepared allocation
-	// is valid when the node has no driver-managed CPUs.
+	// is valid when the node has no driver-managed CPUs; a static pool cannot be
+	// emptied by claims at all.
 	if sharedCPUs.IsEmpty() && !preparedCPUs.IsEmpty() && len(sharedCPUContainers) > 0 {
 		return nil, fmt.Errorf("cannot update shared containers: no shared CPUs available")
 	}
@@ -321,7 +355,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 
 	if len(entries) == 0 {
 		// This is a shared container.
-		sharedCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+		sharedCPUs := cp.sharedContainerCPUs()
 		if sharedCPUs.IsEmpty() && !cp.cpuAllocationStore.GetPreparedCPUs().IsEmpty() {
 			// NRI cannot represent an empty CPUSet as a ContainerAdjustment. Fail
 			// closed instead of allowing the runtime to keep its default affinity.
@@ -368,7 +402,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		}
 		logger.V(2).Info("guaranteed CPUs found", "cpus", guaranteedCPUs.String())
 		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...)
-		adjust.SetLinuxCPUSetCPUs(guaranteedCPUs.String())
+		adjust.SetLinuxCPUSetCPUs(cp.guaranteedContainerCPUs(guaranteedCPUs).String())
 		// A new owner means this is the first CreateContainer after Prepare, so
 		// existing shared containers must be moved off the newly claimed CPUs.
 		// On restart the owner already exists and no shared-container updates are
