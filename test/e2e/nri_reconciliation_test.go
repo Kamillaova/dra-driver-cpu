@@ -120,6 +120,7 @@ var _ = ginkgo.Describe("NRI Reconciliation on Restart", ginkgo.Serial, ginkgo.O
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
 		driverConfig := getDriverConfig(ctx, fxt.K8SClientset)
+		staticPool := driverConfig.staticPool()
 		pod1 := makeTesterPodWithExclusiveCPUClaim(fxt.Namespace.Name, dracpuTesterImage, createdClaimTemplate.Name, 2, targetNode.Name, driverConfig.PublishNodeAllocatableResourceMapping)
 		createdPod1, err := e2epod.CreateSync(ctx, fxt.K8SClientset, pod1)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
@@ -127,7 +128,7 @@ var _ = ginkgo.Describe("NRI Reconciliation on Restart", ginkgo.Serial, ginkgo.O
 		ginkgo.By("Verifying Pod 1 has correct exclusive CPU mask")
 		alloc1 := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, createdPod1)
 		fxt.Log.Info("Pod 1 CPU allocation", "cpuAssigned", alloc1.CPUAssigned.String())
-		gomega.Expect(alloc1.CPUAssigned).To(cpusetmatchers.HaveSize(2), "Pod 1 did not get exclusive CPUs")
+		gomega.Expect(alloc1.CPUAssigned.Difference(staticPool)).To(cpusetmatchers.HaveSize(2), "Pod 1 did not get exclusive CPUs")
 		exclusiveCPUs := alloc1.CPUAssigned
 
 		ginkgo.By("Stopping cpu dra driver pod on target node")
@@ -251,7 +252,7 @@ var _ = ginkgo.Describe("NRI Reconciliation on Restart", ginkgo.Serial, ginkgo.O
 			alloc2Updated := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, createdPod2)
 			fxt.Log.Info("Pod 2 CPU allocation (after NRI recovery)", "cpuAssigned", alloc2Updated.CPUAssigned.String())
 			// pod2 must NOT contain the exclusive CPUs now
-			g.Expect(alloc2Updated.CPUAssigned).To(cpusetmatchers.HaveNoOverlapWith(exclusiveCPUs), "Pod 2 still has access to exclusive CPUs")
+			g.Expect(alloc2Updated.CPUAssigned).To(cpusetmatchers.HaveNoOverlapWith(exclusiveCPUs.Difference(staticPool)), "Pod 2 still has access to exclusive CPUs")
 		}, pollTimeoutRule, pollIntervalRule).Should(gomega.Succeed(), "timed out waiting for Pod 2 CPU mask update")
 	})
 })

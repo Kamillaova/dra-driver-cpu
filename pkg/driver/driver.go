@@ -115,6 +115,11 @@ type CPUDriver struct {
 	reconcileSharedOnUnprepare bool
 	// defrag configures the defragmentation pass, and is zero when it is off.
 	defrag defragOptions
+	// sharedPool is the static shared pool, empty when the pool is dynamic. Its
+	// CPUs are folded into topology.reservedCPUs, so capacity, allocation and
+	// defragmentation all exclude them without knowing the pool exists; only
+	// the code that pins containers tells the two reservations apart.
+	sharedPool cpuset.CPUSet
 	// sysfs is kept so a defragmentation pass can re-read which CPUs are online;
 	// the set read in New is only true of startup.
 	sysfs sysfs.FS
@@ -228,6 +233,10 @@ type Config struct {
 	DefragMinGain int
 	// DefragClaimCooldown is how long a claim is left alone after being moved.
 	DefragClaimCooldown time.Duration
+	// SharedPoolCPUs is the static shared pool, already parsed. Empty keeps the
+	// dynamic pool. Grouped mode only; disjointness from ReservedCPUs is checked
+	// by driverconfig, the topology-dependent checks by New.
+	SharedPoolCPUs cpuset.CPUSet
 }
 
 func (cfg Config) DevicesPerResourceSlice() int {
@@ -292,7 +301,21 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		}
 	}
 
-	plugin.cpuAllocationStore = store.NewCPUAllocation(plugin.topology.cpuTopology, config.ReservedCPUs)
+	// CCX-FORK: the static shared pool is validated against the node and then
+	// folded into the effective reserved set, so device capacity, allocation and
+	// the defragmenter all exclude it as if the operator had reserved it -- while
+	// the container-pinning code still tells the pool apart from the truly
+	// reserved CPUs, which no workload may ever run on.
+	if !config.SharedPoolCPUs.IsEmpty() {
+		if err := validateSharedPool(logger, topo, onlineCPUs, config); err != nil {
+			return nil, err
+		}
+		plugin.sharedPool = config.SharedPoolCPUs
+		plugin.topology.reservedCPUs = config.ReservedCPUs.Union(plugin.sharedPool)
+		logger.Info("dedicated a static shared pool", "cpus", plugin.sharedPool.String())
+	}
+
+	plugin.cpuAllocationStore = store.NewCPUAllocation(plugin.topology.cpuTopology, plugin.topology.reservedCPUs)
 	plugin.refreshAllocationMetrics()
 	plugin.podConfigStore = store.NewPodConfig()
 
@@ -399,6 +422,56 @@ func numaNodeThreadsPerCore(topo *cpuinfo.CPUTopology, groupBy string, nameToID,
 		}
 	}
 	return byNUMANode
+}
+
+// validateSharedPool checks the pool against the node the driver stands on:
+// the config-file checks that need no topology already ran in driverconfig.
+//
+// Existence and onlineness are hard failures, since pinning a container to a
+// CPU the kernel does not run is refused by the kernel. A pool splitting a
+// physical core is a hard failure only under whole-core allocation, whose
+// promise -- no core's siblings split between a claim and the shared pool -- it
+// would break outright; otherwise it costs the same SMT interference that mode
+// exists to prevent, and is warned about. The caches the pool spoils for
+// whole-cache claims are stated rather than judged: which CPUs to sacrifice is
+// the operator's call.
+func validateSharedPool(logger logr.Logger, topo *cpuinfo.CPUTopology, onlineCPUs cpuset.CPUSet, config *Config) error {
+	pool := config.SharedPoolCPUs
+	if unknown := pool.Difference(topo.CPUDetails.CPUs()); !unknown.IsEmpty() {
+		return fmt.Errorf("sharedPoolCPUs %q names CPUs this node does not have: %s", pool.String(), unknown.String())
+	}
+	if offline := pool.Difference(onlineCPUs); !offline.IsEmpty() {
+		return fmt.Errorf("sharedPoolCPUs %q names offline CPUs: %s", pool.String(), offline.String())
+	}
+
+	if split := pool.Difference(topo.CPUDetails.CompleteCores(pool)); !split.IsEmpty() {
+		// The sibling is outside the pool: either allocatable, so shared
+		// workloads would SMT-contend an exclusive claim, or reserved, which is
+		// merely wasteful.
+		if config.FullPhysicalCPUsOnly {
+			return fmt.Errorf("sharedPoolCPUs %q splits physical cores on %s, which fullPhysicalCPUsOnly promises never happens between the shared pool and a claim",
+				pool.String(), split.String())
+		}
+		logger.Info("sharedPoolCPUs splits physical cores; shared workloads will SMT-contend whatever runs on the siblings",
+			"cpus", split.String())
+	}
+
+	for _, numaNodeID := range topo.CPUDetails.NUMANodes().List() {
+		if pool.Intersection(topo.CPUDetails.CPUsInNUMANodes(numaNodeID)).IsEmpty() {
+			logger.Info("NUMA node has no shared pool CPUs; claims there get no local pool appended", "numaNode", numaNodeID)
+		}
+	}
+
+	// State the cost in the unit that matters: every cache the pool touches can
+	// never again be handed to a whole-cache claim.
+	spoiled := map[int]struct{}{}
+	for _, cpuID := range pool.UnsortedList() {
+		if info, ok := topo.CPUDetails[cpuID]; ok && info.UncoreCacheID != -1 {
+			spoiled[info.UncoreCacheID] = struct{}{}
+		}
+	}
+	logger.Info("shared pool cost", "cpus", pool.Size(), "uncoreCachesSpoiledForWholeCacheClaims", len(spoiled))
+	return nil
 }
 
 // registrarDir is the kubelet plugin registration directory, always
