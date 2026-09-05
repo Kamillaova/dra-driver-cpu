@@ -121,6 +121,9 @@ DRACPU_E2E_NODE_ALLOCATABLE_MAPPING ?= false
 # requires; only do this on containerd, whose vendored NRI carries the fix from
 # containerd/nri#301 (see docs/user/defragmentation.md).
 DRACPU_E2E_DEFRAG ?= false
+# Set to "true" to have ci-kind-setup deploy the driver with whole physical core
+# allocation. Has observable effects only where the nodes have SMT enabled.
+DRACPU_E2E_FULL_PCPUS_ONLY ?= false
 # Extra arguments passed to golangci-lint in the lint target.
 # For example, set GOLANGCI_LINT_EXTRA_ARGS=--fix to auto-fix issues.
 GOLANGCI_LINT_EXTRA_ARGS ?=
@@ -218,6 +221,7 @@ endif
 		--set-string args.reservedCPUs=${DRACPU_E2E_RESERVED_CPUS} \
 		--set args.exposePCIeRoots=true \
 		--set driverConfig.publishNodeAllocatableResourceMapping=$(DRACPU_E2E_NODE_ALLOCATABLE_MAPPING) \
+		--set driverConfig.fullPhysicalCPUsOnly=$(DRACPU_E2E_FULL_PCPUS_ONLY) \
 		--set driverConfig.defragEnabled=$(DRACPU_E2E_DEFRAG) \
 		--set driverConfig.assumeUnsolicitedUpdatesSafe=$(DRACPU_E2E_DEFRAG)
 	hack/ci/wait-resourcelices.sh
