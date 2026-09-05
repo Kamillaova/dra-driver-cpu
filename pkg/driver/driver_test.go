@@ -29,7 +29,9 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/utils/cpuset"
 )
@@ -225,6 +227,92 @@ func TestNewReportsResourceSliceCountUnderExposePCIeRoots(t *testing.T) {
 	require.Contains(t, logged, `"devicesPerResourceSlice"=64`)
 	require.Contains(t, logged, `"numResourceSlices"=4`)
 	require.Contains(t, logged, `"exposePCIeRoots"=true`)
+}
+
+// TestSeedAllocationStoreFromDiskRecoversPriorPlacements: a kubelet replaying
+// Prepare for an already-running claim after a restart must not be told the
+// claim's CPUs are free, or a different claim allocated afresh in that window
+// could pick the same ones.
+func TestSeedAllocationStoreFromDiskRecoversPriorPlacements(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-recovered")
+	cdiMgr := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: cpuset.New(0, 1)})
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		cdiMgr:             cdiMgr,
+	}
+
+	d.seedAllocationStoreFromDisk(logger)
+
+	require.Equal(t, 1, cdiMgr.refreshCalls, "must refresh the CDI cache before reading it")
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
+	require.True(t, ok, "the recovered claim must be reserved")
+	require.Equal(t, cpuset.New(0, 1), got)
+
+	// A Prepare replayed for a different, new claim must not be able to land on
+	// the recovered claim's CPUs.
+	require.Error(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-new", cpuset.New(0), false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-new", cpuset.New(2), false))
+}
+
+// TestSeedAllocationStoreFromDiskSkipsAConflictingRecordWithoutFailingStartup:
+// self-consistent CDI specs never conflict, but a corrupted or hand-edited one
+// must not cost every other recovered claim its own recovery.
+func TestSeedAllocationStoreFromDiskSkipsAConflictingRecordWithoutFailingStartup(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	cdiMgr := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+		"claim-good":       cpuset.New(0, 1),
+		"claim-conflicted": cpuset.New(0, 1),
+	})
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		cdiMgr:             cdiMgr,
+	}
+
+	d.seedAllocationStoreFromDisk(logger)
+
+	// One of the two conflicting claims won recovery; the other is absent
+	// rather than the whole recovery having failed.
+	_, goodOK := d.cpuAllocationStore.GetResourceClaimAllocation("claim-good")
+	_, conflictedOK := d.cpuAllocationStore.GetResourceClaimAllocation("claim-conflicted")
+	require.True(t, goodOK != conflictedOK, "exactly one of the conflicting claims must have been recovered")
+}
+
+// TestSeedAllocationStoreFromDiskToleratesARefreshFailure: a failed refresh
+// must not panic or otherwise stop Start from proceeding.
+func TestSeedAllocationStoreFromDiskToleratesARefreshFailure(t *testing.T) {
+	logger := testr.New(t)
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: []cpuinfo.CPUInfo{{CpuID: 0}}}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	cdiMgr := newMockCdiMgr()
+	cdiMgr.refreshError = fmt.Errorf("cannot read CDI spec directory")
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		cdiMgr:             cdiMgr,
+	}
+
+	require.NotPanics(t, func() { d.seedAllocationStoreFromDisk(logger) })
+	require.True(t, d.cpuAllocationStore.GetSharedCPUs().Equals(cpuset.New(0)), "nothing must have been recovered")
 }
 
 // TestWaitForRegistration covers an unexported function, which we would normally
