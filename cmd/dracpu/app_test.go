@@ -17,6 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -36,5 +39,64 @@ func TestRunUsesConfigSysFSOverlay(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "read sysfs overlay") {
 		t.Fatalf("run() error = %v, want sysfs overlay read error (cfg.SysFSOverlay was ignored)", err)
+	}
+}
+
+// TestWaitForShutdownHTTPErrorIsFatal: a bind or serve failure on httpErr
+// must be returned, not swallowed. Left unreported, the process keeps
+// running with nothing listening on the port, and the only way to notice is
+// the liveness probe's own failure threshold.
+func TestWaitForShutdownHTTPErrorIsFatal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := &http.Server{Addr: "127.0.0.1:0"}
+
+	asyncErr := make(chan error)
+	httpErr := make(chan error, 1)
+	httpErr <- errors.New("listen tcp: address already in use")
+
+	err := waitForShutdown(ctx, cancel, testr.New(t), server, asyncErr, httpErr)
+	if err == nil {
+		t.Fatal("waitForShutdown() succeeded, want the HTTP bind error")
+	}
+	if !strings.Contains(err.Error(), "HTTP server error") || !strings.Contains(err.Error(), "address already in use") {
+		t.Fatalf("waitForShutdown() error = %v, want it to wrap the HTTP bind error", err)
+	}
+}
+
+// TestWaitForShutdownNRIErrorIsFatal pins the pre-existing asyncErr path
+// alongside the new httpErr one, so a future change cannot silently prefer
+// one channel over the other.
+func TestWaitForShutdownNRIErrorIsFatal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := &http.Server{Addr: "127.0.0.1:0"}
+
+	asyncErr := make(chan error, 1)
+	httpErr := make(chan error)
+	asyncErr <- errors.New("NRI plugin failed for 5 times to be restarted")
+
+	err := waitForShutdown(ctx, cancel, testr.New(t), server, asyncErr, httpErr)
+	if err == nil {
+		t.Fatal("waitForShutdown() succeeded, want the NRI driver error")
+	}
+	if !strings.Contains(err.Error(), "NRI driver error") {
+		t.Fatalf("waitForShutdown() error = %v, want it to wrap the NRI driver error", err)
+	}
+}
+
+// TestWaitForShutdownContextDoneIsClean: a normal signal-driven shutdown with
+// neither channel firing must return no error.
+func TestWaitForShutdownContextDoneIsClean(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	server := &http.Server{Addr: "127.0.0.1:0"}
+
+	asyncErr := make(chan error)
+	httpErr := make(chan error)
+
+	err := waitForShutdown(ctx, cancel, testr.New(t), server, asyncErr, httpErr)
+	if err != nil {
+		t.Fatalf("waitForShutdown() error = %v, want nil on a clean signal-driven shutdown", err)
 	}
 }
