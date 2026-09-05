@@ -220,6 +220,8 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		ExposePCIeRoots:                       cfg.ExposePCIeRoots,
 		PublishNodeAllocatableResourceMapping: cfg.PublishNodeAllocatableResourceMapping,
 		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
+		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
+		ReconcileSharedOnUnprepare:            cfg.ReconcileSharedOnUnprepare,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 	}
