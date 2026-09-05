@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
@@ -161,6 +162,33 @@ func (c *CdiManager) GetDeviceCPUSet(deviceName string) (cpuset.CPUSet, error) {
 		return cpus, nil
 	}
 	return cpuset.CPUSet{}, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
+}
+
+// PreparedClaimAllocations returns the placement recorded on disk for every
+// claim this driver previously prepared, keyed by claim UID. Call Refresh
+// first to load the latest specs. A device this driver would not itself have
+// generated, or whose recorded placement fails to parse, is skipped and
+// logged rather than aborting recovery of every other claim.
+func (c *CdiManager) PreparedClaimAllocations(logger logr.Logger) map[types.UID]cpuset.CPUSet {
+	allocations := make(map[types.UID]cpuset.CPUSet)
+	for _, qualified := range c.cache.ListDevices() {
+		vendor, class, name, err := cdiparser.ParseQualifiedName(qualified)
+		if err != nil || vendor != cdiVendor || class != cdiClass {
+			continue
+		}
+		claimUID, ok := claimUIDFromDeviceName(name)
+		if !ok {
+			logger.V(2).Info("ignoring CDI device this driver would not have generated", "device", qualified)
+			continue
+		}
+		cpus, err := c.GetDeviceCPUSet(name)
+		if err != nil {
+			logger.Error(err, "ignoring CDI device with an unrecoverable placement", "device", qualified)
+			continue
+		}
+		allocations[claimUID] = cpus
+	}
+	return allocations
 }
 
 // Refresh reloads the CDI specs managed by the cache.
