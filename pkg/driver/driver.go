@@ -399,6 +399,9 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		// Chunk devices into slices of at most devicesPerResourceSlice
 		plugin.topology.deviceSlices = slices.Collect(slices.Chunk(devices, plugin.devicesPerResourceSlice))
 	}
+	logger.Info("chunked devices into ResourceSlices", "numDevices", len(devices),
+		"devicesPerResourceSlice", plugin.devicesPerResourceSlice, "numResourceSlices", len(plugin.topology.deviceSlices),
+		"exposePCIeRoots", config.ExposePCIeRoots)
 
 	for _, d := range devices {
 		plugin.health.devices[d.Name] = &deviceHealthEntry{

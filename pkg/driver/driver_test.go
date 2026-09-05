@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
+	"github.com/go-logr/logr/funcr"
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
@@ -118,6 +119,38 @@ func TestRunNRIPluginWithRetry_SuccessfulRunNoRetry(t *testing.T) {
 // injectable dependencies, so there is no seam to reach this behaviour from
 // outside the package today. Testing it directly is the exception rather than the
 // pattern, and it can move behind Start once Start is separable.
+// TestNewReportsResourceSliceCountUnderExposePCIeRoots: exposePCIeRoots halves
+// devicesPerResourceSlice (128 -> 64) invisibly to the config, which can
+// double how many ResourceSlices a node publishes; New must report the actual
+// count reached rather than leave it something only a slice count in the API
+// would reveal.
+func TestNewReportsResourceSliceCountUnderExposePCIeRoots(t *testing.T) {
+	var logs strings.Builder
+	logger := funcr.New(func(prefix, args string) {
+		logs.WriteString(prefix + " " + args + "\n")
+	}, funcr.Options{})
+
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_DualSocket_120CPUsPerSocket_HT},
+		SysFS:   testSysFS(mockCPUInfos_DualSocket_120CPUsPerSocket_HT),
+	}
+	conf := Config{
+		DriverName:      testDriverName,
+		NodeName:        testNodeName,
+		ReservedCPUs:    cpuset.New(),
+		ExposePCIeRoots: true,
+	}
+	_, err := New(logger, prov, &conf)
+	require.NoError(t, err)
+
+	logged := logs.String()
+	require.Contains(t, logged, `"msg"="chunked devices into ResourceSlices"`)
+	require.Contains(t, logged, `"numDevices"=240`)
+	require.Contains(t, logged, `"devicesPerResourceSlice"=64`)
+	require.Contains(t, logged, `"numResourceSlices"=4`)
+	require.Contains(t, logged, `"exposePCIeRoots"=true`)
+}
+
 func TestWaitForRegistration(t *testing.T) {
 	const registrarPath = "/var/lib/kubelet/plugins_registry"
 	rejection := func(reason string) *registerapi.RegistrationStatus {
