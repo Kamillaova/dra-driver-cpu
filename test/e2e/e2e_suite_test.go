@@ -327,6 +327,7 @@ type driverConfigValues struct {
 	GroupBy                               string `json:"groupBy,omitempty"`
 	ReservedCPUs                          string `json:"reservedCPUs,omitempty"`
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
+	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly,omitempty"`
 	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
 	// ReconcileSharedOnUnprepare defaults to true in the driver, so a config
 	// file that does not mention it leaves it on: absent must read as true,
