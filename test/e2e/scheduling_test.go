@@ -398,15 +398,7 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 		}
 
 		ginkgo.By(fmt.Sprintf("checkerboarding NUMA node %d of the target node with pinned fillers", fragNUMA))
-		var fillers []*v1.Pod
-		for i, cacheFree := range free {
-			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, target,
-				claimSpecWithSelector(cacheFree-2*step, scopeCEL), fmt.Sprintf("cpu-claim-bs-filler-%d", i))
-			if err != nil {
-				break
-			}
-			fillers = append(fillers, pod)
-		}
+		fillers := fillCachesDownTo(ctx, fxt, dracpuTesterImage, target, cfgValues, fragNUMA, 2*step, "cpu-claim-bs-filler")
 		if len(fillers) < 2 {
 			ginkgo.Skip(fmt.Sprintf("could only place %d of %d fillers", len(fillers), len(free)))
 		}

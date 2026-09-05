@@ -27,6 +27,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -2516,4 +2517,27 @@ func TestPreparedEnvSaysDynamicOnlyWhenPlacementCanChange(t *testing.T) {
 
 	d.defrag.enabled = false
 	require.Equal(t, "0-1", d.cdiEnvValue(cpuset.New(0, 1)))
+}
+
+// TestTakeCPUsForDeviceHonoursThePlacementPolicy: the one chokepoint both
+// Prepare and the defragmentation planner draw placements from must follow the
+// configured policy, or the two would disagree about where a claim belongs.
+func TestTakeCPUsForDeviceHonoursThePlacementPolicy(t *testing.T) {
+	logger := testr.New(t)
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: smtPoolInfos()}).GetCPUTopology(logger)
+	require.NoError(t, err)
+	// Cache 0 loses core 0, so it is the partly used cache; caches 1-3 are whole.
+	available := topo.CPUDetails.CPUs().Difference(cpuset.New(0, 8))
+
+	packed := &CPUDriver{placementPolicy: coreselect.Pack}
+	got, err := packed.takeCPUsForDevice(logger, topo, available, 2, 2)
+	require.NoError(t, err)
+	require.Equal(t, 0, topo.CPUDetails[got.List()[0]].UncoreCacheID,
+		"pack must fill the partly used cache, got %s", got.String())
+
+	spread := &CPUDriver{placementPolicy: coreselect.Spread}
+	got, err = spread.takeCPUsForDevice(logger, topo, available, 2, 2)
+	require.NoError(t, err)
+	require.NotEqual(t, 0, topo.CPUDetails[got.List()[0]].UncoreCacheID,
+		"spread must open an untouched cache, got %s", got.String())
 }
