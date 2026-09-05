@@ -25,8 +25,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/stretchr/testify/require"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
+	"k8s.io/utils/cpuset"
 )
 
 type mockNRIRunner struct {
@@ -329,4 +333,56 @@ func TestStartRefusesARootWithNoRoomForTheSocket(t *testing.T) {
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Unix socket path")
+}
+
+func TestValidateReservedCPUsAlignment(t *testing.T) {
+	// Two 2-way SMT cores: (0,2) and (1,3).
+	topo := &cpuinfo.CPUTopology{CPUDetails: cpuinfo.CPUDetails{
+		0: {CpuID: 0, CoreID: 0, SocketID: 0},
+		1: {CpuID: 1, CoreID: 1, SocketID: 0},
+		2: {CpuID: 2, CoreID: 0, SocketID: 0},
+		3: {CpuID: 3, CoreID: 1, SocketID: 0},
+	}}
+
+	require.NoError(t, validateReservedCPUsAlignment(topo, cpuset.New(0, 2)), "whole core reserved")
+	require.NoError(t, validateReservedCPUsAlignment(topo, cpuset.New()), "nothing reserved")
+
+	err := validateReservedCPUsAlignment(topo, cpuset.New(0))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "splits physical cores")
+	require.Contains(t, err.Error(), "0")
+}
+
+func TestNewRejectsReservedCPUsSplittingACoreUnderFullPhysicalCPUsOnly(t *testing.T) {
+	infos := []cpuinfo.CPUInfo{
+		{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 2},
+		{CpuID: 1, CoreID: 1, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 3},
+		{CpuID: 2, CoreID: 0, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 0},
+		{CpuID: 3, CoreID: 1, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 1},
+	}
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}
+
+	_, err := New(testr.New(t), prov, &Config{
+		DriverName:           testDriverName,
+		NodeName:             testNodeName,
+		CPUDeviceMode:        devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy:     devattr.GROUP_BY_NUMA_NODE,
+		ReservedCPUs:         cpuset.New(0),
+		FullPhysicalCPUsOnly: true,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "splits physical cores")
+
+	_, err = New(testr.New(t), prov, &Config{
+		DriverName:           testDriverName,
+		NodeName:             testNodeName,
+		CPUDeviceMode:        devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy:     devattr.GROUP_BY_NUMA_NODE,
+		ReservedCPUs:         cpuset.New(0, 2),
+		FullPhysicalCPUsOnly: true,
+	})
+	require.NoError(t, err, "reserving both siblings does not split the core")
 }
