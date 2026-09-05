@@ -36,6 +36,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	drametadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
@@ -69,6 +70,8 @@ type cdiManager interface {
 	GetDeviceEnv(deviceName string) ([]string, error)
 	// CCX-FORK: added.
 	GetDeviceCPUSet(deviceName string) (cpuset.CPUSet, error)
+	// CCX-FORK: added, seeds the allocation store from disk before Start registers with the kubelet.
+	PreparedClaimAllocations(logger logr.Logger) map[types.UID]cpuset.CPUSet
 	RemoveDevice(logger logr.Logger, deviceName string) error
 }
 
@@ -409,6 +412,7 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, fmt.Errorf("failed to create CDI manager: %w", err)
 	}
 	cp.cdiMgr = cdiMgr
+	cp.seedAllocationStoreFromDisk(logger)
 
 	kubeletOpts := []kubeletplugin.Option{
 		kubeletplugin.DriverName(cp.driverName),
@@ -466,6 +470,29 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	go cp.healthResendLoop(ctx)
 
 	return asyncErr, nil
+}
+
+// seedAllocationStoreFromDisk recovers claim allocations from CDI specs on
+// disk before the kubelet plugin below registers and can replay Prepare
+// calls its own checkpoint remembers but this driver's in-memory store does
+// not. It only prevents a new allocation from colliding with an
+// already-recorded one; reconciling against the runtime's actual committed
+// state remains Synchronize's job (C38: CDI specs alone are not a safe
+// general convergence source).
+func (cp *CPUDriver) seedAllocationStoreFromDisk(logger logr.Logger) {
+	if err := cp.cdiMgr.Refresh(); err != nil {
+		logger.Error(err, "cannot seed the allocation store from disk: CDI cache refresh failed")
+		return
+	}
+	for claimUID, cpus := range cp.cdiMgr.PreparedClaimAllocations(logger) {
+		cLogger := logger.WithValues("claimUID", claimUID)
+		if err := cp.cpuAllocationStore.ReserveResourceClaimAllocation(cLogger, claimUID, cpus, false); err != nil {
+			cLogger.Error(err, "ignoring a recorded claim allocation inconsistent with another one during startup recovery")
+			continue
+		}
+		cLogger.Info("recovered claim allocation from disk", "cpus", cpus.String())
+	}
+	cp.refreshAllocationMetrics()
 }
 
 // Stop stops the CPUDriver.

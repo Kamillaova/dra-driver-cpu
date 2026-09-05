@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -122,6 +123,13 @@ func reservedForPodUIDs(claim *resourceapi.ResourceClaim) []types.UID {
 
 func getCDIDeviceName(uid types.UID) string {
 	return fmt.Sprintf("claim-%s", uid)
+}
+
+// claimUIDFromDeviceName reverses getCDIDeviceName, and reports whether name
+// has the shape this driver generates at all.
+func claimUIDFromDeviceName(name string) (types.UID, bool) {
+	uid, ok := strings.CutPrefix(name, "claim-")
+	return types.UID(uid), ok
 }
 
 // reserveResourceClaimAllocation records a new claim allocation while applying
