@@ -160,8 +160,9 @@ func makeCPUSetFromDiscoveredCPUInfo(cpuInfo discovery.DRACPUInfo) cpuset.CPUSet
 }
 
 type CPUAllocation struct {
-	CPUAssigned cpuset.CPUSet
-	CPUAffinity cpuset.CPUSet
+	CPUAssigned   cpuset.CPUSet
+	CPUAffinity   cpuset.CPUSet
+	SharedEnvCPUs string
 }
 
 func unmarshalLatestReport(data string, v any) error {
@@ -191,6 +192,7 @@ func getTesterPodCPUAllocation(cs kubernetes.Interface, ctx context.Context, pod
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse assigned cpuset: %q", testerInfo.Allocation.CPUs)
 	ret.CPUAffinity, err = cpuset.Parse(testerInfo.Runtimeinfo.CPUAffinity)
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse affinity cpuset: %q", testerInfo.Runtimeinfo.CPUAffinity)
+	ret.SharedEnvCPUs = testerInfo.Env.SharedCPUs
 	return ret
 }
 
