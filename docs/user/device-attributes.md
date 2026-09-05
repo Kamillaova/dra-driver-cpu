@@ -24,7 +24,8 @@ CPU group, `individual` one device per CPU.
 | `resource.kubernetes.io/numaNode` | int     | Standard NUMA node of the group (published when grouping by NUMA node)                                         |
 | `dra.cpu/socketID`                | int     | CPU socket of the group (published when grouping by NUMA node or socket)                                       |
 | `dra.cpu/numCPUs`                 | int     | CPUs available in the group                                                                                    |
-| `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                             |
+| `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled for this group's own cores                                              |
+| `dra.cpu/threadsPerCore`          | int     | This group's own uniform thread count per core (0 when its cores do not all agree); `smtEnabled` is `threadsPerCore > 1` |
 | `dra.cpu/largestUncoreCacheCPUs`  | int     | Allocatable CPUs in the group's largest uncore (L3/CCX) cache — the biggest claim it can align to one cache    |
 | `dra.cpu/uncoreCachesInGroup`     | int     | How many uncore caches contribute allocatable CPUs to the group                                                |
 | `resource.kubernetes.io/pcieRoot` | strings | PCIe roots local to the group's CPUs; needs `--expose-pcie-roots` and the `DRAListTypeAttributes` feature gate |
@@ -55,9 +56,9 @@ These compatibility attributes will be removed in a future version:
 | `dra.net/numaNode`   | int  | Cross-driver NUMA alignment attribute (NUMA grouping) |
 
 Grouped devices also expose the consumable capacity `dra.cpu/cpu` — the number of CPUs
-claimable from the group. With `groupBy: machine`, only `numCPUs`, `smtEnabled`, the uncore cache
-attributes, and — when `--expose-pcie-roots` is enabled — `resource.kubernetes.io/pcieRoot` are
-published.
+claimable from the group. With `groupBy: machine`, only `numCPUs`, `smtEnabled`,
+`threadsPerCore`, the uncore cache attributes, and — when `--expose-pcie-roots` is enabled —
+`resource.kubernetes.io/pcieRoot` are published.
 
 ### Individual mode
 

@@ -94,7 +94,7 @@ func TestDeviceBuilderNodeAllocatableResourceMapping(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var devices []resourceapi.Device
 			if tc.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-				devices, _ = device.BuildGrouped(logr.Discard(), tc.groupBy, topo, online, reserved, store.NewPCIeRootMapper(), tc.publishNodeAllocatableMapping)
+				devices, _, _ = device.BuildGrouped(logr.Discard(), tc.groupBy, topo, online, reserved, store.NewPCIeRootMapper(), tc.publishNodeAllocatableMapping, false)
 			} else {
 				devices, _ = device.Build(topo, reserved, store.NewPCIeRootMapper(), tc.publishNodeAllocatableMapping)
 			}
@@ -166,8 +166,8 @@ func TestGroupedUncoreCacheAttributes(t *testing.T) {
 	topo := fakeCacheTopology()
 	online := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
 
-	devices, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
-		cpuset.New(0), store.NewPCIeRootMapper(), false)
+	devices, _, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+		cpuset.New(0), store.NewPCIeRootMapper(), false, false)
 	require.Len(t, devices, 1)
 	attrs := devices[0].Attributes
 
@@ -187,8 +187,8 @@ func TestGroupedUncoreCacheAttributesOmittedWhenUnknown(t *testing.T) {
 	info.UncoreCacheID = -1
 	topo.CPUDetails[5] = info
 
-	devices, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
-		cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New(), store.NewPCIeRootMapper(), false)
+	devices, _, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
+		cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New(), store.NewPCIeRootMapper(), false, false)
 	require.Len(t, devices, 1)
 
 	require.NotContains(t, devices[0].Attributes, device.AttributeLargestUncoreCacheCPUs)
@@ -203,6 +203,206 @@ func TestIndividualDevicesHaveNoGroupCacheAttributes(t *testing.T) {
 			"device %q: group geometry is meaningless for a single CPU", dev.Name)
 		require.NotContains(t, dev.Attributes, device.AttributeUncoreCachesInGroup, dev.Name)
 	}
+}
+
+// fakeSMTCacheTopology returns 16 CPUs on one socket and one NUMA node: 8 cores
+// of 2 threads across 2 uncore caches, i.e. the smallest shape with more than one
+// cache per NUMA node. Cores are 0-7, thread 1 of core c is CPU c+8.
+//
+//	cache 0: cores 0-3 -> CPUs 0-3, 8-11
+//	cache 1: cores 4-7 -> CPUs 4-7, 12-15
+func fakeSMTCacheTopology() *cpuinfo.CPUTopology {
+	details := cpuinfo.CPUDetails{}
+	for cpu := range 16 {
+		core := cpu % 8
+		details[cpu] = cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        core,
+			SocketID:      0,
+			NUMANodeID:    0,
+			UncoreCacheID: core / 4,
+			SiblingCPUID:  (cpu + 8) % 16,
+		}
+	}
+	return &cpuinfo.CPUTopology{
+		NumCPUs: 16, NumCores: 8, NumSockets: 1, NumNUMANodes: 1, NumUncoreCache: 2,
+		SMTEnabled: true, CPUDetails: details,
+	}
+}
+
+func TestGroupedFullPhysicalCPUsOnly(t *testing.T) {
+	topo := fakeSMTCacheTopology()
+	online := topo.CPUDetails.CPUs()
+
+	buildOne := func(t *testing.T, reserved cpuset.CPUSet, fullPhysicalCPUsOnly bool) resourceapi.Device {
+		t.Helper()
+		devices, _, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+			reserved, store.NewPCIeRootMapper(), false, fullPhysicalCPUsOnly)
+		require.Len(t, devices, 1)
+		return devices[0]
+	}
+
+	cpuCapacity := func(dev resourceapi.Device) resourceapi.DeviceCapacity {
+		c, ok := dev.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+		require.True(t, ok, "device must publish CPU capacity")
+		return c
+	}
+
+	t.Run("publishes a whole-core request policy", func(t *testing.T) {
+		capacity := cpuCapacity(buildOne(t, cpuset.New(), true))
+
+		require.Equal(t, int64(16), capacity.Value.Value())
+		require.NotNil(t, capacity.RequestPolicy)
+		require.NotNil(t, capacity.RequestPolicy.ValidRange)
+		require.EqualValues(t, 2, capacity.RequestPolicy.ValidRange.Min.Value(), "min is one whole core")
+		require.EqualValues(t, 2, capacity.RequestPolicy.ValidRange.Step.Value(), "step is one whole core")
+
+		// Default must stay the full capacity: a claim that omits a capacity
+		// request consumes Default, and upstream gives it the whole device.
+		require.NotNil(t, capacity.RequestPolicy.Default)
+		require.EqualValues(t, 16, capacity.RequestPolicy.Default.Value())
+	})
+
+	t.Run("a core split by the reservation is dropped from capacity", func(t *testing.T) {
+		// Reserving CPU 0 alone leaves its sibling CPU 8 unpairable, so both
+		// leave the pool: 16 - 2 = 14, not 15.
+		dev := buildOne(t, cpuset.New(0), true)
+		capacity := cpuCapacity(dev)
+
+		require.Equal(t, int64(14), capacity.Value.Value())
+		require.EqualValues(t, 14, *dev.Attributes[device.AttributeNumCPUs].IntValue,
+			"numCPUs must agree with the published capacity")
+		require.EqualValues(t, 14, capacity.RequestPolicy.Default.Value())
+		// Cache 0 lost a whole core and holds 6 allocatable CPUs, so cache 1 at
+		// 8 becomes the largest and bounds a single-cache claim.
+		require.EqualValues(t, 8, *dev.Attributes[device.AttributeLargestUncoreCacheCPUs].IntValue)
+	})
+
+	t.Run("disabled leaves capacity and policy untouched", func(t *testing.T) {
+		dev := buildOne(t, cpuset.New(0), false)
+		capacity := cpuCapacity(dev)
+
+		require.Equal(t, int64(15), capacity.Value.Value(), "the odd thread stays claimable")
+		require.Nil(t, capacity.RequestPolicy)
+	})
+
+	t.Run("smtEnabled and threadsPerCore stay true regardless of the option", func(t *testing.T) {
+		// The hardware fact is unaffected by whether allocation enforces it.
+		dev := buildOne(t, cpuset.New(0), false)
+		require.True(t, *dev.Attributes[device.AttributeSMTEnabled].BoolValue)
+		require.EqualValues(t, 2, *dev.Attributes[device.AttributeThreadsPerCore].IntValue)
+	})
+}
+
+func TestGroupedFullPhysicalCPUsOnlyIsANoOpWithoutSMT(t *testing.T) {
+	// Every core has one thread: nothing to keep together, so the feature is a
+	// no-op even though it was requested -- distinct from the non-uniform case,
+	// which is disabled rather than a no-op.
+	topo := fakeCacheTopology()
+	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
+		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true)
+	require.Len(t, devices, 1)
+
+	capacity, ok := devices[0].Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+	require.True(t, ok)
+	require.Equal(t, int64(8), capacity.Value.Value(), "nothing is dropped: single-thread cores are already complete")
+	require.Nil(t, capacity.RequestPolicy, "a step of one CPU would constrain nothing")
+	require.EqualValues(t, 1, *devices[0].Attributes[device.AttributeThreadsPerCore].IntValue)
+	require.False(t, *devices[0].Attributes[device.AttributeSMTEnabled].BoolValue)
+	require.Empty(t, deviceThreadsPerCore, "a step of 1 does not qualify as whole-core allocation in effect")
+}
+
+// twoNUMANodesOneNonUniform returns two NUMA nodes on one socket: NUMA 0 has 4
+// cores uniformly two-way SMT (CPUs 0-3, 8-11), NUMA 1 has 4 cores where core 7
+// lacks its second thread, as a partially offlined SMT core would (CPUs
+// 4-7, 12-14). Regression shape for the bug where one non-uniform core
+// anywhere on the node disabled whole-core allocation for every device.
+func twoNUMANodesOneNonUniform() *cpuinfo.CPUTopology {
+	details := cpuinfo.CPUDetails{}
+	for cpu := range 16 {
+		core := cpu % 8
+		if core == 7 && cpu >= 8 {
+			continue
+		}
+		details[cpu] = cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        core,
+			SocketID:      0,
+			NUMANodeID:    core / 4,
+			UncoreCacheID: core / 4,
+			SiblingCPUID:  (cpu + 8) % 16,
+		}
+	}
+	return &cpuinfo.CPUTopology{
+		NumCPUs: len(details), NumCores: 8, NumSockets: 1, NumNUMANodes: 2, NumUncoreCache: 2,
+		SMTEnabled: true, CPUDetails: details,
+	}
+}
+
+func TestGroupedFullPhysicalCPUsOnlyIsPerDevice(t *testing.T) {
+	topo := twoNUMANodesOneNonUniform()
+	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
+		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true)
+	require.Len(t, devices, 2)
+
+	byName := make(map[string]resourceapi.Device, len(devices))
+	for _, dev := range devices {
+		byName[dev.Name] = dev
+	}
+	numa0 := byName[device.CPUDeviceNUMAGroupedPrefix+"000"]
+	numa1 := byName[device.CPUDeviceNUMAGroupedPrefix+"001"]
+
+	require.EqualValues(t, 2, *numa0.Attributes[device.AttributeThreadsPerCore].IntValue, "NUMA 0's own cores are uniform")
+	require.True(t, *numa0.Attributes[device.AttributeSMTEnabled].BoolValue)
+	require.Equal(t, 2, deviceThreadsPerCore[numa0.Name], "whole-core allocation stays in effect for the uniform device")
+	require.NotNil(t, numa0.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)].RequestPolicy)
+
+	require.EqualValues(t, 0, *numa1.Attributes[device.AttributeThreadsPerCore].IntValue, "NUMA 1's cores do not agree")
+	require.False(t, *numa1.Attributes[device.AttributeSMTEnabled].BoolValue)
+	require.NotContains(t, deviceThreadsPerCore, numa1.Name, "the other device's non-uniform cores must not disable it here")
+	require.Nil(t, numa1.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)].RequestPolicy)
+	// The odd core is not dropped: nothing here promises whole cores for it.
+	require.EqualValues(t, 7, *numa1.Attributes[device.AttributeNumCPUs].IntValue)
+}
+
+func TestGroupedThreadsPerCoreIndependentOfFullPhysicalCPUsOnly(t *testing.T) {
+	// The hardware fact must not read false just because the operator has not
+	// turned on whole-core allocation.
+	topo := fakeSMTCacheTopology()
+	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
+		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, false)
+	require.Len(t, devices, 1)
+
+	require.True(t, *devices[0].Attributes[device.AttributeSMTEnabled].BoolValue)
+	require.EqualValues(t, 2, *devices[0].Attributes[device.AttributeThreadsPerCore].IntValue)
+	require.Nil(t, devices[0].Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)].RequestPolicy,
+		"no request policy without fullPhysicalCPUsOnly")
+	require.Empty(t, deviceThreadsPerCore, "no device gets an allocation step without fullPhysicalCPUsOnly")
+}
+
+func TestGroupedNonUniformDeviceHasNoSMTAttribute(t *testing.T) {
+	// hybridTopo is a hybrid part: cores 0 and 1 are SMT, cores 2 and 3 are
+	// single-threaded, so there is no single thread count for this device.
+	hybridDetails := cpuinfo.CPUDetails{}
+	for cpu := range 4 {
+		hybridDetails[cpu] = cpuinfo.CPUInfo{CpuID: cpu, CoreID: cpu % 2, SocketID: 0, NUMANodeID: 0, UncoreCacheID: 0}
+	}
+	hybridDetails[4] = cpuinfo.CPUInfo{CpuID: 4, CoreID: 2, SocketID: 0, NUMANodeID: 0, UncoreCacheID: 0}
+	hybridDetails[5] = cpuinfo.CPUInfo{CpuID: 5, CoreID: 3, SocketID: 0, NUMANodeID: 0, UncoreCacheID: 0}
+	hybridTopo := &cpuinfo.CPUTopology{
+		NumCPUs: 6, NumCores: 4, NumSockets: 1, NumNUMANodes: 1, NumUncoreCache: 1,
+		SMTEnabled: true, CPUDetails: hybridDetails,
+	}
+
+	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, hybridTopo,
+		hybridTopo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true)
+	require.Len(t, devices, 1)
+
+	require.EqualValues(t, 0, *devices[0].Attributes[device.AttributeThreadsPerCore].IntValue)
+	require.False(t, *devices[0].Attributes[device.AttributeSMTEnabled].BoolValue)
+	require.Empty(t, deviceThreadsPerCore)
+	require.EqualValues(t, 6, *devices[0].Attributes[device.AttributeNumCPUs].IntValue,
+		"nothing is dropped: there is no single core size to enforce")
 }
 
 // wideSMTTopology returns a single-socket, single-NUMA topology of coresPerNode

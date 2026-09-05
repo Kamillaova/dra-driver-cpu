@@ -216,6 +216,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		CPUDeviceGroupBy:                      cfg.GroupBy,
 		ExposePCIeRoots:                       cfg.ExposePCIeRoots,
 		PublishNodeAllocatableResourceMapping: cfg.PublishNodeAllocatableResourceMapping,
+		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 	}
