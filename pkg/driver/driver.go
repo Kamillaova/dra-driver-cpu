@@ -77,17 +77,23 @@ type CPUInfoProvider interface {
 
 // CPUDriver is the structure that holds all the driver runtime information.
 type CPUDriver struct {
-	driverName              string
-	nodeName                string
-	kubeClient              kubernetes.Interface
-	draPlugin               KubeletPlugin
-	nriPlugin               stub.Stub
-	podConfigStore          *store.PodConfig
-	cpuAllocationStore      *store.CPUAllocation
-	cdiMgr                  cdiManager
-	topology                deviceTopology
-	cpuDeviceMode           string
-	cpuDeviceGroupBy        string
+	driverName         string
+	nodeName           string
+	kubeClient         kubernetes.Interface
+	draPlugin          KubeletPlugin
+	nriPlugin          stub.Stub
+	podConfigStore     *store.PodConfig
+	cpuAllocationStore *store.CPUAllocation
+	cdiMgr             cdiManager
+	topology           deviceTopology
+	cpuDeviceMode      string
+	cpuDeviceGroupBy   string
+	// fullPhysicalCPUsOnly mirrors Config.FullPhysicalCPUsOnly: whether the
+	// operator has asked for whole-core allocation at all. Whether it is
+	// actually in effect for a given device is per device -- see
+	// deviceTopology.deviceThreadsPerCore -- since one device's non-uniform
+	// cores must not disable it for another.
+	fullPhysicalCPUsOnly    bool
 	claimTracker            *store.ClaimTracker
 	pcieRootMapper          *store.PCIeRootMapper
 	devicesPerResourceSlice int
@@ -113,6 +119,18 @@ type deviceTopology struct {
 	deviceSlices           [][]resourceapi.Device
 	reservedCPUs           cpuset.CPUSet
 	onlineCPUs             cpuset.CPUSet
+	// deviceThreadsPerCore is each grouped device's own effective whole-core
+	// allocation step (0 when the feature is off or that device has no single
+	// thread count), from BuildGrouped. Keyed by device name, which a caller
+	// preparing a claim already has (alloc.Device).
+	deviceThreadsPerCore map[string]int
+	// numaNodeThreadsPerCore is deviceThreadsPerCore reindexed by NUMA node ID,
+	// derived once in New() from deviceThreadsPerCore plus whichever of
+	// deviceNameToSocketID/deviceNameToNUMANodeID is populated. It exists only
+	// for callers that plan by NUMA node and have no device name in hand
+	// (defragSelector's callers); a NUMA node belongs to exactly one socket, so
+	// this is well defined under either grouping.
+	numaNodeThreadsPerCore map[int]int
 }
 
 // Providers group the interfaces the CPUDriver depends on
@@ -153,6 +171,9 @@ type Config struct {
 	// PublishNodeAllocatableResourceMapping publishes KEP-5517 nodeAllocatableResources mappings in
 	// ResourceSlice devices. Requires the DRANodeAllocatableResources feature gate to be enabled in the cluster.
 	PublishNodeAllocatableResourceMapping bool
+	// FullPhysicalCPUsOnly allocates whole physical cores, so a core's SMT siblings are never split
+	// between two claims or between a claim and the shared pool. Grouped mode only.
+	FullPhysicalCPUsOnly bool
 }
 
 func (cfg Config) DevicesPerResourceSlice() int {
@@ -220,17 +241,21 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	plugin.refreshAllocationMetrics()
 	plugin.podConfigStore = store.NewPodConfig()
 
+	plugin.fullPhysicalCPUsOnly = config.FullPhysicalCPUsOnly
+
 	var devices []resourceapi.Device
 
 	if plugin.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-		var nameToID map[string]int
-		devices, nameToID = device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping)
+		var nameToID, deviceThreadsPerCore map[string]int
+		devices, nameToID, deviceThreadsPerCore = device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping, config.FullPhysicalCPUsOnly)
+		plugin.topology.deviceThreadsPerCore = deviceThreadsPerCore
 		switch plugin.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET:
 			plugin.topology.deviceNameToSocketID = nameToID
 		case device.GROUP_BY_NUMA_NODE:
 			plugin.topology.deviceNameToNUMANodeID = nameToID
 		}
+		plugin.topology.numaNodeThreadsPerCore = numaNodeThreadsPerCore(plugin.topology.cpuTopology, plugin.cpuDeviceGroupBy, nameToID, deviceThreadsPerCore)
 	} else {
 		devices, plugin.topology.deviceNameToCPUID = device.Build(plugin.topology.cpuTopology, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping)
 	}
@@ -251,6 +276,31 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	}
 
 	return plugin, nil
+}
+
+// numaNodeThreadsPerCore reindexes deviceThreadsPerCore by NUMA node ID, for
+// callers that plan by NUMA node and have no device name in hand (defrag and
+// the fit annotation). A NUMA node belongs to exactly one socket, so the
+// reindex is well defined whether the driver groups devices by NUMA node or
+// by socket.
+func numaNodeThreadsPerCore(topo *cpuinfo.CPUTopology, groupBy string, nameToID, deviceThreadsPerCore map[string]int) map[int]int {
+	byNUMANode := make(map[int]int, len(nameToID))
+	switch groupBy {
+	case device.GROUP_BY_NUMA_NODE:
+		for name, numaID := range nameToID {
+			byNUMANode[numaID] = deviceThreadsPerCore[name]
+		}
+	case device.GROUP_BY_SOCKET:
+		bySocket := make(map[int]int, len(nameToID))
+		for name, socketID := range nameToID {
+			bySocket[socketID] = deviceThreadsPerCore[name]
+		}
+		for _, numaID := range topo.CPUDetails.NUMANodes().List() {
+			anyCPU := topo.CPUDetails.CPUsInNUMANodes(numaID).UnsortedList()[0]
+			byNUMANode[numaID] = bySocket[topo.CPUDetails[anyCPU].SocketID]
+		}
+	}
+	return byNUMANode
 }
 
 // registrarDir is the kubelet plugin registration directory, always
