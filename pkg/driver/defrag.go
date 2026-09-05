@@ -305,9 +305,7 @@ func (cp *CPUDriver) claimMovable(claimUID types.UID) bool {
 // which only learns of a spec when it is refreshed and so cannot be relied on to
 // know about a claim this driver prepared itself.
 func (cp *CPUDriver) writeClaimPlacement(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet) error {
-	deviceName := getCDIDeviceName(claimUID)
-	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cp.cdiEnvValue(cpus))
-	return cp.cdiMgr.AddDevice(logger, deviceName, envVar, cpus)
+	return cp.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), cp.claimEnvEdits(claimUID, cpus), cpus)
 }
 
 // roundUpdates builds the one batch of container updates a round consists of: the
