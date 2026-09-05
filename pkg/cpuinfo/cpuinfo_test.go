@@ -495,13 +495,11 @@ func TestGetCPUInfos_ErrorScenarios(t *testing.T) {
 		},
 		{
 			name: "missing core_cpus_list falls back to thread_siblings_list",
-			setup: func(t *testing.T, dir string) {
-				// The fixture wrote core_cpus_list; simulate an older kernel that
+			setup: func(sfs fstest.MapFS) {
+				// The fixture writes core_cpus_list; simulate an older kernel that
 				// only has the deprecated name by renaming it.
-				topologyDir := filepath.Join(dir, "sys/devices/system/cpu/cpu0/topology")
-				if err := os.Rename(filepath.Join(topologyDir, "core_cpus_list"), filepath.Join(topologyDir, "thread_siblings_list")); err != nil {
-					t.Fatal(err)
-				}
+				sfs["devices/system/cpu/cpu0/topology/thread_siblings_list"] = sfs["devices/system/cpu/cpu0/topology/core_cpus_list"]
+				delete(sfs, "devices/system/cpu/cpu0/topology/core_cpus_list")
 			},
 			expectedErrorSubstring: "",
 			expectedInfos: []CPUInfo{
@@ -510,10 +508,8 @@ func TestGetCPUInfos_ErrorScenarios(t *testing.T) {
 		},
 		{
 			name: "missing both core_cpus_list and thread_siblings_list",
-			setup: func(t *testing.T, dir string) {
-				if err := os.Remove(filepath.Join(dir, "sys/devices/system/cpu/cpu0/topology/core_cpus_list")); err != nil {
-					t.Fatal(err)
-				}
+			setup: func(sfs fstest.MapFS) {
+				delete(sfs, "devices/system/cpu/cpu0/topology/core_cpus_list")
 			},
 			expectedErrorSubstring: "",          // Should warn and skip CPU
 			expectedInfos:          []CPUInfo{}, // CPU gets skipped
@@ -551,6 +547,7 @@ func validSingleCPUInfoFS() fstest.MapFS {
 		"devices/system/cpu/online":                            &fstest.MapFile{Data: []byte("0\n")},
 		"devices/system/cpu/cpu0/topology/physical_package_id": &fstest.MapFile{Data: []byte("0\n")},
 		"devices/system/cpu/cpu0/topology/core_id":             &fstest.MapFile{Data: []byte("0\n")},
+		"devices/system/cpu/cpu0/topology/core_cpus_list":      &fstest.MapFile{Data: []byte("0\n")},
 		"devices/system/cpu/cpu0/node0":                        &fstest.MapFile{Mode: 0755 | os.ModeDir},
 		"devices/system/node/node0/cpulist":                    &fstest.MapFile{Data: []byte("0\n")},
 		"devices/system/cpu/cpu0/cache/index3/level":           &fstest.MapFile{Data: []byte("3\n")},
