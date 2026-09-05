@@ -170,6 +170,20 @@ func (m *mockCdiMgr) GetDeviceEnv(deviceName string) ([]string, error) {
 	return []string{env}, nil
 }
 
+func (m *mockCdiMgr) PreparedClaimAllocations(logr.Logger) map[types.UID]cpuset.CPUSet {
+	allocations := make(map[types.UID]cpuset.CPUSet)
+	for deviceName := range m.devices {
+		claimUID, ok := claimUIDFromDeviceName(deviceName)
+		if !ok {
+			continue
+		}
+		if cpus, err := m.GetDeviceCPUSet(deviceName); err == nil {
+			allocations[claimUID] = cpus
+		}
+	}
+	return allocations
+}
+
 func (m *mockCdiMgr) RemoveDevice(_ logr.Logger, deviceName string) error {
 	if m.removeError != nil {
 		return m.removeError
