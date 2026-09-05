@@ -36,13 +36,17 @@ import (
 // "which", where a claim's quantity is the scheduler's, so this endpoint is the
 // only way to see it -- and it cannot be stale, since it is computed on request.
 type placementsReport struct {
-	NodeName      string             `json:"nodeName"`
-	DefragEnabled bool               `json:"defragEnabled"`
-	ReservedCPUs  string             `json:"reservedCPUs"`
-	SharedCPUs    string             `json:"sharedCPUs"`
-	Claims        []claimReport      `json:"claims"`
-	NUMANodes     []numaNodeReport   `json:"numaNodes"`
-	Unmeasurable  []unmeasurableNode `json:"unmeasurableNUMANodes,omitempty"`
+	NodeName      string `json:"nodeName"`
+	DefragEnabled bool   `json:"defragEnabled"`
+	ReservedCPUs  string `json:"reservedCPUs"`
+	// SharedPoolCPUs is the static shared pool, empty when the pool is dynamic.
+	SharedPoolCPUs string `json:"sharedPoolCPUs,omitempty"`
+	// SharedCPUs is what a container without a claim is confined to: the static
+	// pool when one is configured, otherwise whatever the claims have left over.
+	SharedCPUs   string             `json:"sharedCPUs"`
+	Claims       []claimReport      `json:"claims"`
+	NUMANodes    []numaNodeReport   `json:"numaNodes"`
+	Unmeasurable []unmeasurableNode `json:"unmeasurableNUMANodes,omitempty"`
 }
 
 type claimReport struct {
@@ -160,9 +164,13 @@ func (cp *CPUDriver) placements(logger logr.Logger, dryRun bool) (*placementsRep
 	report := &placementsReport{
 		NodeName:      cp.nodeName,
 		DefragEnabled: cp.defrag.enabled,
-		ReservedCPUs:  cp.topology.reservedCPUs.String(),
-		SharedCPUs:    cp.cpuAllocationStore.GetSharedCPUs().String(),
-		Claims:        cp.claimReports(allocations),
+		// The truly reserved CPUs: the pool is folded into the effective
+		// reserved set internally, but to a reader they are opposites -- one
+		// hosts every shared workload, the other none.
+		ReservedCPUs:   cp.topology.reservedCPUs.Difference(cp.sharedPool).String(),
+		SharedPoolCPUs: cp.sharedPool.String(),
+		SharedCPUs:     cp.sharedContainerCPUs().String(),
+		Claims:         cp.claimReports(allocations),
 	}
 
 	placements := defrag.PlacementsByNUMANode(topo, allocations)
@@ -239,7 +247,7 @@ func (cp *CPUDriver) numaNodeReport(logger logr.Logger, nodeTopo *defrag.Topolog
 		MaxMoves:             cp.defrag.maxMoves,
 		MinGain:              cp.defrag.minGain,
 		Eligible:             cp.claimMovable,
-		KeepFreePoolNonEmpty: len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0,
+		KeepFreePoolNonEmpty: cp.keepFreePoolNonEmpty(),
 	})
 	if err != nil {
 		report.Plan = &planReport{Reason: "cannot plan: " + err.Error()}

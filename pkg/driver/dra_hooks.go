@@ -151,7 +151,9 @@ func claimUIDFromDeviceName(name string) (types.UID, bool) {
 // container from the same pod may not have been created yet when this DRA hook
 // runs, so that case is detected later by the NRI CreateContainer check.
 func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet) error {
-	hasSharedContainers := len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
+	// With a static pool the guard is moot: the pool is carved out of the
+	// allocatable set, so no reservation can take a shared container's CPUs.
+	hasSharedContainers := cp.sharedPool.IsEmpty() && len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
 	return cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpus, hasSharedContainers)
 }
 

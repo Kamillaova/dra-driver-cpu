@@ -782,3 +782,20 @@ func TestDefragPassPrunesExpiredCooldowns(t *testing.T) {
 	d.defragPass(context.Background())
 	require.Empty(t, d.lastMoved, "with no cooldown the record has no reader and must not linger")
 }
+
+// TestKeepFreePoolNonEmptyMatchesThePoolModel: the guard exists for the dynamic
+// pool, where an in-flight move holding old and new CPUs could momentarily
+// leave shared containers nothing to sit on. A static pool is out of the
+// claims' reach, so nothing needs protecting -- and the dry-run report plans
+// through this same helper, so it cannot hold back moves the pass would make.
+func TestKeepFreePoolNonEmptyMatchesThePoolModel(t *testing.T) {
+	pooled := newSharedPoolTestDriver(t)
+	pooled.runContainer(t, "pod-uid-s", "ctr-s", "ctr-uid-s")
+	require.False(t, pooled.keepFreePoolNonEmpty(),
+		"a static pool never empties; the guard must stay out of the way")
+
+	dynamic := newDefragTestDriver(t, 2, 4)
+	dynamic.runContainer(t, "pod-uid-s", "ctr-s", "ctr-uid-s")
+	require.True(t, dynamic.keepFreePoolNonEmpty(),
+		"with a dynamic pool and shared containers the guard must hold")
+}
