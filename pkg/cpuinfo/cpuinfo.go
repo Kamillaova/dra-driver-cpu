@@ -131,6 +131,14 @@ type CPUInfo struct {
 	// CPU Sibling of the CpuID
 	SiblingCPUID int `json:"sibling"`
 
+	// SiblingCPUSet is every logical CPU sharing this CPU's physical core,
+	// including itself, read from the kernel's own topology/core_cpus_list (or
+	// the deprecated topology/thread_siblings_list on older kernels). Unlike
+	// SiblingCPUID and the (SocketID, ClusterID, CoreID) triple, this is exact
+	// for any number of threads per core and does not depend on those
+	// identifiers' platform-specific uniqueness.
+	SiblingCPUSet cpuset.CPUSet `json:"siblingCPUSet"`
+
 	// Core Type (e-core or p-core)
 	CoreType CoreType `json:"coreType,omitempty"`
 
@@ -337,6 +345,27 @@ func populateTopologyInfo(sfs sysfs.FS, cpuInfo *CPUInfo, logger logr.Logger) er
 		return fmt.Errorf("could not parse core_id %q for cpu %d: %w", coreStr, cpuID, err)
 	}
 	cpuInfo.CoreID = coreID
+
+	// Get SMT siblings from sysfs. core_cpus_list is the kernel's own,
+	// architecture-neutral list of every CPU sharing this CPU's physical core;
+	// thread_siblings_list is its deprecated name, kept as a fallback for older
+	// kernels. Unlike physical_package_id/cluster_id/core_id, neither file's
+	// correctness depends on a platform-specific uniqueness convention, and
+	// both list all threads of a core regardless of arity.
+	siblingsPath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "topology", "core_cpus_list")
+	siblingsStr, err := readFile(sfs, siblingsPath)
+	if err != nil {
+		siblingsPath = path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "topology", "thread_siblings_list")
+		siblingsStr, err = readFile(sfs, siblingsPath)
+		if err != nil {
+			return fmt.Errorf("could not read core_cpus_list or thread_siblings_list for cpu %d from sysfs: %w", cpuID, err)
+		}
+	}
+	siblingCPUSet, err := cpuset.Parse(strings.TrimSpace(siblingsStr))
+	if err != nil {
+		return fmt.Errorf("could not parse sibling CPU list %q for cpu %d: %w", siblingsStr, cpuID, err)
+	}
+	cpuInfo.SiblingCPUSet = siblingCPUSet
 
 	// Get NUMA Node ID from sysfs
 	nodePath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID))
