@@ -332,8 +332,64 @@ type driverConfigValues struct {
 	// ReconcileSharedOnUnprepare defaults to true in the driver, so a config
 	// file that does not mention it leaves it on: absent must read as true,
 	// which a plain bool cannot express.
-	ReconcileSharedOnUnprepare *bool `json:"reconcileSharedOnUnprepare,omitempty"`
-	DefragEnabled              bool  `json:"defragEnabled,omitempty"`
+	ReconcileSharedOnUnprepare *bool  `json:"reconcileSharedOnUnprepare,omitempty"`
+	DefragEnabled              bool   `json:"defragEnabled,omitempty"`
+	SharedPoolCPUs             string `json:"sharedPoolCPUs,omitempty"`
+}
+
+// staticPool is the configured static shared pool, empty when the pool is
+// dynamic.
+func (v driverConfigValues) staticPool() cpuset.CPUSet {
+	ginkgo.GinkgoHelper()
+	if v.SharedPoolCPUs == "" {
+		return cpuset.New()
+	}
+	pool, err := cpuset.Parse(v.SharedPoolCPUs)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse the driver's sharedPoolCPUs %q", v.SharedPoolCPUs)
+	return pool
+}
+
+// sharedPoolExpectation is what a claimless container should be pinned to: the
+// static pool when one is configured, whatever the claims left over otherwise.
+func sharedPoolExpectation(staticPool, dynamic cpuset.CPUSet) cpuset.CPUSet {
+	if staticPool.IsEmpty() {
+		return dynamic
+	}
+	return staticPool
+}
+
+// numaLocalPool is the slice of the static pool a guaranteed container gets
+// appended to its claims: the pool CPUs of the claims' own NUMA nodes.
+func numaLocalPool(info discovery.DRACPUInfo, staticPool, claimCPUs cpuset.CPUSet) cpuset.CPUSet {
+	if staticPool.IsEmpty() {
+		return staticPool
+	}
+	numaNodes := map[int]bool{}
+	for _, cpu := range info.CPUs {
+		if claimCPUs.Contains(cpu.CpuID) {
+			numaNodes[cpu.NUMANodeID] = true
+		}
+	}
+	var local []int
+	for _, cpu := range info.CPUs {
+		if numaNodes[cpu.NUMANodeID] && staticPool.Contains(cpu.CpuID) {
+			local = append(local, cpu.CpuID)
+		}
+	}
+	return cpuset.New(local...)
+}
+
+func discoverNodeCPUInfo(ctx context.Context, fxt *fixture.Fixture, nodeName, image string) discovery.DRACPUInfo {
+	ginkgo.GinkgoHelper()
+	infoPod := discovery.MakePod(fxt.Namespace.Name, image)
+	infoPod = e2epod.PinToNode(infoPod, nodeName)
+	infoPod, err := e2epod.RunToCompletion(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot run the discovery pod")
+	data, err := e2epod.GetLogs(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get the discovery pod logs")
+	var info discovery.DRACPUInfo
+	gomega.Expect(unmarshalLatestReport(data, &info)).To(gomega.Succeed())
+	return info
 }
 
 // reconcilesSharedOnUnprepare reports whether the driver widens shared
