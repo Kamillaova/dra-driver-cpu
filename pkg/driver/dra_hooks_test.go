@@ -153,29 +153,44 @@ func (m *mockCdiMgr) RemoveDevice(_ logr.Logger, deviceName string) error {
 	return nil
 }
 
+// withSiblingCPUSets fills in SiblingCPUSet from the 2-way-only SiblingCPUID
+// these mock fixtures set, so cpuDeviceInfos (which reads SiblingCPUSet, not
+// SiblingCPUID, since B1/B36) groups them the same way GetCPUInfos would from
+// real sysfs.
+func withSiblingCPUSets(infos []cpuinfo.CPUInfo) []cpuinfo.CPUInfo {
+	for i, info := range infos {
+		if info.SiblingCPUID == -1 {
+			infos[i].SiblingCPUSet = cpuset.New(info.CpuID)
+		} else {
+			infos[i].SiblingCPUSet = cpuset.New(info.CpuID, info.SiblingCPUID)
+		}
+	}
+	return infos
+}
+
 var (
 	// Sibling CPUs are non-consecutive: (0,2), (1,3)
-	mockCPUInfos_SingleSocket_4CPUS_HT = []cpuinfo.CPUInfo{
+	mockCPUInfos_SingleSocket_4CPUS_HT = withSiblingCPUSets([]cpuinfo.CPUInfo{
 		{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 2},
 		{CpuID: 1, CoreID: 1, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 3},
 		{CpuID: 2, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 0},
 		{CpuID: 3, CoreID: 1, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 1},
-	}
-	mockCPUInfos_SingleSocket_4CPUs_HT_Off = []cpuinfo.CPUInfo{
+	})
+	mockCPUInfos_SingleSocket_4CPUs_HT_Off = withSiblingCPUSets([]cpuinfo.CPUInfo{
 		{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: -1},
 		{CpuID: 1, CoreID: 1, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: -1},
 		{CpuID: 2, CoreID: 2, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: -1},
 		{CpuID: 3, CoreID: 3, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: -1},
-	}
+	})
 	// P-core sibling is non-consecutive: (0,2)
-	mockCPUInfos_SingleSocket_Hybrid_HT = []cpuinfo.CPUInfo{
+	mockCPUInfos_SingleSocket_Hybrid_HT = withSiblingCPUSets([]cpuinfo.CPUInfo{
 		{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 2},
 		{CpuID: 1, CoreID: 1, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypeEfficiency, SiblingCPUID: 3},
 		{CpuID: 2, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 0},
 		{CpuID: 3, CoreID: 1, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypeEfficiency, SiblingCPUID: 1},
-	}
+	})
 	// 2 sockets, 2 cores/socket, HT on. Total 8 logical CPUs.
-	mockCPUInfos_DualSocket_4CPUsPerSocket_HT = []cpuinfo.CPUInfo{
+	mockCPUInfos_DualSocket_4CPUsPerSocket_HT = withSiblingCPUSets([]cpuinfo.CPUInfo{
 		{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 4},
 		{CpuID: 1, CoreID: 1, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 5},
 		{CpuID: 2, CoreID: 2, SocketID: 1, NUMANodeID: 1, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 6},
@@ -184,7 +199,7 @@ var (
 		{CpuID: 5, CoreID: 1, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 1},
 		{CpuID: 6, CoreID: 2, SocketID: 1, NUMANodeID: 1, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 2},
 		{CpuID: 7, CoreID: 3, SocketID: 1, NUMANodeID: 1, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: 3},
-	}
+	})
 	mockCPUInfos_DualSocket_EqualsResourceSliceLimit = func() []cpuinfo.CPUInfo {
 		var infos []cpuinfo.CPUInfo
 		cpusPerNumaNode := resourceapi.ResourceSliceMaxDevices / 2
@@ -192,7 +207,7 @@ var (
 			numaNodeID := i / cpusPerNumaNode
 			infos = append(infos, cpuinfo.CPUInfo{CpuID: i, CoreID: i, SocketID: numaNodeID, NUMANodeID: numaNodeID, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: -1})
 		}
-		return infos
+		return withSiblingCPUSets(infos)
 	}()
 	mockCPUInfos_DualSocket_ExceedsResourceSliceLimit = func() []cpuinfo.CPUInfo {
 		var infos []cpuinfo.CPUInfo
@@ -202,7 +217,7 @@ var (
 			numaNodeID := i / cpusPerNumaNode
 			infos = append(infos, cpuinfo.CPUInfo{CpuID: i, CoreID: i, SocketID: numaNodeID, NUMANodeID: numaNodeID, CoreType: cpuinfo.CoreTypePerformance, SiblingCPUID: -1})
 		}
-		return infos
+		return withSiblingCPUSets(infos)
 	}()
 	mockCPUInfos_DualSocket_120CPUsPerSocket_HT = func() []cpuinfo.CPUInfo {
 		var infos []cpuinfo.CPUInfo
@@ -231,7 +246,7 @@ var (
 			}
 		}
 
-		return infos
+		return withSiblingCPUSets(infos)
 
 	}()
 )

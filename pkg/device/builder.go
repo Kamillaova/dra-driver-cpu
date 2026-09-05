@@ -155,10 +155,10 @@ func cpuDeviceInfos(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet) []c
 		reservedCPUs[cpuID] = true
 	}
 
-	allCPUs := make([]cpuinfo.CPUInfo, 0, len(topo.CPUDetails))
+	cpuInfoMap := make(map[int]cpuinfo.CPUInfo, len(topo.CPUDetails))
 	availableCPUs := []cpuinfo.CPUInfo{}
 	for _, cpu := range topo.CPUDetails {
-		allCPUs = append(allCPUs, cpu)
+		cpuInfoMap[cpu.CpuID] = cpu
 		if !reservedCPUs[cpu.CpuID] {
 			availableCPUs = append(availableCPUs, cpu)
 		}
@@ -167,25 +167,29 @@ func cpuDeviceInfos(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet) []c
 		return availableCPUs[i].CpuID < availableCPUs[j].CpuID
 	})
 
+	// Grouped by SiblingCPUSet rather than the 2-way-only SiblingCPUID, so a
+	// core with more than two threads (POWER SMT4/8) gets every one of its
+	// siblings in the same group instead of becoming as many singleton groups
+	// as it has threads.
 	processedCpus := make(map[int]bool)
 	coreGroups := [][]cpuinfo.CPUInfo{}
-	cpuInfoMap := make(map[int]cpuinfo.CPUInfo)
-	for _, info := range allCPUs {
-		cpuInfoMap[info.CpuID] = info
-	}
-
 	for _, cpu := range availableCPUs {
 		if processedCpus[cpu.CpuID] {
 			continue
 		}
-		if cpu.SiblingCPUID == -1 || reservedCPUs[cpu.SiblingCPUID] {
-			coreGroups = append(coreGroups, []cpuinfo.CPUInfo{cpu})
-			processedCpus[cpu.CpuID] = true
-		} else {
-			coreGroups = append(coreGroups, []cpuinfo.CPUInfo{cpu, cpuInfoMap[cpu.SiblingCPUID]})
-			processedCpus[cpu.CpuID] = true
-			processedCpus[cpu.SiblingCPUID] = true
+		var group []cpuinfo.CPUInfo
+		for _, siblingID := range cpu.SiblingCPUSet.List() {
+			if reservedCPUs[siblingID] || processedCpus[siblingID] {
+				continue
+			}
+			sibling, ok := cpuInfoMap[siblingID]
+			if !ok {
+				continue
+			}
+			group = append(group, sibling)
+			processedCpus[siblingID] = true
 		}
+		coreGroups = append(coreGroups, group)
 	}
 
 	sort.Slice(coreGroups, func(i, j int) bool {
