@@ -127,7 +127,7 @@ var _ = ginkgo.Describe("Whole physical cores", ginkgo.Serial, ginkgo.Ordered, g
 
 		ginkgo.By("placing an exclusive claim")
 		claimed, _ := createClaimedTesterPod(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, 2, "cpu-claim-with-shared")
-		exclusive := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, claimed).CPUAssigned
+		exclusive := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, claimed).CPUAssigned.Difference(cfgValues.staticPool())
 		requireWholeCores(exclusive, siblingOf)
 
 		ginkgo.By("placing a container with no claim beside it")
