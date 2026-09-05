@@ -80,6 +80,13 @@ honor these settings, where applicable.
   whole-core tests run instead of skipping. They skip themselves on a node with SMT disabled, where
   every core is a single thread and the option has no observable effect.
 
+- `DRACPU_E2E_SHARED_POOL_CPUS`: (optional, default empty): when set to a cpuset (say `1,17`), *the
+  Makefile* `ci-kind-setup` target deploys the driver with `driverConfig.sharedPoolCPUs` on those
+  CPUs, the static-shared-pool tests run instead of skipping, and the rest of the suite asserts the
+  static-pool behaviours where they differ from the dynamic pool. The CPUs must exist on every node,
+  must not overlap `DRACPU_E2E_RESERVED_CPUS`, and under `DRACPU_E2E_FULL_PCPUS_ONLY` must be whole
+  physical cores.
+
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.
