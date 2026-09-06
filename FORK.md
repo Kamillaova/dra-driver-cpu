@@ -87,6 +87,9 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
 
+- `go.mod`: the `require` and `replace` of the nested `api` module, which upstream builds as part of
+  the root module
+
 - `internal/driverconfig`: the `Defrag*` fields, their defaults and `validateDefrag`; the `Profiles`
   map, `Profile`, `ProfileLabel`, `DefaultProfileName`, `WithProfile`, `asProfile`,
   `validateProfiles` and `WarnDeprecatedCPUFields`
@@ -101,8 +104,13 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   they pin, rather than kept apart
 
 Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/driver/defrag.go`, `reconcile.go`,
-`placements.go`, `deviceorder.go`, `pkg/cpuinfo/coretopology.go`) are visible to `git diff --stat` on
-their own and are not repeated here.
+`placements.go`, `deviceorder.go`, `pkg/cpuinfo/coretopology.go`, `api/attributes.go`,
+`api/v1alpha1/projection.go`) are visible to `git diff --stat` on their own and are not repeated here.
+
+`api/` is a nested module here (`api/go.mod`), because the scheduler plugin that reads the driver's
+device attributes pins it independently and importing it must not drag in the whole driver. Upstream
+builds `api/` as part of the root module, so `./...` reaches it there and does not here: the build,
+lint, modernize and unit-test targets run over the nested module as a second step.
 
 `CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
 placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
@@ -114,6 +122,8 @@ a claim's placement per request instead.
 These carry no fork-only code and are intended to be offered upstream as separate PRs:
 
 - physical-core identity helpers in `pkg/cpuinfo`
+- the nested `api` module holding the opaque claim schema and the device attribute names, so a
+  consumer can pin the schema without pinning the driver
 - uncore cache geometry device attributes
 - `groupBy: uncorecache`, one device per uncore cache
 - claim-ownership authentication against `Container.CDIDevices` (as an *additive* check)
