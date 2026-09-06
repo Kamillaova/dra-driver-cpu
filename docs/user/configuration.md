@@ -214,6 +214,8 @@ on - is configured through other Helm values, not through this file.
   each describes the same CPUs from the other end, and a `reserved` partition is how the list says it.
 - Names are DNS labels of at most 46 characters, since the device names built from them must stay
   DNS labels. Partitions may not overlap.
+- The model, the machine configuration it expects and the runbook for changing it on a live node are
+  in [CPU Partitions](cpu-partitions.md).
 - The chart renders one `DeviceClass` per named partition, `dra.cpu-<name>`, and the `dra.cpu` class
   selects the implicit partition alone. A claim reaches a named partition by naming its class and
   tolerating `dra.cpu/partition=<name>` with `operator: Equal`; an existence toleration with an empty
