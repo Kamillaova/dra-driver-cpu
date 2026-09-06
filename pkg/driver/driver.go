@@ -71,13 +71,13 @@ type KubeletPlugin interface {
 }
 
 type cdiManager interface {
-	AddDevice(logger logr.Logger, deviceName string, envVar string, requests []store.RequestAllocation) error
+	AddDevice(logger logr.Logger, deviceName string, envVar string, record store.ClaimRecord) error
 	Refresh() error
 	GetDeviceEnv(deviceName string) ([]string, error)
 	// CCX-FORK: added; GetDeviceEnv is upstream's and now unused by the driver.
-	GetDeviceAllocations(deviceName string) ([]store.RequestAllocation, error)
+	GetDeviceAllocations(deviceName string) (store.ClaimRecord, error)
 	// CCX-FORK: added, seeds the allocation store from disk before Start registers with the kubelet.
-	PreparedClaimAllocations(logger logr.Logger) map[types.UID][]store.RequestAllocation
+	PreparedClaimAllocations(logger logr.Logger) map[types.UID]store.ClaimRecord
 	RemoveDevice(logger logr.Logger, deviceName string) error
 }
 
@@ -826,13 +826,14 @@ func (cp *CPUDriver) seedAllocationStoreFromDisk(logger logr.Logger) {
 		logger.Error(err, "cannot seed the allocation store from disk: CDI cache refresh failed")
 		return
 	}
-	for claimUID, requests := range cp.cdiMgr.PreparedClaimAllocations(logger) {
+	for claimUID, record := range cp.cdiMgr.PreparedClaimAllocations(logger) {
 		cLogger := logger.WithValues("claimUID", claimUID)
-		if err := cp.cpuAllocationStore.ReserveResourceClaimAllocation(cLogger, claimUID, requests, false); err != nil {
+		if err := cp.cpuAllocationStore.ReserveResourceClaimAllocation(cLogger, claimUID, record, false); err != nil {
 			cLogger.Error(err, "ignoring a recorded claim allocation inconsistent with another one during startup recovery")
 			continue
 		}
-		cLogger.Info("recovered claim allocation from disk", "cpus", store.UnionOf(requests).String())
+		cLogger.Info("recovered claim allocation from disk", "cpus", store.UnionOf(record.Requests).String(),
+			"relocatable", record.Relocatable)
 	}
 	cp.refreshAllocationMetrics()
 }

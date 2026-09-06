@@ -21,6 +21,25 @@ driverConfig:
   defragEnabled: true
 ```
 
+## Which claims are moved
+
+Only a claim that asks to be. Enabling the feature is the operator's half of the decision; the other
+half is the tenant's, because a move changes the CPUs under a running workload and only that workload
+knows whether it survives one. A launcher that re-reads its affinity when `cpuset.cpus` changes loses
+nothing; one that pinned its threads once at start keeps running with that pinning silently gone.
+
+```yaml
+# In the claim's opaque configuration, see opaque-cpuset-overrides.md
+cpuConfig:
+  relocatable: true
+```
+
+The default is `false`, so a claim that says nothing is never moved. Such a claim is not merely left
+out of a pass: the better placement a pass aims at is built around it, so it stands as a fixed
+obstacle rather than a move the driver keeps wanting and can never make. A node full of claims that
+never opted in therefore reports the spread it cannot repair and moves nothing, which is the correct
+outcome and is visible in `dra_cpu_defrag_excess_uncore_caches`.
+
 ## What it does not do
 
 - **It does not change a claim's size.** A claim allocated 4 CPUs always has 4.
@@ -72,7 +91,7 @@ directions. So it is an operator assertion:
 ## What a workload must not do
 
 A container's environment cannot be rewritten once it exists, so the injected `DRA_CPUSET_*` variable
-cannot track a claim that moves. With `defragEnabled` its value is the literal string `dynamic` rather
+cannot track a claim that moves. For a claim that permits moves its value is the literal string `dynamic` rather
 than a cpuset, so a workload that parses it fails loudly instead of quietly pinning itself to CPUs its
 claim has left.
 
