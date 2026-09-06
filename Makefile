@@ -124,6 +124,11 @@ DRACPU_E2E_DEFRAG ?= false
 # Set to "true" to have ci-kind-setup deploy the driver with whole physical core
 # allocation. Has observable effects only where the nodes have SMT enabled.
 DRACPU_E2E_FULL_PCPUS_ONLY ?= false
+# Set to a cpuset to have ci-kind-setup deploy the driver with a CPU partition
+# of one online thread per core on those CPUs. Their SMT siblings must already
+# be offline: the suite verifies that state, it never creates it.
+DRACPU_E2E_NOSMT_PARTITION_CPUS ?=
+comma := ,
 # Extra arguments passed to golangci-lint in the lint target.
 # For example, set GOLANGCI_LINT_EXTRA_ARGS=--fix to auto-fix issues.
 GOLANGCI_LINT_EXTRA_ARGS ?=
@@ -223,7 +228,8 @@ endif
 		--set driverConfig.publishNodeAllocatableResourceMapping=$(DRACPU_E2E_NODE_ALLOCATABLE_MAPPING) \
 		--set driverConfig.fullPhysicalCPUsOnly=$(DRACPU_E2E_FULL_PCPUS_ONLY) \
 		--set driverConfig.defragEnabled=$(DRACPU_E2E_DEFRAG) \
-		--set driverConfig.assumeUnsolicitedUpdatesSafe=$(DRACPU_E2E_DEFRAG)
+		--set driverConfig.assumeUnsolicitedUpdatesSafe=$(DRACPU_E2E_DEFRAG) \
+		$(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),--set-string 'driverConfig.cpuPartitions[0].name=nosmt' --set-string 'driverConfig.cpuPartitions[0].role=exclusive' --set 'driverConfig.cpuPartitions[0].smt=false' --set-string 'driverConfig.cpuPartitions[0].cpus=$(subst $(comma),\$(comma),$(DRACPU_E2E_NOSMT_PARTITION_CPUS))')
 	hack/ci/wait-resourcelices.sh
 
 build-test-image: ## build tests image
