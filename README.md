@@ -174,6 +174,7 @@ when filing an issue — it collects the CPU topology and driver configuration n
 - [CPU Defragmentation](docs/user/defragmentation.md) - recovering uncore cache alignment of running claims (this fork only).
 - [Metrics](docs/user/metrics.md) - Prometheus metrics exposed by the driver.
 - [Device Attributes and Selectors](docs/user/device-attributes.md) - selectable device attributes, CEL selector examples, and sample `ResourceSlice` output in each mode.
+- [Device Metadata Files](docs/user/device-metadata.md) - the per-request JSON file a container reads to see what its claim was given.
 - [Troubleshooting & Diagnostics](docs/user/troubleshooting.md) - the `dracpu gatherinfo` diagnostic tool.
 
 ### Developer Documentation

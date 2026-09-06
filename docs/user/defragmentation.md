@@ -95,7 +95,9 @@ cannot track a claim that moves. For a claim that permits moves its value is the
 than a cpuset, so a workload that parses it fails loudly instead of quietly pinning itself to CPUs its
 claim has left.
 
-Read the current CPUs from the kernel instead:
+Whether a claim may be moved at all is in its own
+[device metadata file](device-metadata.md), as `dra.cpu/relocatable`, so a launcher can decide what to
+do without being configured separately. Where it may, read the current CPUs from the kernel:
 
 - `sched_getaffinity(2)`, which the kernel keeps current through a move; or
 - the container's own `/sys/fs/cgroup/cpuset.cpus.effective`.
