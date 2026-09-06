@@ -93,6 +93,7 @@ type Recorder interface {
 	RecordDefragBlockedMoves(count int)
 	RecordSynchronizeSkippedClaim()
 	RecordMisplacedClaim()
+	SetPartitionState(map[string]bool)
 }
 
 // Metrics owns all custom Prometheus collectors for the CPU driver.
@@ -115,6 +116,7 @@ type Metrics struct {
 
 	synchronizeSkippedClaims prometheus.Counter
 	misplacedClaims          prometheus.Counter
+	partitionVerified        *prometheus.GaugeVec
 }
 
 type metricKind string
@@ -217,6 +219,12 @@ var (
 		kind: metricCounter,
 		help: "Total number of claims or containers Synchronize could not adopt from the runtime's reported state, skipped rather than aborting the whole call.",
 	}
+	partitionVerifiedSpec = metricSpec{
+		name:   "dra_cpu_partition_verified",
+		kind:   metricGauge,
+		help:   "Whether a CPU partition's declaration matches this machine (1) or contradicts it, in which case the partition publishes no devices (0).",
+		labels: []string{"partition"},
+	}
 	misplacedClaimsSpec = metricSpec{
 		name: "dra_cpu_misplaced_claims_total",
 		kind: metricCounter,
@@ -241,6 +249,7 @@ var metricSpecs = []metricSpec{
 	defragPassDurationSpec,
 	synchronizeSkippedClaimsSpec,
 	misplacedClaimsSpec,
+	partitionVerifiedSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -290,6 +299,7 @@ func New(reg prometheus.Registerer) *Metrics {
 
 		synchronizeSkippedClaims: newCounter(synchronizeSkippedClaimsSpec),
 		misplacedClaims:          newCounter(misplacedClaimsSpec),
+		partitionVerified:        newGaugeVec(partitionVerifiedSpec),
 	}
 
 	reg.MustRegister(
@@ -309,6 +319,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragPassDurationSecondsHist,
 		m.synchronizeSkippedClaims,
 		m.misplacedClaims,
+		m.partitionVerified,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -412,6 +423,20 @@ func (m *Metrics) RecordMisplacedClaim() {
 	m.misplacedClaims.Inc()
 }
 
+// SetPartitionState replaces the per-partition series wholesale, so a partition
+// a later configuration no longer declares stops reporting rather than keeping
+// its last value.
+func (m *Metrics) SetPartitionState(verified map[string]bool) {
+	m.partitionVerified.Reset()
+	for partition, ok := range verified {
+		value := 0.0
+		if ok {
+			value = 1.0
+		}
+		m.partitionVerified.WithLabelValues(partition).Set(value)
+	}
+}
+
 type noopRecorder struct{}
 
 // Noop returns a recorder that discards all metric observations.
@@ -429,3 +454,4 @@ func (noopRecorder) RecordDefragMoves(Result, int)          {}
 func (noopRecorder) RecordDefragBlockedMoves(int)           {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()         {}
 func (noopRecorder) RecordMisplacedClaim()                  {}
+func (noopRecorder) SetPartitionState(map[string]bool)      {}

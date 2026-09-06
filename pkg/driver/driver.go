@@ -20,10 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,7 +38,9 @@ import (
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
+	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -124,6 +128,10 @@ type CPUDriver struct {
 	// implicit partition holding whatever the described ones left. Set in New,
 	// read-only after that.
 	partitions []device.Partition
+	// degradedPartitions are the partitions whose declared thread arity the
+	// machine contradicts, mapped to what would fix each. They publish no
+	// devices; the rest of the node serves as usual.
+	degradedPartitions map[string]string
 	// defaultPartitionCPUs is where a container holding no claim runs: the
 	// partitions of role "default", which on an undescribed node is every
 	// allocatable CPU. An exclusive partition never hosts such a container.
@@ -316,10 +324,18 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	// may claim -- the reserved ones and the pools -- join the effective reserved
 	// set, so capacity, allocation and defragmentation exclude them.
 	if len(config.CPUPartitions) > 0 {
-		if err := validatePartitions(topo, onlineCPUs, config.CPUPartitions); err != nil {
+		degraded, err := validatePartitions(topo, onlineCPUs, config.CPUPartitions)
+		if err != nil {
 			return nil, err
 		}
+		plugin.degradedPartitions = degraded
 		plugin.topology.reservedCPUs = plugin.topology.reservedCPUs.Union(unclaimablePartitionCPUs(config.CPUPartitions))
+		presentCPUs, err := cpuinfo.PresentCPUs(logger, sfs)
+		if err != nil {
+			logger.Info("cannot read the present CPU set, so offline CPUs are unaccounted for", "err", err)
+		} else {
+			verifyOfflineAccounting(logger, topo, presentCPUs, onlineCPUs, config.CPUPartitions)
+		}
 	}
 	plugin.partitions = device.WithImplicitDefault(config.CPUPartitions, onlineCPUs.Difference(plugin.topology.reservedCPUs))
 	plugin.defaultPartitionCPUs = cpuset.New()
@@ -329,9 +345,18 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		}
 	}
 	if len(config.CPUPartitions) > 0 {
+		verified := make(map[string]bool, len(plugin.partitions))
 		for _, partition := range plugin.partitions {
+			reason, bad := plugin.degradedPartitions[partition.Name]
+			verified[partition.Name] = !bad
+			if bad {
+				logger.Info("partition publishes no devices: the machine does not match what it declares",
+					"partition", partition.Name, "reason", reason)
+				continue
+			}
 			logger.Info("resolved CPU partition", "partition", partition.Name, "role", partition.Role, "cpus", partition.CPUs.String())
 		}
+		metricsRecorder.SetPartitionState(verified)
 		if implicit := plugin.partitions[len(plugin.partitions)-1]; implicit.CPUs.IsEmpty() {
 			logger.Info("the implicit default partition holds no CPUs: a claim that names no partition has nowhere to land on this node")
 		}
@@ -382,7 +407,11 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	var devicesByPartition [][]resourceapi.Device
 
 	if plugin.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-		built := device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping, config.FullPhysicalCPUsOnly, plugin.partitions)
+		publishable := slices.DeleteFunc(slices.Clone(plugin.partitions), func(p device.Partition) bool {
+			_, degraded := plugin.degradedPartitions[p.Name]
+			return degraded
+		})
+		built := device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping, config.FullPhysicalCPUsOnly, publishable)
 		devicesByPartition = built.ByPartition
 		for _, partitionDevices := range devicesByPartition {
 			devices = append(devices, partitionDevices...)
@@ -444,26 +473,114 @@ func unclaimablePartitionCPUs(partitions []device.Partition) cpuset.CPUSet {
 }
 
 // validatePartitions checks the described cores against the node the driver
-// stands on: the checks that need no topology already ran in driverconfig.
+// stands on: the checks that need no topology already ran in driverconfig. It
+// returns the partitions whose declared thread arity the machine contradicts,
+// keyed by name, with what would fix each.
+//
+// A thread arity the platform did not provide degrades that partition rather
+// than the node: the machine configuration that offlines siblings is separate
+// from this configuration, the two are rolled out separately, and a dataplane
+// partition an operator has not finished preparing must not take the node's
+// virtual machines down with it. Everything else is a hard error, because it
+// describes CPUs this node cannot offer at all.
 //
 // A partition names whole cores, which is what makes a device's thread arity
 // its own: half a core in one partition and half in another leaves neither able
 // to promise anything about SMT siblings. Under smt: false the offline siblings
-// do not exist to the kernel, so the surviving thread is a whole core here.
-func validatePartitions(topo *cpuinfo.CPUTopology, onlineCPUs cpuset.CPUSet, partitions []device.Partition) error {
+// do not exist to the kernel, so the surviving thread is a whole core here --
+// which is why the arity check runs first, or a partition still waiting for its
+// siblings to be offlined would be reported as splitting cores instead.
+func validatePartitions(topo *cpuinfo.CPUTopology, onlineCPUs cpuset.CPUSet, partitions []device.Partition) (map[string]string, error) {
+	degraded := make(map[string]string)
 	for _, partition := range partitions {
 		if offline := partition.CPUs.Difference(onlineCPUs); !offline.IsEmpty() {
-			return fmt.Errorf("partition %q names offline CPUs: %s", partition.Name, offline.String())
+			return nil, fmt.Errorf("partition %q names offline CPUs: %s", partition.Name, offline.String())
 		}
 		if unknown := partition.CPUs.Difference(topo.CPUDetails.CPUs()); !unknown.IsEmpty() {
-			return fmt.Errorf("partition %q names CPUs this node does not have: %s", partition.Name, unknown.String())
+			return nil, fmt.Errorf("partition %q names CPUs this node does not have: %s", partition.Name, unknown.String())
+		}
+		if reason := verifyThreadArity(topo, partition); reason != "" {
+			degraded[partition.Name] = reason
+			continue
 		}
 		if split := partition.CPUs.Difference(topo.CPUDetails.CompleteCores(partition.CPUs)); !split.IsEmpty() {
-			return fmt.Errorf("partition %q splits physical cores on %s: a partition holds whole cores, so that what it says about threads per core is true of every core in it",
+			return nil, fmt.Errorf("partition %q splits physical cores on %s: a partition holds whole cores, so that what it says about threads per core is true of every core in it",
 				partition.Name, split.String())
 		}
 	}
-	return nil
+	return degraded, nil
+}
+
+// verifyThreadArity compares a partition's declared threads per core against
+// what the kernel leaves online, and returns what would make the declaration
+// true, or the empty string when it already is. A partition that declared
+// nothing accepts whatever the platform provides.
+//
+// The surplus threads are named as Talos machine.sysfs keys, which is the
+// configuration that offlines them; the kernel path they set is
+// /sys/devices/system/cpu/cpuN/online.
+func verifyThreadArity(topo *cpuinfo.CPUTopology, partition device.Partition) string {
+	if partition.ThreadsPerCore == 0 {
+		return ""
+	}
+	surplus := cpuset.New()
+	for _, cpuID := range partition.CPUs.List() {
+		siblings := topo.CPUDetails.SiblingsOf(cpuID)
+		if siblings.Size() <= partition.ThreadsPerCore {
+			continue
+		}
+		// The partition keeps the threads it named; the rest of the core is what
+		// the platform was asked to take offline.
+		surplus = surplus.Union(siblings.Difference(partition.CPUs))
+	}
+	if surplus.IsEmpty() {
+		return ""
+	}
+	keys := make([]string, 0, surplus.Size())
+	for _, cpuID := range surplus.List() {
+		keys = append(keys, fmt.Sprintf("devices.system.cpu.cpu%d.online: \"0\"", cpuID))
+	}
+	return fmt.Sprintf("partition %q expects at most %d online thread(s) per core, but %s are online too; offline them with machine.sysfs %s",
+		partition.Name, partition.ThreadsPerCore, surplus.String(), strings.Join(keys, ", "))
+}
+
+// verifyOfflineAccounting compares the CPUs the kernel knows about but does not
+// run against the ones the partitions asked for. A surplus is an offline CPU
+// nobody declared, which is a warning rather than an error: it costs capacity
+// and says the machine and this configuration disagree, but every partition
+// that did state an arity has already been checked against the kernel.
+func verifyOfflineAccounting(logger logr.Logger, topo *cpuinfo.CPUTopology, presentCPUs, onlineCPUs cpuset.CPUSet, partitions []device.Partition) {
+	offline := presentCPUs.Difference(onlineCPUs)
+	if offline.IsEmpty() {
+		return
+	}
+	nativeThreadsPerCore := 0
+	for _, cpuID := range onlineCPUs.List() {
+		if threads := topo.CPUDetails.SiblingsOf(cpuID).Size(); threads > nativeThreadsPerCore {
+			nativeThreadsPerCore = threads
+		}
+	}
+	if nativeThreadsPerCore <= 1 {
+		// Every core the driver can see has one thread, and an offline thread is
+		// in no core, so nothing here can tell a core the platform halved from a
+		// core that never had a sibling.
+		logger.Info("offline CPUs cannot be accounted for: every online core has one thread, so this node's own arity is unknowable from here",
+			"offline", offline.String())
+		return
+	}
+	accounted := 0
+	for _, partition := range partitions {
+		if partition.ThreadsPerCore == 0 || partition.ThreadsPerCore >= nativeThreadsPerCore {
+			continue
+		}
+		cores := topo.CPUDetails.CompleteCores(partition.CPUs).Size() / partition.ThreadsPerCore
+		accounted += cores * (nativeThreadsPerCore - partition.ThreadsPerCore)
+	}
+	if offline.Size() == accounted {
+		return
+	}
+	logger.Info("offline CPUs the partitions do not account for: they are lost capacity, and the machine configuration and the partition list disagree about this node",
+		"offline", offline.String(), "offlineCount", offline.Size(), "accountedFor", accounted, "nativeThreadsPerCore", nativeThreadsPerCore)
 }
 
 // validateReservedCPUsAlignment checks reservedCPUs against the node when
@@ -570,6 +687,8 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, fmt.Errorf("failed to create plugin path %s: %w", driverPluginPath, err)
 	}
 
+	cp.reportDegradedPartitions(ctx)
+
 	cdiMgr, err := NewCdiManager(logger, cp.driverName, cdiSpecDir)
 	if err != nil {
 		return asyncErr, fmt.Errorf("failed to create CDI manager: %w", err)
@@ -633,6 +752,39 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	go cp.healthResendLoop(ctx)
 
 	return asyncErr, nil
+}
+
+// reportDegradedPartitions puts each withheld partition on the node's own event
+// stream, where an operator looking at the node they just configured will find
+// it. The driver's log says the same thing, but only to whoever thinks to read
+// a DaemonSet pod's log on the right node.
+func (cp *CPUDriver) reportDegradedPartitions(ctx context.Context) {
+	logger := ctxlog.FromContext(ctx)
+	if cp.kubeClient == nil {
+		return
+	}
+	for _, partition := range slices.Sorted(maps.Keys(cp.degradedPartitions)) {
+		event := &v1.Event{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: cp.nodeName + ".",
+				Namespace:    metav1.NamespaceDefault,
+			},
+			// A Node has no namespace and the driver holds no reference to the
+			// object, so this is the reference the kubelet itself writes for
+			// node events: kind and name, with the name as the UID.
+			InvolvedObject: v1.ObjectReference{Kind: "Node", Name: cp.nodeName, UID: types.UID(cp.nodeName)},
+			Reason:         "CPUPartitionDegraded",
+			Message:        cp.degradedPartitions[partition],
+			Type:           v1.EventTypeWarning,
+			Source:         v1.EventSource{Component: cp.driverName, Host: cp.nodeName},
+			FirstTimestamp: metav1.Now(),
+			LastTimestamp:  metav1.Now(),
+			Count:          1,
+		}
+		if _, err := cp.kubeClient.CoreV1().Events(metav1.NamespaceDefault).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+			logger.Error(err, "cannot report a degraded partition as an event", "partition", partition)
+		}
+	}
 }
 
 // seedAllocationStoreFromDisk recovers claim allocations from CDI specs on
