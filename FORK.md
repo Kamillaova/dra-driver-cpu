@@ -65,6 +65,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`
 
+- `internal/driverconfig`: `DefragEnabled` and `validateDefrag`
+
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
 
@@ -105,3 +107,6 @@ behaviour) rather than silently adapting.
   the store owns. Preserving the per-NUMA footprint and taking whole cores are properties of the
   target, enforced where the target is chosen; duplicating them in the store would give the same
   policy two homes.
+- **The defragmentation option is a flat `defrag*` field, not a nested block.** `Config` is flat
+  throughout, its dump mirror is a field-for-field type conversion, and two reflection tests walk its
+  fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
