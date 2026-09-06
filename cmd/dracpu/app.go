@@ -222,6 +222,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
 		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
 		ReconcileSharedOnUnprepare:            cfg.ReconcileSharedOnUnprepare,
+		DefragEnabled:                         cfg.DefragEnabled,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 	}
