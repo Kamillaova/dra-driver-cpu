@@ -84,7 +84,11 @@ func (cp *CPUDriver) reconcileSharedContainers(ctx context.Context) {
 		return
 	}
 
+	// Read the pool under the lock and let go of it before calling out: holding
+	// it across the update is the deadlock applyMu's contract forbids.
+	cp.applyMu.Lock()
 	updates, err := cp.getSharedContainerUpdates(logger, types.UID(""))
+	cp.applyMu.Unlock()
 	if err != nil {
 		logger.Error(err, "cannot reconcile shared containers")
 		return
