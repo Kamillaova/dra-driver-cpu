@@ -80,6 +80,10 @@ honor these settings, where applicable.
   whole-core tests run instead of skipping. They skip themselves on a node with SMT disabled, where
   every core is a single thread and the option has no observable effect.
 
+- The **cross-node scheduling** specs need no knob: they run whenever at least two nodes publish
+  `dra.cpu` devices and skip themselves otherwise. On a heterogeneous fleet they exercise capacity
+  routing, geometry CEL selectors, burst races, and the scheduler's fragmentation blind spot.
+
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.
