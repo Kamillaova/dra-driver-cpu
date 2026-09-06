@@ -1,0 +1,142 @@
+# The in-pod shim implementing the workload contract from
+# docs/user/defragmentation.md: the injected DRA_CPUSET_* variable is never
+# parsed; the live CPU set comes from the container's own cgroup; vCPU threads
+# are pinned vCPU k -> k-th allocated CPU; and a change to the cpuset -- a
+# defragmentation move -- is picked up via inotify on cpuset.cpus (the writable
+# file, which generates events) and answered by re-reading
+# cpuset.cpus.effective (the derived file, which carries the truth but no
+# events), with a slow poll as the backstop for the two changes inotify cannot
+# see (CPU hotplug, a parent cgroup shrinking).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qemu-launcher
+data:
+  launch-qemu.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    CG=/sys/fs/cgroup
+    QMP_SOCK=/tmp/qmp.sock
+
+    # QEMU's own threads -- main loop, iothreads, vhost workers -- must never
+    # steal time from a vCPU, so CONTROL_CPUS of the claim are set aside for
+    # them: a container's threads cannot be pinned outside its own cgroup
+    # cpuset.
+    VCPUS=$(python3 /scripts/pin-vcpus.py count)
+    echo "starting VM: ${VCPUS} vCPUs, ${CONTROL_CPUS:-0} control CPUs, cpuset $(cat "$CG/cpuset.cpus.effective")"
+
+    qemu-system-x86_64 \
+      -enable-kvm -machine q35 -cpu host \
+      -smp "${VCPUS}" \
+      -m "${VM_MEMORY_MB:-4096}" \
+      -object memory-backend-file,id=mem0,size="${VM_MEMORY_MB:-4096}M",mem-path=/dev/hugepages,share=on,prealloc=on \
+      -numa node,memdev=mem0 \
+      -qmp "unix:${QMP_SOCK},server,nowait" \
+      -display none -serial null -monitor none \
+      "$@" &
+    QEMU_PID=$!
+
+    for _ in $(seq 1 50); do [ -S "$QMP_SOCK" ] && break; sleep 0.2; done
+    python3 /scripts/pin-vcpus.py pin "$QEMU_PID" "$QMP_SOCK"
+
+    # Re-pin on every cpuset write (each defragmentation move is one), with a
+    # 30s backstop for changes that produce no inotify event.
+    (
+      while sleep 30; do python3 /scripts/pin-vcpus.py pin "$QEMU_PID" "$QMP_SOCK" || true; done
+    ) &
+    (
+      inotifywait -m -q -e modify "$CG/cpuset.cpus" | while read -r _; do
+        echo "cpuset changed, re-pinning onto $(cat "$CG/cpuset.cpus.effective")"
+        python3 /scripts/pin-vcpus.py pin "$QEMU_PID" "$QMP_SOCK" || true
+      done
+    ) &
+
+    wait "$QEMU_PID"
+  pin-vcpus.py: |
+    #!/usr/bin/env python3
+    """Split the container's CPUs into vCPU and control CPUs, and pin QEMU.
+
+    The allocated CPUs are grouped by the L3 cache they share, read from the
+    container's own sysfs view, and ordered largest cache group first: vCPUs
+    fill the front of that order, so they stay inside one cache whenever the
+    claim allows it, and the last CONTROL_CPUS of it -- the stragglers in the
+    other cache, when the claim is one cache plus a spare core -- take every
+    thread that is not a vCPU. The counts never change across a
+    defragmentation move, only the identities, so the split is stable and
+    -smp stays valid.
+
+    Usage: pin-vcpus.py count | pin <qemu-pid> <qmp-socket>
+    """
+    import json, os, socket, sys
+
+    CONTROL_CPUS = int(os.environ.get("CONTROL_CPUS", "0"))
+
+    def cpu_list(spec):
+        cpus = []
+        for part in spec.strip().split(","):
+            if "-" in part:
+                lo, hi = part.split("-")
+                cpus.extend(range(int(lo), int(hi) + 1))
+            elif part:
+                cpus.append(int(part))
+        return sorted(cpus)
+
+    def sysfs(cpu, name):
+        try:
+            return open(f"/sys/devices/system/cpu/cpu{cpu}/{name}").read().strip()
+        except OSError:
+            return "?"
+
+    def cache_ordered(cpus):
+        groups = {}
+        for cpu in cpus:
+            groups.setdefault(sysfs(cpu, "cache/index3/id"), []).append(cpu)
+        ordered = []
+        for _, group in sorted(groups.items(), key=lambda kv: (-len(kv[1]), sorted(kv[1]))):
+            # SMT siblings adjacent, so the control tail is whole cores rather
+            # than the second threads of cores whose first threads are vCPUs.
+            ordered.extend(sorted(group, key=lambda c: (sysfs(c, "topology/core_id"), c)))
+        return ordered
+
+    def split(cpus):
+        # CONTROL_CPUS are carved out of the claim itself: the cache-ordered
+        # tail, which the sibling-adjacent ordering keeps to whole cores.
+        ordered = cache_ordered(cpus)
+        control = min(CONTROL_CPUS, max(0, len(ordered) - 1))
+        if control == 0:
+            return ordered, ordered
+        return ordered[:-control], ordered[-control:]
+
+    def qmp(sock, command):
+        sock.sendall((json.dumps({"execute": command}) + "\n").encode())
+        while True:
+            reply = json.loads(sock.makefile().readline())
+            if "return" in reply:
+                return reply["return"]
+
+    cpus = cpu_list(open("/sys/fs/cgroup/cpuset.cpus.effective").read())
+    vcpu_cpus, control_cpus = split(cpus)
+
+    if sys.argv[1] == "count":
+        print(len(vcpu_cpus))
+        sys.exit(0)
+
+    qemu_pid, qmp_path = int(sys.argv[2]), sys.argv[3]
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.connect(qmp_path)
+        sock.makefile().readline()          # greeting
+        qmp(sock, "qmp_capabilities")
+        vcpus = qmp(sock, "query-cpus-fast")
+
+    pinned = set()
+    for vcpu in sorted(vcpus, key=lambda v: v["cpu-index"]):
+        tid = vcpu["thread-id"]
+        target = vcpu_cpus[vcpu["cpu-index"] % len(vcpu_cpus)]
+        os.sched_setaffinity(tid, {target})
+        pinned.add(tid)
+        print(f"vCPU {vcpu['cpu-index']} (tid {tid}) -> CPU {target}")
+
+    for tid in os.listdir(f"/proc/{qemu_pid}/task"):
+        if int(tid) not in pinned:
+            os.sched_setaffinity(int(tid), set(control_cpus))
+    print(f"control threads -> CPUs {sorted(control_cpus)}")
