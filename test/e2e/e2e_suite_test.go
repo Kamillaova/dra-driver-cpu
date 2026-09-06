@@ -57,6 +57,8 @@ const (
 	argReservedCPUs       = "--reserved-cpus="
 	argCPUDeviceMode      = "--cpu-device-mode="
 	argGroupBy            = "--group-by="
+	profileLabel          = "dra.cpu/profile"
+	defaultProfileName    = "default"
 	daemonSetNamespace    = "kube-system"
 	daemonSetLabel        = "app=dracpu"
 	driverPodPollInterval = 2 * time.Second
@@ -332,9 +334,69 @@ type driverConfigValues struct {
 	// ReconcileSharedOnUnprepare defaults to true in the driver, so a config
 	// file that does not mention it leaves it on: absent must read as true,
 	// which a plain bool cannot express.
-	ReconcileSharedOnUnprepare *bool  `json:"reconcileSharedOnUnprepare,omitempty"`
-	DefragEnabled              bool   `json:"defragEnabled,omitempty"`
-	CachePlacementPolicy       string `json:"cachePlacementPolicy,omitempty"`
+	ReconcileSharedOnUnprepare *bool                    `json:"reconcileSharedOnUnprepare,omitempty"`
+	DefragEnabled              bool                     `json:"defragEnabled,omitempty"`
+	CPUPartitions              []driverConfigPartition  `json:"cpuPartitions,omitempty"`
+	CachePlacementPolicy       string                   `json:"cachePlacementPolicy,omitempty"`
+	Profiles                   map[string]profileValues `json:"profiles,omitempty"`
+}
+
+type profileValues struct {
+	CPUPartitions []driverConfigPartition `json:"cpuPartitions,omitempty"`
+}
+
+// driverConfigPartition is one entry of the driver's cpuPartitions list. The
+// thread-arity expectation is read raw, since the config file spells it as a
+// boolean or a count and the suite only asks whether it is one thread per core.
+type driverConfigPartition struct {
+	Name string          `json:"name"`
+	Role string          `json:"role"`
+	CPUs string          `json:"cpus"`
+	SMT  json.RawMessage `json:"smt,omitempty"`
+}
+
+// singleThreadPartition returns the first partition declaring one online thread
+// per core, which is the shape a node has to be prepared for by hand.
+func (v driverConfigValues) singleThreadPartition() (driverConfigPartition, bool) {
+	for _, partition := range v.CPUPartitions {
+		switch string(partition.SMT) {
+		case "false", "1":
+			return partition, true
+		}
+	}
+	return driverConfigPartition{}, false
+}
+
+// effectiveFor mirrors the driver's config-profile resolution: the node's
+// dra.cpu/profile label picks the partitions describing that node's cores.
+func (v driverConfigValues) effectiveFor(node *v1.Node) driverConfigValues {
+	ginkgo.GinkgoHelper()
+	if len(v.Profiles) == 0 {
+		name := node.Labels[profileLabel]
+		gomega.Expect(name == "" || name == defaultProfileName).To(gomega.BeTrue(),
+			"node %s selects config profile %q, which the driver config does not declare", node.Name, name)
+		return v
+	}
+	name := node.Labels[profileLabel]
+	gomega.Expect(name).ToNot(gomega.BeEmpty(), "node %s carries no %s label, so its driver would not have started", node.Name, profileLabel)
+	profile, declared := v.Profiles[name]
+	gomega.Expect(declared || name == defaultProfileName).To(gomega.BeTrue(),
+		"node %s selects config profile %q, which the driver config does not declare", node.Name, name)
+	v.CPUPartitions = profile.CPUPartitions
+	return v
+}
+
+func discoverNodeCPUInfo(ctx context.Context, fxt *fixture.Fixture, nodeName, image string) discovery.DRACPUInfo {
+	ginkgo.GinkgoHelper()
+	infoPod := discovery.MakePod(fxt.Namespace.Name, image)
+	infoPod = e2epod.PinToNode(infoPod, nodeName)
+	infoPod, err := e2epod.RunToCompletion(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot run the discovery pod")
+	data, err := e2epod.GetLogs(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get the discovery pod logs")
+	var info discovery.DRACPUInfo
+	gomega.Expect(unmarshalLatestReport(data, &info)).To(gomega.Succeed())
+	return info
 }
 
 // reconcilesSharedOnUnprepare reports whether the driver widens shared
