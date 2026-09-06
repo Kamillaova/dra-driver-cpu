@@ -733,9 +733,9 @@ func TestPrepareResourceClaims(t *testing.T) {
 			expectedCdiEnvVar:       fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-1"),
 			expectedPreparedDevices: []kubeletplugin.Device{
 				{PoolName: testNodeName, DeviceName: "cpudev000", CDIDeviceIDs: []string{cdiQualifiedName},
-					Metadata: metadataFromCPUInfo(cpuinfo.CPUInfo{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance}, false)},
+					Metadata: metadataFromCPUInfo(cpuinfo.CPUInfo{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance}, false, "0-1")},
 				{PoolName: testNodeName, DeviceName: "cpudev002", CDIDeviceIDs: []string{cdiQualifiedName},
-					Metadata: metadataFromCPUInfo(cpuinfo.CPUInfo{CpuID: 1, CoreID: 1, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance}, false)},
+					Metadata: metadataFromCPUInfo(cpuinfo.CPUInfo{CpuID: 1, CoreID: 1, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance}, false, "0-1")},
 			},
 		},
 		{
@@ -839,7 +839,7 @@ func TestPrepareResourceClaims(t *testing.T) {
 			expectedCdiEnvVar:       fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0"),
 			expectedPreparedDevices: []kubeletplugin.Device{
 				{PoolName: testNodeName, DeviceName: "cpudev000", CDIDeviceIDs: []string{cdiQualifiedName},
-					Metadata: metadataFromCPUInfo(cpuinfo.CPUInfo{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance}, false)},
+					Metadata: metadataFromCPUInfo(cpuinfo.CPUInfo{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, CoreType: cpuinfo.CoreTypePerformance}, false, "0")},
 			},
 		},
 		{
@@ -1393,6 +1393,18 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 				} else {
 					require.NoError(t, result.Err, "Unexpected error for test case: %s", tc.name)
 
+					// The metadata of every device of a request names that
+					// request's own CPUs, which for a claim of several requests
+					// is not the claim's whole set. Which CPU went to which
+					// request is the driver's choice, so it is read back rather
+					// than predicted.
+					cpusByRequest := map[string]string{}
+					if record, ok := driver.cpuAllocationStore.GetClaimRecord(claimUID); ok {
+						for _, request := range record.Requests {
+							cpusByRequest[request.Request] = request.CPUs.String()
+						}
+					}
+
 					// Build expected devices based on the claim request
 					expectedPreparedDevices := []kubeletplugin.Device{}
 					if tc.expectedCPUSet.Size() != 0 || tc.expectedError {
@@ -1406,7 +1418,7 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 								DeviceName:   res.Device,
 								CDIDeviceIDs: []string{cdiQualifiedName},
 								Requests:     []string{res.Request},
-								Metadata:     expectedGroupMetadata(tc.groupBy, tc.cpuInfos, tc.reservedCPUs, res.Device, allocatedCPUs),
+								Metadata:     expectedGroupMetadata(tc.groupBy, tc.cpuInfos, tc.reservedCPUs, res.Device, allocatedCPUs, cpusByRequest[res.Request]),
 							})
 						}
 					}
@@ -2328,7 +2340,10 @@ func createCPUDriverForTest(t *testing.T, groupBy string, cpuInfos []cpuinfo.CPU
 
 // metadataFromCPUInfo builds a DeviceMetadata from static test data,
 // independent of production code paths.
-func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool) *kubeletplugin.DeviceMetadata {
+// metadataFromCPUInfo builds the expected DeviceMetadata for one individual
+// device. requestCPUs is what the whole request the device serves was given,
+// which every device of that request's file names.
+func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool, requestCPUs string) *kubeletplugin.DeviceMetadata {
 	attrs := map[string]resourceapi.DeviceAttribute{
 		// DRA standard attributes first
 		string(deviceattribute.StandardDeviceAttributeNUMANode): {IntValue: new(int64(cpu.NUMANodeID))},
@@ -2342,12 +2357,27 @@ func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool) *kubeletplugin.De
 		"dra.net/numaNode":                  {IntValue: new(int64(cpu.NUMANodeID))},
 		"dra.cpu/numaNodeID":                {IntValue: new(int64(cpu.NUMANodeID))},
 	}
+	addExpectedClaimFacts(attrs, requestCPUs)
 	return &kubeletplugin.DeviceMetadata{Attributes: attrs}
+}
+
+// addExpectedClaimFacts mirrors what the driver adds to every request's
+// metadata from the claim itself. The claims in these tests carry no opaque
+// configuration, so they permit no move, which is also what lets their CPUs be
+// named in a file that cannot be rewritten later.
+func addExpectedClaimFacts(attrs map[string]resourceapi.DeviceAttribute, requestCPUs string) {
+	attrs[string(devattr.AttributeRelocatable)] = resourceapi.DeviceAttribute{BoolValue: new(false)}
+	attrs[string(devattr.AttributeAlignment)] = resourceapi.DeviceAttribute{
+		StringValue: new(string(v1alpha1.AlignmentBestEffort)),
+	}
+	if requestCPUs != "" {
+		attrs[string(devattr.AttributeCPUSet)] = resourceapi.DeviceAttribute{StringValue: new(requestCPUs)}
+	}
 }
 
 // expectedGroupMetadata builds the expected DeviceMetadata for a grouped
 // device from static test data, independent of production code paths.
-func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedCPUs cpuset.CPUSet, deviceName string, allocatedCPUs int64) *kubeletplugin.DeviceMetadata {
+func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedCPUs cpuset.CPUSet, deviceName string, allocatedCPUs int64, requestCPUs string) *kubeletplugin.DeviceMetadata {
 	attrs := map[string]resourceapi.DeviceAttribute{}
 
 	switch groupBy {
@@ -2413,6 +2443,7 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 	if allocatedCPUs > 0 {
 		attrs[string(devattr.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(allocatedCPUs)}
 	}
+	addExpectedClaimFacts(attrs, requestCPUs)
 
 	return &kubeletplugin.DeviceMetadata{Attributes: attrs}
 }
@@ -2987,4 +3018,99 @@ func TestPrepareFailsClosedOnAContradictoryConfig(t *testing.T) {
 			require.True(t, d.cpuAllocationStore.GetPreparedCPUs().IsEmpty())
 		})
 	}
+}
+
+// TestMetadataCarriesWhatTheClaimSaidAboutItsPlacement: the metadata file is a
+// workload's only in-band copy of its own contract, and it is written once,
+// before the container starts. So it always says whether the claim may be
+// moved, and it names CPUs only where they cannot change afterwards -- which
+// for a claimed pool is always, since a pool is never moved.
+func TestMetadataCarriesWhatTheClaimSaidAboutItsPlacement(t *testing.T) {
+	logger := testr.New(t)
+	cpuInfos := mockCPUInfos_SingleSocket_4CPUS_HT
+	driver, err := New(logger, Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: cpuInfos},
+		SysFS:   testSysFS(cpuInfos),
+	}, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		CPUPartitions: []devattr.Partition{
+			{Name: "helpers", Role: devattr.PARTITION_ROLE_SHARED, CPUs: cpuset.New(1, 3)},
+		},
+	})
+	require.NoError(t, err)
+	driver.cdiMgr = newMockCdiMgr()
+
+	poolDevice := devattr.CPUDevicePoolPrefix + "000-helpers"
+	newClaim := func(uid types.UID, raw string) *resourceapi.ResourceClaim {
+		claim := testClaimWithResults(uid, []resourceapi.DeviceRequestAllocationResult{
+			{
+				Driver:           testDriverName,
+				Pool:             testNodeName,
+				Device:           "cpudevnuma000",
+				Request:          "vcpus",
+				ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: *resource.NewQuantity(1, resource.DecimalSI)},
+			},
+			{
+				Driver:           testDriverName,
+				Pool:             testNodeName,
+				Device:           poolDevice,
+				Request:          "helpers",
+				ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: *resource.NewMilliQuantity(100, resource.DecimalSI)},
+			},
+		})
+		if raw == "" {
+			return claim
+		}
+		return claimWithRawConfigs(claim, testDriverName, raw)
+	}
+
+	metadataOf := func(t *testing.T, result kubeletplugin.PrepareResult, deviceName string) map[string]resourceapi.DeviceAttribute {
+		t.Helper()
+		for _, prepared := range result.Devices {
+			if prepared.DeviceName == deviceName {
+				require.NotNil(t, prepared.Metadata, deviceName)
+				return prepared.Metadata.Attributes
+			}
+		}
+		t.Fatalf("no prepared device %q", deviceName)
+		return nil
+	}
+
+	movable := newClaim("claim-movable", `{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`)
+	fixed := newClaim("claim-fixed", "")
+	results, err := driver.PrepareResourceClaims(context.Background(),
+		[]*resourceapi.ResourceClaim{movable, fixed})
+	require.NoError(t, err)
+	require.NoError(t, results[movable.UID].Err)
+	require.NoError(t, results[fixed.UID].Err)
+
+	t.Run("a claim that permits moves does not name its exclusive CPUs", func(t *testing.T) {
+		attrs := metadataOf(t, results[movable.UID], "cpudevnuma000")
+		require.True(t, *attrs[string(devattr.AttributeRelocatable)].BoolValue)
+		require.Equal(t, string(v1alpha1.AlignmentBestEffort), *attrs[string(devattr.AttributeAlignment)].StringValue)
+		require.NotContains(t, attrs, string(devattr.AttributeCPUSet),
+			"a file that cannot be rewritten must not name CPUs the claim may leave")
+	})
+
+	t.Run("its pool's CPUs are named even so", func(t *testing.T) {
+		attrs := metadataOf(t, results[movable.UID], poolDevice)
+		require.True(t, *attrs[string(devattr.AttributeRelocatable)].BoolValue)
+		require.Equal(t, "1,3", *attrs[string(devattr.AttributeCPUSet)].StringValue,
+			"a claimed pool is never moved, so its CPUs are settled")
+	})
+
+	t.Run("a claim that said nothing names its exclusive CPUs", func(t *testing.T) {
+		attrs := metadataOf(t, results[fixed.UID], "cpudevnuma000")
+		require.False(t, *attrs[string(devattr.AttributeRelocatable)].BoolValue)
+		recorded, ok := driver.cpuAllocationStore.GetClaimRecord(fixed.UID)
+		require.True(t, ok)
+		for _, request := range recorded.Requests {
+			if request.Request == "vcpus" {
+				require.Equal(t, request.CPUs.String(), *attrs[string(devattr.AttributeCPUSet)].StringValue)
+			}
+		}
+	})
 }

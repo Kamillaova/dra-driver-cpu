@@ -49,6 +49,8 @@ func TestAttributeNamesAreValidQualifiedNames(t *testing.T) {
 		AttributeRole,
 		AttributeAllocatedNumCPUs,
 		AttributeCPUSet,
+		AttributeRelocatable,
+		AttributeAlignment,
 		AttributeRepairRounds,
 		AttributeFrontierInput,
 	}
