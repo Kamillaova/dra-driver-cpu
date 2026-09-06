@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,13 +39,21 @@ type fakeContainerUpdater struct {
 	calls  [][]*api.ContainerUpdate
 	failed []*api.ContainerUpdate
 	err    error
+	// onUpdate runs during the call, outside the driver's applyMu, which is when
+	// a container lifecycle event can really interleave with a round.
+	onUpdate func([]*api.ContainerUpdate)
 }
 
 func (f *fakeContainerUpdater) UpdateContainers(updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, updates)
-	return f.failed, f.err
+	failed, err := f.failed, f.err
+	hook := f.onUpdate
+	f.mu.Unlock()
+	if hook != nil {
+		hook(updates)
+	}
+	return failed, err
 }
 
 func (f *fakeContainerUpdater) allCalls() [][]*api.ContainerUpdate {
@@ -168,4 +177,25 @@ func TestReconcileWorkerServesRequests(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestReconcileReleasesApplyMuDuringTheRuntimeCall(t *testing.T) {
+	// Same contract as the defragmentation pass: the pool is read under applyMu,
+	// but the update must go out with it released, or the runtime-side lock
+	// inversion behind containerd/nri#301 deadlocks the driver against its own
+	// inbound hooks.
+	d, updater := driverWithSharedContainer(t, "claim-1", cpuset.New(0, 1))
+
+	var lockWasFree atomic.Bool
+	updater.onUpdate = func([]*api.ContainerUpdate) {
+		if d.applyMu.TryLock() {
+			d.applyMu.Unlock()
+			lockWasFree.Store(true)
+		}
+	}
+
+	d.reconcileSharedContainers(context.Background())
+
+	require.Len(t, updater.allCalls(), 1)
+	require.True(t, lockWasFree.Load(), "applyMu was held across the runtime call")
 }
