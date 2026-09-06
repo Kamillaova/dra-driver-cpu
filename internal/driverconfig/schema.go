@@ -40,7 +40,17 @@ var schemaExcludedFields = map[string]string{
 var schemaEnums = map[string][]any{
 	"cachePlacementStrategy": {string(coreselect.Pack), string(coreselect.Spread)},
 	"cpuDeviceMode":          {device.CPU_DEVICE_MODE_GROUPED, device.CPU_DEVICE_MODE_INDIVIDUAL},
-	"groupBy":                {device.GROUP_BY_NUMA_NODE, device.GROUP_BY_SOCKET, device.GROUP_BY_MACHINE},
+	"groupBy":                groupingEnum(),
+}
+
+// groupingEnum is groupings as an enum, so that the config files the driver
+// accepts and the ones the chart accepts cannot drift apart.
+func groupingEnum() []any {
+	enum := make([]any, 0, len(groupings))
+	for _, grouping := range groupings {
+		enum = append(enum, grouping)
+	}
+	return enum
 }
 
 // schemaListEnums are the allowed values for a field of a list field's item,
