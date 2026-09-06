@@ -77,8 +77,8 @@ args:
   logLevel: 4 # @schema type:integer;minimum:0;required:true
   # -- **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.cpuDeviceMode` instead. CPU exposure mode: `grouped` (expose NUMA nodes or sockets as devices) or `individual` (expose each CPU as a device); defaults to `grouped` when empty.
   cpuDeviceMode: "" # @schema enum:["",grouped,individual];required:true
-  # -- **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.groupBy` instead. Grouping criteria when `cpuDeviceMode=grouped`: `numanode`, `socket` or `machine`; defaults to `numanode` when empty.
-  groupBy: "" # @schema enum:["",numanode,socket,machine];required:true
+  # -- **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.groupBy` instead. Grouping criteria when `cpuDeviceMode=grouped`: `numanode`, `socket`, `machine` or `uncorecache`; defaults to `numanode` when empty.
+  groupBy: "" # @schema enum:["",numanode,socket,machine,uncorecache];required:true
   # -- **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.reservedCPUs` instead. CPUs reserved for the OS and kubelet, excluded from DRA management (e.g. `"0-1"`).
   reservedCPUs: ""
   # -- **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.hostnameOverride` instead. Overrides the node name the driver registers under.
