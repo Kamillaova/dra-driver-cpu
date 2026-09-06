@@ -44,7 +44,7 @@ var schemaEnums = map[string][]any{
 }
 
 // schemaListEnums are the allowed values for a field of a list field's item,
-// which schemaEnums cannot express: it keys on Config's own properties.
+// which schemaEnums cannot express: it keys on the name of the list.
 var schemaListEnums = map[string]map[string][]any{
 	"cpuPartitions": {
 		"role": {
@@ -97,29 +97,33 @@ func GenerateDriverConfigSchema() ([]byte, error) {
 	}
 
 	for jsonKey, enums := range schemaListEnums {
-		item, err := listItemSchema(schema, jsonKey)
+		items, err := listItemSchemas(schema, jsonKey)
 		if err != nil {
 			return nil, err
 		}
-		for field, enum := range enums {
-			prop, ok := item.Properties[field]
-			if !ok {
-				return nil, fmt.Errorf("schemaListEnums has entry %q.%q but the list item has no matching field", jsonKey, field)
+		for _, item := range items {
+			for field, enum := range enums {
+				prop, ok := item.Properties[field]
+				if !ok {
+					return nil, fmt.Errorf("schemaListEnums has entry %q.%q but the list item has no matching field", jsonKey, field)
+				}
+				prop.Enum = enum
 			}
-			prop.Enum = enum
 		}
 	}
 
 	for jsonKey, fields := range schemaListFields {
-		item, err := listItemSchema(schema, jsonKey)
+		items, err := listItemSchemas(schema, jsonKey)
 		if err != nil {
 			return nil, err
 		}
-		for field, replacement := range fields {
-			if _, ok := item.Properties[field]; !ok {
-				return nil, fmt.Errorf("schemaListFields has entry %q.%q but the list item has no matching field", jsonKey, field)
+		for _, item := range items {
+			for field, replacement := range fields {
+				if _, ok := item.Properties[field]; !ok {
+					return nil, fmt.Errorf("schemaListFields has entry %q.%q but the list item has no matching field", jsonKey, field)
+				}
+				item.Properties[field] = replacement
 			}
-			item.Properties[field] = replacement
 		}
 	}
 
@@ -140,13 +144,37 @@ func GenerateDriverConfigSchema() ([]byte, error) {
 	return append(out, '\n'), nil
 }
 
-func listItemSchema(schema *jsonschema.Schema, jsonKey string) (*jsonschema.Schema, error) {
-	prop, ok := schema.Properties[jsonKey]
-	if !ok {
+// listItemSchemas returns the item schema of every list named jsonKey anywhere
+// under schema, not only the one on Config itself: the same list is declared
+// again inside a profile, and a constraint applied to one copy and not the
+// other would accept in a profile what it rejects fleet-wide.
+func listItemSchemas(schema *jsonschema.Schema, jsonKey string) ([]*jsonschema.Schema, error) {
+	var items []*jsonschema.Schema
+	var walk func(*jsonschema.Schema) error
+	visited := map[*jsonschema.Schema]bool{}
+	walk = func(s *jsonschema.Schema) error {
+		if s == nil || visited[s] {
+			return nil
+		}
+		visited[s] = true
+		if prop, ok := s.Properties[jsonKey]; ok {
+			if prop.Items == nil {
+				return fmt.Errorf("field %q is not a list", jsonKey)
+			}
+			items = append(items, prop.Items)
+		}
+		for _, prop := range s.Properties {
+			if err := walk(prop); err != nil {
+				return err
+			}
+		}
+		return walk(s.AdditionalProperties)
+	}
+	if err := walk(schema); err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
 		return nil, fmt.Errorf("Config has no field %q", jsonKey)
 	}
-	if prop.Items == nil {
-		return nil, fmt.Errorf("field %q is not a list", jsonKey)
-	}
-	return prop.Items, nil
+	return items, nil
 }

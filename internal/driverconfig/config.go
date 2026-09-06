@@ -18,6 +18,8 @@ package driverconfig
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 
 	"sigs.k8s.io/yaml"
 )
@@ -110,6 +112,76 @@ type Config struct {
 	// both is an error and a reserved partition is how CPUs are kept from
 	// workloads once the list is used.
 	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
+	// Profiles are per-node-type descriptions of a node's own cores, one
+	// cpuPartitions list each. CPU numbering is a property of the hardware, so
+	// a fleet mixing node types has no single description that is right
+	// everywhere; every other field stays fleet-wide policy. A node selects its
+	// profile with the ProfileLabel label.
+	//
+	// Declaring any profile makes the fleet-wide CPU-naming fields errors and
+	// an unlabelled node refuse to start, so a node of one type can never take
+	// a description meant for another. Every profile is validated on every
+	// node, so a typo in any of them fails the whole fleet fast instead of one
+	// node quietly.
+	Profiles map[string]Profile `json:"profiles,omitempty"`
+}
+
+// Profile is one node type's description of its own cores.
+type Profile struct {
+	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
+}
+
+// ProfileLabel is the node label whose value names the config profile the
+// node's driver applies at startup. Changing it takes effect on the next
+// driver restart, deliberately: the partitions it selects are the ground truth
+// under every current placement, not a value to swap live.
+const ProfileLabel = "dra.cpu/profile"
+
+// DefaultProfileName selects the implicit profile, which declares no partition
+// and so leaves the whole node in the implicit default one. It always exists
+// and is never declared, so a node whose cores are all interchangeable asks
+// for it by name rather than by carrying no label.
+const DefaultProfileName = "default"
+
+func (p Profile) String() string {
+	return fmt.Sprintf("{cpuPartitions: %v}", p.CPUPartitions)
+}
+
+// asProfile returns c with p's cores in place of its own, revalidated. It is
+// the step selecting a profile on a node and checking every profile from every
+// node have in common, so the two cannot drift on what a profile means or on
+// what they say when one does not hold.
+func (c Config) asProfile(name string, p Profile) (Config, error) {
+	c.CPUPartitions = p.CPUPartitions
+	c.Profiles = nil
+	if err := c.Validate(); err != nil {
+		return Config{}, fmt.Errorf("config profile %q does not validate: %w", name, err)
+	}
+	return c, nil
+}
+
+// WithProfile returns the config the node runs on once the profile its label
+// names is applied, revalidated. Naming a profile the config does not define
+// is an error, never a fallback: a typo must not run a node on another node
+// type's description of its cores.
+func (c Config) WithProfile(name string) (Config, error) {
+	if len(c.Profiles) == 0 {
+		if name != "" && name != DefaultProfileName {
+			return Config{}, fmt.Errorf("the node's %s label selects config profile %q, but the config declares no profiles",
+				ProfileLabel, name)
+		}
+		return c, nil
+	}
+	if name == "" {
+		return Config{}, fmt.Errorf("the node carries no %s label and the config declares profiles %v: label the node with the profile matching its hardware, or with %q for a node whose cores are all interchangeable",
+			ProfileLabel, slices.Sorted(maps.Keys(c.Profiles)), DefaultProfileName)
+	}
+	profile, declared := c.Profiles[name]
+	if !declared && name != DefaultProfileName {
+		return Config{}, fmt.Errorf("the node's %s label selects config profile %q, but the config declares only %v",
+			ProfileLabel, name, slices.Sorted(maps.Keys(c.Profiles)))
+	}
+	return c.asProfile(name, profile)
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -135,32 +207,34 @@ func (c Config) LogValues() []any {
 		"defragClaimCooldownSeconds", c.DefragClaimCooldownSeconds,
 		"cachePlacementPolicy", c.CachePlacementPolicy,
 		"cpuPartitions", c.CPUPartitions,
+		"profiles", c.Profiles,
 	}
 }
 
 // dumpConfig mirrors Config field-for-field but drops the omitempty json
 // tags, so Dump also prints zero values (e.g. exposePCIeRoots=false).
 type dumpConfig struct {
-	Kubeconfig                            string         `json:"kubeconfig"`
-	HostnameOverride                      string         `json:"hostnameOverride"`
-	BindAddress                           string         `json:"bindAddress"`
-	ReservedCPUs                          string         `json:"reservedCPUs"`
-	CPUDeviceMode                         string         `json:"cpuDeviceMode"`
-	GroupBy                               string         `json:"groupBy"`
-	ExposePCIeRoots                       bool           `json:"exposePCIeRoots"`
-	SysFSOverlay                          string         `json:"sysfsOverlay"`
-	KubeletRootDir                        string         `json:"kubeletRootDir"`
-	PublishNodeAllocatableResourceMapping bool           `json:"publishNodeAllocatableResourceMapping"`
-	FullPhysicalCPUsOnly                  bool           `json:"fullPhysicalCPUsOnly"`
-	AssumeUnsolicitedUpdatesSafe          bool           `json:"assumeUnsolicitedUpdatesSafe"`
-	ReconcileSharedOnUnprepare            bool           `json:"reconcileSharedOnUnprepare"`
-	DefragEnabled                         bool           `json:"defragEnabled"`
-	DefragIntervalSeconds                 int            `json:"defragIntervalSeconds"`
-	DefragMaxMovesPerPass                 int            `json:"defragMaxMovesPerPass"`
-	DefragMinGain                         int            `json:"defragMinGain"`
-	DefragClaimCooldownSeconds            int            `json:"defragClaimCooldownSeconds"`
-	CachePlacementPolicy                  string         `json:"cachePlacementPolicy"`
-	CPUPartitions                         []CPUPartition `json:"cpuPartitions"`
+	Kubeconfig                            string             `json:"kubeconfig"`
+	HostnameOverride                      string             `json:"hostnameOverride"`
+	BindAddress                           string             `json:"bindAddress"`
+	ReservedCPUs                          string             `json:"reservedCPUs"`
+	CPUDeviceMode                         string             `json:"cpuDeviceMode"`
+	GroupBy                               string             `json:"groupBy"`
+	ExposePCIeRoots                       bool               `json:"exposePCIeRoots"`
+	SysFSOverlay                          string             `json:"sysfsOverlay"`
+	KubeletRootDir                        string             `json:"kubeletRootDir"`
+	PublishNodeAllocatableResourceMapping bool               `json:"publishNodeAllocatableResourceMapping"`
+	FullPhysicalCPUsOnly                  bool               `json:"fullPhysicalCPUsOnly"`
+	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe"`
+	ReconcileSharedOnUnprepare            bool               `json:"reconcileSharedOnUnprepare"`
+	DefragEnabled                         bool               `json:"defragEnabled"`
+	DefragIntervalSeconds                 int                `json:"defragIntervalSeconds"`
+	DefragMaxMovesPerPass                 int                `json:"defragMaxMovesPerPass"`
+	DefragMinGain                         int                `json:"defragMinGain"`
+	DefragClaimCooldownSeconds            int                `json:"defragClaimCooldownSeconds"`
+	CachePlacementPolicy                  string             `json:"cachePlacementPolicy"`
+	CPUPartitions                         []CPUPartition     `json:"cpuPartitions"`
+	Profiles                              map[string]Profile `json:"profiles"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of

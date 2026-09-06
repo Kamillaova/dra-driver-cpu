@@ -1123,3 +1123,204 @@ cpuPartitions:
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must be true, false or a thread count")
 }
+
+// TestWithProfile: the label value picks the node type's description of its
+// own cores; the implicit profile leaves the whole node in one default
+// partition; a name the config does not declare is an error, never a fallback
+// onto another node type's cores, and an unlabelled node does not start at all.
+func TestWithProfile(t *testing.T) {
+	r7625 := []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "8-15"}}
+	base := driverconfig.Default()
+	base.Profiles = map[string]driverconfig.Profile{
+		"r7625": {CPUPartitions: r7625},
+		"x3d":   {CPUPartitions: []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "4-7"}}},
+	}
+
+	t.Run("a profile becomes the node's partitions", func(t *testing.T) {
+		cfg, err := base.WithProfile("r7625")
+		require.NoError(t, err)
+		assert.Equal(t, r7625, cfg.CPUPartitions)
+		assert.Empty(t, cfg.Profiles, "the profile a node did not select is not its business")
+	})
+
+	t.Run("the implicit profile declares nothing", func(t *testing.T) {
+		cfg, err := base.WithProfile(driverconfig.DefaultProfileName)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.CPUPartitions)
+	})
+
+	t.Run("an unlabelled node does not start", func(t *testing.T) {
+		_, err := base.WithProfile("")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), driverconfig.ProfileLabel)
+		assert.Contains(t, err.Error(), "r7625")
+		assert.Contains(t, err.Error(), "x3d")
+	})
+
+	t.Run("an unknown profile is an error", func(t *testing.T) {
+		_, err := base.WithProfile("tpyo")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"tpyo"`)
+		assert.Contains(t, err.Error(), driverconfig.ProfileLabel)
+		assert.Contains(t, err.Error(), "r7625")
+	})
+
+	t.Run("without profiles the fleet-wide fields stand", func(t *testing.T) {
+		fleet := driverconfig.Default()
+		fleet.ReservedCPUs = "0-1"
+		for _, name := range []string{"", driverconfig.DefaultProfileName} {
+			cfg, err := fleet.WithProfile(name)
+			require.NoError(t, err)
+			assert.Equal(t, "0-1", cfg.ReservedCPUs)
+		}
+		_, err := fleet.WithProfile("r7625")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "declares no profiles")
+	})
+}
+
+// TestValidate_Profiles covers the scope rule around profiles and the checks
+// on the profiles themselves, all of which every node runs.
+func TestValidate_Profiles(t *testing.T) {
+	vm := []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "8-15"}}
+	testCases := []struct {
+		name          string
+		mutate        func(*driverconfig.Config)
+		expectedError string
+	}{
+		{
+			name: "a valid profile",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {CPUPartitions: vm}}
+			},
+		},
+		{
+			name: "reservedCPUs beside profiles",
+			mutate: func(c *driverconfig.Config) {
+				c.ReservedCPUs = "0"
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {CPUPartitions: vm}}
+			},
+			expectedError: "with profiles declared",
+		},
+		{
+			name: "cpuPartitions beside profiles",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = vm
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {CPUPartitions: vm}}
+			},
+			expectedError: "the partitions belong to the profiles",
+		},
+		{
+			name: "the implicit profile's name",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{"default": {CPUPartitions: vm}}
+			},
+			expectedError: "never declared",
+		},
+		{
+			name: "a profile describing no cores",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {}}
+			},
+			expectedError: "describes no cores",
+		},
+		{
+			name: "a profile the node under test does not select",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{
+					"r7625": {CPUPartitions: vm},
+					"x3d":   {CPUPartitions: []driverconfig.CPUPartition{{Name: "vm", Role: "burst", CPUs: "1"}}},
+				}
+			},
+			expectedError: `config profile "x3d" does not validate`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestResolve_ProfileRejectsReservedCPUs: a profile carries partitions and
+// nothing else, so upstream's fleet-wide cpuset inside one is a typo the
+// operator has to see rather than a key that decodes into nothing.
+func TestResolve_ProfileRejectsReservedCPUs(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+profiles:
+  r7625:
+    reservedCPUs: "0,128"
+`)
+
+	_, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reservedCPUs")
+}
+
+// TestWarnDeprecatedCPUFields: a node's cores described outside a profile
+// still work and say so; described inside one, there is nothing to warn about.
+func TestWarnDeprecatedCPUFields(t *testing.T) {
+	partitions := []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "8-15"}}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*driverconfig.Config)
+		want   []string
+		absent bool
+	}{
+		{
+			name:   "a fleet-wide reservation",
+			mutate: func(c *driverconfig.Config) { c.ReservedCPUs = "0-1" },
+			want:   []string{"deprecated", "reservedCPUs", driverconfig.ProfileLabel},
+		},
+		{
+			name:   "a fleet-wide partition list",
+			mutate: func(c *driverconfig.Config) { c.CPUPartitions = partitions },
+			want:   []string{"deprecated", "cpuPartitions"},
+		},
+		{
+			name: "the same list inside a profile",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {CPUPartitions: partitions}}
+			},
+			absent: true,
+		},
+		{
+			name:   "nothing named at all",
+			mutate: func(c *driverconfig.Config) {},
+			absent: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			tc.mutate(&cfg)
+
+			var logs strings.Builder
+			logger := funcr.New(func(prefix, args string) {
+				logs.WriteString(prefix + " " + args + "\n")
+			}, funcr.Options{})
+
+			cfg.WarnDeprecatedCPUFields(logger)
+
+			if tc.absent {
+				assert.NotContains(t, logs.String(), "deprecated")
+				return
+			}
+			for _, want := range tc.want {
+				assert.Contains(t, logs.String(), want)
+			}
+		})
+	}
+}
