@@ -1338,9 +1338,6 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 					// Build expected devices based on the claim request
 					expectedPreparedDevices := []kubeletplugin.Device{}
 					if tc.expectedCPUSet.Size() != 0 || tc.expectedError {
-						// testSysFS doesn't include cpu/smt/control, so
-						// the driver's cpuTopology.SMTEnabled is always false
-						smtEnabled := false
 						for _, res := range tc.claims[0].Status.Allocation.Devices.Results {
 							var allocatedCPUs int64
 							if q, ok := res.ConsumedCapacity[devattr.CPUResourceQualifiedName]; ok {
@@ -1351,7 +1348,7 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 								DeviceName:   res.Device,
 								CDIDeviceIDs: []string{cdiQualifiedName},
 								Requests:     []string{res.Request},
-								Metadata:     expectedGroupMetadata(tc.groupBy, tc.cpuInfos, tc.reservedCPUs, res.Device, smtEnabled, allocatedCPUs),
+								Metadata:     expectedGroupMetadata(tc.groupBy, tc.cpuInfos, tc.reservedCPUs, res.Device, allocatedCPUs),
 							})
 						}
 					}
@@ -2268,7 +2265,7 @@ func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool) *kubeletplugin.De
 
 // expectedGroupMetadata builds the expected DeviceMetadata for a grouped
 // device from static test data, independent of production code paths.
-func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedCPUs cpuset.CPUSet, deviceName string, smtEnabled bool, allocatedCPUs int64) *kubeletplugin.DeviceMetadata {
+func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedCPUs cpuset.CPUSet, deviceName string, allocatedCPUs int64) *kubeletplugin.DeviceMetadata {
 	attrs := map[string]resourceapi.DeviceAttribute{}
 
 	switch groupBy {
@@ -2281,9 +2278,11 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 				groupCPUs = append(groupCPUs, ci)
 			}
 		}
+		threadsPerCore := groupThreadsPerCore(cpuInfos, groupCPUs)
 		attrs[string(devattr.AttributeSocketID)] = resourceapi.DeviceAttribute{IntValue: new(int64(socketID))}
 		attrs[string(devattr.AttributeNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(int64(len(groupCPUs)))}
-		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(smtEnabled)}
+		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(threadsPerCore > 1)}
+		attrs[string(devattr.AttributeThreadsPerCore)] = resourceapi.DeviceAttribute{IntValue: new(int64(threadsPerCore))}
 		addExpectedUncoreAttrs(attrs, groupCPUs)
 
 	case devattr.GROUP_BY_NUMA_NODE:
@@ -2298,12 +2297,14 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 			}
 		}
 		numCPUs := int64(len(groupCPUs))
+		threadsPerCore := groupThreadsPerCore(cpuInfos, groupCPUs)
 		// DRA standard attributes first
 		attrs[string(deviceattribute.StandardDeviceAttributeNUMANode)] = resourceapi.DeviceAttribute{IntValue: new(int64(numaID))}
 		// Driver specific attributes next
 		attrs[string(devattr.AttributeSocketID)] = resourceapi.DeviceAttribute{IntValue: new(int64(socketID))}
 		attrs[string(devattr.AttributeNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(numCPUs)}
-		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(smtEnabled)}
+		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(threadsPerCore > 1)}
+		attrs[string(devattr.AttributeThreadsPerCore)] = resourceapi.DeviceAttribute{IntValue: new(int64(threadsPerCore))}
 		attrs["dra.net/numaNode"] = resourceapi.DeviceAttribute{IntValue: new(int64(numaID))}
 		attrs["dra.cpu/numaNodeID"] = resourceapi.DeviceAttribute{IntValue: new(int64(numaID))}
 		addExpectedUncoreAttrs(attrs, groupCPUs)
@@ -2315,8 +2316,10 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 				groupCPUs = append(groupCPUs, ci)
 			}
 		}
+		threadsPerCore := groupThreadsPerCore(cpuInfos, groupCPUs)
 		attrs[string(devattr.AttributeNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(int64(len(groupCPUs)))}
-		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(smtEnabled)}
+		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(threadsPerCore > 1)}
+		attrs[string(devattr.AttributeThreadsPerCore)] = resourceapi.DeviceAttribute{IntValue: new(int64(threadsPerCore))}
 		addExpectedUncoreAttrs(attrs, groupCPUs)
 	}
 
@@ -2325,6 +2328,22 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 	}
 
 	return &kubeletplugin.DeviceMetadata{Attributes: attrs}
+}
+
+// groupThreadsPerCore mirrors CPUDetails.UniformThreadsPerCore over one
+// group's own CPUs, matching what the builder computes per device. cpuInfos
+// is the full topology (a core split by the reservation still has all its
+// threads counted), groupCPUs the group's own allocatable-minus-reserved set.
+func groupThreadsPerCore(cpuInfos []cpuinfo.CPUInfo, groupCPUs []cpuinfo.CPUInfo) int {
+	details := cpuinfo.CPUDetails{}
+	for _, ci := range cpuInfos {
+		details[ci.CpuID] = ci
+	}
+	cpuIDs := make([]int, len(groupCPUs))
+	for i, ci := range groupCPUs {
+		cpuIDs[i] = ci.CpuID
+	}
+	return details.UniformThreadsPerCore(cpuset.New(cpuIDs...))
 }
 
 // addExpectedUncoreAttrs mirrors the uncore cache geometry the builder publishes

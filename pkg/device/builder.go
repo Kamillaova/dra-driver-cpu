@@ -48,9 +48,20 @@ func Build(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet, pcieRootMapp
 	return createCPUDeviceSlices(deviceInfos, pcieRootMapper, topo.SMTEnabled, nodeAllocatableResources), nameToID
 }
 
-func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs, reservedCPUSet cpuset.CPUSet, pcieRootMapper *store.PCIeRootMapper, nodeAllocatableResources bool) ([]resourceapi.Device, map[string]int) {
-	deviceInfos := groupedCPUDeviceInfos(groupBy, topo, onlineCPUs, reservedCPUSet)
+// BuildGrouped publishes one device per CPU group. Each device's own
+// thread-per-core count decides whether whole-core allocation applies to it,
+// so one device's non-uniform cores never disable the feature for a different,
+// uniform device on the same node; fullPhysicalCPUsOnly is only the operator's
+// request for the feature, not a per-device guarantee.
+//
+// The returned deviceThreadsPerCore map is each device's effective allocation
+// step (0 when the feature is off or that device has no single thread count),
+// so a caller allocating a claim onto one of these devices decides consistently
+// with what was just published for it.
+func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs, reservedCPUSet cpuset.CPUSet, pcieRootMapper *store.PCIeRootMapper, nodeAllocatableResources bool, fullPhysicalCPUsOnly bool) ([]resourceapi.Device, map[string]int, map[string]int) {
+	deviceInfos := groupedCPUDeviceInfos(logger, groupBy, topo, onlineCPUs, reservedCPUSet, fullPhysicalCPUsOnly)
 	nameToID := make(map[string]int)
+	deviceThreadsPerCore := make(map[string]int)
 	for _, dev := range deviceInfos {
 		switch groupBy {
 		case GROUP_BY_SOCKET:
@@ -58,8 +69,11 @@ func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology,
 		case GROUP_BY_NUMA_NODE:
 			nameToID[dev.name] = dev.numaNodeID
 		}
+		if fullPhysicalCPUsOnly && dev.threadsPerCore > 1 {
+			deviceThreadsPerCore[dev.name] = dev.threadsPerCore
+		}
 	}
-	return createGroupedCPUDeviceSlices(logger, groupBy, deviceInfos, pcieRootMapper, topo, nodeAllocatableResources), nameToID
+	return createGroupedCPUDeviceSlices(logger, groupBy, deviceInfos, pcieRootMapper, topo, nodeAllocatableResources, fullPhysicalCPUsOnly), nameToID, deviceThreadsPerCore
 }
 
 func groupedCPUNodeAllocatable(enabled bool) map[v1.ResourceName]resourceapi.NodeAllocatableResource {
@@ -94,6 +108,11 @@ type groupedCPUDeviceInfo struct {
 	cpus       cpuset.CPUSet
 	socketID   int
 	numaNodeID int
+	// threadsPerCore is this device's own uniform thread-per-core count (0 when
+	// its cores do not all agree), independent of fullPhysicalCPUsOnly: it is a
+	// hardware fact published on every device, whether or not whole-core
+	// allocation is requested.
+	threadsPerCore int
 }
 
 type cpuDeviceInfo struct {
@@ -101,27 +120,56 @@ type cpuDeviceInfo struct {
 	cpu  cpuinfo.CPUInfo
 }
 
-func groupedCPUDeviceInfos(groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs, reservedCPUs cpuset.CPUSet) []groupedCPUDeviceInfo {
+func groupedCPUDeviceInfos(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs, reservedCPUs cpuset.CPUSet, fullPhysicalCPUsOnly bool) []groupedCPUDeviceInfo {
 	var devices []groupedCPUDeviceInfo
+	// build reports a device's own thread-per-core count and, under whole-core
+	// allocation, drops any core the reservation split rather than publishing it
+	// as capacity the allocator would refuse to hand out. The count is computed
+	// from this device's own CPUs alone, so another device's non-uniform cores
+	// never disable whole-core allocation here, and it is reported even when
+	// fullPhysicalCPUsOnly is off, since it is a hardware fact.
+	build := func(name string, rawCPUs cpuset.CPUSet) (cpuset.CPUSet, int) {
+		threadsPerCore := topo.CPUDetails.UniformThreadsPerCore(rawCPUs)
+		if !fullPhysicalCPUsOnly {
+			return rawCPUs, threadsPerCore
+		}
+		switch threadsPerCore {
+		case 0:
+			logger.Info("fullPhysicalCPUsOnly disabled for this device: its allocatable cores do not all have the same thread count",
+				"device", name, "allocatableCPUs", rawCPUs.String())
+			return rawCPUs, threadsPerCore
+		case 1:
+			// Nothing to keep together, so leave capacity untouched rather than
+			// publishing a request policy with a step of one CPU.
+			logger.V(2).Info("fullPhysicalCPUsOnly is a no-op for this device: every core has one thread", "device", name)
+			return rawCPUs, threadsPerCore
+		}
+		return topo.CPUDetails.CompleteCores(rawCPUs), threadsPerCore
+	}
 
 	switch groupBy {
 	case GROUP_BY_SOCKET:
 		socketIDs := topo.CPUDetails.Sockets().List()
 		for _, socketID := range socketIDs {
-			allocatableCPUs := topo.CPUDetails.CPUsInSockets(socketID).Difference(reservedCPUs)
+			name := fmt.Sprintf("%s%03d", CPUDeviceSocketGroupedPrefix, socketID)
+			rawCPUs := topo.CPUDetails.CPUsInSockets(socketID).Difference(reservedCPUs)
+			allocatableCPUs, threadsPerCore := build(name, rawCPUs)
 			if allocatableCPUs.Size() == 0 {
 				continue
 			}
 			devices = append(devices, groupedCPUDeviceInfo{
-				name:     fmt.Sprintf("%s%03d", CPUDeviceSocketGroupedPrefix, socketID),
-				cpus:     allocatableCPUs,
-				socketID: socketID,
+				name:           name,
+				cpus:           allocatableCPUs,
+				socketID:       socketID,
+				threadsPerCore: threadsPerCore,
 			})
 		}
 	case GROUP_BY_NUMA_NODE:
 		numaNodeIDs := topo.CPUDetails.NUMANodes().List()
 		for _, numaID := range numaNodeIDs {
-			allocatableCPUs := topo.CPUDetails.CPUsInNUMANodes(numaID).Difference(reservedCPUs)
+			name := fmt.Sprintf("%s%03d", CPUDeviceNUMAGroupedPrefix, numaID)
+			rawCPUs := topo.CPUDetails.CPUsInNUMANodes(numaID).Difference(reservedCPUs)
+			allocatableCPUs, threadsPerCore := build(name, rawCPUs)
 			if allocatableCPUs.Size() == 0 {
 				continue
 			}
@@ -129,17 +177,20 @@ func groupedCPUDeviceInfos(groupBy string, topo *cpuinfo.CPUTopology, onlineCPUs
 			// All CPUs in a NUMA node belong to the same socket.
 			anyCPU := allocatableCPUs.UnsortedList()[0]
 			devices = append(devices, groupedCPUDeviceInfo{
-				name:       fmt.Sprintf("%s%03d", CPUDeviceNUMAGroupedPrefix, numaID),
-				cpus:       allocatableCPUs,
-				socketID:   topo.CPUDetails[anyCPU].SocketID,
-				numaNodeID: numaID,
+				name:           name,
+				cpus:           allocatableCPUs,
+				socketID:       topo.CPUDetails[anyCPU].SocketID,
+				numaNodeID:     numaID,
+				threadsPerCore: threadsPerCore,
 			})
 		}
 	case GROUP_BY_MACHINE:
-		allocatableCPUs := onlineCPUs.Difference(reservedCPUs)
+		rawCPUs := onlineCPUs.Difference(reservedCPUs)
+		allocatableCPUs, threadsPerCore := build(CPUDeviceMachineGrouped, rawCPUs)
 		devices = append(devices, groupedCPUDeviceInfo{
-			name: CPUDeviceMachineGrouped,
-			cpus: allocatableCPUs,
+			name:           CPUDeviceMachineGrouped,
+			cpus:           allocatableCPUs,
+			threadsPerCore: threadsPerCore,
 		})
 	}
 	return devices
@@ -211,23 +262,37 @@ func cpuDeviceInfos(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet) []c
 }
 
 // createGroupedCPUDeviceSlices creates Device objects based on the CPU topology, grouped by a specific criteria.
-func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfos []groupedCPUDeviceInfo, pcieRootMapper *store.PCIeRootMapper, topo *cpuinfo.CPUTopology, nodeAllocatableResources bool) []resourceapi.Device {
+//
+// smtEnabled and the published thread count are per device, from that device's
+// own threadsPerCore, not the node-wide topology: a reduced- or non-uniform-SMT
+// device must not advertise the same answer as a full-SMT one. The request
+// policy stays gated by fullPhysicalCPUsOnly, since it is a promise about
+// allocation, not a description of the hardware.
+func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfos []groupedCPUDeviceInfo, pcieRootMapper *store.PCIeRootMapper, topo *cpuinfo.CPUTopology, nodeAllocatableResources bool, fullPhysicalCPUsOnly bool) []resourceapi.Device {
 	logger.V(4).Info("creating grouped CPU devices")
 	var devices []resourceapi.Device
-	smtEnabled := topo.SMTEnabled
 
 	for _, deviceInfo := range deviceInfos {
 		availableCPUs := int64(deviceInfo.cpus.Size())
+		smtEnabled := deviceInfo.threadsPerCore > 1
+		requestPolicyStep := 0
+		if fullPhysicalCPUsOnly {
+			requestPolicyStep = deviceInfo.threadsPerCore
+		}
 		deviceCapacity := map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
-			CPUResourceQualifiedName: {Value: *resource.NewQuantity(availableCPUs, resource.DecimalSI)},
+			CPUResourceQualifiedName: {
+				Value:         *resource.NewQuantity(availableCPUs, resource.DecimalSI),
+				RequestPolicy: wholeCoreRequestPolicy(availableCPUs, requestPolicyStep),
+			},
 		}
 
 		switch groupBy {
 		case GROUP_BY_SOCKET:
 			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				AttributeSocketID:   {IntValue: new(int64(deviceInfo.socketID))},
-				AttributeNumCPUs:    {IntValue: new(availableCPUs)},
-				AttributeSMTEnabled: {BoolValue: new(smtEnabled)},
+				AttributeSocketID:       {IntValue: new(int64(deviceInfo.socketID))},
+				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
+				AttributeSMTEnabled:     {BoolValue: new(smtEnabled)},
+				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
 			addUncoreCacheAttributes(topo, deviceAttrs, deviceInfo.cpus)
 			addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...)
@@ -244,9 +309,10 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 				// DRA standard attributes first
 				deviceattribute.StandardDeviceAttributeNUMANode: {IntValue: new(int64(deviceInfo.numaNodeID))},
 				// Driver-specific/non-standard attributes next
-				AttributeSocketID:   {IntValue: new(int64(deviceInfo.socketID))},
-				AttributeSMTEnabled: {BoolValue: new(smtEnabled)},
-				AttributeNumCPUs:    {IntValue: new(availableCPUs)},
+				AttributeSocketID:       {IntValue: new(int64(deviceInfo.socketID))},
+				AttributeSMTEnabled:     {BoolValue: new(smtEnabled)},
+				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
+				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
 			addCompatibilityAttributes(deviceAttrs, int64(deviceInfo.numaNodeID))
 			addUncoreCacheAttributes(topo, deviceAttrs, deviceInfo.cpus)
@@ -261,8 +327,9 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 			})
 		case GROUP_BY_MACHINE:
 			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				AttributeSMTEnabled: {BoolValue: new(smtEnabled)},
-				AttributeNumCPUs:    {IntValue: new(availableCPUs)},
+				AttributeSMTEnabled:     {BoolValue: new(smtEnabled)},
+				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
+				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
 			addUncoreCacheAttributes(topo, deviceAttrs, deviceInfo.cpus)
 			addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...)
@@ -321,4 +388,31 @@ func addPCIeRootsAttribute(pcieRootMapper *store.PCIeRootMapper, attrs map[resou
 		return
 	}
 	attrs[deviceattribute.StandardDeviceAttributePCIeRoot] = resourceapi.DeviceAttribute{StringValues: pcieRoots}
+}
+
+// wholeCoreRequestPolicy constrains a device's CPU capacity to whole-core
+// multiples, so the scheduler rounds a request up instead of allocating an amount
+// the driver would have to refuse.
+//
+// Default must be the full capacity, not the step: ValidRange requires a Default,
+// and a claim that omits a capacity request consumes it. Upstream semantics for an
+// omitted request are the whole device, so a Default of one core would silently
+// shrink such claims.
+//
+// This diverges from the kubelet CPU Manager, which rejects a request that is not
+// a whole-core multiple. DRA has no reject-unless-multiple primitive, and rounding
+// resolves at scheduling time and is recorded in ConsumedCapacity, rather than
+// failing admission once the pod is already bound.
+func wholeCoreRequestPolicy(capacityCPUs int64, threadsPerCore int) *resourceapi.CapacityRequestPolicy {
+	if threadsPerCore <= 1 || capacityCPUs <= 0 {
+		return nil
+	}
+	step := resource.NewQuantity(int64(threadsPerCore), resource.DecimalSI)
+	return &resourceapi.CapacityRequestPolicy{
+		Default: resource.NewQuantity(capacityCPUs, resource.DecimalSI),
+		ValidRange: &resourceapi.CapacityRequestPolicyRange{
+			Min:  step,
+			Step: step,
+		},
+	}
 }
