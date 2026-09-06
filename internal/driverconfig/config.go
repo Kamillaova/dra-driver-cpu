@@ -100,6 +100,16 @@ type Config struct {
 	// cache offers nothing better -- whole-core allocation is what actually
 	// forbids that.
 	CachePlacementStrategy string `json:"cachePlacementStrategy,omitempty"`
+	// CPUPartitions describes the node's cores as named partitions: which CPUs
+	// each holds, whether workloads may run there and how, and how many threads
+	// per core it expects to find online. The CPUs no partition names form the
+	// implicit "default" partition, where a claim that names no partition lands.
+	//
+	// It replaces ReservedCPUs rather than joining it: two descriptions of the
+	// same CPUs in one scope have no precedence rule worth writing, so setting
+	// both is an error and a reserved partition is how CPUs are kept from
+	// workloads once the list is used.
+	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -124,31 +134,33 @@ func (c Config) LogValues() []any {
 		"defragMinGain", c.DefragMinGain,
 		"defragClaimCooldownSeconds", c.DefragClaimCooldownSeconds,
 		"cachePlacementStrategy", c.CachePlacementStrategy,
+		"cpuPartitions", c.CPUPartitions,
 	}
 }
 
 // dumpConfig mirrors Config field-for-field but drops the omitempty json
 // tags, so Dump also prints zero values (e.g. exposePCIeRoots=false).
 type dumpConfig struct {
-	Kubeconfig                            string `json:"kubeconfig"`
-	HostnameOverride                      string `json:"hostnameOverride"`
-	BindAddress                           string `json:"bindAddress"`
-	ReservedCPUs                          string `json:"reservedCPUs"`
-	CPUDeviceMode                         string `json:"cpuDeviceMode"`
-	GroupBy                               string `json:"groupBy"`
-	ExposePCIeRoots                       bool   `json:"exposePCIeRoots"`
-	SysFSOverlay                          string `json:"sysfsOverlay"`
-	KubeletRootDir                        string `json:"kubeletRootDir"`
-	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping"`
-	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly"`
-	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe"`
-	ReconcileSharedOnUnprepare            bool   `json:"reconcileSharedOnUnprepare"`
-	DefragEnabled                         bool   `json:"defragEnabled"`
-	DefragIntervalSeconds                 int    `json:"defragIntervalSeconds"`
-	DefragMaxMovesPerPass                 int    `json:"defragMaxMovesPerPass"`
-	DefragMinGain                         int    `json:"defragMinGain"`
-	DefragClaimCooldownSeconds            int    `json:"defragClaimCooldownSeconds"`
-	CachePlacementStrategy                string `json:"cachePlacementStrategy"`
+	Kubeconfig                            string         `json:"kubeconfig"`
+	HostnameOverride                      string         `json:"hostnameOverride"`
+	BindAddress                           string         `json:"bindAddress"`
+	ReservedCPUs                          string         `json:"reservedCPUs"`
+	CPUDeviceMode                         string         `json:"cpuDeviceMode"`
+	GroupBy                               string         `json:"groupBy"`
+	ExposePCIeRoots                       bool           `json:"exposePCIeRoots"`
+	SysFSOverlay                          string         `json:"sysfsOverlay"`
+	KubeletRootDir                        string         `json:"kubeletRootDir"`
+	PublishNodeAllocatableResourceMapping bool           `json:"publishNodeAllocatableResourceMapping"`
+	FullPhysicalCPUsOnly                  bool           `json:"fullPhysicalCPUsOnly"`
+	AssumeUnsolicitedUpdatesSafe          bool           `json:"assumeUnsolicitedUpdatesSafe"`
+	ReconcileSharedOnUnprepare            bool           `json:"reconcileSharedOnUnprepare"`
+	DefragEnabled                         bool           `json:"defragEnabled"`
+	DefragIntervalSeconds                 int            `json:"defragIntervalSeconds"`
+	DefragMaxMovesPerPass                 int            `json:"defragMaxMovesPerPass"`
+	DefragMinGain                         int            `json:"defragMinGain"`
+	DefragClaimCooldownSeconds            int            `json:"defragClaimCooldownSeconds"`
+	CachePlacementStrategy                string         `json:"cachePlacementStrategy"`
+	CPUPartitions                         []CPUPartition `json:"cpuPartitions"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of

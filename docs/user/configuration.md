@@ -196,6 +196,44 @@ on - is configured through other Helm values, not through this file.
   both. Requires `cpuDeviceMode: grouped`: in individual mode the scheduler names exact CPU devices
   and the driver picks nothing.
 
+`cpuPartitions` (list of partition, default: empty)
+
+- Describe the node's cores as named partitions, each with a `name`, a `role`, an explicit `cpus`
+  cpuset of whole cores, and an optional `smt` expectation. The CPUs no partition names form the
+  implicit partition `default`, which is the one a claim reaches without naming a partition, so the
+  name `default` may not be declared.
+- `role` says what the cores are for. `reserved`: no container ever runs there, the successor of
+  `reservedCPUs`. `default`: devices are published and containers without a claim run on whatever is
+  left unclaimed. `shared`: a pool a workload reaches by claiming it. `exclusive`: devices are
+  published and no container without a claim ever runs there.
+- `smt` is how many threads per core the partition expects the platform to leave online: `true` (the
+  default) accepts whatever the hardware has, `false` means one thread per core, and an integer is an
+  upper bound. The driver verifies the expectation against the running kernel and never changes
+  hotplug state itself, so offlining siblings stays the machine configuration's job.
+- Requires `cpuDeviceMode: grouped`. `reservedCPUs` in the same scope is an error rather than a merge:
+  each describes the same CPUs from the other end, and a `reserved` partition is how the list says it.
+- Names are DNS labels of at most 46 characters, since the device names built from them must stay
+  DNS labels. Partitions may not overlap.
+
+```yaml
+driverConfig:
+  cpuDeviceMode: grouped
+  cpuPartitions:
+    - name: system
+      role: reserved
+      cpus: "0,128"
+    - name: helpers
+      role: shared
+      cpus: "4-7,132-135"
+    - name: dataplane
+      role: exclusive
+      cpus: "8-15"
+      smt: false
+    - name: vm
+      role: exclusive
+      cpus: "16-127,144-255"
+```
+
 #### Example
 
 ```yaml
