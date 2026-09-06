@@ -37,6 +37,9 @@ import (
 const (
 	cgroupPath = "fs/cgroup"
 	cpusetFile = "cpuset.cpus.effective"
+	// metadataRoot is where the kubelet mounts one KEP-5304 metadata file per
+	// request of every claim the container holds.
+	metadataRoot = "/var/run/kubernetes.io/dra-device-attributes"
 	// affinityScanMax is the upper bound when scanning sched_getaffinity if topology is unavailable.
 	// Using runtime.NumCPU() would miss CPUs when the cgroup cpuset is non-contiguous (e.g. 2-5,9-13).
 	affinityScanMax = 2048
@@ -84,6 +87,67 @@ func affinityScanBoundFromTopology(topo *cpuinfo.CPUTopology) int {
 	}
 	list := cpus.List()
 	return list[len(list)-1] + 1
+}
+
+// deviceMetadata mirrors the fields of the metadata file this test reads. It
+// is deliberately a local shape rather than the library type: the point is to
+// exercise the file as a workload sees it.
+type deviceMetadata struct {
+	Requests []struct {
+		Name    string `json:"name"`
+		Devices []struct {
+			Name       string `json:"name"`
+			Attributes map[string]struct {
+				String *string `json:"string"`
+			} `json:"attributes"`
+		} `json:"devices"`
+	} `json:"requests"`
+}
+
+// requestMetadata reports what every mounted metadata file says, one entry per
+// device of every request. The file is a stream of the same object once per
+// API version, newest first, so only the first is decoded.
+func requestMetadata() []discovery.DRACPURequestMetadata {
+	claims, err := os.ReadDir(metadataRoot)
+	if err != nil {
+		return nil
+	}
+	var entries []discovery.DRACPURequestMetadata
+	for _, claim := range claims {
+		requests, err := os.ReadDir(filepath.Join(metadataRoot, claim.Name()))
+		if err != nil {
+			continue
+		}
+		for _, request := range requests {
+			raw, err := os.ReadFile(filepath.Join(metadataRoot, claim.Name(), request.Name(), "metadata.json"))
+			if err != nil {
+				continue
+			}
+			var metadata deviceMetadata
+			if err := json.NewDecoder(strings.NewReader(string(raw))).Decode(&metadata); err != nil {
+				continue
+			}
+			for _, req := range metadata.Requests {
+				if req.Name != request.Name() {
+					continue
+				}
+				for _, dev := range req.Devices {
+					entry := discovery.DRACPURequestMetadata{Claim: claim.Name(), Request: req.Name}
+					if v, ok := dev.Attributes["dra.cpu/partition"]; ok && v.String != nil {
+						entry.Partition = *v.String
+					}
+					if v, ok := dev.Attributes["dra.cpu/role"]; ok && v.String != nil {
+						entry.Role = *v.String
+					}
+					if v, ok := dev.Attributes["dra.cpu/cpuset"]; ok && v.String != nil {
+						entry.CPUs = *v.String
+					}
+					entries = append(entries, entry)
+				}
+			}
+		}
+	}
+	return entries
 }
 
 func main() {
