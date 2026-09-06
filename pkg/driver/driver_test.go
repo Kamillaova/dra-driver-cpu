@@ -31,7 +31,9 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -735,4 +737,78 @@ func TestNewRejectsPartitionsTheNodeContradicts(t *testing.T) {
 	err = newWith(devattr.Partition{Name: "vm", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1)})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "splits physical cores")
+}
+
+// partitionedDriver is a driver over partitionTestInfos with cores 1 and 5
+// declared as a dataplane partition, so CPUs 0,4,2,6,3,7 are the implicit one.
+func partitionedDriver(t *testing.T) *CPUDriver {
+	t.Helper()
+	infos := partitionTestInfos()
+	cp, err := New(testr.New(t), Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		CPUPartitions: []devattr.Partition{
+			{Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)},
+		},
+	})
+	require.NoError(t, err)
+	cp.cdiMgr = newMockCdiMgr()
+	return cp
+}
+
+func TestPrepareTakesCPUsInsideTheDevicesPartition(t *testing.T) {
+	cp := partitionedDriver(t)
+
+	claim := testClaim("claim-dataplane", testDriverName, testNodeName,
+		map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "000-dataplane": 2})
+	results, err := cp.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.NoError(t, results[claim.UID].Err)
+
+	got, ok := cp.cpuAllocationStore.GetResourceClaimAllocation(claim.UID)
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(1, 5), got, "a claim on the dataplane device takes the dataplane partition's CPUs")
+}
+
+func TestPrepareRefusesADeviceThisNodeDoesNotPublish(t *testing.T) {
+	cp := partitionedDriver(t)
+
+	claim := testClaim("claim-elsewhere", testDriverName, testNodeName,
+		map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "000-storage": 2})
+	results, err := cp.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.ErrorContains(t, results[claim.UID].Err, "was not published by this driver")
+}
+
+func TestSharedContainersStayInTheDefaultPartition(t *testing.T) {
+	cp := partitionedDriver(t)
+
+	require.Equal(t, cpuset.New(0, 2, 3, 4, 6, 7), cp.sharedContainerCPUs(),
+		"a container holding no claim never runs on an exclusive partition's CPUs")
+
+	claim := testClaim("claim-dataplane", testDriverName, testNodeName,
+		map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "000-dataplane": 2})
+	_, err := cp.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(0, 2, 3, 4, 6, 7), cp.sharedContainerCPUs(),
+		"claiming inside another partition changes nothing for them either")
+}
+
+func TestCheckClaimPartitionCountsAClaimNoPartitionHolds(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cp := partitionedDriver(t)
+	cp.metrics = cpumetrics.New(reg)
+
+	cp.checkClaimPartition(testr.New(t), cpuset.New(1, 5))
+	require.Equal(t, float64(0), metricValue(t, reg, "dra_cpu_misplaced_claims_total", nil),
+		"a claim inside one partition is where it belongs")
+
+	cp.checkClaimPartition(testr.New(t), cpuset.New(1, 2))
+	require.Equal(t, float64(1), metricValue(t, reg, "dra_cpu_misplaced_claims_total", nil),
+		"a claim straddling two partitions is counted and kept")
 }
