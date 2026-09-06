@@ -51,13 +51,23 @@ func (cp *CPUDriver) PublishResources(ctx context.Context) {
 	logger.V(4).Info("begin: publishing resources")
 	defer logger.V(4).Info("end: publishing resources")
 
-	if cp.topology.deviceSlices == nil {
+	// CCX-FORK: upstream publishes the slices New cut, once and for all. The
+	// order of cache devices tracks which caches hold a claim, so it is rebuilt
+	// here; publishMu keeps a slower publisher from leaving the controller with
+	// an order a faster one has already superseded.
+	cp.publishMu.Lock()
+	defer cp.publishMu.Unlock()
+	cp.applyMu.Lock()
+	chunks := cp.refreshDeviceOrder()
+	cp.applyMu.Unlock()
+
+	if chunks == nil {
 		logger.Info("no devices to publish or error occurred")
 		return
 	}
 
-	slices := make([]resourceslice.Slice, 0, len(cp.topology.deviceSlices))
-	for _, chunk := range cp.topology.deviceSlices {
+	slices := make([]resourceslice.Slice, 0, len(chunks))
+	for _, chunk := range chunks {
 		slices = append(slices, resourceslice.Slice{Devices: chunk})
 	}
 
@@ -120,7 +130,26 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 			cp.requestReconcile()
 		}
 	}
+	// CCX-FORK: upstream's slices never change after startup, so it publishes
+	// them once and nothing here republishes.
+	cp.republishOnCacheOrderChange(ctx)
 	return result, nil
+}
+
+// republishOnCacheOrderChange sends the slices out again when this batch left a
+// cache holding a claim that held none, or the other way round: the published
+// order says which cache the allocator meets first, and it has just changed.
+//
+// The publication runs on its own, because it must not be held under applyMu
+// and the kubelet's call is over as soon as this returns. It neither blocks nor
+// uses the context for anything but logging.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) republishOnCacheOrderChange(ctx context.Context) {
+	if !cp.cacheOrderIsStale() {
+		return
+	}
+	go cp.PublishResources(context.WithoutCancel(ctx))
 }
 
 // reservedForPodUIDs returns the pod UIDs claim.Status.ReservedFor names,
@@ -504,6 +533,9 @@ func (cp *CPUDriver) UnprepareResourceClaims(ctx context.Context, claims []kubel
 			cp.refreshAllocationMetrics()
 		}
 	}
+	// CCX-FORK: a released claim can leave a cache empty, which the published
+	// order depends on; upstream's order depends on nothing.
+	cp.republishOnCacheOrderChange(ctx)
 	return result, nil
 }
 

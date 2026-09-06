@@ -75,6 +75,9 @@ func testSysFS(infos []cpuinfo.CPUInfo) fstest.MapFS {
 type mockKubeletPlugin struct {
 	publishedResources *resourceslice.DriverResources
 	publishError       error
+	// publishCalls counts publications, so a test can tell a republished order
+	// from an unchanged one. Atomic because the driver republishes on its own.
+	publishCalls atomic.Int32
 	// statusFunc answers one registration poll, and is given the number of the
 	// call so a test can change kubelet's answer over time. Left nil by the
 	// tests that do not exercise registration.
@@ -84,6 +87,7 @@ type mockKubeletPlugin struct {
 
 func (m *mockKubeletPlugin) PublishResources(ctx context.Context, resources resourceslice.DriverResources) error {
 	m.publishedResources = &resources
+	m.publishCalls.Add(1)
 	if m.publishError != nil {
 		return m.publishError
 	}
