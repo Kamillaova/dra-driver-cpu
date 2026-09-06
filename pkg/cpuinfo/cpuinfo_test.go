@@ -78,6 +78,56 @@ func TestOnlineCPUs(t *testing.T) {
 	}
 }
 
+func TestPresentCPUs(t *testing.T) {
+	logger := testr.New(t)
+	tests := []struct {
+		name    string
+		fs      fstest.MapFS
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "missing cpu present file",
+			fs:      fstest.MapFS{},
+			wantErr: true,
+		},
+		{
+			name: "present exceeds online",
+			fs: fstest.MapFS{
+				filepath.Join("devices", "system", "cpu", "present"): &fstest.MapFile{
+					Data: []byte("0-15\n"),
+				},
+				filepath.Join("devices", "system", "cpu", "online"): &fstest.MapFile{
+					Data: []byte("0-7"),
+				},
+			},
+			want: "0-15",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := PresentCPUs(logger, tt.fs)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want, err := cpuset.Parse(tt.want)
+			if err != nil {
+				t.Fatalf("parsing want cpuset %q: %v", tt.want, err)
+			}
+			if !got.Equals(want) {
+				t.Errorf("got %v, want %v", got, want)
+			}
+		})
+	}
+}
+
 func TestPopulateCpuSiblings(t *testing.T) {
 	testCases := []struct {
 		name             string
