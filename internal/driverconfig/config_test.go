@@ -19,6 +19,7 @@ limitations under the License.
 package driverconfig_test
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"os"
@@ -479,6 +480,37 @@ groupBy: garbage
 	assert.Contains(t, err.Error(), "garbage")
 }
 
+// TestResolve_GroupByUncoreCache: a config file may ask for one device per
+// uncore cache, and the generated schema accepts exactly what the validator
+// does.
+func TestResolve_GroupByUncoreCache(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+groupBy: uncorecache
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, device.GROUP_BY_UNCORE_CACHE, result.GroupBy)
+
+	raw, err := driverconfig.GenerateDriverConfigSchema()
+	require.NoError(t, err)
+	var schema struct {
+		Properties struct {
+			GroupBy struct {
+				Enum []string `json:"enum"`
+			} `json:"groupBy"`
+		} `json:"properties"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &schema))
+	assert.Contains(t, schema.Properties.GroupBy.Enum, device.GROUP_BY_UNCORE_CACHE,
+		"a value the driver accepts that the schema does not is a config file the chart rejects")
+}
+
 // TestResolve_ExcludedFieldInFileIsError: excluded and removed fields aren't
 // configurable via the config file.
 func TestResolve_ExcludedFieldInFileIsError(t *testing.T) {
@@ -791,6 +823,13 @@ func TestValidate_DefragRequirements(t *testing.T) {
 			name:          "grouped by machine",
 			mutate:        func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_MACHINE },
 			expectedError: "requires groupBy",
+		},
+		{
+			// Here the driver does choose the CPUs, but a device is one cache, so
+			// a move would take the claim off the device it was allocated on.
+			name:          "grouped by uncore cache",
+			mutate:        func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_UNCORE_CACHE },
+			expectedError: "a device is one uncore cache",
 		},
 		{
 			name:          "without the unsolicited update assertion",
