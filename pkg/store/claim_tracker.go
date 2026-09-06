@@ -49,11 +49,16 @@ type ClaimTracker struct {
 	// No claims can be shared by containers or pods
 	// But a container can have more than a claim.
 	ownerByClaimUID map[k8stypes.UID]OwnerIdent
+	// reservedForByClaimUID records, for a prepared claim, the pod UIDs its own
+	// status.reservedFor names at Prepare -- the API server's record of intent,
+	// which a pod spec cannot forge the way it can a DRA_CPUSET_* env value.
+	reservedForByClaimUID map[k8stypes.UID][]k8stypes.UID
 }
 
 func NewClaimTracker() *ClaimTracker {
 	return &ClaimTracker{
-		ownerByClaimUID: make(map[k8stypes.UID]OwnerIdent),
+		ownerByClaimUID:       make(map[k8stypes.UID]OwnerIdent),
+		reservedForByClaimUID: make(map[k8stypes.UID][]k8stypes.UID),
 	}
 }
 
@@ -94,11 +99,39 @@ func (ctk *ClaimTracker) SetOwner(logger logr.Logger, podUID k8stypes.UID, conta
 	return newlyBound, nil
 }
 
+// SetReservedFor records the pod UIDs a claim's own reservation names at
+// Prepare, replacing any previously recorded reservation for it.
+func (ctk *ClaimTracker) SetReservedFor(claimUID k8stypes.UID, podUIDs []k8stypes.UID) {
+	ctk.mu.Lock()
+	defer ctk.mu.Unlock()
+	ctk.reservedForByClaimUID[claimUID] = append([]k8stypes.UID(nil), podUIDs...)
+}
+
+// ReservedFor reports whether podUID is one of a claim's reserved consumers.
+// recorded is false when the claim's reservation was never recorded at all
+// (never prepared, or prepared before this driver started tracking it), which
+// callers must not treat the same as an empty reservation.
+func (ctk *ClaimTracker) ReservedFor(claimUID, podUID k8stypes.UID) (reserved, recorded bool) {
+	ctk.mu.Lock()
+	defer ctk.mu.Unlock()
+	podUIDs, ok := ctk.reservedForByClaimUID[claimUID]
+	if !ok {
+		return false, false
+	}
+	for _, p := range podUIDs {
+		if p == podUID {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 func (ctk *ClaimTracker) Cleanup(claimUIDs ...k8stypes.UID) {
 	ctk.mu.Lock()
 	defer ctk.mu.Unlock()
 	for _, claimUID := range claimUIDs {
 		delete(ctk.ownerByClaimUID, claimUID)
+		delete(ctk.reservedForByClaimUID, claimUID)
 	}
 }
 
