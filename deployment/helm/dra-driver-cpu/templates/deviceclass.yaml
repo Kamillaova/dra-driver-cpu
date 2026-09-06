@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+{{- /* A class is rendered for every partition a claim can reach: the ones
+       publishing exclusive devices and the pools. A reserved partition
+       publishes no device, so a class for it would select nothing. */ -}}
+{{- $partitions := (include "dra-driver-cpu.effectiveDriverConfig" . | fromYaml).cpuPartitions | default list }}
 ---
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
@@ -19,4 +23,17 @@ metadata:
 spec:
   selectors:
     - cel:
-        expression: device.driver == "dra.cpu"
+        expression: device.driver == "dra.cpu" && device.attributes["dra.cpu"].partition == "default"
+{{- range $partition := $partitions }}
+{{- if ne $partition.role "reserved" }}
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dra.cpu-{{ $partition.name }}
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "dra.cpu" && device.attributes["dra.cpu"].partition == "{{ $partition.name }}"
+{{- end }}
+{{- end }}
