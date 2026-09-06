@@ -37,7 +37,15 @@ const (
 	CPUDeviceSocketGroupedPrefix = "cpudevsocket"
 	CPUDeviceNUMAGroupedPrefix   = "cpudevnuma"
 	CPUDeviceMachineGrouped      = "cpudevmachine"
+	CPUDevicePoolPrefix          = "cpudevpool"
 )
+
+// poolShareMilliCPUs is the smallest share of a pool a request may take, and
+// what a request that names no amount takes. A request policy's default is what
+// an omitted capacity request consumes, and for an exclusive device that is
+// deliberately the whole device; on a pool the same rule would let one template
+// omission swallow a resource every other claim is meant to share.
+const poolShareMilliCPUs = 100
 
 func Build(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet, pcieRootMapper *store.PCIeRootMapper, nodeAllocatableResources bool) ([]resourceapi.Device, map[string]int) {
 	deviceInfos := cpuDeviceInfos(topo, reservedCPUSet)
@@ -66,6 +74,10 @@ type GroupedDevices struct {
 	// where whole cores are promised. A claim on that device takes CPUs from
 	// here and nowhere else.
 	CPUs map[string]cpuset.CPUSet
+	// Roles is each device's partition role, so a caller resolving an allocation
+	// knows whether the device grants CPUs the claim holds alone or a share of a
+	// pool every other claim on it holds too.
+	Roles map[string]string
 }
 
 // BuildGrouped publishes one device per CPU group of every partition that
@@ -86,13 +98,26 @@ func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology,
 		NameToID:       make(map[string]int),
 		ThreadsPerCore: make(map[string]int),
 		CPUs:           make(map[string]cpuset.CPUSet),
+		Roles:          make(map[string]string),
 	}
 	for _, partition := range partitions {
-		if !partition.PublishesDevices() {
+		if partition.IsPool() {
+			deviceInfos := poolDeviceInfos(topo, partition)
+			for _, dev := range deviceInfos {
+				built.CPUs[dev.name] = dev.cpus
+				built.Roles[dev.name] = partition.Role
+			}
+			if devices := createPoolDeviceSlices(deviceInfos, partition); len(devices) > 0 {
+				built.ByPartition = append(built.ByPartition, devices)
+			}
+			continue
+		}
+		if !partition.PublishesExclusiveDevices() {
 			continue
 		}
 		deviceInfos := groupedCPUDeviceInfos(logger, groupBy, topo, onlineCPUs, reservedCPUSet, fullPhysicalCPUsOnly, partition, len(partitions) > 1)
 		for _, dev := range deviceInfos {
+			built.Roles[dev.name] = partition.Role
 			switch groupBy {
 			case GROUP_BY_SOCKET:
 				built.NameToID[dev.name] = dev.socketID
@@ -165,6 +190,79 @@ type groupedCPUDeviceInfo struct {
 type cpuDeviceInfo struct {
 	name string
 	cpu  cpuinfo.CPUInfo
+}
+
+type poolDeviceInfo struct {
+	name       string
+	cpus       cpuset.CPUSet
+	socketID   int
+	numaNodeID int
+}
+
+// poolDeviceInfos splits a pool partition into one device per NUMA node it
+// touches. A NUMA node is as fine as a pool is ever cut, whatever grouping the
+// exclusive partitions use: what a pool offers a workload is locality, and
+// below a NUMA node there is none left to promise.
+func poolDeviceInfos(topo *cpuinfo.CPUTopology, partition Partition) []poolDeviceInfo {
+	var devices []poolDeviceInfo
+	for _, numaID := range topo.CPUDetails.NUMANodes().List() {
+		cpus := partition.CPUs.Intersection(topo.CPUDetails.CPUsInNUMANodes(numaID))
+		if cpus.IsEmpty() {
+			continue
+		}
+		devices = append(devices, poolDeviceInfo{
+			name:       partitionDeviceName(fmt.Sprintf("%s%03d", CPUDevicePoolPrefix, numaID), partition),
+			cpus:       cpus,
+			socketID:   topo.CPUDetails[cpus.UnsortedList()[0]].SocketID,
+			numaNodeID: numaID,
+		})
+	}
+	return devices
+}
+
+// createPoolDeviceSlices publishes a pool as devices every claim that asks for
+// it may hold at once. Each grants its whole CPU set rather than a cut of it,
+// so the capacity is an admission bound on how much work lands on the pool and
+// not a promise of exclusivity, and it carries no node-allocatable mapping: the
+// same CPUs already count once for the containers holding no claim.
+func createPoolDeviceSlices(deviceInfos []poolDeviceInfo, partition Partition) []resourceapi.Device {
+	var devices []resourceapi.Device
+	for _, deviceInfo := range deviceInfos {
+		deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+			deviceattribute.StandardDeviceAttributeNUMANode: {IntValue: new(int64(deviceInfo.numaNodeID))},
+			AttributeSocketID: {IntValue: new(int64(deviceInfo.socketID))},
+			AttributeNumCPUs:  {IntValue: new(int64(deviceInfo.cpus.Size()))},
+		}
+		addCompatibilityAttributes(deviceAttrs, int64(deviceInfo.numaNodeID))
+		addPartitionAttributes(deviceAttrs, partition)
+
+		devices = append(devices, resourceapi.Device{
+			Name:       deviceInfo.name,
+			Attributes: deviceAttrs,
+			Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
+				CPUResourceQualifiedName: {
+					Value:         *resource.NewQuantity(int64(deviceInfo.cpus.Size()), resource.DecimalSI),
+					RequestPolicy: poolShareRequestPolicy(),
+				},
+			},
+			AllowMultipleAllocations: new(true),
+			Taints:                   partitionTaints(partition),
+		})
+	}
+	return devices
+}
+
+// poolShareRequestPolicy makes a share of a pool the unit a request is measured
+// in, down to a tenth of a CPU.
+func poolShareRequestPolicy() *resourceapi.CapacityRequestPolicy {
+	share := resource.NewMilliQuantity(poolShareMilliCPUs, resource.DecimalSI)
+	return &resourceapi.CapacityRequestPolicy{
+		Default: share,
+		ValidRange: &resourceapi.CapacityRequestPolicyRange{
+			Min:  share,
+			Step: share,
+		},
+	}
 }
 
 // CCX-FORK: upstream describes every group of the node in one call; here each
