@@ -94,7 +94,8 @@ func TestDeviceBuilderNodeAllocatableResourceMapping(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var devices []resourceapi.Device
 			if tc.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-				devices, _, _ = device.BuildGrouped(logr.Discard(), tc.groupBy, topo, online, reserved, store.NewPCIeRootMapper(), tc.publishNodeAllocatableMapping, false)
+				built := device.BuildGrouped(logr.Discard(), tc.groupBy, topo, online, reserved, store.NewPCIeRootMapper(), tc.publishNodeAllocatableMapping, false, unpartitioned(online))
+				devices = onlyPartition(t, built.ByPartition)
 			} else {
 				devices, _ = device.Build(topo, reserved, store.NewPCIeRootMapper(), tc.publishNodeAllocatableMapping)
 			}
@@ -162,12 +163,26 @@ func fakeCacheTopology() *cpuinfo.CPUTopology {
 	}
 }
 
+// unpartitioned is the one partition a node whose cores nobody described has:
+// the implicit one, holding every allocatable CPU.
+func unpartitioned(allocatable cpuset.CPUSet) []device.Partition {
+	return device.WithImplicitDefault(nil, allocatable)
+}
+
+// onlyPartition unwraps the single group of devices such a node publishes.
+func onlyPartition(t *testing.T, byPartition [][]resourceapi.Device) []resourceapi.Device {
+	t.Helper()
+	require.Len(t, byPartition, 1)
+	return byPartition[0]
+}
+
 func TestGroupedUncoreCacheAttributes(t *testing.T) {
 	topo := fakeCacheTopology()
 	online := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
 
-	devices, _, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
-		cpuset.New(0), store.NewPCIeRootMapper(), false, false)
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+		cpuset.New(0), store.NewPCIeRootMapper(), false, false, unpartitioned(online.Difference(cpuset.New(0))))
+	devices := onlyPartition(t, built.ByPartition)
 	require.Len(t, devices, 1)
 	attrs := devices[0].Attributes
 
@@ -187,8 +202,10 @@ func TestGroupedUncoreCacheAttributesOmittedWhenUnknown(t *testing.T) {
 	info.UncoreCacheID = -1
 	topo.CPUDetails[5] = info
 
-	devices, _, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
-		cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New(), store.NewPCIeRootMapper(), false, false)
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
+		cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New(), store.NewPCIeRootMapper(), false, false,
+		unpartitioned(cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)))
+	devices := onlyPartition(t, built.ByPartition)
 	require.Len(t, devices, 1)
 
 	require.NotContains(t, devices[0].Attributes, device.AttributeLargestUncoreCacheCPUs)
@@ -236,8 +253,9 @@ func TestGroupedFullPhysicalCPUsOnly(t *testing.T) {
 
 	buildOne := func(t *testing.T, reserved cpuset.CPUSet, fullPhysicalCPUsOnly bool) resourceapi.Device {
 		t.Helper()
-		devices, _, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
-			reserved, store.NewPCIeRootMapper(), false, fullPhysicalCPUsOnly)
+		built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+			reserved, store.NewPCIeRootMapper(), false, fullPhysicalCPUsOnly, unpartitioned(online.Difference(reserved)))
+		devices := onlyPartition(t, built.ByPartition)
 		require.Len(t, devices, 1)
 		return devices[0]
 	}
@@ -299,8 +317,9 @@ func TestGroupedFullPhysicalCPUsOnlyIsANoOpWithoutSMT(t *testing.T) {
 	// no-op even though it was requested -- distinct from the non-uniform case,
 	// which is disabled rather than a no-op.
 	topo := fakeCacheTopology()
-	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
-		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true)
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
+		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true, unpartitioned(topo.CPUDetails.CPUs()))
+	devices := onlyPartition(t, built.ByPartition)
 	require.Len(t, devices, 1)
 
 	capacity, ok := devices[0].Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
@@ -309,7 +328,7 @@ func TestGroupedFullPhysicalCPUsOnlyIsANoOpWithoutSMT(t *testing.T) {
 	require.Nil(t, capacity.RequestPolicy, "a step of one CPU would constrain nothing")
 	require.EqualValues(t, 1, *devices[0].Attributes[device.AttributeThreadsPerCore].IntValue)
 	require.False(t, *devices[0].Attributes[device.AttributeSMTEnabled].BoolValue)
-	require.Empty(t, deviceThreadsPerCore, "a step of 1 does not qualify as whole-core allocation in effect")
+	require.Empty(t, built.ThreadsPerCore, "a step of 1 does not qualify as whole-core allocation in effect")
 }
 
 // twoNUMANodesOneNonUniform returns two NUMA nodes on one socket: NUMA 0 has 4
@@ -341,8 +360,9 @@ func twoNUMANodesOneNonUniform() *cpuinfo.CPUTopology {
 
 func TestGroupedFullPhysicalCPUsOnlyIsPerDevice(t *testing.T) {
 	topo := twoNUMANodesOneNonUniform()
-	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
-		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true)
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
+		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true, unpartitioned(topo.CPUDetails.CPUs()))
+	devices := onlyPartition(t, built.ByPartition)
 	require.Len(t, devices, 2)
 
 	byName := make(map[string]resourceapi.Device, len(devices))
@@ -354,12 +374,12 @@ func TestGroupedFullPhysicalCPUsOnlyIsPerDevice(t *testing.T) {
 
 	require.EqualValues(t, 2, *numa0.Attributes[device.AttributeThreadsPerCore].IntValue, "NUMA 0's own cores are uniform")
 	require.True(t, *numa0.Attributes[device.AttributeSMTEnabled].BoolValue)
-	require.Equal(t, 2, deviceThreadsPerCore[numa0.Name], "whole-core allocation stays in effect for the uniform device")
+	require.Equal(t, 2, built.ThreadsPerCore[numa0.Name], "whole-core allocation stays in effect for the uniform device")
 	require.NotNil(t, numa0.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)].RequestPolicy)
 
 	require.EqualValues(t, 0, *numa1.Attributes[device.AttributeThreadsPerCore].IntValue, "NUMA 1's cores do not agree")
 	require.False(t, *numa1.Attributes[device.AttributeSMTEnabled].BoolValue)
-	require.NotContains(t, deviceThreadsPerCore, numa1.Name, "the other device's non-uniform cores must not disable it here")
+	require.NotContains(t, built.ThreadsPerCore, numa1.Name, "the other device's non-uniform cores must not disable it here")
 	require.Nil(t, numa1.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)].RequestPolicy)
 	// The odd core is not dropped: nothing here promises whole cores for it.
 	require.EqualValues(t, 7, *numa1.Attributes[device.AttributeNumCPUs].IntValue)
@@ -369,15 +389,16 @@ func TestGroupedThreadsPerCoreIndependentOfFullPhysicalCPUsOnly(t *testing.T) {
 	// The hardware fact must not read false just because the operator has not
 	// turned on whole-core allocation.
 	topo := fakeSMTCacheTopology()
-	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
-		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, false)
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
+		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, false, unpartitioned(topo.CPUDetails.CPUs()))
+	devices := onlyPartition(t, built.ByPartition)
 	require.Len(t, devices, 1)
 
 	require.True(t, *devices[0].Attributes[device.AttributeSMTEnabled].BoolValue)
 	require.EqualValues(t, 2, *devices[0].Attributes[device.AttributeThreadsPerCore].IntValue)
 	require.Nil(t, devices[0].Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)].RequestPolicy,
 		"no request policy without fullPhysicalCPUsOnly")
-	require.Empty(t, deviceThreadsPerCore, "no device gets an allocation step without fullPhysicalCPUsOnly")
+	require.Empty(t, built.ThreadsPerCore, "no device gets an allocation step without fullPhysicalCPUsOnly")
 }
 
 func TestGroupedNonUniformDeviceHasNoSMTAttribute(t *testing.T) {
@@ -394,13 +415,14 @@ func TestGroupedNonUniformDeviceHasNoSMTAttribute(t *testing.T) {
 		SMTEnabled: true, CPUDetails: hybridDetails,
 	}
 
-	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, hybridTopo,
-		hybridTopo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true)
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, hybridTopo,
+		hybridTopo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true, unpartitioned(hybridTopo.CPUDetails.CPUs()))
+	devices := onlyPartition(t, built.ByPartition)
 	require.Len(t, devices, 1)
 
 	require.EqualValues(t, 0, *devices[0].Attributes[device.AttributeThreadsPerCore].IntValue)
 	require.False(t, *devices[0].Attributes[device.AttributeSMTEnabled].BoolValue)
-	require.Empty(t, deviceThreadsPerCore)
+	require.Empty(t, built.ThreadsPerCore)
 	require.EqualValues(t, 6, *devices[0].Attributes[device.AttributeNumCPUs].IntValue,
 		"nothing is dropped: there is no single core size to enforce")
 }
@@ -510,4 +532,114 @@ func TestIndividualModeReservedSiblingLeavesRestOfCoreGrouped(t *testing.T) {
 	sort.Ints(nums)
 	require.Equal(t, []int{nums[0], nums[0] + 1, nums[0] + 2}, nums,
 		"the three unreserved siblings must still get consecutive device IDs, got %v", nums)
+}
+
+func TestGroupedDevicesPerPartition(t *testing.T) {
+	topo := fakeCacheTopology()
+	online := topo.CPUDetails.CPUs()
+	// system is kept from every workload and helpers is a pool, so both are out
+	// of the allocatable set the way the driver folds them into it.
+	allocatable := online.Difference(cpuset.New(0, 1))
+	partitions := device.WithImplicitDefault([]device.Partition{
+		{Name: "system", Role: device.PARTITION_ROLE_RESERVED, CPUs: cpuset.New(0)},
+		{Name: "helpers", Role: device.PARTITION_ROLE_SHARED, CPUs: cpuset.New(1)},
+		{Name: "dataplane", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(2, 3), ThreadsPerCore: 1},
+	}, allocatable)
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+		cpuset.New(0, 1), store.NewPCIeRootMapper(), false, false, partitions)
+
+	require.Len(t, built.ByPartition, 2, "the reserved partition and the pool publish no device")
+	dataplane := built.ByPartition[0]
+	implicit := built.ByPartition[1]
+	require.Len(t, dataplane, 1)
+	require.Len(t, implicit, 1)
+
+	require.Equal(t, device.CPUDeviceNUMAGroupedPrefix+"000-dataplane", dataplane[0].Name)
+	require.Equal(t, "dataplane", *dataplane[0].Attributes[device.AttributePartition].StringValue)
+	require.Equal(t, device.PARTITION_ROLE_EXCLUSIVE, *dataplane[0].Attributes[device.AttributeRole].StringValue)
+	dataplaneCapacity := dataplane[0].Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+	require.EqualValues(t, 2, dataplaneCapacity.Value.Value())
+	require.Equal(t, []resourceapi.DeviceTaint{{
+		Key:    device.PartitionTaintKey,
+		Value:  "dataplane",
+		Effect: resourceapi.DeviceTaintEffectNoSchedule,
+	}}, dataplane[0].Taints, "a named partition is reached only by a claim that tolerates it")
+
+	require.Equal(t, device.CPUDeviceNUMAGroupedPrefix+"000", implicit[0].Name,
+		"the implicit partition keeps the name an undescribed node publishes")
+	require.Equal(t, device.DefaultPartitionName, *implicit[0].Attributes[device.AttributePartition].StringValue)
+	require.Empty(t, implicit[0].Taints, "a claim naming no partition must be allocatable somewhere")
+	implicitCapacity := implicit[0].Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+	require.EqualValues(t, 4, implicitCapacity.Value.Value(),
+		"CPUs 4-7: what the described partitions and the reservation left")
+}
+
+func TestGroupedDevicesOfAnUndescribedNodeNameTheImplicitPartition(t *testing.T) {
+	topo := fakeCacheTopology()
+	online := topo.CPUDetails.CPUs()
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+		cpuset.New(), store.NewPCIeRootMapper(), false, false, unpartitioned(online))
+	devices := onlyPartition(t, built.ByPartition)
+	require.Len(t, devices, 1)
+
+	require.Equal(t, device.CPUDeviceNUMAGroupedPrefix+"000", devices[0].Name)
+	require.Equal(t, device.DefaultPartitionName, *devices[0].Attributes[device.AttributePartition].StringValue)
+	require.Equal(t, device.PARTITION_ROLE_DEFAULT, *devices[0].Attributes[device.AttributeRole].StringValue)
+	require.Empty(t, devices[0].Taints)
+}
+
+func TestGroupedPartitionSplitsAGroupIntoTwoDevices(t *testing.T) {
+	// One NUMA node split between two partitions must yield two devices with
+	// disjoint CPUs, not one device answering for both.
+	topo := fakeCacheTopology()
+	online := topo.CPUDetails.CPUs()
+	partitions := device.WithImplicitDefault([]device.Partition{
+		{Name: "vm", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(4, 5, 6, 7)},
+	}, online)
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+		cpuset.New(), store.NewPCIeRootMapper(), false, false, partitions)
+	require.Len(t, built.ByPartition, 2)
+	require.Len(t, built.ByPartition[0], 1)
+	require.Len(t, built.ByPartition[1], 1)
+
+	vm := built.ByPartition[0][0]
+	implicit := built.ByPartition[1][0]
+	require.Equal(t, device.CPUDeviceNUMAGroupedPrefix+"000-vm", vm.Name)
+	vmCapacity := vm.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+	implicitCapacity := implicit.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+	require.EqualValues(t, 4, vmCapacity.Value.Value())
+	require.EqualValues(t, 4, implicitCapacity.Value.Value())
+}
+
+func TestGroupedPartitionDeviceThreadArityIsItsOwn(t *testing.T) {
+	// The dataplane partition's siblings are offline, so its cores have one
+	// thread while the rest of the node has two. Whole-core allocation must stay
+	// in effect for the partition that still has SMT.
+	topo := fakeSMTCacheTopology()
+	for _, cpu := range []int{10, 11} {
+		delete(topo.CPUDetails, cpu)
+	}
+	topo.NumCPUs = len(topo.CPUDetails)
+	online := topo.CPUDetails.CPUs()
+	partitions := device.WithImplicitDefault([]device.Partition{
+		{Name: "dataplane", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(2, 3), ThreadsPerCore: 1},
+	}, online)
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+		cpuset.New(), store.NewPCIeRootMapper(), false, true, partitions)
+	require.Len(t, built.ByPartition, 2)
+	dataplane := built.ByPartition[0][0]
+	implicit := built.ByPartition[1][0]
+
+	require.EqualValues(t, 1, *dataplane.Attributes[device.AttributeThreadsPerCore].IntValue)
+	require.False(t, *dataplane.Attributes[device.AttributeSMTEnabled].BoolValue)
+	require.NotContains(t, built.ThreadsPerCore, dataplane.Name, "one thread per core needs no allocation step")
+	require.Nil(t, dataplane.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)].RequestPolicy)
+
+	require.EqualValues(t, 2, *implicit.Attributes[device.AttributeThreadsPerCore].IntValue)
+	require.Equal(t, 2, built.ThreadsPerCore[implicit.Name])
+	require.NotNil(t, implicit.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)].RequestPolicy)
 }
