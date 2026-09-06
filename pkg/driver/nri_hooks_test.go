@@ -1146,3 +1146,69 @@ func TestSynchronizeKeepsStaleContainersClaimCPUsReserved(t *testing.T) {
 	require.Equal(t, "ctr-1", updates[0].GetContainerId())
 	require.Equal(t, "4-5", updates[0].GetLinux().GetResources().GetCpu().GetCpus())
 }
+
+func TestDynamicEnvIsAcceptedAndNamesItsClaim(t *testing.T) {
+	logger := testr.New(t)
+	entries, err := parseDRAEnv(logger, []string{
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-dynamic", cdiEnvDynamicValue),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-fixed", "2-3"),
+		"UNRELATED=whatever",
+	})
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	require.Equal(t, types.UID("claim-dynamic"), entries[0].claimUID)
+	require.True(t, entries[0].dynamic)
+	require.True(t, entries[0].cpus.IsEmpty())
+
+	require.Equal(t, types.UID("claim-fixed"), entries[1].claimUID)
+	require.False(t, entries[1].dynamic)
+	require.Equal(t, cpuset.New(2, 3), entries[1].cpus)
+
+	// A value that is neither is still rejected: the prefix is reserved, and a
+	// pod setting a bad one must not be started as if it held nothing.
+	_, err = parseDRAEnv(logger, []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-bad", "a-b")})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to parse cpuset value")
+}
+
+func TestSynchronizeAdoptsAClaimWithADynamicEnv(t *testing.T) {
+	// The env says nothing about placement, so the spec on disk is the only
+	// record, and the container must be pinned from it.
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 8 {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpu, CoreID: cpu, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-1")
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgr(),
+	}
+	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue), cpuset.New(2, 3)))
+
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
+	ctr := &api.Container{
+		Id:           "ctr-uid-1",
+		PodSandboxId: pod.Id,
+		Name:         "ctr",
+		Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue)},
+	}
+
+	updates, err := d.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr})
+	require.NoError(t, err)
+
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
+	require.True(t, ok, "the claim must be adopted, not dropped")
+	require.Equal(t, cpuset.New(2, 3), got)
+	require.Len(t, updates, 1)
+	require.Equal(t, "ctr-uid-1", updates[0].GetContainerId())
+	require.Equal(t, "2-3", updates[0].GetLinux().GetResources().GetCpu().GetCpus())
+}
