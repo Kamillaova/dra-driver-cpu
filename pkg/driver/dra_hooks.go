@@ -231,26 +231,23 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		var cur cpuset.CPUSet
 		var err error
 
+		// CCX-FORK: upstream takes the CPUs of the socket or NUMA node the device
+		// groups. A device answers for its partition's share of that group, so
+		// its own published CPUs are the set a claim on it may take from.
+		deviceCPUs, published := cp.topology.deviceNameToCPUs[alloc.Device]
+
 		switch cp.cpuDeviceGroupBy {
-		case device.GROUP_BY_SOCKET:
-			socketID, ok := cp.topology.deviceNameToSocketID[alloc.Device]
-			if !ok {
-				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no valid socket ID found for device %s", alloc.Device)}
+		case device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE:
+			if !published {
+				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
 			}
-			socketCPUs := topo.CPUDetails.CPUsInSockets(socketID)
-			availableCPUsForDevice := allocatableCPUs.Difference(cpuAssignment).Intersection(socketCPUs)
-			logger.V(4).Info("socket CPU availability", "socketID", socketID, "socketCPUs", socketCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.takeCPUsForDevice(logger, topo, availableCPUsForDevice, int(claimCPUCount), threadsPerCore)
-		case device.GROUP_BY_NUMA_NODE:
-			numaNodeID, ok := cp.topology.deviceNameToNUMANodeID[alloc.Device]
-			if !ok {
-				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no valid NUMA node ID found for device %s", alloc.Device)}
-			}
-			numaCPUs := topo.CPUDetails.CPUsInNUMANodes(numaNodeID)
-			availableCPUsForDevice := allocatableCPUs.Difference(cpuAssignment).Intersection(numaCPUs)
-			logger.V(4).Info("NUMA node CPU availability", "numaNodeID", numaNodeID, "numaCPUs", numaCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
+			availableCPUsForDevice := allocatableCPUs.Difference(cpuAssignment).Intersection(deviceCPUs)
+			logger.V(4).Info("device CPU availability", "device", alloc.Device, "deviceCPUs", deviceCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
 			cur, err = cp.takeCPUsForDevice(logger, topo, availableCPUsForDevice, int(claimCPUCount), threadsPerCore)
 		case device.GROUP_BY_MACHINE:
+			if !published {
+				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
+			}
 			opaqueCPUSet, ok, err := cp.getOpaqueCPUSet(logger, claim.Status.Allocation, alloc)
 			if err != nil {
 				return kubeletplugin.PrepareResult{Err: err}
@@ -259,7 +256,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no opaque cpuset configuration found for allocation request %q", alloc.Request)}
 			}
 
-			if err := cp.validateOpaqueCPUSet(opaqueCPUSet, cp.topology.onlineCPUs, cpuAssignment, claimCPUCount); err != nil {
+			if err := cp.validateOpaqueCPUSet(opaqueCPUSet, cp.topology.onlineCPUs, cpuAssignment, claimCPUCount, deviceCPUs); err != nil {
 				return kubeletplugin.PrepareResult{Err: err}
 			}
 			cur = opaqueCPUSet
@@ -569,7 +566,9 @@ func (cp *CPUDriver) getOpaqueCPUSet(logger logr.Logger, allocation *resourceapi
 	return cpuset.CPUSet{}, false, nil
 }
 
-func (cp *CPUDriver) validateOpaqueCPUSet(opaqueCPUSet cpuset.CPUSet, onlineCPUs cpuset.CPUSet, cpuAssignment cpuset.CPUSet, claimCPUCount int64) error {
+// CCX-FORK: upstream checks the named CPUs against the node, which has one
+// device; here they are checked against the device they were allocated on.
+func (cp *CPUDriver) validateOpaqueCPUSet(opaqueCPUSet cpuset.CPUSet, onlineCPUs cpuset.CPUSet, cpuAssignment cpuset.CPUSet, claimCPUCount int64, deviceCPUs cpuset.CPUSet) error {
 	// Verify core count matches requested capacity
 	if int64(opaqueCPUSet.Size()) != claimCPUCount {
 		return fmt.Errorf("opaque config cpuset size %d does not match requested capacity %d", opaqueCPUSet.Size(), claimCPUCount)
@@ -598,6 +597,15 @@ func (cp *CPUDriver) validateOpaqueCPUSet(opaqueCPUSet cpuset.CPUSet, onlineCPUs
 	existingClaimCPUs := cp.cpuAllocationStore.GetPreparedCPUs()
 	if opaqueCPUSet.Intersection(existingClaimCPUs).Size() > 0 {
 		return fmt.Errorf("requested CPUs %s from opaque config conflict with already allocated claims", opaqueCPUSet.String())
+	}
+
+	// CCX-FORK: the claim names its own CPUs here, so nothing else keeps them
+	// inside the partition whose device it was allocated on. Last of the
+	// membership checks, so that a CPU which is offline, reserved or already
+	// taken is reported as such rather than as belonging elsewhere.
+	if outside := opaqueCPUSet.Difference(deviceCPUs); !outside.IsEmpty() {
+		return fmt.Errorf("requested CPUs %s from opaque config are outside the device's own CPUs: %s belong to another partition",
+			opaqueCPUSet.String(), outside.String())
 	}
 
 	// Under whole-core allocation an explicit cpuset must not split a core

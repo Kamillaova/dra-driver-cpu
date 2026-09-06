@@ -124,6 +124,10 @@ type CPUDriver struct {
 	// implicit partition holding whatever the described ones left. Set in New,
 	// read-only after that.
 	partitions []device.Partition
+	// defaultPartitionCPUs is where a container holding no claim runs: the
+	// partitions of role "default", which on an undescribed node is every
+	// allocatable CPU. An exclusive partition never hosts such a container.
+	defaultPartitionCPUs cpuset.CPUSet
 	// sysfs is kept so a defragmentation pass can re-read which CPUs are online;
 	// the set read in New is only true of startup.
 	sysfs sysfs.FS
@@ -166,6 +170,10 @@ type deviceTopology struct {
 	deviceSlices           [][]resourceapi.Device
 	reservedCPUs           cpuset.CPUSet
 	onlineCPUs             cpuset.CPUSet
+	// deviceNameToCPUs is each grouped device's own allocatable CPUs, which is
+	// where a claim allocated onto that device takes its CPUs from: the group's,
+	// inside its partition, and without the cores whole-core allocation dropped.
+	deviceNameToCPUs map[string]cpuset.CPUSet
 	// deviceThreadsPerCore is each grouped device's own effective whole-core
 	// allocation step (0 when the feature is off or that device has no single
 	// thread count), from BuildGrouped. Keyed by device name, which a caller
@@ -311,6 +319,12 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		plugin.topology.reservedCPUs = plugin.topology.reservedCPUs.Union(unclaimablePartitionCPUs(config.CPUPartitions))
 	}
 	plugin.partitions = device.WithImplicitDefault(config.CPUPartitions, onlineCPUs.Difference(plugin.topology.reservedCPUs))
+	plugin.defaultPartitionCPUs = cpuset.New()
+	for _, partition := range plugin.partitions {
+		if partition.Role == device.PARTITION_ROLE_DEFAULT {
+			plugin.defaultPartitionCPUs = plugin.defaultPartitionCPUs.Union(partition.CPUs)
+		}
+	}
 	if len(config.CPUPartitions) > 0 {
 		for _, partition := range plugin.partitions {
 			logger.Info("resolved CPU partition", "partition", partition.Name, "role", partition.Role, "cpus", partition.CPUs.String())
@@ -371,6 +385,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 			devices = append(devices, partitionDevices...)
 		}
 		plugin.topology.deviceThreadsPerCore = built.ThreadsPerCore
+		plugin.topology.deviceNameToCPUs = built.CPUs
 		switch plugin.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET:
 			plugin.topology.deviceNameToSocketID = built.NameToID
