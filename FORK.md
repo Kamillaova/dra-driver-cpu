@@ -87,7 +87,7 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   and the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields
 
 - `pkg/driver/dra_hooks.go`: `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
-  `requestAllocations`, `addRequestCPUs`
+  `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 
