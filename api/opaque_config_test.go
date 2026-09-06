@@ -19,26 +19,34 @@ package api
 import (
 	"testing"
 
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/utils/cpuset"
 )
+
+// bestEffort is the placement a configuration that says nothing about it gets.
+var bestEffort = ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort}
 
 func TestParseOpaqueConfig(t *testing.T) {
 	testCases := []struct {
 		name          string
 		rawJSON       string
-		expected      cpuset.CPUSet
+		expected      ClaimConfig
 		expectedError string
 	}{
 		{
-			name:     "valid config",
-			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": "2-5"}}`,
-			expected: cpuset.New(2, 3, 4, 5),
+			name:    "valid config",
+			rawJSON: `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": "2-5"}}`,
+			expected: ClaimConfig{
+				ClaimPlacement: bestEffort,
+				CPUs:           cpuset.New(2, 3, 4, 5),
+				HasCPUs:        true,
+			},
 		},
 		{
-			name:          "invalid - empty cpuset",
-			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": ""}}`,
-			expectedError: "opaque config: cpuConfig.cpuset is empty or missing",
+			name:     "no cpuset",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": ""}}`,
+			expected: ClaimConfig{ClaimPlacement: bestEffort},
 		},
 		{
 			name:          "invalid - invalid cpuset format",
@@ -60,6 +68,69 @@ func TestParseOpaqueConfig(t *testing.T) {
 			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig":`,
 			expectedError: "failed to unmarshal opaque config",
 		},
+		{
+			name:     "relocatable defaults to false",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {}}`,
+			expected: ClaimConfig{ClaimPlacement: bestEffort},
+		},
+		{
+			name:    "relocatable stated",
+			rawJSON: `{"apiVersion": "v1alpha1", "cpuConfig": {"relocatable": true}}`,
+			expected: ClaimConfig{ClaimPlacement: ClaimPlacement{
+				Relocatable: true,
+				Alignment:   v1alpha1.AlignmentBestEffort,
+			}},
+		},
+		{
+			name:    "alignment stated explicitly is distinguishable from the default",
+			rawJSON: `{"apiVersion": "v1alpha1", "cpuConfig": {"alignment": "BestEffort"}}`,
+			expected: ClaimConfig{ClaimPlacement: ClaimPlacement{
+				Alignment:    v1alpha1.AlignmentBestEffort,
+				AlignmentSet: true,
+			}},
+		},
+		{
+			name:    "repairable with relocatable",
+			rawJSON: `{"apiVersion": "v1alpha1", "cpuConfig": {"alignment": "Repairable", "relocatable": true}}`,
+			expected: ClaimConfig{ClaimPlacement: ClaimPlacement{
+				Relocatable:  true,
+				Alignment:    v1alpha1.AlignmentRepairable,
+				AlignmentSet: true,
+			}},
+		},
+		{
+			// Repair moves the claim's own CPUs, so a claim that refuses moves
+			// cannot ask for it.
+			name:          "invalid - repairable without relocatable",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"alignment": "Repairable"}}`,
+			expectedError: "cpuConfig.alignment \"Repairable\" requires cpuConfig.relocatable",
+		},
+		{
+			name:          "invalid - unknown alignment",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"alignment": "Strict"}}`,
+			expectedError: "unsupported cpuConfig.alignment \"Strict\"",
+		},
+		{
+			// The named CPUs are what such a claim is for; permitting the driver
+			// to leave them contradicts naming them.
+			name:          "invalid - cpuset with relocatable",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": "2-5", "relocatable": true}}`,
+			expectedError: "cpuConfig.cpuset \"2-5\" cannot be combined with cpuConfig.relocatable",
+		},
+		{
+			// Accepted here: whether the claim's requests leave the allocator a
+			// choice of shape is not visible to this package.
+			name:    "cpuset with alignment parses",
+			rawJSON: `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": "2-5", "alignment": "BestEffort"}}`,
+			expected: ClaimConfig{
+				ClaimPlacement: ClaimPlacement{
+					Alignment:    v1alpha1.AlignmentBestEffort,
+					AlignmentSet: true,
+				},
+				CPUs:    cpuset.New(2, 3, 4, 5),
+				HasCPUs: true,
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -68,7 +139,7 @@ func TestParseOpaqueConfig(t *testing.T) {
 			if tc.expectedError != "" {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), tc.expectedError)
-				assert.True(t, result.IsEmpty())
+				assert.Equal(t, ClaimConfig{}, result)
 			} else {
 				assert.NoError(t, err)
 				assert.Equal(t, tc.expected, result)
