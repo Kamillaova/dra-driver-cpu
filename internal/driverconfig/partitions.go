@@ -101,6 +101,26 @@ func (p CPUPartition) ThreadsPerCore() int {
 	return p.SMT.Threads
 }
 
+// Partitions resolves the configured partitions into the form the driver works
+// in, parsing each cpuset once. Validate has already refused a cpuset that does
+// not parse, so this fails only on a Config no config file could produce.
+func (c Config) Partitions() ([]device.Partition, error) {
+	partitions := make([]device.Partition, 0, len(c.CPUPartitions))
+	for _, partition := range c.CPUPartitions {
+		cpus, err := cpuset.Parse(partition.CPUs)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cpus %q of partition %q: %w", partition.CPUs, partition.Name, err)
+		}
+		partitions = append(partitions, device.Partition{
+			Name:           partition.Name,
+			Role:           partition.Role,
+			CPUs:           cpus,
+			ThreadsPerCore: partition.ThreadsPerCore(),
+		})
+	}
+	return partitions, nil
+}
+
 // partitionNameMaxLength keeps every device name the driver builds from a
 // partition a DNS label: a device name may be 63 characters and the longest
 // prefix the driver prepends is "cpudevsocket000-".
