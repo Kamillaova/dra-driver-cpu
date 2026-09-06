@@ -19,12 +19,14 @@ package driver
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
@@ -59,9 +61,15 @@ func (cp *CPUDriver) defragPass(ctx context.Context) {
 		return
 	}
 
+	start := time.Now()
+	cp.observeNodeShape(logger, online)
+	result := cpumetrics.ResultSuccess
 	for _, numaNodeID := range cp.topology.cpuTopology.CPUDetails.NUMANodes().List() {
-		cp.defragNode(ctx, numaNodeID, online)
+		if cp.defragNode(ctx, numaNodeID, online) == cpumetrics.ResultError {
+			result = cpumetrics.ResultError
+		}
 	}
+	cp.metricsRecorder().RecordDefragPass(result, time.Since(start))
 }
 
 // defragRetryPass runs a round on one NUMA node alone.
@@ -72,7 +80,9 @@ func (cp *CPUDriver) defragRetryPass(ctx context.Context, numaNodeID int) {
 		return
 	}
 
-	cp.defragNode(ctx, numaNodeID, online)
+	start := time.Now()
+	result := cp.defragNode(ctx, numaNodeID, online)
+	cp.metricsRecorder().RecordDefragPass(result, time.Since(start))
 }
 
 // defragOnlineCPUs reports the CPUs a pass may place on, and whether there is
@@ -98,11 +108,11 @@ func (cp *CPUDriver) defragOnlineCPUs(logger logr.Logger) (cpuset.CPUSet, bool) 
 // The work is split around a single call into the runtime, because applyMu may
 // not be held across one: reserve and record under the lock, update the
 // containers with it released, then confirm or undo under it again.
-func (cp *CPUDriver) defragNode(ctx context.Context, numaNodeID int, online cpuset.CPUSet) {
+func (cp *CPUDriver) defragNode(ctx context.Context, numaNodeID int, online cpuset.CPUSet) cpumetrics.Result {
 	logger := ctxlog.FromContext(ctx).WithValues("numaNode", numaNodeID)
 	round := cp.beginDefragRound(logger, numaNodeID, online)
 	if round == nil {
-		return
+		return cpumetrics.ResultSuccess
 	}
 
 	logger.V(2).Info("applying defragmentation moves", "numMoves", len(round.moves), "numUpdates", len(round.updates))
@@ -113,7 +123,33 @@ func (cp *CPUDriver) defragNode(ctx context.Context, numaNodeID int, online cpus
 	}
 	// An empty round means nothing is running on the CPUs involved, so the store
 	// and the specs are the whole of the move.
-	cp.finishDefragRound(logger, round, failed, updateErr)
+	return cp.finishDefragRound(logger, round, failed, updateErr)
+}
+
+// observeNodeShape republishes how well placed the node's claims are and how
+// large a claim each NUMA node could still take unsplit.
+//
+// It measures rather than plans, so every NUMA node is reported on every pass,
+// including one whose round is still unsettled. The gauges are replaced
+// wholesale, which is why they are taken together and not one round at a time.
+func (cp *CPUDriver) observeNodeShape(logger logr.Logger, online cpuset.CPUSet) {
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
+	// Every node the topology has, not only those holding a claim. A node with no
+	// claims has nothing to move, but it still has a shape worth reporting: how
+	// large a claim it could take aligned is most interesting precisely when it is
+	// empty, and a gauge that disappears as a node drains cannot be alerted on.
+	state := cpumetrics.DefragState{LargestAlignableFreeCPUs: map[int]int{}}
+	for _, numaNodeID := range cp.topology.cpuTopology.CPUDetails.NUMANodes().List() {
+		view, ok := cp.defragView(logger.WithValues("numaNode", numaNodeID), numaNodeID, online)
+		if !ok {
+			continue
+		}
+		state.ExcessUncoreCaches += view.topology.Cost(view.placements)
+		state.LargestAlignableFreeCPUs[numaNodeID] = largestAlignableFreeCPUs(view.topology, view.free)
+	}
+	cp.metricsRecorder().SetDefragState(state)
 }
 
 func (cp *CPUDriver) currentOnlineCPUs(logger logr.Logger) (cpuset.CPUSet, error) {
@@ -196,7 +232,7 @@ func (cp *CPUDriver) takePendingRound(logger logr.Logger, numaNodeID int) *defra
 	return round
 }
 
-// defragNodeView is one NUMA node as planning sees it.
+// defragNodeView is one NUMA node as both planning and measuring see it.
 type defragNodeView struct {
 	topology   *defrag.Topology
 	free       cpuset.CPUSet
@@ -246,7 +282,20 @@ func (cp *CPUDriver) planNodeMoves(logger logr.Logger, numaNodeID int, online cp
 	}
 	logger.V(4).Info("planned defragmentation", "numMoves", len(plan.Moves), "blocked", plan.Blocked,
 		"currentCost", plan.CurrentCost, "idealCost", plan.IdealCost, "reason", plan.Reason)
+	cp.metricsRecorder().RecordDefragBlockedMoves(plan.Blocked)
 	return plan.Moves
+}
+
+// largestAlignableFreeCPUs is the most CPUs still free inside a single uncore
+// cache of a node, which is the largest claim it could take without splitting it.
+func largestAlignableFreeCPUs(nodeTopo *defrag.Topology, free cpuset.CPUSet) int {
+	largest := 0
+	for _, cacheID := range nodeTopo.Caches() {
+		if inCache := nodeTopo.CPUsInCache(cacheID).Intersection(free).Size(); inCache > largest {
+			largest = inCache
+		}
+	}
+	return largest
 }
 
 // defragSelector is the allocator Prepare places a new claim with, so a move can
@@ -330,7 +379,7 @@ func (cp *CPUDriver) roundUpdates(logger logr.Logger, moves []defrag.Move) ([]*a
 
 // finishDefragRound settles every move in a round according to what the runtime
 // reported.
-func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, failed []*api.ContainerUpdate, updateErr error) {
+func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, failed []*api.ContainerUpdate, updateErr error) cpumetrics.Result {
 	cp.applyMu.Lock()
 	defer cp.applyMu.Unlock()
 
@@ -341,7 +390,7 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		logger.V(2).Info("defragmentation round outlived its stores", "numMoves", len(round.moves))
 		delete(cp.pendingRounds, round.numaNodeID)
 		cp.forgetDefragRetry(round.numaNodeID)
-		return
+		return cpumetrics.ResultSuccess
 	}
 	if updateErr != nil {
 		// Nothing can be concluded from a failed call: some of the batch may have
@@ -350,7 +399,7 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		logger.Error(updateErr, "defragmentation round unconfirmed, will retry", "numMoves", len(round.moves))
 		cp.pendingRounds[round.numaNodeID] = round
 		cp.retryDefragNode(round.numaNodeID)
-		return
+		return cpumetrics.ResultError
 	}
 	delete(cp.pendingRounds, round.numaNodeID)
 
@@ -382,6 +431,8 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		}
 		committed++
 	}
+	cp.metricsRecorder().RecordDefragMoves(cpumetrics.ResultSuccess, committed)
+	cp.metricsRecorder().RecordDefragMoves(cpumetrics.ResultError, reverted)
 
 	if committed > 0 {
 		// Two jobs at once. The CPUs the moved claims left are back in the pool
@@ -394,9 +445,10 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		// The runtime declined a move the plan still wants, so the node is not
 		// settled and nothing else is going to look at it.
 		cp.retryDefragNode(round.numaNodeID)
-		return
+		return cpumetrics.ResultError
 	}
 	cp.forgetDefragRetry(round.numaNodeID)
+	return cpumetrics.ResultSuccess
 }
 
 // retryDefragNode asks for another attempt at a NUMA node the runtime left
