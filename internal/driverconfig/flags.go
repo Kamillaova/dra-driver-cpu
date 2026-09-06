@@ -126,6 +126,9 @@ func (c Config) Validate() error {
 	if err := c.validateCachePlacementPolicy(); err != nil {
 		return err
 	}
+	if err := c.validateCPUPartitions(); err != nil {
+		return err
+	}
 	// The kubelet root becomes socket and mount locations, so a relative path
 	// would resolve against the working directory and silently break
 	// registration.
