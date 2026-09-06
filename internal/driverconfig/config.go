@@ -117,6 +117,16 @@ type Config struct {
 	// cache offers nothing better -- whole-core allocation is what actually
 	// forbids that.
 	CachePlacementPolicy string `json:"cachePlacementPolicy,omitempty"`
+	// CPUPartitions describes the node's cores as named partitions: which CPUs
+	// each holds, whether workloads may run there and how, and how many threads
+	// per core it expects to find online. The CPUs no partition names form the
+	// implicit "default" partition, where a claim that names no partition lands.
+	//
+	// It replaces ReservedCPUs rather than joining it: two descriptions of the
+	// same CPUs in one scope have no precedence rule worth writing, so setting
+	// both is an error and a reserved partition is how CPUs are kept from
+	// workloads once the list is used.
+	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
 	// Profiles are named per-node overrides for the fields that name CPUs.
 	// CPU numbering is a property of the node's hardware, so a fleet mixing
 	// node types cannot state one reservedCPUs or sharedPoolCPUs for all of
@@ -204,6 +214,7 @@ func (c Config) LogValues() []any {
 		"defragClaimCooldownSeconds", c.DefragClaimCooldownSeconds,
 		"sharedPoolCPUs", c.SharedPoolCPUs,
 		"cachePlacementPolicy", c.CachePlacementPolicy,
+		"cpuPartitions", c.CPUPartitions,
 		"profiles", c.Profiles,
 	}
 }
@@ -231,6 +242,7 @@ type dumpConfig struct {
 	DefragClaimCooldownSeconds            int                `json:"defragClaimCooldownSeconds"`
 	SharedPoolCPUs                        string             `json:"sharedPoolCPUs"`
 	CachePlacementPolicy                  string             `json:"cachePlacementPolicy"`
+	CPUPartitions                         []CPUPartition     `json:"cpuPartitions"`
 	Profiles                              map[string]Profile `json:"profiles"`
 }
 
