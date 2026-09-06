@@ -170,6 +170,9 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 		return nil, err
 	}
 	containerUpdates = append(containerUpdates, sharedContainerUpdates...)
+	// CCX-FORK: the store was just rebuilt from what is actually running, which
+	// is the other way a cache stops being empty.
+	cp.republishOnCacheOrderChange(ctx)
 	// CCX-FORK: a driver that has just learnt the node's real placements is
 	// looking at a node nothing has defragmented since it went down, which is
 	// exactly when the spread is worst.
