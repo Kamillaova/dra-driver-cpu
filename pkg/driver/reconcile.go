@@ -43,12 +43,51 @@ func (cp *CPUDriver) runReconcileWorker(ctx context.Context) {
 	logger.V(2).Info("reconcile worker started")
 	defer logger.V(2).Info("reconcile worker stopped")
 
+	// CCX-FORK: the worker also runs defragmentation passes, on the same trigger
+	// and on the retries a round the runtime left unsettled arms for itself.
+	if cp.defragRetries != nil {
+		defer cp.defragRetries.ShutDown()
+		go cp.runDefragRetryWorker(ctx)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-cp.reconcileTrigger:
-			cp.reconcileSharedContainers(ctx)
+			// A pass narrows shared containers off the CPUs it is moving claims
+			// onto, so it needs them widened again once the claims those CPUs
+			// belonged to have vacated. That makes the widening part of finishing
+			// a move, not only a service the unprepare reconcile offers.
+			if cp.reconcileSharedOnUnprepare || cp.defrag.enabled {
+				cp.reconcileSharedContainers(ctx)
+			}
+			cp.defragPass(ctx)
+		case numaNodeID := <-cp.defragRetryDue:
+			cp.defragRetryPass(ctx, numaNodeID)
+			cp.defragRetries.Done(numaNodeID)
+		}
+	}
+}
+
+// runDefragRetryWorker hands each NUMA node the rate limiter releases to the
+// worker above, which is the one goroutine that runs passes: a round's runtime
+// call happens with applyMu released, so a second goroutine planning the same
+// node would undo the one-round-per-node bound.
+//
+// With defragmentation off there is no queue and no worker, and the receive from
+// the nil channel above blocks forever, which is what it should do.
+func (cp *CPUDriver) runDefragRetryWorker(ctx context.Context) {
+	for {
+		numaNodeID, shutdown := cp.defragRetries.Get()
+		if shutdown {
+			return
+		}
+		select {
+		case cp.defragRetryDue <- numaNodeID:
+		case <-ctx.Done():
+			cp.defragRetries.Done(numaNodeID)
+			return
 		}
 	}
 }

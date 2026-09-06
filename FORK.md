@@ -67,7 +67,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`, `GetDeviceCPUSet`
 
-- `pkg/driver/driver.go`: the `applyMu` and `defrag` fields, and `Config.DefragEnabled`
+- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries` and
+  `defragRetryDue` fields, and `Config.DefragEnabled`
 
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`
 
@@ -124,3 +125,7 @@ behaviour) rather than silently adapting.
 - **The defragmentation option is a flat `defrag*` field, not a nested block.** `Config` is flat
   throughout, its dump mirror is a field-for-field type conversion, and two reflection tests walk its
   fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
+- **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
+  node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
+  which needs a flag carried through `ContainerState`. Neither affects correctness — the first only
+  lets a pass do avoidable work on a node about to be emptied.

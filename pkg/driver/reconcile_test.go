@@ -85,6 +85,9 @@ func driverWithSharedContainer(t *testing.T, claimUID types.UID, claimCPUs cpuse
 		cdiMgr:             newMockCdiMgr(),
 		containerUpdater:   updater,
 		reconcileTrigger:   make(chan struct{}, 1),
+		// The worker serves two jobs and gates them separately, so the shared
+		// reconcile only runs when it is the one asked for.
+		reconcileSharedOnUnprepare: true,
 	}
 	requirePreparedResourceClaim(t, logger, d.cpuAllocationStore, claimUID, claimCPUs)
 	d.podConfigStore.SetContainerState("shared-pod", store.NewContainerState("shared-ctr", "shared-ctr-id"))

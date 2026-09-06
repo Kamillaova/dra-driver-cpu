@@ -167,6 +167,12 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 		return nil, err
 	}
 	containerUpdates = append(containerUpdates, sharedContainerUpdates...)
+	// CCX-FORK: a driver that has just learnt the node's real placements is
+	// looking at a node nothing has defragmented since it went down, which is
+	// exactly when the spread is worst.
+	if cp.defrag.enabled {
+		cp.requestReconcile()
+	}
 	return containerUpdates, nil
 }
 

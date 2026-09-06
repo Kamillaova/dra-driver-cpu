@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/workqueue"
 	drametadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
@@ -117,6 +118,18 @@ type CPUDriver struct {
 	reconcileSharedOnUnprepare bool
 	// defrag configures the defragmentation pass, and is zero when it is off.
 	defrag defragOptions
+	// sysfs is kept so a defragmentation pass can re-read which CPUs are online;
+	// the set read in New is only true of startup.
+	sysfs sysfs.FS
+	// pendingRounds is, per NUMA node, a set of moves the runtime never
+	// confirmed, held so the next attempt at that node can send it again.
+	// Guarded by applyMu.
+	pendingRounds map[int]*defragRound
+	// defragRetries holds the NUMA nodes whose last round the runtime left
+	// unsettled, each released again once its own backoff has elapsed.
+	defragRetries workqueue.TypedRateLimitingInterface[int]
+	// defragRetryDue carries those nodes to the reconcile worker.
+	defragRetryDue chan int
 	// applyMu serializes the work that decides which CPUs back a claim: the DRA
 	// prepare and unprepare hooks, the NRI hooks that read a placement or record
 	// container state, and the background worker's local phases. It also covers
@@ -251,6 +264,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		kubeletRootDir:          config.KubeletRootDir,
 	}
 	sfs := providers.EnsureSysFS()
+	plugin.sysfs = sfs
 
 	onlineCPUs, err := cpuinfo.OnlineCPUs(logger, sfs)
 	if err != nil {
@@ -292,7 +306,12 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		// CCX-FORK: defragmentation, like the reconcile, presupposes unsolicited
 		// updates.
 		plugin.defrag = defragOptions{enabled: config.DefragEnabled}
-		if plugin.reconcileSharedOnUnprepare {
+		if plugin.defrag.enabled {
+			plugin.pendingRounds = make(map[int]*defragRound)
+			plugin.defragRetries = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[int]())
+			plugin.defragRetryDue = make(chan int)
+		}
+		if plugin.reconcileSharedOnUnprepare || plugin.defrag.enabled {
 			plugin.reconcileTrigger = make(chan struct{}, 1)
 		}
 	} else {
