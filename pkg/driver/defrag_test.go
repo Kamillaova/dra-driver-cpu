@@ -108,9 +108,9 @@ func (f *fakeContainerUpdater) setErr(err error) {
 func (d *defragTestDriver) placeClaim(t *testing.T, claimUID types.UID, cpus cpuset.CPUSet) {
 	t.Helper()
 	logger := testr.New(t)
-	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpus, false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(cpus), false))
 	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
-		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cpus.String()), cpus))
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cpus.String()), exclusiveOn(cpus)))
 }
 
 // runContainer binds claims to a running container, as CreateContainer would.
@@ -126,9 +126,9 @@ func (d *defragTestDriver) runContainer(t *testing.T, podUID types.UID, name str
 // recordedPlacement is the cpuset a claim's CDI spec names.
 func (d *defragTestDriver) recordedPlacement(t *testing.T, claimUID types.UID) cpuset.CPUSet {
 	t.Helper()
-	cpus, err := d.cdiMgr.GetDeviceCPUSet(getCDIDeviceName(claimUID))
+	requests, err := d.cdiMgr.GetDeviceAllocations(getCDIDeviceName(claimUID))
 	require.NoError(t, err)
-	return cpus
+	return store.UnionOf(requests)
 }
 
 func updateFor(t *testing.T, updates []*api.ContainerUpdate, containerID string) string {
@@ -396,8 +396,8 @@ func TestDefragPassKeepsTheDynamicEnvWhenItMovesAClaim(t *testing.T) {
 	logger := testr.New(t)
 	claimUID := types.UID("claim-1")
 	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue)
-	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpuset.New(0, 4), false))
-	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), envVar, cpuset.New(0, 4)))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(cpuset.New(0, 4)), false))
+	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), envVar, exclusiveOn(cpuset.New(0, 4))))
 	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", claimUID)
 
 	d.defragPass(context.Background())
@@ -793,10 +793,10 @@ func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
 	d.cdiMgr = realCDI
 
 	claimUID := types.UID("claim-real-cdi")
-	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpuset.New(0, 4), false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(cpuset.New(0, 4)), false))
 	// Exactly as Prepare writes it, with no Refresh afterwards.
 	require.NoError(t, realCDI.AddDevice(logger, getCDIDeviceName(claimUID),
-		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue), cpuset.New(0, 4)))
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue), exclusiveOn(cpuset.New(0, 4))))
 	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", claimUID)
 
 	d.defragPass(context.Background())
@@ -808,9 +808,9 @@ func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
 
 	// And the spec on disk agrees, since that is what a restart rebuilds from.
 	require.NoError(t, realCDI.Refresh())
-	recorded, err := realCDI.GetDeviceCPUSet(getCDIDeviceName(claimUID))
+	recorded, err := realCDI.GetDeviceAllocations(getCDIDeviceName(claimUID))
 	require.NoError(t, err)
-	require.Equal(t, cpuset.New(0, 1), recorded)
+	require.Equal(t, exclusiveOn(cpuset.New(0, 1)), recorded)
 }
 
 func TestDefragPassAsksForTheNextPassWhenItCommitsAnything(t *testing.T) {
