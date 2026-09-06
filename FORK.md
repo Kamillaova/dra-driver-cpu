@@ -63,6 +63,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `GetDeviceCPUSet`
 
+- `pkg/driver/driver.go`: the `applyMu` field
+
 - `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`
 
 - `internal/driverconfig`: `DefragEnabled` and `validateDefrag`
