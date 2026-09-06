@@ -170,6 +170,9 @@ type deviceTopology struct {
 	// where a claim allocated onto that device takes its CPUs from: the group's,
 	// inside its partition, and without the cores whole-core allocation dropped.
 	deviceNameToCPUs map[string]cpuset.CPUSet
+	// deviceNameToRole is each grouped device's partition role, which is what
+	// tells a claim's share of a pool from the CPUs it holds alone.
+	deviceNameToRole map[string]string
 	// deviceThreadsPerCore is each grouped device's own effective whole-core
 	// allocation step (0 when the feature is off or that device has no single
 	// thread count), from BuildGrouped. Keyed by device name, which a caller
@@ -396,6 +399,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		}
 		plugin.topology.deviceThreadsPerCore = built.ThreadsPerCore
 		plugin.topology.deviceNameToCPUs = built.CPUs
+		plugin.topology.deviceNameToRole = built.Roles
 		switch plugin.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET:
 			plugin.topology.deviceNameToSocketID = built.NameToID
