@@ -137,6 +137,46 @@ func (r placementsReport) numaWithMostCaches() int {
 	return best
 }
 
+// fillCachesDownTo fills every cache of one NUMA node down to leave free CPUs.
+// Each filler is sized for the cache the deployed placement policy will land
+// it in -- pack best-fits the fullest cache that fits, spread takes the
+// least-tenanted one -- because a filler sized for one cache and landed in
+// another leaves a hole big enough for the victim to fit whole, and the
+// scenario never fragments.
+func fillCachesDownTo(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numaID, leave int, prefix string) []*v1.Pod {
+	ginkgo.GinkgoHelper()
+	var fillers []*v1.Pod
+	for i := 0; i < 64; i++ {
+		report, err := getPlacements(ctx, fxt.K8SClientset, nodeName, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		free := report.freePerCacheOn(numaID)
+		size := 0
+		if cfg.CachePlacementStrategy == "spread" {
+			if len(free) > 0 && free[len(free)-1] > leave {
+				size = free[len(free)-1] - leave
+			}
+		} else {
+			for _, cacheFree := range free {
+				if cacheFree > leave {
+					size = cacheFree - leave
+					break
+				}
+			}
+		}
+		if size <= 0 {
+			break
+		}
+		pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, image, nodeName,
+			claimSpecWithSelector(size, numaCEL(cfg, numaID)), fmt.Sprintf("%s-%d", prefix, i))
+		if err != nil {
+			fxt.Log.Info("stopped filling", "placed", len(fillers), "reason", err.Error())
+			break
+		}
+		fillers = append(fillers, pod)
+	}
+	return fillers
+}
+
 // caches is how many uncore caches the driver can see across the node.
 func (r placementsReport) caches() int {
 	total := 0
@@ -304,17 +344,8 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 				3*step, free))
 		}
 
-		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free, smallest cache first", fragNUMA))
-		var fillers []*v1.Pod
-		for i, cacheFree := range free {
-			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-				claimSpecWithSelector(cacheFree-leaveFreePerCache, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-filler-%d", i))
-			if err != nil {
-				fxt.Log.Info("stopped filling", "placed", len(fillers), "reason", err.Error())
-				break
-			}
-			fillers = append(fillers, pod)
-		}
+		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free", fragNUMA))
+		fillers := fillCachesDownTo(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, fragNUMA, leaveFreePerCache, "cpu-claim-filler")
 		if len(fillers) < 2 {
 			ginkgo.Skip(fmt.Sprintf("could only place %d of %d fillers", len(fillers), len(free)))
 		}
@@ -403,15 +434,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		}
 
 		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free", fragNUMA))
-		var fillers []*v1.Pod
-		for i, cacheFree := range free {
-			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-				claimSpecWithSelector(cacheFree-2*step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-rs-filler-%d", i))
-			if err != nil {
-				break
-			}
-			fillers = append(fillers, pod)
-		}
+		fillers := fillCachesDownTo(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, fragNUMA, 2*step, "cpu-claim-rs-filler")
 		if len(fillers) < 2 {
 			ginkgo.Skip(fmt.Sprintf("could only place %d of %d fillers", len(fillers), len(free)))
 		}
@@ -661,15 +684,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		}
 
 		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free", fragNUMA))
-		var fillers []*v1.Pod
-		for i, cacheFree := range free {
-			pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-				claimSpecWithSelector(cacheFree-2*step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-un-filler-%d", i))
-			if err != nil {
-				break
-			}
-			fillers = append(fillers, pod)
-		}
+		fillers := fillCachesDownTo(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, fragNUMA, 2*step, "cpu-claim-un-filler")
 		if len(fillers) < 2 {
 			ginkgo.Skip(fmt.Sprintf("could only place %d of %d fillers", len(fillers), len(free)))
 		}

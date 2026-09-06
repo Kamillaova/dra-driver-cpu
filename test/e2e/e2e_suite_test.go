@@ -332,8 +332,9 @@ type driverConfigValues struct {
 	// ReconcileSharedOnUnprepare defaults to true in the driver, so a config
 	// file that does not mention it leaves it on: absent must read as true,
 	// which a plain bool cannot express.
-	ReconcileSharedOnUnprepare *bool `json:"reconcileSharedOnUnprepare,omitempty"`
-	DefragEnabled              bool  `json:"defragEnabled,omitempty"`
+	ReconcileSharedOnUnprepare *bool  `json:"reconcileSharedOnUnprepare,omitempty"`
+	DefragEnabled              bool   `json:"defragEnabled,omitempty"`
+	CachePlacementStrategy     string `json:"cachePlacementStrategy,omitempty"`
 }
 
 // reconcilesSharedOnUnprepare reports whether the driver widens shared
