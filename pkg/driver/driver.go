@@ -158,6 +158,15 @@ type CPUDriver struct {
 	// needs; if that hook is waiting here meanwhile, neither side can proceed.
 	// Inbound hooks may hold it freely, since answering one makes no call out.
 	applyMu sync.Mutex
+	// publishMu serializes ResourceSlice publication, so that two publishers
+	// cannot read the device order and then hand it to the controller in the
+	// opposite order, leaving the older one standing. Taken before applyMu,
+	// never after.
+	publishMu sync.Mutex
+	// publishedOccupancy is, per device, whether it held a claim when the device
+	// order was last published, which is the only input that order has. Guarded
+	// by applyMu.
+	publishedOccupancy map[string]bool
 
 	kubeletRootDir string
 }
@@ -169,15 +178,23 @@ type deviceHealthEntry struct {
 }
 
 // deviceTopology holds the CPU topology and device-to-CPU/socket/NUMA
-// mappings. Set once in New(), read-only after that.
+// mappings. Set once in New() and read-only after that, except deviceSlices,
+// whose order is a live quantity under cache grouping.
 type deviceTopology struct {
 	cpuTopology            *cpuinfo.CPUTopology
 	deviceNameToCPUID      map[string]int
 	deviceNameToSocketID   map[string]int
 	deviceNameToNUMANodeID map[string]int
-	deviceSlices           [][]resourceapi.Device
-	reservedCPUs           cpuset.CPUSet
-	onlineCPUs             cpuset.CPUSet
+	// devicesByPartition is each publishing partition's devices, which is what
+	// the published slices are cut from. A partition's devices never share a
+	// slice with another's, so its taints cannot travel in another's.
+	devicesByPartition [][]resourceapi.Device
+	// deviceSlices is devicesByPartition as it was last published: ordered and
+	// chunked. Order is a live quantity under cache grouping, so this is rebuilt
+	// on publication rather than fixed in New. Guarded by applyMu.
+	deviceSlices [][]resourceapi.Device
+	reservedCPUs cpuset.CPUSet
+	onlineCPUs   cpuset.CPUSet
 	// deviceNameToCPUs is each grouped device's own allocatable CPUs, which is
 	// where a claim allocated onto that device takes its CPUs from: the group's,
 	// inside its partition, and without the cores whole-core allocation dropped.
@@ -438,13 +455,8 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		plugin.devicesPerResourceSlice = min(plugin.devicesPerResourceSlice, resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures)
 	}
 
-	for _, partitionDevices := range devicesByPartition {
-		if len(partitionDevices) == 0 {
-			continue
-		}
-		// Chunk devices into slices of at most devicesPerResourceSlice
-		plugin.topology.deviceSlices = append(plugin.topology.deviceSlices, slices.Collect(slices.Chunk(partitionDevices, plugin.devicesPerResourceSlice))...)
-	}
+	plugin.topology.devicesByPartition = devicesByPartition
+	plugin.refreshDeviceOrder()
 	logger.Info("chunked devices into ResourceSlices", "numDevices", len(devices),
 		"devicesPerResourceSlice", plugin.devicesPerResourceSlice, "numResourceSlices", len(plugin.topology.deviceSlices),
 		"exposePCIeRoots", config.ExposePCIeRoots)
