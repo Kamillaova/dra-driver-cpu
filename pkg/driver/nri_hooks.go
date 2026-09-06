@@ -89,11 +89,12 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				// belongs, and it is rewritten whenever placement changes. The
 				// container's env is only where it belonged when the container
 				// started, so it cannot decide anything here.
-				desired, err := cp.cdiMgr.GetDeviceCPUSet(deviceName)
+				recorded, err := cp.cdiMgr.GetDeviceAllocations(deviceName)
 				if err != nil {
 					caLogger.Error(err, "ignoring claim not prepared by this driver during synchronize")
 					continue
 				}
+				desired := store.UnionOf(recorded)
 				if !entry.dynamic && !desired.Equals(entry.cpus) {
 					// Expected whenever the claim was moved after its container
 					// started. The ContainerUpdate below carries the container to
@@ -105,7 +106,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				// An overlapping claim rebuilt earlier in this call must not fail
 				// the whole synchronize; skip it instead of leaving every other pod
 				// and container on the node without a driver.
-				if err := cpuAllocationStore.ReserveResourceClaimAllocation(caLogger, uid, desired, false); err != nil {
+				if err := cpuAllocationStore.ReserveResourceClaimAllocation(caLogger, uid, recorded, false); err != nil {
 					caLogger.Error(err, "skipping claim with an allocation inconsistent with an earlier one during synchronize")
 					cp.metricsRecorder().RecordSynchronizeSkippedClaim()
 					continue
@@ -113,23 +114,24 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				claimUIDs = append(claimUIDs, uid)
 			}
 
-			if len(claimUIDs) > 0 {
-				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, claimUIDs...); err != nil {
+			// CCX-FORK: upstream binds every claim the container names.
+			if owned := exclusiveClaimUIDs(cpuAllocationStore, claimUIDs); len(owned) > 0 {
+				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, owned...); err != nil {
 					// An inconsistency in the runtime's own reported state, not a
 					// reason to fail every other pod and container being
 					// synchronized: treat this container as unclaimed instead.
 					cLogger.Error(err, "treating container as unclaimed: its claim ownership conflicts with an earlier one during synchronize")
 					cp.metricsRecorder().RecordSynchronizeSkippedClaim()
 					claimUIDs = nil
-				} else {
-					// This container is exactly as trustworthy a source as a fresh
-					// Prepare: CreateContainer's CRI-O fallback reads this to
-					// authenticate a container recreated after this driver
-					// restarts, on a runtime that never reports CDI devices.
-					for _, uid := range claimUIDs {
-						claimTracker.SetReservedFor(uid, []types.UID{types.UID(pod.Uid)})
-					}
 				}
+			}
+			// This container is exactly as trustworthy a source as a fresh
+			// Prepare: CreateContainer's CRI-O fallback reads this to
+			// authenticate a container recreated after this driver restarts, on
+			// a runtime that never reports CDI devices. Every claim it holds
+			// needs one, ownership or not, since that fallback checks them all.
+			for _, uid := range claimUIDs {
+				claimTracker.SetReservedFor(uid, []types.UID{types.UID(pod.Uid)})
 			}
 
 			var state *store.ContainerState
@@ -168,6 +170,18 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	}
 	containerUpdates = append(containerUpdates, sharedContainerUpdates...)
 	return containerUpdates, nil
+}
+
+// A claim given no CPUs of its own takes nothing away from anything else, so it
+// binds to no single container and several containers and pods may reference it.
+func exclusiveClaimUIDs(allocations *store.CPUAllocation, claimUIDs []types.UID) []types.UID {
+	var owned []types.UID
+	for _, claimUID := range claimUIDs {
+		if allocations.HoldsExclusiveCPUs(claimUID) {
+			owned = append(owned, claimUID)
+		}
+	}
+	return owned
 }
 
 // runtimeCDIDevices returns the CDI device names the runtime reports for the
@@ -357,9 +371,13 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 			}
 			claimUIDs = append(claimUIDs, entry.claimUID)
 		}
-		newOwners, err := cp.claimTracker.SetOwner(logger, podUID, ctr.Name, claimUIDs...)
-		if err != nil {
-			return nil, nil, err
+		// CCX-FORK: upstream binds every claim the container names.
+		var newOwners []types.UID
+		if owned := exclusiveClaimUIDs(cp.cpuAllocationStore, claimUIDs); len(owned) > 0 {
+			newOwners, err = cp.claimTracker.SetOwner(logger, podUID, ctr.Name, owned...)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 		guaranteedCPUs, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
 		if err != nil {
