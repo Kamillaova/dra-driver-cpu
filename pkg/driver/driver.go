@@ -442,7 +442,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 func unclaimablePartitionCPUs(partitions []device.Partition) cpuset.CPUSet {
 	unclaimable := cpuset.New()
 	for _, partition := range partitions {
-		if !partition.PublishesDevices() {
+		if !partition.PublishesExclusiveDevices() {
 			unclaimable = unclaimable.Union(partition.CPUs)
 		}
 	}
