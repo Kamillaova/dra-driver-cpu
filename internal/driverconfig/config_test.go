@@ -33,6 +33,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 )
 
 // newFlagSet creates a FlagSet with cfg registered and args parsed.
@@ -909,4 +910,43 @@ defragClaimCooldownSeconds: 0
 	assert.Equal(t, 2, result.DefragMaxMovesPerPass)
 	assert.Equal(t, 3, result.DefragMinGain)
 	assert.Equal(t, 0, result.DefragClaimCooldownSeconds)
+}
+
+// TestWithProfile: the label value picks the profile; nothing picked keeps the
+// fleet-wide values; a name the config does not define is an error, never a
+// fallback onto the wrong carve-outs.
+func TestWithProfile(t *testing.T) {
+	base := driverconfig.Default()
+	base.ReservedCPUs = "0"
+	base.Profiles = map[string]driverconfig.Profile{
+		"epyc": {ReservedCPUs: ptr.To("1,65,129,193")},
+		"bare": {ReservedCPUs: ptr.To("")},
+	}
+
+	t.Run("no label keeps the fleet-wide values", func(t *testing.T) {
+		cfg, err := base.WithProfile("")
+		require.NoError(t, err)
+		assert.Equal(t, "0", cfg.ReservedCPUs)
+	})
+
+	t.Run("a profile overrides what it names", func(t *testing.T) {
+		cfg, err := base.WithProfile("epyc")
+		require.NoError(t, err)
+		assert.Equal(t, "1,65,129,193", cfg.ReservedCPUs)
+	})
+
+	t.Run("an explicit empty string clears", func(t *testing.T) {
+		cfg, err := base.WithProfile("bare")
+		require.NoError(t, err)
+		assert.Empty(t, cfg.ReservedCPUs)
+	})
+
+	t.Run("an unknown profile is an error", func(t *testing.T) {
+		_, err := base.WithProfile("tpyo")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"tpyo"`)
+		assert.Contains(t, err.Error(), driverconfig.ProfileLabel)
+		assert.Contains(t, err.Error(), "bare")
+		assert.Contains(t, err.Error(), "epyc")
+	})
 }
