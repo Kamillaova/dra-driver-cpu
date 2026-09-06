@@ -61,7 +61,7 @@ spec:
     command: ["/scripts/launch-qemu.sh"]
     env:
     # NOTE: DRA_CPUSET_<claimUID> is injected automatically. Do NOT parse it:
-    # with defragmentation enabled its value is the literal string "dynamic",
+    # for a claim stating cpuConfig.relocatable its value is the literal string "dynamic",
     # and with it disabled it is only where the claim was when this container
     # started. The launcher reads the live set from the cgroup instead.
     - name: VM_MEMORY_MB

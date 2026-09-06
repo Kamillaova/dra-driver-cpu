@@ -96,9 +96,9 @@ func TestPublishedCacheDeviceOrder(t *testing.T) {
 			// A claim on cache 0 of NUMA node 0 and one on cache 3 of NUMA node 1,
 			// so that each node has one tenanted cache and one clean one.
 			require.NoError(t, cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-numa0",
-				[]store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 8), Role: store.RoleExclusive}}, false))
+				store.ClaimRecord{Requests: []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 8), Role: store.RoleExclusive}}}, false))
 			require.NoError(t, cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-numa1",
-				[]store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(6, 14), Role: store.RoleExclusive}}, false))
+				store.ClaimRecord{Requests: []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(6, 14), Role: store.RoleExclusive}}}, false))
 
 			cp.PublishResources(context.Background())
 
@@ -119,9 +119,9 @@ func TestPublishedCacheDeviceOrderKeepsNUMANodesContiguous(t *testing.T) {
 	// One claim per NUMA node, each on that node's first cache, so spread has to
 	// move something inside both nodes.
 	require.NoError(t, cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-numa0",
-		[]store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0), Role: store.RoleExclusive}}, false))
+		store.ClaimRecord{Requests: []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0), Role: store.RoleExclusive}}}, false))
 	require.NoError(t, cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-numa1",
-		[]store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(4), Role: store.RoleExclusive}}, false))
+		store.ClaimRecord{Requests: []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(4), Role: store.RoleExclusive}}}, false))
 
 	cp.PublishResources(context.Background())
 

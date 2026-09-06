@@ -42,8 +42,8 @@ func newTestCPUAllocation(logger logr.Logger, allCPUs, reserved cpuset.CPUSet) *
 
 // exclusiveRequest is the shape of every allocation this driver makes today:
 // one request granting CPUs its claim holds alone.
-func exclusiveRequest(cpus cpuset.CPUSet) []RequestAllocation {
-	return []RequestAllocation{{Request: "cpus", CPUs: cpus, Role: RoleExclusive}}
+func exclusiveRequest(cpus cpuset.CPUSet) ClaimRecord {
+	return ClaimRecord{Requests: []RequestAllocation{{Request: "cpus", CPUs: cpus, Role: RoleExclusive}}}
 }
 
 func poolRequest(name string, cpus cpuset.CPUSet) RequestAllocation {
@@ -745,14 +745,14 @@ func TestReserveRecordsEveryRequestOfAClaim(t *testing.T) {
 		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: RoleExclusive},
 	}
 
-	require.NoError(t, store.ReserveResourceClaimAllocation(logger, claimUID, requests, false))
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, claimUID, ClaimRecord{Requests: requests}, false))
 
-	got, ok := store.GetResourceClaimRequests(claimUID)
+	got, ok := store.GetClaimRecord(claimUID)
 	require.True(t, ok)
 	require.Equal(t, []RequestAllocation{
 		{Request: "helpers", CPUs: cpuset.New(2, 3), Role: RoleExclusive},
 		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: RoleExclusive},
-	}, got, "requests read back in name order, whatever order they were recorded in")
+	}, got.Requests, "requests read back in name order, whatever order they were recorded in")
 
 	cpus, ok := store.GetResourceClaimAllocation(claimUID)
 	require.True(t, ok)
@@ -760,12 +760,12 @@ func TestReserveRecordsEveryRequestOfAClaim(t *testing.T) {
 	require.Equal(t, cpuset.New(0, 1, 2, 3), store.GetPreparedCPUs())
 
 	// The same allocation described in the other order is the same allocation.
-	require.NoError(t, store.ReserveResourceClaimAllocation(logger, claimUID, []RequestAllocation{requests[1], requests[0]}, false))
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, claimUID, ClaimRecord{Requests: []RequestAllocation{requests[1], requests[0]}}, false))
 	// The same CPUs split differently between the requests is not.
-	require.Error(t, store.ReserveResourceClaimAllocation(logger, claimUID, []RequestAllocation{
+	require.Error(t, store.ReserveResourceClaimAllocation(logger, claimUID, ClaimRecord{Requests: []RequestAllocation{
 		{Request: "helpers", CPUs: cpuset.New(0, 1), Role: RoleExclusive},
 		{Request: "vcpus", CPUs: cpuset.New(2, 3), Role: RoleExclusive},
-	}, false))
+	}}, false))
 }
 
 func TestOnlyExclusiveRequestsAreWithheldFromOtherClaims(t *testing.T) {
@@ -774,19 +774,19 @@ func TestOnlyExclusiveRequestsAreWithheldFromOtherClaims(t *testing.T) {
 	store := newTestCPUAllocation(logger, allCPUs, cpuset.New())
 	pool := cpuset.New(6, 7)
 
-	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-1", []RequestAllocation{
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-1", ClaimRecord{Requests: []RequestAllocation{
 		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: RoleExclusive},
 		poolRequest("helpers", pool),
-	}, false))
+	}}, false))
 	// The second claim takes the same pool CPUs, which an exclusive request
 	// could not.
-	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-2", []RequestAllocation{
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-2", ClaimRecord{Requests: []RequestAllocation{
 		{Request: "vcpus", CPUs: cpuset.New(2, 3), Role: RoleExclusive},
 		poolRequest("helpers", pool),
-	}, false))
-	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-3", []RequestAllocation{
+	}}, false))
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-3", ClaimRecord{Requests: []RequestAllocation{
 		poolRequest("helpers", pool),
-	}, false))
+	}}, false))
 
 	require.Equal(t, cpuset.New(0, 1, 2, 3), store.GetPreparedCPUs())
 	require.Equal(t, cpuset.New(4, 5, 6, 7), store.GetSharedCPUs())
@@ -816,21 +816,21 @@ func TestRebindMovesEveryExclusiveRequestOfAClaim(t *testing.T) {
 		{Request: "b", CPUs: cpuset.New(2), Role: RoleExclusive},
 		poolRequest("pool", cpuset.New(7)),
 	}
-	require.NoError(t, store.ReserveResourceClaimAllocation(logger, claimUID, origin, false))
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, claimUID, ClaimRecord{Requests: origin}, false))
 
 	require.NoError(t, store.BeginRebind(logger, claimUID, cpuset.New(3, 4, 5)))
-	moved, ok := store.GetResourceClaimRequests(claimUID)
+	moved, ok := store.GetClaimRecord(claimUID)
 	require.True(t, ok)
 	require.Equal(t, []RequestAllocation{
 		{Request: "a", CPUs: cpuset.New(3, 4), Role: RoleExclusive},
 		{Request: "b", CPUs: cpuset.New(5), Role: RoleExclusive},
 		poolRequest("pool", cpuset.New(7)),
-	}, moved, "each request keeps its size, and a pool request does not move")
+	}, moved.Requests, "each request keeps its size, and a pool request does not move")
 
 	require.NoError(t, store.AbortRebind(logger, claimUID))
-	restored, ok := store.GetResourceClaimRequests(claimUID)
+	restored, ok := store.GetClaimRecord(claimUID)
 	require.True(t, ok)
-	require.Equal(t, origin, restored)
+	require.Equal(t, origin, restored.Requests)
 	require.Equal(t, cpuset.New(0, 1, 2), store.GetPreparedCPUs())
 }
 
@@ -838,10 +838,30 @@ func TestReserveRejectsAClaimHoldingOneCPUTwice(t *testing.T) {
 	logger := testr.New(t)
 	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3), cpuset.New())
 
-	err := store.ReserveResourceClaimAllocation(logger, "claim-1", []RequestAllocation{
+	err := store.ReserveResourceClaimAllocation(logger, "claim-1", ClaimRecord{Requests: []RequestAllocation{
 		{Request: "a", CPUs: cpuset.New(0, 1), Role: RoleExclusive},
 		{Request: "b", CPUs: cpuset.New(1, 2), Role: RoleExclusive},
-	}, false)
+	}}, false)
 	require.ErrorContains(t, err, `claim "claim-1" was given CPUs "1" for more than one of its exclusive requests`)
 	require.True(t, store.GetPreparedCPUs().IsEmpty())
+}
+
+func TestIsRelocatable(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3), cpuset.New())
+
+	movable := exclusiveRequest(cpuset.New(0, 1))
+	movable.Relocatable = true
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "movable", movable, false))
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "fixed", exclusiveRequest(cpuset.New(2, 3)), false))
+
+	require.True(t, store.IsRelocatable("movable"))
+	require.False(t, store.IsRelocatable("fixed"), "a claim that said nothing does not permit moves")
+	require.False(t, store.IsRelocatable("absent"), "a claim this store does not hold cannot be moved")
+
+	// The answer goes with the claim, so a claim released and replaced on the
+	// same CPUs does not inherit it.
+	store.RemoveResourceClaimAllocation(logger, "movable")
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "replacement", exclusiveRequest(cpuset.New(0, 1)), false))
+	require.False(t, store.IsRelocatable("replacement"))
 }
