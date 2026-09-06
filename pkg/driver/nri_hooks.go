@@ -82,10 +82,13 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					caLogger.Error(err, "ignoring invalid claim allocation during synchronize")
 					continue
 				}
-				// Synchronize restores an allocation that already exists in the runtime;
-				// the shared-pool guard applies only to new reservations.
+				// An overlapping claim rebuilt earlier in this call must not fail
+				// the whole synchronize; skip it instead of leaving every other pod
+				// and container on the node without a driver.
 				if err := cpuAllocationStore.ReserveResourceClaimAllocation(caLogger, uid, cpus, false); err != nil {
-					return nil, err
+					caLogger.Error(err, "skipping claim with an allocation inconsistent with an earlier one during synchronize")
+					cp.metricsRecorder().RecordSynchronizeSkippedClaim()
+					continue
 				}
 
 				allGuaranteedCPUs = allGuaranteedCPUs.Union(cpus)
@@ -93,13 +96,21 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				validatedClaimAllocations[uid] = cpus
 			}
 
+			if len(claimUIDs) > 0 {
+				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, claimUIDs...); err != nil {
+					// An inconsistency in the runtime's own reported state, not a
+					// reason to fail every other pod and container being
+					// synchronized: treat this container as unclaimed instead.
+					cLogger.Error(err, "treating container as unclaimed: its claim ownership conflicts with an earlier one during synchronize")
+					cp.metricsRecorder().RecordSynchronizeSkippedClaim()
+					claimUIDs = nil
+				}
+			}
+
 			var state *store.ContainerState
 			if len(claimUIDs) == 0 {
 				state = store.NewContainerState(container.GetName(), containerUID)
 			} else {
-				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, claimUIDs...); err != nil {
-					return nil, err
-				}
 				if err := cpuAllocationStore.ValidateResourceClaimAllocations(validatedClaimAllocations); err != nil {
 					return nil, err
 				}

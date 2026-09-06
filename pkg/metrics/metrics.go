@@ -71,18 +71,20 @@ type Recorder interface {
 	RecordPrepare(result Result, duration time.Duration)
 	RecordUnprepare(result Result)
 	RecordClaimAllocatedCPUs(cpus int)
+	RecordSynchronizeSkippedClaim()
 }
 
 // Metrics owns all custom Prometheus collectors for the CPU driver.
 type Metrics struct {
-	allocatedCPUs        prometheus.Gauge
-	availableCPUs        prometheus.Gauge
-	reservedCPUs         prometheus.Gauge
-	activeResourceClaims prometheus.Gauge
-	prepareClaims        *prometheus.CounterVec
-	unprepareClaims      *prometheus.CounterVec
-	prepareClaimDuration prometheus.Histogram
-	claimAllocatedCPUs   prometheus.Histogram
+	allocatedCPUs            prometheus.Gauge
+	availableCPUs            prometheus.Gauge
+	reservedCPUs             prometheus.Gauge
+	activeResourceClaims     prometheus.Gauge
+	prepareClaims            *prometheus.CounterVec
+	unprepareClaims          *prometheus.CounterVec
+	prepareClaimDuration     prometheus.Histogram
+	claimAllocatedCPUs       prometheus.Histogram
+	synchronizeSkippedClaims prometheus.Counter
 }
 
 type metricKind string
@@ -146,6 +148,11 @@ var (
 		help:    "Number of CPUs allocated for each newly successful claim allocation.",
 		buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024},
 	}
+	synchronizeSkippedClaimsSpec = metricSpec{
+		name: "dra_cpu_synchronize_skipped_claims_total",
+		kind: metricCounter,
+		help: "Total number of claims or containers Synchronize could not adopt from the runtime's reported state, skipped rather than aborting the whole call.",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -157,6 +164,7 @@ var metricSpecs = []metricSpec{
 	unprepareClaimsSpec,
 	prepareClaimDurationSpec,
 	claimAllocatedCPUsSpec,
+	synchronizeSkippedClaimsSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -188,14 +196,15 @@ func New(reg prometheus.Registerer) *Metrics {
 	}
 
 	m := &Metrics{
-		allocatedCPUs:        newGauge(allocatedCPUsSpec),
-		availableCPUs:        newGauge(availableCPUsSpec),
-		reservedCPUs:         newGauge(reservedCPUsSpec),
-		activeResourceClaims: newGauge(activeResourceClaimsSpec),
-		prepareClaims:        newCounterVec(prepareClaimsSpec),
-		unprepareClaims:      newCounterVec(unprepareClaimsSpec),
-		prepareClaimDuration: newHistogram(prepareClaimDurationSpec),
-		claimAllocatedCPUs:   newHistogram(claimAllocatedCPUsSpec),
+		allocatedCPUs:            newGauge(allocatedCPUsSpec),
+		availableCPUs:            newGauge(availableCPUsSpec),
+		reservedCPUs:             newGauge(reservedCPUsSpec),
+		activeResourceClaims:     newGauge(activeResourceClaimsSpec),
+		prepareClaims:            newCounterVec(prepareClaimsSpec),
+		unprepareClaims:          newCounterVec(unprepareClaimsSpec),
+		prepareClaimDuration:     newHistogram(prepareClaimDurationSpec),
+		claimAllocatedCPUs:       newHistogram(claimAllocatedCPUsSpec),
+		synchronizeSkippedClaims: newCounter(synchronizeSkippedClaimsSpec),
 	}
 
 	reg.MustRegister(
@@ -207,6 +216,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.unprepareClaims,
 		m.prepareClaimDuration,
 		m.claimAllocatedCPUs,
+		m.synchronizeSkippedClaims,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -237,6 +247,13 @@ func newHistogram(spec metricSpec) prometheus.Histogram {
 	})
 }
 
+func newCounter(spec metricSpec) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{
+		Name: spec.name,
+		Help: spec.help,
+	})
+}
+
 func (m *Metrics) SetAllocationState(state AllocationState) {
 	m.allocatedCPUs.Set(float64(state.AllocatedCPUs))
 	m.availableCPUs.Set(float64(state.AvailableCPUs))
@@ -257,6 +274,10 @@ func (m *Metrics) RecordClaimAllocatedCPUs(cpus int) {
 	m.claimAllocatedCPUs.Observe(float64(cpus))
 }
 
+func (m *Metrics) RecordSynchronizeSkippedClaim() {
+	m.synchronizeSkippedClaims.Inc()
+}
+
 type noopRecorder struct{}
 
 // Noop returns a recorder that discards all metric observations.
@@ -268,3 +289,4 @@ func (noopRecorder) SetAllocationState(AllocationState)  {}
 func (noopRecorder) RecordPrepare(Result, time.Duration) {}
 func (noopRecorder) RecordUnprepare(Result)              {}
 func (noopRecorder) RecordClaimAllocatedCPUs(int)        {}
+func (noopRecorder) RecordSynchronizeSkippedClaim()      {}
