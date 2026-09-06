@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/discovery"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
 	podmatchers "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/matchers/pod"
@@ -162,6 +163,9 @@ func makeCPUSetFromDiscoveredCPUInfo(cpuInfo discovery.DRACPUInfo) cpuset.CPUSet
 type CPUAllocation struct {
 	CPUAssigned cpuset.CPUSet
 	CPUAffinity cpuset.CPUSet
+	// Metadata is what the container's own KEP-5304 metadata files say about
+	// each request of each claim it holds.
+	Metadata []discovery.DRACPURequestMetadata
 }
 
 func unmarshalLatestReport(data string, v any) error {
@@ -191,6 +195,7 @@ func getTesterPodCPUAllocation(cs kubernetes.Interface, ctx context.Context, pod
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse assigned cpuset: %q", testerInfo.Allocation.CPUs)
 	ret.CPUAffinity, err = cpuset.Parse(testerInfo.Runtimeinfo.CPUAffinity)
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse affinity cpuset: %q", testerInfo.Runtimeinfo.CPUAffinity)
+	ret.Metadata = testerInfo.Metadata
 	return ret
 }
 
@@ -351,6 +356,17 @@ type driverConfigPartition struct {
 	Role string          `json:"role"`
 	CPUs string          `json:"cpus"`
 	SMT  json.RawMessage `json:"smt,omitempty"`
+}
+
+// poolPartition is the partition a workload reaches by claiming it, empty when
+// the node's cores describe none.
+func (v driverConfigValues) poolPartition() (driverConfigPartition, bool) {
+	for _, partition := range v.CPUPartitions {
+		if partition.Role == device.PARTITION_ROLE_SHARED {
+			return partition, true
+		}
+	}
+	return driverConfigPartition{}, false
 }
 
 // singleThreadPartition returns the first partition declaring one online thread
