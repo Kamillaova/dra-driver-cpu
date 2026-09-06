@@ -84,6 +84,13 @@ honor these settings, where applicable.
   `dra.cpu` devices and skip themselves otherwise. On a heterogeneous fleet they exercise capacity
   routing, geometry CEL selectors, burst races, and the scheduler's fragmentation blind spot.
 
+- `DRACPU_E2E_NOSMT_PARTITION_CPUS`: (optional, default empty): when set to a cpuset, *the Makefile*
+  `ci-kind-setup` target deploys the driver with an exclusive CPU partition named `nosmt` declaring
+  one online thread per core on those CPUs, and the single-thread partition tests run instead of
+  skipping. The SMT siblings of those CPUs must already be offline on the node: the suite verifies
+  that state and never changes a machine, so the driver withholds the partition and the tests report
+  themselves as not run where the node was not prepared.
+
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.
