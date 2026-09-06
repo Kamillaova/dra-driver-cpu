@@ -147,7 +147,7 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, online cpuset.CPUSet) 
 		// The spec on disk is the desired placement, and it is what a driver
 		// restart rebuilds the store from, so it has to name the target before
 		// the container is told about it.
-		if err := cp.writeClaimPlacement(mLogger, move.ClaimUID, move.To); err != nil {
+		if err := cp.writeClaimPlacement(mLogger, move.ClaimUID); err != nil {
 			mLogger.Error(err, "cannot record new placement, leaving claim where it is", "to", move.To.String())
 			if abortErr := cp.cpuAllocationStore.AbortRebind(mLogger, move.ClaimUID); abortErr != nil {
 				mLogger.Error(abortErr, "cannot undo the reservation either")
@@ -209,7 +209,7 @@ func (cp *CPUDriver) planDefragMoves(logger logr.Logger, online cpuset.CPUSet) (
 
 	keepFree := cp.keepFreePoolNonEmpty()
 
-	placements := defrag.PlacementsByNUMANode(topo, cp.cpuAllocationStore.ResourceClaimAllocations())
+	placements := defrag.PlacementsByNUMANode(topo, cp.cpuAllocationStore.ExclusiveClaimAllocations())
 	// Every node the topology has, not only those holding a claim. A node with no
 	// claims has nothing to move, but it still has a shape worth reporting: how
 	// large a claim it could take aligned is most interesting precisely when it is
@@ -297,15 +297,20 @@ func (cp *CPUDriver) claimMovable(claimUID types.UID) bool {
 	return !ok || time.Since(movedAt) >= cp.defrag.claimCooldown
 }
 
-// writeClaimPlacement rewrites a claim's CDI spec to record where it now belongs.
+// writeClaimPlacement rewrites a claim's CDI spec to record where each of its
+// requests now belongs, as the store has it.
 //
 // The environment edit is reconstructed rather than read back from the spec. It
 // is a pure function of the claim UID and whether placement is mutable, so
 // rebuilding it is exact -- and reading it would mean querying the CDI cache,
 // which only learns of a spec when it is refreshed and so cannot be relied on to
 // know about a claim this driver prepared itself.
-func (cp *CPUDriver) writeClaimPlacement(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet) error {
-	return cp.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), cp.claimEnvEdits(claimUID, cpus), cpus)
+func (cp *CPUDriver) writeClaimPlacement(logger logr.Logger, claimUID types.UID) error {
+	requests, ok := cp.cpuAllocationStore.GetResourceClaimRequests(claimUID)
+	if !ok {
+		return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
+	}
+	return cp.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), cp.claimEnvEdits(claimUID, store.UnionOf(requests)), requests)
 }
 
 // roundUpdates builds the one batch of container updates a round consists of: the
@@ -402,7 +407,7 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 				mLogger.Error(err, "cannot undo the reservation")
 				continue
 			}
-			if err := cp.writeClaimPlacement(mLogger, move.ClaimUID, move.From); err != nil {
+			if err := cp.writeClaimPlacement(mLogger, move.ClaimUID); err != nil {
 				mLogger.Error(err, "cannot restore the recorded placement")
 			}
 			continue
@@ -458,7 +463,7 @@ func (cp *CPUDriver) abortMoves(logger logr.Logger, moves []defrag.Move) {
 			mLogger.Error(err, "cannot undo the reservation")
 			continue
 		}
-		if err := cp.writeClaimPlacement(mLogger, move.ClaimUID, move.From); err != nil {
+		if err := cp.writeClaimPlacement(mLogger, move.ClaimUID); err != nil {
 			mLogger.Error(err, "cannot restore the recorded placement")
 		}
 	}

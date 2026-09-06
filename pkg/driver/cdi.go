@@ -16,9 +16,11 @@ limitations under the License.
 package driver
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/go-logr/logr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
@@ -33,13 +35,19 @@ const (
 	cdiEnvVarPrefix = "DRA_CPUSET"
 	cdiSpecDir      = "/var/run/cdi"
 
-	// cdiCPUSetAnnotation records the CPUs a claim is currently pinned to.
+	// cdiPlacementsAnnotation records what each request of a claim currently
+	// holds: its CPUs and the role of the CPUs it was given.
 	//
 	// It lives in the CDI spec's device annotations rather than in its container
 	// edits because CDI annotations are, per the specification, "CDI-specific and
 	// do not affect container metadata": nothing is injected into the container,
 	// so the driver can rewrite them at will. The injected env var cannot serve
 	// this purpose, since a running container's environment is fixed at creation.
+	cdiPlacementsAnnotation = "dra.cpu/placements"
+
+	// cdiCPUSetAnnotation records the CPUs a claim is pinned to, without saying
+	// which request holds them. Specs written before the driver recorded
+	// placement per request carry this one instead.
 	cdiCPUSetAnnotation = "dra.cpu/cpuset"
 
 	// cdiEnvDynamicValue stands in for a cpuset in the injected variable when a
@@ -99,16 +107,21 @@ func (c *CdiManager) getSpecName(deviceName string) string {
 	return cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, deviceName) + ".json"
 }
 
-// AddDevice writes a dedicated CDI spec file for a single device allocation,
-// recording cpus as the device's current placement and injecting envVar into the
-// container.
+// AddDevice writes a dedicated CDI spec file for a single claim, recording
+// requests as its current placement and injecting envVar into the container.
+// One device carries every request of the claim.
 //
 // The spec is written atomically by the CDI cache, so a concurrent reader sees
 // either the previous placement or this one, never a mixture.
 //
-// CCX-FORK: upstream takes no cpus argument and records no placement.
-func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVars []string, cpus cpuset.CPUSet) error {
+// CCX-FORK: upstream takes no requests argument and records no placement.
+func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVars []string, requests []store.RequestAllocation) error {
 	specName := c.getSpecName(deviceName)
+
+	placements, err := encodePlacements(requests)
+	if err != nil {
+		return fmt.Errorf("failed to record the placement of CDI device %q: %w", deviceName, err)
+	}
 
 	spec := &cdiSpec.Spec{
 		Version: cdiSpecVersion,
@@ -117,7 +130,7 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVars []
 			{
 				Name: deviceName,
 				Annotations: map[string]string{
-					cdiCPUSetAnnotation: cpus.String(),
+					cdiPlacementsAnnotation: placements,
 				},
 				ContainerEdits: cdiSpec.ContainerEdits{
 					Env: envVars,
@@ -130,38 +143,90 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVars []
 		return fmt.Errorf("failed to write CDI spec %q: %w", specName, err)
 	}
 
-	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVars, "cpus", cpus.String())
+	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVars, "placements", placements)
 	return nil
 }
 
-// GetDeviceCPUSet returns the CPUs recorded for a device allocation. Call Refresh
-// before lookup to load the latest on-disk specs.
+type cdiRequestPlacement struct {
+	Request string `json:"request"`
+	CPUs    string `json:"cpus"`
+	Role    string `json:"role"`
+}
+
+func encodePlacements(requests []store.RequestAllocation) (string, error) {
+	placements := make([]cdiRequestPlacement, 0, len(requests))
+	for _, request := range requests {
+		placements = append(placements, cdiRequestPlacement{
+			Request: request.Request,
+			CPUs:    request.CPUs.String(),
+			Role:    string(request.Role),
+		})
+	}
+	encoded, err := json.Marshal(placements)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func decodePlacements(recorded string) ([]store.RequestAllocation, error) {
+	var placements []cdiRequestPlacement
+	if err := json.Unmarshal([]byte(recorded), &placements); err != nil {
+		return nil, err
+	}
+	requests := make([]store.RequestAllocation, 0, len(placements))
+	for _, placement := range placements {
+		cpus, err := cpuset.Parse(placement.CPUs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse the CPUs of request %q: %w", placement.Request, err)
+		}
+		requests = append(requests, store.RequestAllocation{
+			Request: placement.Request,
+			CPUs:    cpus,
+			Role:    store.Role(placement.Role),
+		})
+	}
+	return requests, nil
+}
+
+// GetDeviceAllocations returns what each request of a claim was given, as its
+// device allocation records it. Call Refresh before lookup to load the latest
+// on-disk specs.
 //
-// Specs written before the driver recorded placement in an annotation carry it
-// only in the injected env var, so fall back to parsing that. The spec file is
+// A spec written before the driver recorded placement per request names one
+// cpuset for the whole claim, or carries it only in the injected env var; both
+// describe a single exclusive request without a name. The spec file is
 // driver-owned, so unlike a container's environment its env value is current.
-func (c *CdiManager) GetDeviceCPUSet(deviceName string) (cpuset.CPUSet, error) {
+func (c *CdiManager) GetDeviceAllocations(deviceName string) ([]store.RequestAllocation, error) {
 	device := c.cache.GetDevice(cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName))
 	if device == nil {
-		return cpuset.CPUSet{}, fmt.Errorf("failed to find CDI device %q", deviceName)
+		return nil, fmt.Errorf("failed to find CDI device %q", deviceName)
+	}
+
+	if recorded, ok := device.Annotations[cdiPlacementsAnnotation]; ok {
+		requests, err := decodePlacements(recorded)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiPlacementsAnnotation, recorded, deviceName, err)
+		}
+		return requests, nil
 	}
 
 	if recorded, ok := device.Annotations[cdiCPUSetAnnotation]; ok {
 		cpus, err := cpuset.Parse(recorded)
 		if err != nil {
-			return cpuset.CPUSet{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiCPUSetAnnotation, recorded, deviceName, err)
+			return nil, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiCPUSetAnnotation, recorded, deviceName, err)
 		}
-		return cpus, nil
+		return []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}}, nil
 	}
 
 	allocations, err := parseDRAEnvToClaimAllocations(logr.Discard(), device.ContainerEdits.Env)
 	if err != nil {
-		return cpuset.CPUSet{}, fmt.Errorf("failed to parse CDI device %q: %w", deviceName, err)
+		return nil, fmt.Errorf("failed to parse CDI device %q: %w", deviceName, err)
 	}
 	for _, cpus := range allocations {
-		return cpus, nil
+		return []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}}, nil
 	}
-	return cpuset.CPUSet{}, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
+	return nil, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
 }
 
 // PreparedClaimAllocations returns the placement recorded on disk for every
@@ -169,8 +234,8 @@ func (c *CdiManager) GetDeviceCPUSet(deviceName string) (cpuset.CPUSet, error) {
 // first to load the latest specs. A device this driver would not itself have
 // generated, or whose recorded placement fails to parse, is skipped and
 // logged rather than aborting recovery of every other claim.
-func (c *CdiManager) PreparedClaimAllocations(logger logr.Logger) map[types.UID]cpuset.CPUSet {
-	allocations := make(map[types.UID]cpuset.CPUSet)
+func (c *CdiManager) PreparedClaimAllocations(logger logr.Logger) map[types.UID][]store.RequestAllocation {
+	allocations := make(map[types.UID][]store.RequestAllocation)
 	for _, qualified := range c.cache.ListDevices() {
 		vendor, class, name, err := cdiparser.ParseQualifiedName(qualified)
 		if err != nil || vendor != cdiVendor || class != cdiClass {
@@ -181,12 +246,12 @@ func (c *CdiManager) PreparedClaimAllocations(logger logr.Logger) map[types.UID]
 			logger.V(2).Info("ignoring CDI device this driver would not have generated", "device", qualified)
 			continue
 		}
-		cpus, err := c.GetDeviceCPUSet(name)
+		requests, err := c.GetDeviceAllocations(name)
 		if err != nil {
 			logger.Error(err, "ignoring CDI device with an unrecoverable placement", "device", qualified)
 			continue
 		}
-		allocations[claimUID] = cpus
+		allocations[claimUID] = requests
 	}
 	return allocations
 }

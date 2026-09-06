@@ -33,7 +33,7 @@ With `defragEnabled` the injected value is the literal string `dynamic` rather t
 because a claim whose placement may change has none to name for the life of its container.
 
 **upstream → fork: no drain.** Identity comes from the variable's name. A spec written by upstream
-carries no `dra.cpu/cpuset` annotation, so the fork falls back to parsing that spec's own env value,
+carries no `dra.cpu/placements` annotation, so the fork falls back to parsing that spec's own env value,
 which for an upstream spec is the real placement. Each claim gains an annotation the next time its spec
 is written.
 
@@ -67,21 +67,24 @@ DaemonSet.
 Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
-- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`, `cdiSharedEnvVar`, `GetDeviceCPUSet`
+- `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`,
+  `cdiSharedEnvVar`, `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`,
+  `decodePlacements`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `lastMoved`, `pendingRound` and
   `sharedPool` fields, the `Config.Defrag*` and `Config.SharedPoolCPUs` options, and
   `validateSharedPool`
 
-- `pkg/driver/dra_hooks.go`: `claimEnvEdits`
+- `pkg/driver/dra_hooks.go`: `claimEnvEdits`, `requestAllocations`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`, `sharedContainerCPUs`, `guaranteedContainerCPUs`,
-  `localSharedPool`
+  `localSharedPool`, `exclusiveClaimUIDs`
 
-- `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`,
-  `ResourceClaimAllocations`
+- `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RequestAllocation`, `UnionOf`,
+  `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
+  `GetRebindOrigin`, `GetResourceClaimRequests`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 
@@ -107,6 +110,8 @@ are not repeated here.
 
 `CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
 placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
+`CPUAllocation.GetResourceClaimAllocation` is upstream's and is kept for the same reason: the fork reads
+a claim's placement per request instead.
 
 ## Upstreamable pieces
 

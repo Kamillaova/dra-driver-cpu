@@ -159,7 +159,7 @@ func (cp *CPUDriver) placements(logger logr.Logger, dryRun bool) (*placementsRep
 	if cp.fullPhysicalCPUsOnly {
 		free = topo.CPUDetails.CompleteCores(free)
 	}
-	allocations := cp.cpuAllocationStore.ResourceClaimAllocations()
+	allocations := cp.cpuAllocationStore.ExclusiveClaimAllocations()
 
 	report := &placementsReport{
 		NodeName:      cp.nodeName,

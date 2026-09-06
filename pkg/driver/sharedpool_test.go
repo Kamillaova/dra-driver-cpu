@@ -93,7 +93,7 @@ func TestSharedPoolPinsClaimlessContainersConstantly(t *testing.T) {
 
 	// A claim being prepared and released must not touch it: the pool is
 	// static, so there is nothing to narrow onto or widen back to.
-	require.NoError(t, d.reserveResourceClaimAllocation(logger, "claim-1", cpuset.New(0, 8)))
+	require.NoError(t, d.reserveResourceClaimAllocation(logger, "claim-1", exclusiveOn(cpuset.New(0, 8))))
 	shared, err := d.getSharedContainerUpdates(logger, "")
 	require.NoError(t, err)
 	require.Len(t, shared, 1)
@@ -124,7 +124,7 @@ func TestSharedPoolSurvivesSynchronize(t *testing.T) {
 	d := newSharedPoolTestDriver(t)
 	logger := testr.New(t)
 	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName("claim-1"),
-		[]string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-1", cdiEnvDynamicValue)}, cpuset.New(0, 8)))
+		[]string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-1", cdiEnvDynamicValue)}, exclusiveOn(cpuset.New(0, 8))))
 
 	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
 	guaranteed := &api.Container{
@@ -165,7 +165,7 @@ func TestSharedPoolDefragRoundCarriesOnlyGuaranteedContainers(t *testing.T) {
 
 func TestSharedPoolIsUnreachableByClaims(t *testing.T) {
 	d := newSharedPoolTestDriver(t)
-	err := d.reserveResourceClaimAllocation(testr.New(t), "claim-greedy", cpuset.New(1, 2))
+	err := d.reserveResourceClaimAllocation(testr.New(t), "claim-greedy", exclusiveOn(cpuset.New(1, 2)))
 	require.Error(t, err, "a reservation touching the pool must be refused")
 	require.Contains(t, err.Error(), "overlapping")
 }
@@ -269,8 +269,8 @@ func TestSharedPoolEnvNamesTheLocalPoolAndSurvivesAMove(t *testing.T) {
 	}, d.claimEnvEdits("claim-2", cpuset.New(4, 12)), "a claim on NUMA node 1 is told node 1's pool")
 
 	logger := testr.New(t)
-	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-1", cpuset.New(0, 8, 2, 10), false))
-	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName("claim-1"), envs, cpuset.New(0, 8, 2, 10)))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-1", exclusiveOn(cpuset.New(0, 8, 2, 10)), false))
+	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName("claim-1"), envs, exclusiveOn(cpuset.New(0, 8, 2, 10))))
 	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
 
 	d.defragPass(context.Background())

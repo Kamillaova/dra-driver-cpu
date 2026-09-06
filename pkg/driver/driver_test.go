@@ -263,8 +263,8 @@ func TestSeedAllocationStoreFromDiskRecoversPriorPlacements(t *testing.T) {
 
 	// A Prepare replayed for a different, new claim must not be able to land on
 	// the recovered claim's CPUs.
-	require.Error(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-new", cpuset.New(0), false))
-	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-new", cpuset.New(2), false))
+	require.Error(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-new", exclusiveOn(cpuset.New(0)), false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-new", exclusiveOn(cpuset.New(2)), false))
 }
 
 // TestSeedAllocationStoreFromDiskSkipsAConflictingRecordWithoutFailingStartup:
@@ -625,7 +625,7 @@ func TestPlacementChangesAreSerialized(t *testing.T) {
 	}
 
 	allocationStore := store.NewCPUAllocation(topo, cpuset.New())
-	require.NoError(t, allocationStore.ReserveResourceClaimAllocation(logger, claimUID, claimedCPUs, false))
+	require.NoError(t, allocationStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(claimedCPUs), false))
 
 	d := &CPUDriver{
 		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: claimedCPUs}),
