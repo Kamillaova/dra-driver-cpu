@@ -65,6 +65,15 @@ type Config struct {
 	// narrower cpuset until their next lifecycle event. Requires
 	// AssumeUnsolicitedUpdatesSafe, and is inert without it. Defaults to true.
 	ReconcileSharedOnUnprepare bool `json:"reconcileSharedOnUnprepare,omitempty"`
+	// DefragEnabled lets the driver move a running claim onto different CPUs to
+	// recover uncore cache alignment lost to claim churn, without restarting its
+	// container. The claim keeps its CPU count; only which CPUs back it change.
+	//
+	// Requires cpuDeviceMode "grouped" with groupBy "numanode" or "socket", since
+	// the driver only chooses a claim's CPUs in those modes, and
+	// AssumeUnsolicitedUpdatesSafe, since a move is pushed to the runtime
+	// unprompted. Defaults to false.
+	DefragEnabled bool `json:"defragEnabled,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -83,6 +92,7 @@ func (c Config) LogValues() []any {
 		"fullPhysicalCPUsOnly", c.FullPhysicalCPUsOnly,
 		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
 		"reconcileSharedOnUnprepare", c.ReconcileSharedOnUnprepare,
+		"defragEnabled", c.DefragEnabled,
 	}
 }
 
@@ -102,6 +112,7 @@ type dumpConfig struct {
 	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly"`
 	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe"`
 	ReconcileSharedOnUnprepare            bool   `json:"reconcileSharedOnUnprepare"`
+	DefragEnabled                         bool   `json:"defragEnabled"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
