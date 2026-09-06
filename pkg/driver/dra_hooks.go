@@ -157,9 +157,9 @@ func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID
 	return cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, requests, hasSharedContainers)
 }
 
-// Every device this driver publishes grants CPUs its claim holds alone, so
-// every request of a claim it prepares is exclusive.
-func requestAllocations(byRequest map[string]cpuset.CPUSet) []store.RequestAllocation {
+// requestAllocations orders what each request of a claim was given by request
+// name, so the store and the records it writes never depend on map order.
+func requestAllocations(byRequest map[string]store.RequestAllocation) []store.RequestAllocation {
 	names := make([]string, 0, len(byRequest))
 	for name := range byRequest {
 		names = append(names, name)
@@ -167,13 +167,21 @@ func requestAllocations(byRequest map[string]cpuset.CPUSet) []store.RequestAlloc
 	sort.Strings(names)
 	requests := make([]store.RequestAllocation, 0, len(names))
 	for _, name := range names {
-		requests = append(requests, store.RequestAllocation{
-			Request: name,
-			CPUs:    byRequest[name],
-			Role:    store.RoleExclusive,
-		})
+		requests = append(requests, byRequest[name])
 	}
 	return requests
+}
+
+// addRequestCPUs merges one allocation result into the request it belongs to. A
+// request satisfied by several devices holds their union, and every device of
+// one request has the same role, since a device class selects one partition.
+func addRequestCPUs(byRequest map[string]store.RequestAllocation, name string, cpus cpuset.CPUSet, role store.Role) {
+	existing := byRequest[name]
+	byRequest[name] = store.RequestAllocation{
+		Request: name,
+		CPUs:    existing.CPUs.Union(cpus),
+		Role:    role,
+	}
 }
 
 func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
@@ -196,10 +204,24 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 	}
 
 	var cpuAssignment cpuset.CPUSet
-	byRequest := map[string]cpuset.CPUSet{}
+	byRequest := map[string]store.RequestAllocation{}
 	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs()
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != cp.driverName {
+			continue
+		}
+		// CCX-FORK: upstream takes every result's CPUs out of the device's
+		// capacity, since each of its devices is held by one claim. A pool
+		// device is claimed, not carved up: the claim is given its whole CPU
+		// set, and the amount the allocator charged bounds how much work lands
+		// there rather than naming a number of CPUs to take.
+		if cp.topology.deviceNameToRole[alloc.Device] == device.PARTITION_ROLE_SHARED {
+			poolCPUs, published := cp.topology.deviceNameToCPUs[alloc.Device]
+			if !published {
+				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
+			}
+			addRequestCPUs(byRequest, alloc.Request, poolCPUs, store.RoleShared)
+			logger.V(2).Info("claimed a CPU pool", "device", alloc.Device, "cpus", poolCPUs.String())
 			continue
 		}
 		quantity, ok := alloc.ConsumedCapacity[device.CPUResourceQualifiedName]
@@ -267,11 +289,11 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 			return kubeletplugin.PrepareResult{Err: err}
 		}
 		cpuAssignment = cpuAssignment.Union(cur)
-		byRequest[alloc.Request] = byRequest[alloc.Request].Union(cur)
+		addRequestCPUs(byRequest, alloc.Request, cur, store.RoleExclusive)
 		logger.V(2).Info("CPU assignment for device", "device", alloc.Device, "assigned", cur.String(), "allAssigned", cpuAssignment.String())
 	}
 
-	if cpuAssignment.Size() == 0 {
+	if len(byRequest) == 0 {
 		logger.V(6).Info("claim has no CPU allocations for this driver")
 		return kubeletplugin.PrepareResult{}
 	}
@@ -320,7 +342,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	}
 
 	claimCPUIDs := []int{}
-	byRequest := map[string]cpuset.CPUSet{}
+	byRequest := map[string]store.RequestAllocation{}
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != cp.driverName {
 			continue
@@ -332,7 +354,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 			}
 		}
 		claimCPUIDs = append(claimCPUIDs, cpuID)
-		byRequest[alloc.Request] = byRequest[alloc.Request].Union(cpuset.New(cpuID))
+		addRequestCPUs(byRequest, alloc.Request, cpuset.New(cpuID), store.RoleExclusive)
 	}
 
 	if len(claimCPUIDs) == 0 {
@@ -390,6 +412,10 @@ func (cp *CPUDriver) cdiEnvValue(cpus cpuset.CPUSet) string {
 
 func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, requests []store.RequestAllocation) kubeletplugin.PrepareResult {
 	deviceName := getCDIDeviceName(claim.UID)
+	byRequest := make(map[string]store.RequestAllocation, len(requests))
+	for _, request := range requests {
+		byRequest[request.Request] = request
+	}
 	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, cp.cdiEnvValue(store.UnionOf(requests)))
 	// CCX-FORK: the requests argument is the fork's placement record.
 	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar, requests); err != nil {
@@ -420,6 +446,17 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 				allocatedCount := quantity.Value()
 				metadataAttrs[string(device.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{
 					IntValue: &allocatedCount,
+				}
+			}
+			// CCX-FORK: upstream's metadata file carries the device attributes
+			// and the allocated count alone. A pool never moves, so its
+			// request's file may name the CPUs too; the file is written before
+			// the container starts and cannot be rewritten afterwards, which is
+			// why a claim whose placement may change reads its CPUs from the
+			// kernel instead.
+			if request, ok := byRequest[allocResult.Request]; ok && request.Role == store.RoleShared {
+				metadataAttrs[string(device.AttributeCPUSet)] = resourceapi.DeviceAttribute{
+					StringValue: new(request.CPUs.String()),
 				}
 			}
 			preparedDevice.Metadata = &kubeletplugin.DeviceMetadata{
