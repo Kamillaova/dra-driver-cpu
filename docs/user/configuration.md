@@ -119,6 +119,26 @@ on - is configured through other Helm values, not through this file.
   per-CPU devices, so the driver cannot keep a core's siblings together.
 - A no-op where SMT is disabled, since every core has one thread.
 
+`assumeUnsolicitedUpdatesSafe` (bool, default: `false`)
+
+- Permit the driver to push container cpuset updates the runtime did not ask for. Every
+  feature that reacts to a change without waiting for a container lifecycle event needs
+  this, including `reconcileSharedOnUnprepare`.
+- It is an operator assertion, not something the driver can detect. Unsolicited updates
+  deadlock runtimes whose vendored NRI predates
+  [containerd/nri#301](https://github.com/containerd/nri/pull/301), and the NRI `Configure`
+  handshake reports the runtime version but not its NRI version, so there is no reliable
+  check. containerd carries the fix from NRI v0.12.1 onwards, first released in containerd
+  v2.4.0-beta.0; containerd v2.3.4 and CRI-O v1.36 do not.
+
+`reconcileSharedOnUnprepare` (bool, default: `true`)
+
+- Widen shared containers onto the CPUs a claim released as soon as it is unprepared,
+  rather than leaving them on the narrower cpuset until their next `CreateContainer` or
+  driver restart.
+- Requires `assumeUnsolicitedUpdatesSafe` and is inert without it, so enabling that one
+  option is enough.
+
 #### Example
 
 ```yaml
