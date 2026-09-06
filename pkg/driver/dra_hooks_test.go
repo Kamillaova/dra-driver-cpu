@@ -943,6 +943,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 			cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 			podConfigStore:     store.NewPodConfig(),
 			metrics:            cpumetrics.Noop(),
+			claimTracker:       store.NewClaimTracker(),
 		}
 		if withExistingAllocation {
 			requirePreparedResourceClaim(t, logger, driver.cpuAllocationStore, claimUID, existingCPUs)
@@ -967,6 +968,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 			podConfigStore:     store.NewPodConfig(),
 			metrics:            cpumetrics.Noop(),
 			cpuAllocator:       cpuallocator.NewCPUManager(testDriverName, topo),
+			claimTracker:       store.NewClaimTracker(),
 		}
 		if withExistingAllocation {
 			requirePreparedResourceClaim(t, logger, driver.cpuAllocationStore, claimUID, existingCPUs)
@@ -1618,6 +1620,7 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 			cdiMgr:             cdiMgr,
 			podConfigStore:     store.NewPodConfig(),
 			metrics:            cpumetrics.Noop(),
+			claimTracker:       store.NewClaimTracker(),
 		}, cpuStore, cdiMgr
 	}
 	makeNUMADriver := func(logger logr.Logger) (*CPUDriver, *store.CPUAllocation, *mockCdiMgr) {
@@ -1639,6 +1642,7 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 			cdiMgr:             cdiMgr,
 			podConfigStore:     store.NewPodConfig(),
 			metrics:            cpumetrics.Noop(),
+			claimTracker:       store.NewClaimTracker(),
 		}, cpuStore, cdiMgr
 	}
 
@@ -2318,6 +2322,7 @@ func createCPUDriverExternalAllocForTest(t *testing.T, groupBy string, cpuInfos 
 	driver.cpuAllocationStore = store.NewCPUAllocation(driver.topology.cpuTopology, reservedCPUs)
 	driver.podConfigStore = store.NewPodConfig()
 	driver.cpuAllocator = cpuallocator.NewExternal(testDriverName, driver.topology.cpuTopology.CPUDetails.CPUs(), reservedCPUs)
+	driver.claimTracker = store.NewClaimTracker()
 	for claimUID, cpus := range initialAllocations {
 		requirePreparedResourceClaim(t, logger, driver.cpuAllocationStore, claimUID, cpus)
 	}
