@@ -119,6 +119,10 @@ type CPUDriver struct {
 	reconcileSharedOnUnprepare bool
 	// defrag configures the defragmentation pass, and is zero when it is off.
 	defrag defragOptions
+	// partitions is the node's cores as described, always ending with the
+	// implicit partition holding whatever the described ones left. Set in New,
+	// read-only after that.
+	partitions []device.Partition
 	// sharedPool is the static shared pool, empty when the pool is dynamic. Its
 	// CPUs are folded into topology.reservedCPUs, so capacity, allocation and
 	// defragmentation all exclude them without knowing the pool exists; only
@@ -244,6 +248,10 @@ type Config struct {
 	// dynamic pool. Grouped mode only; disjointness from ReservedCPUs is checked
 	// by driverconfig, the topology-dependent checks by New.
 	SharedPoolCPUs cpuset.CPUSet
+	// CPUPartitions describes the node's cores, already parsed and validated as
+	// far as that is possible without the node's topology. Empty leaves the whole
+	// node in the implicit partition, which is what an undescribed node has.
+	CPUPartitions []device.Partition
 }
 
 func (cfg Config) DevicesPerResourceSlice() int {
@@ -322,6 +330,26 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		logger.Info("dedicated a static shared pool", "cpus", plugin.sharedPool.String())
 	}
 
+	// CCX-FORK: the cores an operator described as partitions. Those no workload
+	// may claim -- the reserved ones and the pools -- join the effective reserved
+	// set, so capacity, allocation and defragmentation exclude them the same way
+	// they exclude the static shared pool above.
+	if len(config.CPUPartitions) > 0 {
+		if err := validatePartitions(topo, onlineCPUs, config.CPUPartitions); err != nil {
+			return nil, err
+		}
+		plugin.topology.reservedCPUs = plugin.topology.reservedCPUs.Union(unclaimablePartitionCPUs(config.CPUPartitions))
+	}
+	plugin.partitions = device.WithImplicitDefault(config.CPUPartitions, onlineCPUs.Difference(plugin.topology.reservedCPUs))
+	if len(config.CPUPartitions) > 0 {
+		for _, partition := range plugin.partitions {
+			logger.Info("resolved CPU partition", "partition", partition.Name, "role", partition.Role, "cpus", partition.CPUs.String())
+		}
+		if implicit := plugin.partitions[len(plugin.partitions)-1]; implicit.CPUs.IsEmpty() {
+			logger.Info("the implicit default partition holds no CPUs: a claim that names no partition has nowhere to land on this node")
+		}
+	}
+
 	plugin.cpuAllocationStore = store.NewCPUAllocation(plugin.topology.cpuTopology, plugin.topology.reservedCPUs)
 	plugin.refreshAllocationMetrics()
 	plugin.podConfigStore = store.NewPodConfig()
@@ -366,25 +394,42 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	}
 
 	var devices []resourceapi.Device
+	// CCX-FORK: grouped devices are built per partition, so that one partition's
+	// taints never travel in another's ResourceSlice.
+	var devicesByPartition [][]resourceapi.Device
 
 	if plugin.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-		var nameToID, deviceThreadsPerCore map[string]int
-		devices, nameToID, deviceThreadsPerCore = device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping, config.FullPhysicalCPUsOnly)
-		plugin.topology.deviceThreadsPerCore = deviceThreadsPerCore
+		built := device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.onlineCPUs, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping, config.FullPhysicalCPUsOnly, plugin.partitions)
+		devicesByPartition = built.ByPartition
+		for _, partitionDevices := range devicesByPartition {
+			devices = append(devices, partitionDevices...)
+		}
+		plugin.topology.deviceThreadsPerCore = built.ThreadsPerCore
 		switch plugin.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET:
-			plugin.topology.deviceNameToSocketID = nameToID
+			plugin.topology.deviceNameToSocketID = built.NameToID
 		case device.GROUP_BY_NUMA_NODE:
-			plugin.topology.deviceNameToNUMANodeID = nameToID
+			plugin.topology.deviceNameToNUMANodeID = built.NameToID
 		}
-		plugin.topology.numaNodeThreadsPerCore = numaNodeThreadsPerCore(plugin.topology.cpuTopology, plugin.cpuDeviceGroupBy, nameToID, deviceThreadsPerCore)
+		plugin.topology.numaNodeThreadsPerCore = numaNodeThreadsPerCore(plugin.topology.cpuTopology, plugin.cpuDeviceGroupBy, built.NameToID, built.ThreadsPerCore)
 	} else {
 		devices, plugin.topology.deviceNameToCPUID = device.Build(plugin.topology.cpuTopology, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping)
+		devicesByPartition = [][]resourceapi.Device{devices}
 	}
 
-	if len(devices) > 0 {
+	// A slice holding a tainted device may carry half as many devices as one
+	// without, so the limit follows what was actually built rather than the
+	// options alone.
+	if slices.ContainsFunc(devices, func(d resourceapi.Device) bool { return len(d.Taints) > 0 }) {
+		plugin.devicesPerResourceSlice = min(plugin.devicesPerResourceSlice, resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures)
+	}
+
+	for _, partitionDevices := range devicesByPartition {
+		if len(partitionDevices) == 0 {
+			continue
+		}
 		// Chunk devices into slices of at most devicesPerResourceSlice
-		plugin.topology.deviceSlices = slices.Collect(slices.Chunk(devices, plugin.devicesPerResourceSlice))
+		plugin.topology.deviceSlices = append(plugin.topology.deviceSlices, slices.Collect(slices.Chunk(partitionDevices, plugin.devicesPerResourceSlice))...)
 	}
 	logger.Info("chunked devices into ResourceSlices", "numDevices", len(devices),
 		"devicesPerResourceSlice", plugin.devicesPerResourceSlice, "numResourceSlices", len(plugin.topology.deviceSlices),
@@ -398,6 +443,42 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	}
 
 	return plugin, nil
+}
+
+// unclaimablePartitionCPUs is every CPU a partition holds that no claim may
+// take: the reserved partitions, and the pools, which are reached by claiming
+// a pool device rather than by taking exclusive CPUs.
+func unclaimablePartitionCPUs(partitions []device.Partition) cpuset.CPUSet {
+	unclaimable := cpuset.New()
+	for _, partition := range partitions {
+		if !partition.PublishesDevices() {
+			unclaimable = unclaimable.Union(partition.CPUs)
+		}
+	}
+	return unclaimable
+}
+
+// validatePartitions checks the described cores against the node the driver
+// stands on: the checks that need no topology already ran in driverconfig.
+//
+// A partition names whole cores, which is what makes a device's thread arity
+// its own: half a core in one partition and half in another leaves neither able
+// to promise anything about SMT siblings. Under smt: false the offline siblings
+// do not exist to the kernel, so the surviving thread is a whole core here.
+func validatePartitions(topo *cpuinfo.CPUTopology, onlineCPUs cpuset.CPUSet, partitions []device.Partition) error {
+	for _, partition := range partitions {
+		if offline := partition.CPUs.Difference(onlineCPUs); !offline.IsEmpty() {
+			return fmt.Errorf("partition %q names offline CPUs: %s", partition.Name, offline.String())
+		}
+		if unknown := partition.CPUs.Difference(topo.CPUDetails.CPUs()); !unknown.IsEmpty() {
+			return fmt.Errorf("partition %q names CPUs this node does not have: %s", partition.Name, unknown.String())
+		}
+		if split := partition.CPUs.Difference(topo.CPUDetails.CompleteCores(partition.CPUs)); !split.IsEmpty() {
+			return fmt.Errorf("partition %q splits physical cores on %s: a partition holds whole cores, so that what it says about threads per core is true of every core in it",
+				partition.Name, split.String())
+		}
+	}
+	return nil
 }
 
 // validateReservedCPUsAlignment checks reservedCPUs against the node when

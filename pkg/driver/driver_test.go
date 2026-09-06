@@ -33,6 +33,7 @@ import (
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
@@ -655,4 +656,83 @@ func TestPlacementChangesAreSerialized(t *testing.T) {
 	shared := d.cpuAllocationStore.GetSharedCPUs()
 	require.True(t, prepared.Intersection(shared).IsEmpty(), "a CPU is both claimed and shared")
 	require.True(t, prepared.Union(shared).Equals(allCPUs), "CPUs went missing")
+}
+
+// partitionTestInfos is a single-socket, single-NUMA part of four two-way SMT
+// cores: CPUs 0-3 and their siblings 4-7.
+func partitionTestInfos() []cpuinfo.CPUInfo {
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 8 {
+		core := cpu % 4
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        core,
+			SocketID:      0,
+			NUMANodeID:    0,
+			UncoreCacheID: 0,
+			SiblingCPUID:  (cpu + 4) % 8,
+			SiblingCPUSet: cpuset.New(core, core+4),
+		})
+	}
+	return infos
+}
+
+func TestNewPublishesOneSlicePerPartition(t *testing.T) {
+	infos := partitionTestInfos()
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}
+
+	cp, err := New(testr.New(t), prov, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		CPUPartitions: []devattr.Partition{
+			{Name: "system", Role: devattr.PARTITION_ROLE_RESERVED, CPUs: cpuset.New(0, 4)},
+			{Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Len(t, cp.topology.deviceSlices, 2, "a partition's taints must not travel in another partition's slice")
+	require.Len(t, cp.topology.deviceSlices[0], 1)
+	require.Len(t, cp.topology.deviceSlices[1], 1)
+	require.Equal(t, devattr.CPUDeviceNUMAGroupedPrefix+"000-dataplane", cp.topology.deviceSlices[0][0].Name)
+	require.NotEmpty(t, cp.topology.deviceSlices[0][0].Taints)
+	require.Equal(t, devattr.CPUDeviceNUMAGroupedPrefix+"000", cp.topology.deviceSlices[1][0].Name)
+	require.Empty(t, cp.topology.deviceSlices[1][0].Taints)
+
+	require.Equal(t, cpuset.New(0, 4), cp.topology.reservedCPUs, "a reserved partition is reserved")
+	require.Equal(t, resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures, cp.devicesPerResourceSlice,
+		"a slice holding a tainted device carries half as many devices")
+}
+
+func TestNewRejectsPartitionsTheNodeContradicts(t *testing.T) {
+	infos := partitionTestInfos()
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}
+	newWith := func(partitions ...devattr.Partition) error {
+		_, err := New(testr.New(t), prov, &Config{
+			DriverName:       testDriverName,
+			NodeName:         testNodeName,
+			CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+			CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+			CPUPartitions:    partitions,
+		})
+		return err
+	}
+
+	require.NoError(t, newWith(devattr.Partition{Name: "vm", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)}))
+
+	err := newWith(devattr.Partition{Name: "vm", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 99)})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "offline CPUs")
+
+	err = newWith(devattr.Partition{Name: "vm", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1)})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "splits physical cores")
 }

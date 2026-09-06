@@ -244,6 +244,10 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse shared pool CPUs: %w", err)
 	}
+	cpuPartitions, err := cfg.Partitions()
+	if err != nil {
+		return err
+	}
 
 	driverConfig := driver.Config{
 		DriverName:                            driverName,
@@ -263,6 +267,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		DefragMinGain:                         cfg.DefragMinGain,
 		DefragClaimCooldown:                   time.Duration(cfg.DefragClaimCooldownSeconds) * time.Second,
 		SharedPoolCPUs:                        sharedPoolCPUSet,
+		CPUPartitions:                         cpuPartitions,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 	}

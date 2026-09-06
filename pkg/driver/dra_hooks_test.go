@@ -2373,6 +2373,11 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 		addExpectedUncoreAttrs(attrs, groupCPUs)
 	}
 
+	// Every grouped device names the partition its CPUs come from, which on a
+	// node whose cores nobody described is the implicit one.
+	attrs[string(devattr.AttributePartition)] = resourceapi.DeviceAttribute{StringValue: new(devattr.DefaultPartitionName)}
+	attrs[string(devattr.AttributeRole)] = resourceapi.DeviceAttribute{StringValue: new(devattr.PARTITION_ROLE_DEFAULT)}
+
 	if allocatedCPUs > 0 {
 		attrs[string(devattr.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(allocatedCPUs)}
 	}
