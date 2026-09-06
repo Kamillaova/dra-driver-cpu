@@ -549,9 +549,11 @@ func TestGroupedDevicesPerPartition(t *testing.T) {
 	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
 		cpuset.New(0, 1), store.NewPCIeRootMapper(), false, false, partitions)
 
-	require.Len(t, built.ByPartition, 2, "the reserved partition and the pool publish no device")
-	dataplane := built.ByPartition[0]
-	implicit := built.ByPartition[1]
+	require.Len(t, built.ByPartition, 3, "the reserved partition publishes no device")
+	helpers := built.ByPartition[0]
+	dataplane := built.ByPartition[1]
+	implicit := built.ByPartition[2]
+	require.Len(t, helpers, 1)
 	require.Len(t, dataplane, 1)
 	require.Len(t, implicit, 1)
 
@@ -573,6 +575,70 @@ func TestGroupedDevicesPerPartition(t *testing.T) {
 	implicitCapacity := implicit[0].Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
 	require.EqualValues(t, 4, implicitCapacity.Value.Value(),
 		"CPUs 4-7: what the described partitions and the reservation left")
+}
+
+// fakeTwoNUMACacheTopology is eight single-thread CPUs split over two NUMA
+// nodes, so a partition spanning both must be published as two pool devices.
+func fakeTwoNUMACacheTopology() *cpuinfo.CPUTopology {
+	details := cpuinfo.CPUDetails{}
+	for cpu := range 8 {
+		details[cpu] = cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        cpu,
+			SocketID:      0,
+			NUMANodeID:    cpu / 4,
+			UncoreCacheID: cpu / 4,
+			SiblingCPUID:  -1,
+			SiblingCPUSet: cpuset.New(cpu),
+		}
+	}
+	return &cpuinfo.CPUTopology{
+		NumCPUs: 8, NumCores: 8, NumSockets: 1, NumNUMANodes: 2, NumUncoreCache: 2,
+		SMTEnabled: false, CPUDetails: details,
+	}
+}
+
+// TestPoolPartitionPublishesOneDevicePerNUMANode: a pool is claimed rather than
+// appended, so it has to be a device -- one per NUMA node it touches, whatever
+// grouping the exclusive partitions use.
+func TestPoolPartitionPublishesOneDevicePerNUMANode(t *testing.T) {
+	topo := fakeTwoNUMACacheTopology()
+	online := topo.CPUDetails.CPUs()
+	pool := cpuset.New(0, 1, 4)
+	partitions := device.WithImplicitDefault([]device.Partition{
+		{Name: "helpers", Role: device.PARTITION_ROLE_SHARED, CPUs: pool},
+	}, online.Difference(pool))
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_MACHINE, topo, online,
+		pool, store.NewPCIeRootMapper(), true, false, partitions)
+
+	require.Len(t, built.ByPartition, 2)
+	devices := built.ByPartition[0]
+	require.Len(t, devices, 2, "the pool touches both NUMA nodes")
+
+	require.Equal(t, device.CPUDevicePoolPrefix+"000-helpers", devices[0].Name)
+	require.Equal(t, device.CPUDevicePoolPrefix+"001-helpers", devices[1].Name)
+	require.Equal(t, cpuset.New(0, 1), built.CPUs[devices[0].Name])
+	require.Equal(t, cpuset.New(4), built.CPUs[devices[1].Name])
+	require.Equal(t, device.PARTITION_ROLE_SHARED, built.Roles[devices[0].Name])
+	require.Equal(t, "helpers", *devices[0].Attributes[device.AttributePartition].StringValue)
+	require.Equal(t, device.PARTITION_ROLE_SHARED, *devices[0].Attributes[device.AttributeRole].StringValue)
+	require.True(t, *devices[0].AllowMultipleAllocations)
+	require.Nil(t, devices[0].NodeAllocatableResources,
+		"a pool's CPUs are not exclusive, so mapping them would count them against the node twice")
+	require.Equal(t, []resourceapi.DeviceTaint{{
+		Key:    device.PartitionTaintKey,
+		Value:  "helpers",
+		Effect: resourceapi.DeviceTaintEffectNoSchedule,
+	}}, devices[0].Taints)
+
+	capacity := devices[0].Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+	require.EqualValues(t, 2, capacity.Value.Value())
+	require.NotNil(t, capacity.RequestPolicy)
+	require.Equal(t, "100m", capacity.RequestPolicy.Default.String(),
+		"a request that names no amount takes a share, never the whole pool")
+	require.Equal(t, "100m", capacity.RequestPolicy.ValidRange.Min.String())
+	require.Equal(t, "100m", capacity.RequestPolicy.ValidRange.Step.String())
 }
 
 func TestGroupedDevicesOfAnUndescribedNodeNameTheImplicitPartition(t *testing.T) {
