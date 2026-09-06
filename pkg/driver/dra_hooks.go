@@ -304,7 +304,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		// If the CDI file is already created on disk, the CDI manager will safely overwrite it with the same configuration.
 		// This ensures that the CDI specification file is written/recreated on disk (for example, if the driver
 		// pod restarted and synchronized its memory store from the runtime but did not recreate the CDI files on disk).
-		return cp.prepareDevices(logger, claim, existing)
+		return cp.prepareDevices(logger, claim, existing, placement)
 	}
 
 	var cpuAssignment cpuset.CPUSet
@@ -408,7 +408,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, record)
+	result := cp.prepareDevices(logger, claim, record, placement)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 		return result
@@ -478,7 +478,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 				Err: fmt.Errorf("claim %s/%s is already prepared with different CPUs %s (requested %s)", claim.Namespace, claim.Name, existingCPUs.String(), claimCPUSet.String()),
 			}
 		}
-		return cp.prepareDevices(logger, claim, existing)
+		return cp.prepareDevices(logger, claim, existing, placement)
 	}
 
 	// All the CPUs allocated to a claim must not be prepared for another claim.
@@ -494,7 +494,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, record)
+	result := cp.prepareDevices(logger, claim, record, placement)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 		return result
@@ -524,7 +524,7 @@ func (cp *CPUDriver) cdiEnvValue(record store.ClaimRecord) string {
 
 // CCX-FORK: upstream is handed the claim's cpuset and nothing else about the
 // claim.
-func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, record store.ClaimRecord) kubeletplugin.PrepareResult {
+func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, record store.ClaimRecord, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
 	deviceName := getCDIDeviceName(claim.UID)
 	byRequest := make(map[string]store.RequestAllocation, len(record.Requests))
 	for _, request := range record.Requests {
@@ -562,12 +562,20 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 				}
 			}
 			// CCX-FORK: upstream's metadata file carries the device attributes
-			// and the allocated count alone. A pool never moves, so its
-			// request's file may name the CPUs too; the file is written before
-			// the container starts and cannot be rewritten afterwards, which is
-			// why a claim whose placement may change reads its CPUs from the
-			// kernel instead.
-			if request, ok := byRequest[allocResult.Request]; ok && request.Role == store.RoleShared {
+			// and the allocated count alone. The fork adds what the claim itself
+			// said about its placement, so a workload can read its own contract
+			// rather than being told it out of band.
+			metadataAttrs[string(device.AttributeRelocatable)] = resourceapi.DeviceAttribute{
+				BoolValue: new(record.Relocatable),
+			}
+			metadataAttrs[string(device.AttributeAlignment)] = resourceapi.DeviceAttribute{
+				StringValue: new(string(placement.Alignment)),
+			}
+			// The file is written before the container starts and cannot be
+			// rewritten afterwards, so it may name CPUs only where they are
+			// settled for the container's life. A claim whose CPUs may change
+			// reads them from the kernel instead.
+			if request, ok := byRequest[allocResult.Request]; ok && requestCPUsAreFixed(record, request) {
 				metadataAttrs[string(device.AttributeCPUSet)] = resourceapi.DeviceAttribute{
 					StringValue: new(request.CPUs.String()),
 				}
@@ -584,6 +592,12 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 	return kubeletplugin.PrepareResult{
 		Devices: preparedDevices,
 	}
+}
+
+// requestCPUsAreFixed reports whether a request's CPUs are settled for the life
+// of its container.
+func requestCPUsAreFixed(record store.ClaimRecord, request store.RequestAllocation) bool {
+	return request.Role == store.RoleShared || !record.Relocatable
 }
 
 // UnprepareResourceClaims is called by the kubelet to unprepare the resources for a claim.
