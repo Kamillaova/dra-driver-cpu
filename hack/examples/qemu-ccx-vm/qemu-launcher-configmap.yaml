@@ -19,9 +19,10 @@ data:
     QMP_SOCK=/tmp/qmp.sock
 
     # QEMU's own threads -- main loop, iothreads, vhost workers -- must never
-    # steal time from a vCPU, so CONTROL_CPUS of the claim are set aside for
-    # them: a container's threads cannot be pinned outside its own cgroup
-    # cpuset.
+    # steal time from a vCPU. They go to the CPUs of the claim's helpers
+    # request, a share of the node's pool; without such a request CONTROL_CPUS
+    # of the claim are set aside for them instead, since a container's threads
+    # cannot be pinned outside its own cgroup cpuset.
     VCPUS=$(python3 /scripts/pin-vcpus.py count)
     echo "starting VM: ${VCPUS} vCPUs, ${CONTROL_CPUS:-0} control CPUs, cpuset $(cat "$CG/cpuset.cpus.effective")"
 
@@ -56,20 +57,32 @@ data:
     #!/usr/bin/env python3
     """Split the container's CPUs into vCPU and control CPUs, and pin QEMU.
 
-    The allocated CPUs are grouped by the L3 cache they share, read from the
-    container's own sysfs view, and ordered largest cache group first: vCPUs
-    fill the front of that order, so they stay inside one cache whenever the
-    claim allows it, and the last CONTROL_CPUS of it -- the stragglers in the
-    other cache, when the claim is one cache plus a spare core -- take every
-    thread that is not a vCPU. The counts never change across a
-    defragmentation move, only the identities, so the split is stable and
-    -smp stays valid.
+    A claim with a helpers request on a shared partition has those CPUs in its
+    cpuset already, and names them in that request's device metadata file: the
+    pool never moves, so unlike an exclusive placement it is safe to read once.
+    They take every thread that is not a vCPU, and the rest are exclusive.
+
+    Without such a request the allocated CPUs are grouped by the L3 cache they
+    share, read from the container's own sysfs view, and ordered largest cache
+    group first: vCPUs fill the front of that order, so they stay inside one
+    cache whenever the claim allows it, and the last CONTROL_CPUS of it -- the
+    stragglers in the other cache, when the claim is one cache plus a spare
+    core -- take every thread that is not a vCPU. Either way the counts never
+    change across a defragmentation move, only the identities, so the split is
+    stable and -smp stays valid.
 
     Usage: pin-vcpus.py count | pin <qemu-pid> <qmp-socket>
     """
     import json, os, socket, sys
 
     CONTROL_CPUS = int(os.environ.get("CONTROL_CPUS", "0"))
+    HELPERS_REQUEST = os.environ.get("HELPERS_REQUEST", "helpers")
+    METADATA_ROOT = "/var/run/kubernetes.io/dra-device-attributes"
+    # The framework files a claim referenced by name under resourceclaims by its
+    # own name, and one generated from a template under resourceclaimtemplates
+    # by the pod's name for it, and names the file after the driver.
+    METADATA_SUBDIRS = ("resourceclaims", "resourceclaimtemplates")
+    METADATA_FILE = "dra.cpu-metadata.json"
 
     def cpu_list(spec):
         cpus = []
@@ -98,9 +111,40 @@ data:
             ordered.extend(sorted(group, key=lambda c: (sysfs(c, "topology/core_id"), c)))
         return ordered
 
+    def pool_cpus():
+        # The CPUs the helpers request was given, from the metadata file the
+        # kubelet mounts for that request. A pool never moves, so the driver
+        # names its CPUs there; an exclusive request has no such attribute,
+        # because its CPUs may change while this container runs.
+        for subdir in METADATA_SUBDIRS:
+            root = os.path.join(METADATA_ROOT, subdir)
+            if not os.path.isdir(root):
+                continue
+            for claim in sorted(os.listdir(root)):
+                path = os.path.join(root, claim, HELPERS_REQUEST, METADATA_FILE)
+                if not os.path.exists(path):
+                    continue
+                # A stream of the same object once per API version, in the order
+                # the driver listed them.
+                metadata = json.JSONDecoder().raw_decode(open(path).read())[0]
+                for request in metadata.get("requests", []):
+                    if request.get("name") != HELPERS_REQUEST:
+                        continue
+                    for device in request.get("devices", []):
+                        cpus = device.get("attributes", {}).get("dra.cpu/cpuset", {}).get("string")
+                        if cpus:
+                            return cpu_list(cpus)
+        return []
+
     def split(cpus):
-        # CONTROL_CPUS are carved out of the claim itself: the cache-ordered
-        # tail, which the sibling-adjacent ordering keeps to whole cores.
+        # With a claimed pool the helpers are already in the container's cpuset
+        # and every other CPU is exclusive.
+        pool = set(pool_cpus())
+        if pool:
+            return cache_ordered([cpu for cpu in cpus if cpu not in pool]), sorted(pool & set(cpus))
+        # Without one, CONTROL_CPUS are carved out of the claim itself: the
+        # cache-ordered tail, which the sibling-adjacent ordering keeps to whole
+        # cores.
         ordered = cache_ordered(cpus)
         control = min(CONTROL_CPUS, max(0, len(ordered) - 1))
         if control == 0:

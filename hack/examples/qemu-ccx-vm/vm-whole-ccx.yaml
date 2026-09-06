@@ -2,8 +2,11 @@
 # a split L3) to themselves.
 #
 # QEMU's own threads -- main loop, iothreads, vhost workers -- need CPU time
-# too, and left beside the vCPUs they steal it from them. Set CONTROL_CPUS and
-# size the claim vCPUs + one core: the launcher carves the control core out of
+# too, and left beside the vCPUs they steal it from them. On a node with a
+# shared partition the claim asks for a share of it in a second request, and the
+# launcher reads that request's CPUs from its own device metadata file. Where no
+# such partition exists, drop the helpers request, set CONTROL_CPUS and size the
+# vCPU request one core larger: the launcher then carves the control core out of
 # the claim itself.
 #
 # The CEL selector keeps the pod off nodes whose caches are too small to ever
@@ -29,6 +32,21 @@ spec:
               # dra.cpu/uncoreCachesInGroup is also published, for spreading
               # across a known number of caches instead.
               expression: device.attributes["dra.cpu"].largestUncoreCacheCPUs >= 16
+      # A share of the node's pool, for every thread that is not a vCPU. One
+      # claim with two requests rather than two claims: a container holding two
+      # claims is pinned to their union and nothing inside it can tell which
+      # CPUs came from which.
+      - name: helpers
+        exactly:
+          deviceClassName: dra.cpu-helpers
+          capacity:
+            requests:
+              dra.cpu/cpu: "500m"
+          tolerations:
+          - key: dra.cpu/partition
+            operator: Equal
+            value: helpers
+            effect: NoSchedule
 ---
 apiVersion: v1
 kind: Pod
