@@ -75,6 +75,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/dra_hooks.go`: `requestAllocations`
 
+- `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
+
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RequestAllocation`, `UnionOf`,

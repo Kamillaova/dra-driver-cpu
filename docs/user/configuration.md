@@ -234,6 +234,58 @@ driverConfig:
       cpus: "16-127,144-255"
 ```
 
+`profiles` (map of string to profile, default: empty)
+
+- One `cpuPartitions` list per node type, and nothing else in a profile. CPU numbering is a property
+  of the node's hardware, so a fleet mixing node types cannot state one list for all of them —
+  `"1,17"` is a whole core on one part and two half cores on another. Every other field stays
+  fleet-wide policy.
+- A node selects its profile with the **`dra.cpu/profile` node label**; the driver reads it at
+  startup. Changing the label takes effect on the next driver restart, deliberately: the partitions
+  are the ground truth under every current placement, not a value to swap live. Naming a profile the
+  config does not declare fails that node's driver loudly — a typo must not run a node on another
+  node type's cores.
+- Declaring any profile makes `reservedCPUs` and `cpuPartitions` outside a profile errors, and a node
+  without the label refuses to start rather than picking up a description meant for a different part.
+  A node whose cores are all interchangeable is labelled `dra.cpu/profile=default`: that profile
+  always exists, is never declared, and leaves the whole node in the implicit `default` partition.
+- Every profile is validated on every node at startup, so a broken profile fails the fleet at rollout
+  rather than one node type at its next reboot.
+- With no profiles at all, the fleet-wide `reservedCPUs` and `cpuPartitions` still apply, and the
+  driver logs that they are on their way out.
+
+```yaml
+driverConfig:
+  cpuDeviceMode: grouped
+  profiles:
+    r7625:
+      cpuPartitions:
+        - name: system
+          role: reserved
+          cpus: "0,128"
+        - name: dataplane
+          role: exclusive
+          cpus: "8-15"
+          smt: false
+        - name: vm
+          role: exclusive
+          cpus: "16-127,144-255"
+    x3d:
+      cpuPartitions:
+        - name: system
+          role: reserved
+          cpus: "0,16"
+        - name: vm
+          role: exclusive
+          cpus: "1-15,17-31"
+```
+
+```console
+kubectl label node worker-a dra.cpu/profile=x3d
+kubectl label node --selector=node.kubernetes.io/instance-type=epyc-bare dra.cpu/profile=r7625
+kubectl label node worker-z dra.cpu/profile=default
+```
+
 #### Example
 
 ```yaml
