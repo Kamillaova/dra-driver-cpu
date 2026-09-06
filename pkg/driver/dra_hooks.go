@@ -110,6 +110,13 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 			cp.claimTracker.SetReservedFor(claim.UID, reservedForPodUIDs(claim))
 		}
 		cp.metricsRecorder().RecordPrepare(prepareResult, time.Since(start))
+		// CCX-FORK: a claim that just landed split across caches is exactly what a
+		// pass exists to repair, and it is cheapest to move while the container is
+		// still starting. Only defragmentation wants this: after a prepare there is
+		// nothing for the shared reconcile to do that CreateContainer will not.
+		if cp.defrag.enabled && result[claim.UID].Err == nil {
+			cp.requestReconcile()
+		}
 	}
 	return result, nil
 }
