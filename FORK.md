@@ -73,13 +73,13 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries` and
   `defragRetryDue` fields, and `Config.DefragEnabled`
 
-- `pkg/driver/dra_hooks.go`: `requestAllocations`
+- `pkg/driver/dra_hooks.go`: `requestAllocations`, `addRequestCPUs`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`, `sharedContainerCPUs`
 
-- `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RequestAllocation`, `UnionOf`,
+- `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
   `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `GetRebindOrigin`, `GetResourceClaimRequests`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
 
