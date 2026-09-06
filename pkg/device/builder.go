@@ -61,6 +61,11 @@ type GroupedDevices struct {
 	// holds no entry for a device where whole-core allocation is off or has no
 	// single thread count to work with.
 	ThreadsPerCore map[string]int
+	// CPUs is each device's own allocatable CPUs: the group's, inside the
+	// partition, minus the reservation, and minus any core the reservation split
+	// where whole cores are promised. A claim on that device takes CPUs from
+	// here and nowhere else.
+	CPUs map[string]cpuset.CPUSet
 }
 
 // BuildGrouped publishes one device per CPU group of every partition that
@@ -80,6 +85,7 @@ func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology,
 	built := GroupedDevices{
 		NameToID:       make(map[string]int),
 		ThreadsPerCore: make(map[string]int),
+		CPUs:           make(map[string]cpuset.CPUSet),
 	}
 	for _, partition := range partitions {
 		if !partition.PublishesDevices() {
@@ -96,6 +102,7 @@ func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology,
 			if fullPhysicalCPUsOnly && dev.threadsPerCore > 1 {
 				built.ThreadsPerCore[dev.name] = dev.threadsPerCore
 			}
+			built.CPUs[dev.name] = dev.cpus
 		}
 		devices := createGroupedCPUDeviceSlices(logger, groupBy, deviceInfos, pcieRootMapper, topo, nodeAllocatableResources, fullPhysicalCPUsOnly, partition)
 		if len(devices) > 0 {

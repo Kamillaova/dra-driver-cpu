@@ -1003,6 +1003,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 				cpuTopology:            topo,
 				deviceNameToSocketID:   map[string]int{"cpudevsocket0": 0},
 				deviceNameToNUMANodeID: map[string]int{},
+				deviceNameToCPUs:       deviceCPUsFromGroups(topo, map[string]int{"cpudevsocket0": 0}, nil, cpuset.New()),
 			},
 			cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 			podConfigStore:     store.NewPodConfig(),
@@ -1649,6 +1650,7 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 				cpuTopology:            topo,
 				deviceNameToSocketID:   map[string]int{"cpudevsocket0": 0, "cpudevsocket1": 1},
 				deviceNameToNUMANodeID: map[string]int{},
+				deviceNameToCPUs:       deviceCPUsFromGroups(topo, map[string]int{"cpudevsocket0": 0, "cpudevsocket1": 1}, nil, cpuset.New()),
 			},
 			cpuAllocationStore: cpuStore,
 			cdiMgr:             cdiMgr,
@@ -1669,6 +1671,7 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 				cpuTopology:            topo,
 				deviceNameToSocketID:   map[string]int{},
 				deviceNameToNUMANodeID: map[string]int{"cpudevnuma0": 0, "cpudevnuma1": 1},
+				deviceNameToCPUs:       deviceCPUsFromGroups(topo, nil, map[string]int{"cpudevnuma0": 0, "cpudevnuma1": 1}, cpuset.New()),
 			},
 			cpuAllocationStore: cpuStore,
 			cdiMgr:             cdiMgr,
@@ -2198,11 +2201,16 @@ func TestOpaqueConfigAllocation(t *testing.T) {
 			name: "CPU allocation with overlapping cores inside the same claim",
 			claims: []*resourceapi.ResourceClaim{
 				func() *resourceapi.ResourceClaim {
-					claim := testClaim("claim-1", testDriverName, testNodeName, map[string]int64{devattr.CPUDeviceMachineGrouped: 2, devattr.CPUDeviceMachineGrouped + "-1": 2})
+					claim := testClaim("claim-1", testDriverName, testNodeName, map[string]int64{devattr.CPUDeviceMachineGrouped: 2})
+					// A second request on the same device, so both results
+					// resolve to the same cpuset and the overlap is inside one
+					// claim whichever of them is taken first.
+					second := claim.Status.Allocation.Devices.Results[0]
+					second.Request = "claim-1-second"
+					claim.Status.Allocation.Devices.Results = append(claim.Status.Allocation.Devices.Results, second)
 					claim.Status.Allocation.Devices.Config = []resourceapi.DeviceAllocationConfiguration{
 						{
-							Source:   resourceapi.AllocationConfigSourceClaim,
-							Requests: []string{"claim-1"},
+							Source: resourceapi.AllocationConfigSourceClaim,
 							DeviceConfiguration: resourceapi.DeviceConfiguration{
 								Opaque: &resourceapi.OpaqueDeviceConfiguration{
 									Driver: testDriverName,
@@ -2258,6 +2266,19 @@ func TestOpaqueConfigAllocation(t *testing.T) {
 	}
 }
 
+// deviceCPUsFromGroups mirrors what the builder publishes as a device's own
+// CPUs on a node with one partition: the group's CPUs, minus the reservation.
+func deviceCPUsFromGroups(topo *cpuinfo.CPUTopology, socketIDs, numaIDs map[string]int, reserved cpuset.CPUSet) map[string]cpuset.CPUSet {
+	byDevice := map[string]cpuset.CPUSet{}
+	for name, socketID := range socketIDs {
+		byDevice[name] = topo.CPUDetails.CPUsInSockets(socketID).Difference(reserved)
+	}
+	for name, numaID := range numaIDs {
+		byDevice[name] = topo.CPUDetails.CPUsInNUMANodes(numaID).Difference(reserved)
+	}
+	return byDevice
+}
+
 func createCPUDriverForTest(t *testing.T, groupBy string, cpuInfos []cpuinfo.CPUInfo, initialAllocations map[types.UID]cpuset.CPUSet, reservedCPUs cpuset.CPUSet, cdiMgr cdiManager) *CPUDriver {
 	t.Helper()
 	logger := testr.New(t)
@@ -2290,6 +2311,10 @@ func createCPUDriverForTest(t *testing.T, groupBy string, cpuInfos []cpuinfo.CPU
 		for i := 0; i < topo.NumNUMANodes; i++ {
 			driver.topology.deviceNameToNUMANodeID[fmt.Sprintf("%s%d", devattr.CPUDeviceNUMAGroupedPrefix, i)] = i
 		}
+	}
+	driver.topology.deviceNameToCPUs = deviceCPUsFromGroups(topo, driver.topology.deviceNameToSocketID, driver.topology.deviceNameToNUMANodeID, reservedCPUs)
+	if driver.cpuDeviceGroupBy == devattr.GROUP_BY_MACHINE {
+		driver.topology.deviceNameToCPUs[devattr.CPUDeviceMachineGrouped] = driver.topology.onlineCPUs.Difference(reservedCPUs)
 	}
 	return driver
 }
