@@ -27,6 +27,9 @@ alignment lost to claim churn is recovered.
 The `DRA_CPUSET_<claimUID>` variable keeps upstream's name and format, so neither direction needs a
 reader for a legacy format and a claim's identity survives either swap.
 
+With `defragEnabled` the injected value is the literal string `dynamic` rather than a cpuset,
+because a claim whose placement may change has none to name for the life of its container.
+
 **upstream → fork: no drain.** Identity comes from the variable's name. A spec written by upstream
 carries no `dra.cpu/cpuset` annotation, so the fork falls back to parsing that spec's own env value,
 which for an upstream spec is the real placement. Each claim gains an annotation the next time its spec
@@ -38,10 +41,11 @@ exactly as it does with its own.
 
 Once claims can move, **a rollback requires draining the node first.** An upstream driver treats the
 env value as the claim's placement, and a moved claim's value no longer describes its container.
-Depending on the value, upstream either rejects the claim — leaving the container holding none, which
-it then classifies as shared and flattens onto the shared pool, losing both its exclusivity and its
-CPUs — or skips the container entirely, leaving its CPUs to be handed out to others as well. Draining
-avoids both. Runbook: drain the node, confirm no remaining pod holds a `dra.cpu` claim
+`dynamic` is the value it does least harm with: it cannot parse it, so it passes the container over
+and leaves its cpuset alone, and only the CPUs that claim holds are then handed out to others as well.
+Had the value been a stale-looking cpuset, upstream would instead reject the claim and, finding the
+container holding none, classify it as shared and flatten a guaranteed container onto the shared pool.
+Draining avoids either. Runbook: drain the node, confirm no remaining pod holds a `dra.cpu` claim
 (`--ignore-daemonsets` skips DaemonSet pods, and static pods cannot be evicted at all), then roll the
 DaemonSet.
 
@@ -61,9 +65,11 @@ DaemonSet.
 Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
-- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `GetDeviceCPUSet`
+- `pkg/driver/cdi.go`: `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`, `GetDeviceCPUSet`
 
-- `pkg/driver/driver.go`: the `applyMu` field
+- `pkg/driver/driver.go`: the `applyMu` and `defrag` fields, and the `Config.Defrag*` options
+
+- `pkg/driver/nri_hooks.go`: `draEnvEntry`
 
 - `pkg/store/cpu_allocation.go`: `BeginRebind`, `CommitRebind`, `AbortRebind`, `GetRebindOrigin`,
   `ResourceClaimAllocations`
@@ -77,8 +83,9 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
 
-Wholly new files (`pkg/defrag`, `pkg/coreselect`, `reconcile.go`, `pkg/cpuinfo/coretopology.go`) are
-visible to `git diff --stat` on their own and are not repeated here.
+Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/driver/defrag.go`, `reconcile.go`,
+`pkg/cpuinfo/coretopology.go`) are visible to `git diff --stat` on their own and are not repeated
+here.
 
 `CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
 placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
