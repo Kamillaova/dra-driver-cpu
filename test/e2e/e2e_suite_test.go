@@ -337,6 +337,7 @@ type driverConfigValues struct {
 	ReconcileSharedOnUnprepare *bool                    `json:"reconcileSharedOnUnprepare,omitempty"`
 	DefragEnabled              bool                     `json:"defragEnabled,omitempty"`
 	SharedPoolCPUs             string                   `json:"sharedPoolCPUs,omitempty"`
+	CPUPartitions              []driverConfigPartition  `json:"cpuPartitions,omitempty"`
 	CachePlacementPolicy       string                   `json:"cachePlacementPolicy,omitempty"`
 	Profiles                   map[string]profileValues `json:"profiles,omitempty"`
 }
@@ -344,6 +345,28 @@ type driverConfigValues struct {
 type profileValues struct {
 	ReservedCPUs   *string `json:"reservedCPUs,omitempty"`
 	SharedPoolCPUs *string `json:"sharedPoolCPUs,omitempty"`
+}
+
+// driverConfigPartition is one entry of the driver's cpuPartitions list. The
+// thread-arity expectation is read raw, since the config file spells it as a
+// boolean or a count and the suite only asks whether it is one thread per core.
+type driverConfigPartition struct {
+	Name string          `json:"name"`
+	Role string          `json:"role"`
+	CPUs string          `json:"cpus"`
+	SMT  json.RawMessage `json:"smt,omitempty"`
+}
+
+// singleThreadPartition returns the first partition declaring one online thread
+// per core, which is the shape a node has to be prepared for by hand.
+func (v driverConfigValues) singleThreadPartition() (driverConfigPartition, bool) {
+	for _, partition := range v.CPUPartitions {
+		switch string(partition.SMT) {
+		case "false", "1":
+			return partition, true
+		}
+	}
+	return driverConfigPartition{}, false
 }
 
 // effectiveFor mirrors the driver's config-profile resolution: the node's
