@@ -56,6 +56,13 @@ const (
 	// reject the claim and, finding the container holding none, pin a guaranteed
 	// container to the shared pool.
 	cdiEnvDynamicValue = "dynamic"
+
+	// cdiSharedEnvVar names the static shared pool CPUs local to a claim's NUMA
+	// nodes. It is the one placement fact that is safe to put in a container's
+	// environment: the pool is fixed for the node's lifetime, and a move
+	// preserves the claim's NUMA footprint, so the value cannot go stale. A
+	// workload derives its exclusive CPUs as sched_getaffinity minus this.
+	cdiSharedEnvVar = "DRA_SHARED_CPUS"
 )
 
 // CdiManager handles the lifecycle of CDI allocations for the driver.
@@ -100,7 +107,7 @@ func (c *CdiManager) getSpecName(deviceName string) string {
 // either the previous placement or this one, never a mixture.
 //
 // CCX-FORK: upstream takes no cpus argument and records no placement.
-func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar string, cpus cpuset.CPUSet) error {
+func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVars []string, cpus cpuset.CPUSet) error {
 	specName := c.getSpecName(deviceName)
 
 	spec := &cdiSpec.Spec{
@@ -113,7 +120,7 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 					cdiCPUSetAnnotation: cpus.String(),
 				},
 				ContainerEdits: cdiSpec.ContainerEdits{
-					Env: []string{envVar},
+					Env: envVars,
 				},
 			},
 		},
@@ -123,7 +130,7 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 		return fmt.Errorf("failed to write CDI spec %q: %w", specName, err)
 	}
 
-	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVar, "cpus", cpus.String())
+	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVars, "cpus", cpus.String())
 	return nil
 }
 

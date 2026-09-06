@@ -362,16 +362,29 @@ func (cp *CPUDriver) cdiEnvValue(cpus cpuset.CPUSet) string {
 	return cpus.String()
 }
 
+// claimEnvEdits is the environment a claim's CDI device injects: the claim's
+// identity, and -- when a static pool is configured -- the pool CPUs local to
+// the claim's NUMA nodes, which the container also gets appended to its cpuset.
+//
+// CCX-FORK: upstream injects the identity variable alone, with the cpuset as
+// its value.
+func (cp *CPUDriver) claimEnvEdits(claimUID types.UID, claimCPUSet cpuset.CPUSet) []string {
+	envVars := []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cp.cdiEnvValue(claimCPUSet))}
+	if localPool := cp.localSharedPool(claimCPUSet); !localPool.IsEmpty() {
+		envVars = append(envVars, fmt.Sprintf("%s=%s", cdiSharedEnvVar, localPool.String()))
+	}
+	return envVars
+}
+
 func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, claimCPUSet cpuset.CPUSet) kubeletplugin.PrepareResult {
 	deviceName := getCDIDeviceName(claim.UID)
-	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, cp.cdiEnvValue(claimCPUSet))
 	// CCX-FORK: the cpuset argument is the fork's placement record.
-	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar, claimCPUSet); err != nil {
+	if err := cp.cdiMgr.AddDevice(logger, deviceName, cp.claimEnvEdits(claim.UID, claimCPUSet), claimCPUSet); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
 
 	qualifiedName := cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName)
-	logger.V(6).Info("prepared CDI device", "cdiDeviceName", deviceName, "envVar", envVar, "qualifiedName", qualifiedName)
+	logger.V(6).Info("prepared CDI device", "cdiDeviceName", deviceName, "qualifiedName", qualifiedName)
 	preparedDevices := []kubeletplugin.Device{}
 	for _, allocResult := range claim.Status.Allocation.Devices.Results {
 		if allocResult.Driver != cp.driverName {
