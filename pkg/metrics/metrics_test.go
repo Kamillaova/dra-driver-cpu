@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 13)
+	require.Len(t, descriptors, 14)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -54,7 +54,9 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_nri_create_container_duration_seconds",
 		"dra_cpu_nri_stop_container_duration_seconds",
 		"dra_cpu_nri_remove_container_duration_seconds",
+		"dra_cpu_synchronize_skipped_claims_total",
 	}, names)
+	require.Empty(t, descriptors[13].Labels)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
 }
@@ -94,6 +96,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_prepare_claims_total",
 		"dra_cpu_reserved_cpus",
 		"dra_cpu_resource_claims_active",
+		"dra_cpu_synchronize_skipped_claims_total",
 		"dra_cpu_unprepare_claim_duration_seconds",
 		"dra_cpu_unprepare_claims_total",
 	}, names)
@@ -139,6 +142,7 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordUnprepare(ResultSuccess, time.Second)
 	m.RecordUnprepare(ResultError, time.Second)
 	m.RecordClaimAllocatedCPUs(1)
+	m.RecordSynchronizeSkippedClaim()
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -175,7 +179,18 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.RecordPrepare(ResultSuccess, time.Second)
 		recorder.RecordUnprepare(ResultError, time.Second)
 		recorder.RecordClaimAllocatedCPUs(4)
+		recorder.RecordSynchronizeSkippedClaim()
 	})
+}
+
+func TestSynchronizeSkippedClaimsMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	require.InDelta(t, 0, testutil.ToFloat64(m.synchronizeSkippedClaims), 0.01)
+	m.RecordSynchronizeSkippedClaim()
+	m.RecordSynchronizeSkippedClaim()
+	require.InDelta(t, 2, testutil.ToFloat64(m.synchronizeSkippedClaims), 0.01)
 }
 
 func requireMetricLabelValueAbsent(t *testing.T, reg *prometheus.Registry, metricName, labelName, labelValue string) {
