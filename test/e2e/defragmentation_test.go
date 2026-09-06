@@ -740,6 +740,221 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero())
 	})
 
+	ginkgo.It("should consolidate lone one-core claims to admit a claim of two whole caches", func(ctx context.Context) {
+		// The confetti worst case: churn leaves one small claim marooned in
+		// every cache, each individually placed as well as it can be, so a
+		// planner that pins "already-optimal" claims would never free a cache
+		// again. The scheduler then admits a two-cache claim against the
+		// device's scalar capacity -- correctly, the CPUs exist -- and only a
+		// from-scratch repack that relocates bystanders can align it.
+		fxt := rootFxt.WithPrefix("defrag-confetti")
+		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(fxt.Teardown)
+
+		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
+		if len(free) < 4 {
+			ginkgo.Skip(fmt.Sprintf("the confetti scenario needs at least four caches on one NUMA node, got %d", len(free)))
+		}
+		cacheSize := free[len(free)-1]
+		bigSize := 2 * cacheSize
+		if free[len(free)-2] != cacheSize {
+			ginkgo.Skip(fmt.Sprintf("needs two caches of %d allocatable CPUs for the big claim, free: %v", cacheSize, free))
+		}
+
+		minNonzeroFree := func(report placementsReport) int {
+			smallest := 0
+			for _, node := range report.NUMANodes {
+				if node.NUMANodeID != fragNUMA {
+					continue
+				}
+				for _, cache := range node.Caches {
+					cpus, err := cpuset.Parse(cache.FreeCPUs)
+					if err != nil || cpus.Size() == 0 {
+						continue
+					}
+					if smallest == 0 || cpus.Size() < smallest {
+						smallest = cpus.Size()
+					}
+				}
+			}
+			return smallest
+		}
+		cachesTouched := func(report placementsReport, cpus cpuset.CPUSet) []int {
+			var touched []int
+			for _, node := range report.NUMANodes {
+				for _, cache := range node.Caches {
+					inCache, err := cpuset.Parse(cache.CPUs)
+					if err != nil {
+						continue
+					}
+					if !cpus.Intersection(inCache).IsEmpty() {
+						touched = append(touched, cache.CacheID)
+					}
+				}
+			}
+			return touched
+		}
+
+		var smallUIDs []string
+		if cfgValues.CachePlacementPolicy == "spread" {
+			// Under spread the confetti is not an accident of churn but the
+			// allocator's own preference: consecutive smalls land one per cache.
+			ginkgo.By("placing one one-core claim per cache, as spread does naturally")
+			for i := range free {
+				_, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+					claimSpecWithSelector(step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-small-%d", i))
+				if err != nil {
+					break
+				}
+				smallUIDs = append(smallUIDs, uid)
+			}
+		} else {
+			ginkgo.By("marooning one one-core claim in every cache: a small, then a filler sealing its cache")
+			var fillers []*v1.Pod
+			for i := range free {
+				report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+				hole := minNonzeroFree(report)
+				if hole < 2*step {
+					break
+				}
+				_, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+					claimSpecWithSelector(step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-small-%d", i))
+				if err != nil {
+					break
+				}
+				smallUIDs = append(smallUIDs, uid)
+				filler, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+					claimSpecWithSelector(hole-step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-filler-%d", i))
+				if err != nil {
+					break
+				}
+				fillers = append(fillers, filler)
+			}
+			defer func() {
+				for _, filler := range fillers {
+					_ = e2epod.DeleteSync(ctx, fxt.K8SClientset, filler)
+				}
+			}()
+			if len(fillers) < len(smallUIDs) {
+				ginkgo.Skip(fmt.Sprintf("could not maroon enough smalls (%d smalls, %d fillers)", len(smallUIDs), len(fillers)))
+			}
+			ginkgo.By("releasing the fillers, leaving only the marooned smalls")
+			for _, filler := range fillers {
+				gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, filler)).To(gomega.Succeed())
+			}
+			fillers = nil
+		}
+		if len(smallUIDs) < 3 {
+			ginkgo.Skip(fmt.Sprintf("could not place enough smalls (%d)", len(smallUIDs)))
+		}
+
+		ginkgo.By("verifying the confetti actually formed: every small alone in a distinct cache")
+		shape, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		seen := map[int]bool{}
+		scattered := true
+		for _, uid := range smallUIDs {
+			cpus, ok := shape.claimCPUs(uid)
+			gomega.Expect(ok).To(gomega.BeTrue(), "small claim %s is not reported", uid)
+			touched := cachesTouched(shape, cpus)
+			if len(touched) != 1 || seen[touched[0]] {
+				scattered = false
+				break
+			}
+			seen[touched[0]] = true
+		}
+		if !scattered {
+			gomega.Expect(cfgValues.CachePlacementPolicy).ToNot(gomega.Equal("spread"),
+				"under spread, one claim per cache is the allocator's own promise, not a scenario to construct")
+			ginkgo.Skip("the allocator did not scatter the smalls one per cache; the scenario cannot form on this geometry")
+		}
+
+		movesBefore := defragMovesCommitted(ctx, fxt.K8SClientset, targetNode.Name)
+		bystanders := map[string]cpuset.CPUSet{}
+		for _, uid := range smallUIDs {
+			cpus, ok := shape.claimCPUs(uid)
+			gomega.Expect(ok).To(gomega.BeTrue())
+			bystanders[uid] = cpus
+		}
+
+		ginkgo.By(fmt.Sprintf("requesting %d CPUs: two whole caches, while every cache hosts a small", bigSize))
+		bigPod, bigUID, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+			claimSpecWithSelector(bigSize, numaCEL(cfgValues, fragNUMA)), "cpu-claim-cf-big")
+		gomega.Expect(err).ToNot(gomega.HaveOccurred(),
+			"the scheduler must admit the claim: the CPUs exist, only their shape is wrong")
+
+		fragmented, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		bigBefore, ok := fragmented.claimCPUs(bigUID)
+		gomega.Expect(ok).To(gomega.BeTrue())
+		spreadBefore := spreadOf(fragmented, bigBefore)
+		fxt.Log.Info("big claim landed", "cpus", bigBefore.String(), "spread", spreadBefore, "smalls", len(smallUIDs))
+		if spreadBefore <= 2 {
+			ginkgo.Skip(fmt.Sprintf("the big claim landed on %d caches; nothing to consolidate", spreadBefore))
+		}
+
+		ginkgo.By("waiting for defragmentation to relocate the bystanders and align the claim")
+		var settled placementsReport
+		gomega.Eventually(func(g gomega.Gomega) {
+			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, true)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(report.plannedMoves()).To(gomega.BeZero())
+			g.Expect(report.totalExcess()).To(gomega.BeZero(),
+				"claims still span more caches than their sizes require: %+v", report.NUMANodes)
+			settled = report
+		}, 4*time.Minute, 5*time.Second).Should(gomega.Succeed())
+
+		ginkgo.By("verifying the big claim owns exactly two caches and every small survived intact")
+		bigAfter, ok := settled.claimCPUs(bigUID)
+		gomega.Expect(ok).To(gomega.BeTrue(), "the big claim vanished: %+v", settled.Claims)
+		gomega.Expect(spreadOf(settled, bigAfter)).To(gomega.Equal(2), "the big claim is not on two whole caches: %s", bigAfter.String())
+		gomega.Expect(bigAfter).To(cpusetmatchers.HaveSize(bigSize))
+		union := bigAfter
+		for _, uid := range smallUIDs {
+			cpus, ok := settled.claimCPUs(uid)
+			gomega.Expect(ok).To(gomega.BeTrue(), "small claim %s vanished", uid)
+			gomega.Expect(cpus).To(cpusetmatchers.HaveSize(step), "small claim %s changed size", uid)
+			gomega.Expect(spreadOf(settled, cpus)).To(gomega.Equal(1), "small claim %s ended split", uid)
+			gomega.Expect(cpus).To(cpusetmatchers.HaveNoOverlapWith(union), "claim %s overlaps another claim", uid)
+			union = union.Union(cpus)
+		}
+
+		// The alignment cannot come for free -- the big claim moved and the two
+		// smalls in its way stepped aside -- but it must cost no more than that:
+		// three claims touched, at most four commits (the straddler may take an
+		// interim step, since it cannot land on CPUs a bystander still holds in
+		// the same pass), and every other small keeps its exact CPUs.
+		moves := defragMovesCommitted(ctx, fxt.K8SClientset, targetNode.Name) - movesBefore
+		gomega.Expect(moves).To(gomega.BeNumerically(">=", 3),
+			"aligning the big claim requires moving it plus at least the two smalls in its way")
+		gomega.Expect(moves).To(gomega.BeNumerically("<=", 4),
+			"the repair herded bystanders it did not need")
+		movedSmalls := 0
+		for uid, before := range bystanders {
+			cpus, ok := settled.claimCPUs(uid)
+			gomega.Expect(ok).To(gomega.BeTrue())
+			if !cpus.Equals(before) {
+				movedSmalls++
+			}
+		}
+		gomega.Expect(movedSmalls).To(gomega.BeNumerically("<=", 2),
+			"only the smalls inside the big claim's two target caches may move, %d did", movedSmalls)
+
+		ginkgo.By("verifying the container followed its claim without a restart")
+		reread, err := fxt.K8SClientset.CoreV1().Pods(bigPod.Namespace).Get(ctx, bigPod.Name, metav1.GetOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero())
+		want := bigAfter
+		gomega.Eventually(func(g gomega.Gomega) {
+			alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread)
+			g.Expect(alloc.CPUAssigned).To(cpusetmatchers.Equal(want))
+			g.Expect(alloc.CPUAffinity).To(cpusetmatchers.Equal(want))
+		}, 30*time.Second, 5*time.Second).Should(gomega.Succeed())
+	})
+
 	ginkgo.It("should recover a claim's placement when the driver restarts", func(ctx context.Context) {
 		fxt := rootFxt.WithPrefix("defrag-restart")
 		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
