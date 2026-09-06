@@ -92,6 +92,7 @@ type Recorder interface {
 	RecordDefragMoves(result Result, count int)
 	RecordDefragBlockedMoves(count int)
 	RecordSynchronizeSkippedClaim()
+	RecordMisplacedClaim()
 }
 
 // Metrics owns all custom Prometheus collectors for the CPU driver.
@@ -113,6 +114,7 @@ type Metrics struct {
 	defragPassDurationSecondsHist prometheus.Histogram
 
 	synchronizeSkippedClaims prometheus.Counter
+	misplacedClaims          prometheus.Counter
 }
 
 type metricKind string
@@ -215,6 +217,11 @@ var (
 		kind: metricCounter,
 		help: "Total number of claims or containers Synchronize could not adopt from the runtime's reported state, skipped rather than aborting the whole call.",
 	}
+	misplacedClaimsSpec = metricSpec{
+		name: "dra_cpu_misplaced_claims_total",
+		kind: metricCounter,
+		help: "Total number of restored claims whose CPUs no single CPU partition holds, which is what a partition list edited under a running node looks like.",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -233,6 +240,7 @@ var metricSpecs = []metricSpec{
 	defragBlockedMovesSpec,
 	defragPassDurationSpec,
 	synchronizeSkippedClaimsSpec,
+	misplacedClaimsSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -281,6 +289,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		defragPassDurationSecondsHist: newHistogram(defragPassDurationSpec),
 
 		synchronizeSkippedClaims: newCounter(synchronizeSkippedClaimsSpec),
+		misplacedClaims:          newCounter(misplacedClaimsSpec),
 	}
 
 	reg.MustRegister(
@@ -299,6 +308,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragBlockedMoves,
 		m.defragPassDurationSecondsHist,
 		m.synchronizeSkippedClaims,
+		m.misplacedClaims,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -398,6 +408,10 @@ func (m *Metrics) RecordSynchronizeSkippedClaim() {
 	m.synchronizeSkippedClaims.Inc()
 }
 
+func (m *Metrics) RecordMisplacedClaim() {
+	m.misplacedClaims.Inc()
+}
+
 type noopRecorder struct{}
 
 // Noop returns a recorder that discards all metric observations.
@@ -414,3 +428,4 @@ func (noopRecorder) RecordDefragPass(Result, time.Duration) {}
 func (noopRecorder) RecordDefragMoves(Result, int)          {}
 func (noopRecorder) RecordDefragBlockedMoves(int)           {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()         {}
+func (noopRecorder) RecordMisplacedClaim()                  {}
