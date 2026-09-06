@@ -179,6 +179,23 @@ on - is configured through other Helm values, not through this file.
 - How long a claim is left alone after being moved, so a workload is not re-homed
   repeatedly while it settles. `0` disables the cooldown.
 
+`cachePlacementPolicy` (string, `pack` | `spread`, default: `pack`)
+
+- How a claim that fits inside one uncore cache chooses among the caches that can hold it. `pack`,
+  the default and upstream's behaviour, fills the fullest cache that fits: clean caches stay whole
+  for larger claims, small tenants share L3. `spread` fills the emptiest cache: each small claim gets
+  a cache of its own while there is slack — L3 isolation first — and a whole-cache claim arriving
+  later relies on defragmentation to consolidate the small tenants out of its way, rather than on
+  caches having been hoarded against its possible arrival. Claims no cache can hold take the largest
+  caches first under either policy.
+- Both allocation and defragmentation draw placements from the same policy-aware selector, so the two
+  can never disagree about where a claim belongs. `spread` works with or without
+  `fullPhysicalCPUsOnly`; without it, a claim still avoids splitting a physical core where it can,
+  but two claims may end up on one core's SMT siblings once the chosen cache offers nothing better —
+  whole-core allocation is what actually forbids that, and isolation-minded deployments should run
+  both. Requires `cpuDeviceMode: grouped`: in individual mode the scheduler names exact CPU devices
+  and the driver picks nothing.
+
 `profiles` (map of string to profile, default: empty)
 
 - Named per-node overrides for the field that names CPUs, `reservedCPUs`. CPU numbering is a property

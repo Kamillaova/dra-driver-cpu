@@ -138,6 +138,15 @@ behaviour) rather than silently adapting.
   fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
 - **One metric carries a `numa_node` label**, against the rule stated in `docs/user/metrics.md`. The
   rule is amended there rather than quietly broken.
+- **Allocation-time cache placement is a policy, not a constant.** The design held that upstream's
+  packed order "needs no improvement" because it preserves whole caches for future large claims. The
+  platform wants the opposite for its small tenants -- one VM per cache while there is slack, L3
+  isolation first, with defragmentation consolidating the small tenants when a whole-cache claim
+  actually arrives instead of caches being hoarded against its possible arrival. That is
+  `cachePlacementPolicy: spread`; `pack` stays the default and upstream-identical. The same decision
+  reshaped the planner: the ideal packing is a repair target for misaligned claims only, and a claim
+  already spread as little as its size allows is never herded into the ideal's preferred slots for
+  tidiness (watched on hardware: six moves where three were needed, one of them intra-cache).
 - **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
   node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
   which needs a flag carried through `ContainerState`. Neither affects correctness — the first only

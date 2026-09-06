@@ -334,6 +334,7 @@ type driverConfigValues struct {
 	// which a plain bool cannot express.
 	ReconcileSharedOnUnprepare *bool                    `json:"reconcileSharedOnUnprepare,omitempty"`
 	DefragEnabled              bool                     `json:"defragEnabled,omitempty"`
+	CachePlacementPolicy       string                   `json:"cachePlacementPolicy,omitempty"`
 	Profiles                   map[string]profileValues `json:"profiles,omitempty"`
 }
 
