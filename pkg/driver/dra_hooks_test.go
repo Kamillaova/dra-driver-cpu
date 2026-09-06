@@ -2611,6 +2611,80 @@ func TestTakeCPUsForDeviceHonoursThePlacementPolicy(t *testing.T) {
 		"spread must open an untouched cache, got %s", got.String())
 }
 
+// TestPrepareGivesAClaimedPoolItsWholeDevice: a pool is claimed, so the claim
+// gets the device's CPUs entire, they stay available to every other claim, and
+// the container is pinned to the union of what its requests were given.
+func TestPrepareGivesAClaimedPoolItsWholeDevice(t *testing.T) {
+	logger := testr.New(t)
+	cpuInfos := mockCPUInfos_SingleSocket_4CPUS_HT
+	driver, err := New(logger, Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: cpuInfos},
+		SysFS:   testSysFS(cpuInfos),
+	}, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		CPUPartitions: []devattr.Partition{
+			{Name: "helpers", Role: devattr.PARTITION_ROLE_SHARED, CPUs: cpuset.New(1, 3)},
+		},
+	})
+	require.NoError(t, err)
+	mockCdi := newMockCdiMgr()
+	driver.cdiMgr = mockCdi
+
+	poolDevice := devattr.CPUDevicePoolPrefix + "000-helpers"
+	require.Equal(t, cpuset.New(1, 3), driver.topology.deviceNameToCPUs[poolDevice])
+
+	claimUID := types.UID("claim-vm-with-helpers")
+	claim := testClaimWithResults(claimUID, []resourceapi.DeviceRequestAllocationResult{
+		{
+			Driver:           testDriverName,
+			Pool:             testNodeName,
+			Device:           "cpudevnuma000",
+			Request:          "vcpus",
+			ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: *resource.NewQuantity(2, resource.DecimalSI)},
+		},
+		{
+			Driver:           testDriverName,
+			Pool:             testNodeName,
+			Device:           poolDevice,
+			Request:          "helpers",
+			ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: *resource.NewMilliQuantity(100, resource.DecimalSI)},
+		},
+	})
+
+	results, err := driver.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.NoError(t, results[claimUID].Err)
+
+	requests, ok := driver.cpuAllocationStore.GetResourceClaimRequests(claimUID)
+	require.True(t, ok)
+	require.Len(t, requests, 2)
+	require.Equal(t, "helpers", requests[0].Request)
+	require.Equal(t, store.RoleShared, requests[0].Role)
+	require.Equal(t, cpuset.New(1, 3), requests[0].CPUs, "a pool grants its whole device, not a share of it")
+	require.Equal(t, "vcpus", requests[1].Request)
+	require.Equal(t, store.RoleExclusive, requests[1].Role)
+	require.Equal(t, 2, requests[1].CPUs.Size())
+
+	require.Equal(t, requests[1].CPUs, driver.cpuAllocationStore.GetPreparedCPUs(),
+		"only exclusive CPUs are withheld from other claims")
+	require.True(t, driver.cpuAllocationStore.GetSharedCPUs().Intersection(requests[1].CPUs).IsEmpty())
+
+	for _, prepared := range results[claimUID].Devices {
+		if prepared.DeviceName != poolDevice {
+			continue
+		}
+		require.NotNil(t, prepared.Metadata)
+		cpus := prepared.Metadata.Attributes[string(devattr.AttributeCPUSet)]
+		require.NotNil(t, cpus.StringValue)
+		require.Equal(t, "1,3", *cpus.StringValue, "a pool request reads its CPUs from its own metadata file")
+		require.Equal(t, "helpers", *prepared.Metadata.Attributes[string(devattr.AttributePartition)].StringValue)
+		require.Equal(t, devattr.PARTITION_ROLE_SHARED, *prepared.Metadata.Attributes[string(devattr.AttributeRole)].StringValue)
+	}
+}
+
 func TestPrepareRecordsEachRequestOfAClaim(t *testing.T) {
 	logger := testr.New(t)
 	cpuInfos := mockCPUInfos_SingleSocket_4CPUS_HT
