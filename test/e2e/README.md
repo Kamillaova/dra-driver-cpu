@@ -82,7 +82,8 @@ honor these settings, where applicable.
 
 - The **cross-node scheduling** specs need no knob: they run whenever at least two nodes publish
   `dra.cpu` devices and skip themselves otherwise. On a heterogeneous fleet they exercise capacity
-  routing, geometry CEL selectors, burst races, and the scheduler's fragmentation blind spot.
+  routing, geometry CEL selectors, burst races, and the scheduler's fragmentation blind spot; the
+  suite resolves each node's effective config through its `dra.cpu/config` profile label.
 
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs

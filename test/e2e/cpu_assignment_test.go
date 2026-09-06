@@ -100,14 +100,8 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 		cfgValues, err := getDriverConfigValues(ctx, rootFxt.K8SClientset, "kube-system", daemonSet)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot read dracpu driver config values")
 		var dsReservedCPUs cpuset.CPUSet
-		if len(cfgValues.ReservedCPUs) > 0 {
-			dsReservedCPUs, err = cpuset.Parse(cfgValues.ReservedCPUs)
-			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse daemonset reserved cpus: %v", err)
-		}
 		cpuDeviceMode = cfgValues.CPUDeviceMode
 		groupBy = cfgValues.GroupBy
-		rootFxt.Log.Info("daemonset --reserved-cpus configuration", "cpus", dsReservedCPUs.String())
-		gomega.Expect(dsReservedCPUs).To(cpusetmatchers.Equal(reservedCPUs), "daemonset reserved cpus do not match test reserved cpus")
 		rootFxt.Log.Info("daemonset --cpu-device-mode configuration", "mode", cpuDeviceMode, "groupBy", groupBy)
 		driverConfig := getDriverConfig(ctx, rootFxt.K8SClientset)
 		publishNodeAllocatableMapping = driverConfig.PublishNodeAllocatableResourceMapping
@@ -116,6 +110,18 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 		targetNode, err = e2enode.PickWorker(ctx, rootFxt.K8SClientset, 5*time.Second, 1*time.Minute, rootFxt.Log)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		rootFxt.Log.Info("using worker node", "nodeName", targetNode.Name)
+
+		// The reserved set is a per-node fact once profiles exist, so it
+		// resolves against the picked node, and the env-provided reserved set
+		// describes that node.
+		effective := driverConfig.effectiveFor(targetNode)
+		dsReservedCPUs = cpuset.New()
+		if len(effective.ReservedCPUs) > 0 {
+			dsReservedCPUs, err = cpuset.Parse(effective.ReservedCPUs)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse daemonset reserved cpus: %v", err)
+		}
+		rootFxt.Log.Info("daemonset --reserved-cpus configuration", "cpus", dsReservedCPUs.String())
+		gomega.Expect(dsReservedCPUs).To(cpusetmatchers.Equal(reservedCPUs), "daemonset reserved cpus do not match test reserved cpus")
 
 		infoPod := discovery.MakePod(infraFxt.Namespace.Name, dracpuTesterImage)
 		infoPod = e2epod.PinToNode(infoPod, targetNode.Name)
