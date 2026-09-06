@@ -91,6 +91,12 @@ honor these settings, where applicable.
   that state and never changes a machine, so the driver withholds the partition and the tests report
   themselves as not run where the node was not prepared.
 
+- `DRACPU_E2E_POOL_PARTITION_CPUS`: (optional, default empty): when set to a cpuset, *the Makefile*
+  `ci-kind-setup` target deploys the driver with a CPU partition named `helpers` of role `shared` on
+  those CPUs, and the claimed-pool tests run instead of skipping. The CPUs must exist on every node
+  and must not overlap `DRACPU_E2E_RESERVED_CPUS` or `DRACPU_E2E_NOSMT_PARTITION_CPUS`. Setting it
+  together with `DRACPU_E2E_NOSMT_PARTITION_CPUS` declares both partitions.
+
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.
