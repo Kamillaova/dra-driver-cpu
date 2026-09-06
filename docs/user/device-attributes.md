@@ -81,6 +81,8 @@ untainted, which is where a claim that names no partition is allocated. See
 | `dra.cpu/cacheL3ID`               | int     | L3 (last-level/uncore) cache group                                                                    |
 | `resource.kubernetes.io/numaNode` | int     | Standard NUMA node                                                                                    |
 | `dra.cpu/socketID`                | int     | CPU socket                                                                                            |
+| `dra.cpu/partition`               | string  | Always `default`: `cpuPartitions` requires grouped mode, so every CPU is in the implicit partition    |
+| `dra.cpu/role`                    | string  | Always `default`, that partition's role                                                               |
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                    |
 | `resource.kubernetes.io/pcieRoot` | strings | PCIe roots local to the CPU; needs `--expose-pcie-roots` and the `DRAListTypeAttributes` feature gate |
 
