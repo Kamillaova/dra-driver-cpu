@@ -16,7 +16,10 @@ limitations under the License.
 
 package driverconfig
 
-import "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+import (
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+)
 
 // DefaultKubeletRootDir is the standard kubelet root directory, so behaviour is
 // unchanged unless the kubelet --root-dir is relocated.
@@ -33,5 +36,6 @@ func Default() Config {
 		// enabling that one option gets the prompt reconcile without a second
 		// switch.
 		ReconcileSharedOnUnprepare: true,
+		CachePlacementStrategy:     string(coreselect.Pack),
 	}
 }
