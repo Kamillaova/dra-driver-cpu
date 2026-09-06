@@ -24,6 +24,7 @@ The command prints JSON metadata for custom `dra_cpu_*` metrics only. It does no
 | `dra_cpu_prepare_claim_duration_seconds`   | Histogram | none     | Per-claim prepare latency in seconds.                                                                                              |
 | `dra_cpu_claim_allocated_cpus`             | Histogram | none     | CPUs allocated for each newly successful claim allocation.                                                                         |
 | `dra_cpu_synchronize_skipped_claims_total` | Counter   | none     | Claims or containers `Synchronize` could not adopt from the runtime's reported state, skipped rather than aborting the whole call. |
+| `dra_cpu_misplaced_claims_total`          | Counter   | none     | Restored claims whose CPUs no single CPU partition holds, which is what a partition list edited under a running node looks like. |
 
 ## Defragmentation
 

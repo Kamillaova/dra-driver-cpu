@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 15)
+	require.Len(t, descriptors, 16)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -56,6 +56,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_blocked_moves_total",
 		"dra_cpu_defrag_pass_duration_seconds",
 		"dra_cpu_synchronize_skipped_claims_total",
+		"dra_cpu_misplaced_claims_total",
 	}, names)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
@@ -63,6 +64,7 @@ func TestDescriptors(t *testing.T) {
 	require.Equal(t, []string{"result"}, descriptors[10].Labels)
 	require.Equal(t, []string{"result"}, descriptors[11].Labels)
 	require.Empty(t, descriptors[14].Labels)
+	require.Empty(t, descriptors[15].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -100,6 +102,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_defrag_moves_total",
 		"dra_cpu_defrag_pass_duration_seconds",
 		"dra_cpu_defrag_passes_total",
+		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_prepare_claim_duration_seconds",
 		"dra_cpu_prepare_claims_total",
 		"dra_cpu_reserved_cpus",
