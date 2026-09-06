@@ -36,13 +36,16 @@ import (
 // "which", where a claim's quantity is the scheduler's, so this endpoint is the
 // only way to see it -- and it cannot be stale, since it is computed on request.
 type placementsReport struct {
-	NodeName      string             `json:"nodeName"`
-	DefragEnabled bool               `json:"defragEnabled"`
-	ReservedCPUs  string             `json:"reservedCPUs"`
-	SharedCPUs    string             `json:"sharedCPUs"`
-	Claims        []claimReport      `json:"claims"`
-	NUMANodes     []numaNodeReport   `json:"numaNodes"`
-	Unmeasurable  []unmeasurableNode `json:"unmeasurableNUMANodes,omitempty"`
+	NodeName      string `json:"nodeName"`
+	DefragEnabled bool   `json:"defragEnabled"`
+	ReservedCPUs  string `json:"reservedCPUs"`
+	// SharedCPUs is what a container holding no claim is confined to, which
+	// once the node's cores are described is what the claims left unclaimed
+	// inside the partitions such a container may run in.
+	SharedCPUs   string             `json:"sharedCPUs"`
+	Claims       []claimReport      `json:"claims"`
+	NUMANodes    []numaNodeReport   `json:"numaNodes"`
+	Unmeasurable []unmeasurableNode `json:"unmeasurableNUMANodes,omitempty"`
 }
 
 type claimReport struct {
@@ -161,7 +164,7 @@ func (cp *CPUDriver) placements(logger logr.Logger, dryRun bool) (*placementsRep
 		NodeName:      cp.nodeName,
 		DefragEnabled: cp.defrag.enabled,
 		ReservedCPUs:  cp.topology.reservedCPUs.String(),
-		SharedCPUs:    cp.cpuAllocationStore.GetSharedCPUs().String(),
+		SharedCPUs:    cp.sharedContainerCPUs().String(),
 		Claims:        cp.claimReports(allocations),
 	}
 
