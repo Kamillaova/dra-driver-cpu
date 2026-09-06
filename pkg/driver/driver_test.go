@@ -29,14 +29,18 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/funcr"
 	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/utils/cpuset"
@@ -837,4 +841,101 @@ func TestCheckClaimPartitionCountsAClaimNoPartitionHolds(t *testing.T) {
 	cp.checkClaimPartition(testr.New(t), cpuset.New(1, 2))
 	require.Equal(t, float64(1), metricValue(t, reg, "dra_cpu_misplaced_claims_total", nil),
 		"a claim straddling two partitions is counted and kept")
+}
+
+func TestNewDegradesAPartitionTheMachineContradicts(t *testing.T) {
+	// The operator declared one thread per core on the dataplane partition but
+	// has not offlined the siblings yet.
+	infos := partitionTestInfos()
+	reg := prometheus.NewRegistry()
+	cp, err := New(testr.New(t), Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		Metrics:          cpumetrics.New(reg),
+		CPUPartitions: []devattr.Partition{
+			{Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1), ThreadsPerCore: 1},
+		},
+	})
+	require.NoError(t, err, "one partition's machine configuration must not fail the node")
+
+	require.Contains(t, cp.degradedPartitions, "dataplane")
+	require.Contains(t, cp.degradedPartitions["dataplane"], `devices.system.cpu.cpu5.online: "0"`,
+		"the message names the key that would make the declaration true")
+
+	require.Len(t, cp.topology.deviceSlices, 1, "the degraded partition publishes nothing")
+	require.Equal(t, devattr.CPUDeviceNUMAGroupedPrefix+"000", cp.topology.deviceSlices[0][0].Name)
+	require.Equal(t, float64(0), metricValue(t, reg, "dra_cpu_partition_verified", map[string]string{"partition": "dataplane"}))
+	require.Equal(t, float64(1), metricValue(t, reg, "dra_cpu_partition_verified", map[string]string{"partition": "default"}))
+}
+
+func TestNewAcceptsAPartitionWhoseSiblingsAreOffline(t *testing.T) {
+	// The same declaration once the platform has taken the siblings offline: the
+	// surviving thread is a whole core, and the partition publishes as usual.
+	var infos []cpuinfo.CPUInfo
+	for _, info := range partitionTestInfos() {
+		if info.CpuID == 5 {
+			continue
+		}
+		if info.CpuID == 1 {
+			info.SiblingCPUSet = cpuset.New(1)
+		}
+		infos = append(infos, info)
+	}
+	cp, err := New(testr.New(t), Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		CPUPartitions: []devattr.Partition{
+			{Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1), ThreadsPerCore: 1},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Empty(t, cp.degradedPartitions)
+	require.Len(t, cp.topology.deviceSlices, 2)
+	require.Equal(t, devattr.CPUDeviceNUMAGroupedPrefix+"000-dataplane", cp.topology.deviceSlices[0][0].Name)
+}
+
+func TestVerifyThreadArityAcceptsWhatItWasNotToldAbout(t *testing.T) {
+	logger := testr.New(t)
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: partitionTestInfos()}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	require.Empty(t, verifyThreadArity(topo, devattr.Partition{Name: "vm", CPUs: cpuset.New(1, 5)}),
+		"a partition that declared no arity accepts what the platform provides")
+	require.Empty(t, verifyThreadArity(topo, devattr.Partition{Name: "vm", CPUs: cpuset.New(1, 5), ThreadsPerCore: 2}))
+	require.NotEmpty(t, verifyThreadArity(topo, devattr.Partition{Name: "vm", CPUs: cpuset.New(1), ThreadsPerCore: 1}))
+}
+
+func TestReportDegradedPartitionsWritesANodeEvent(t *testing.T) {
+	client := k8sfake.NewSimpleClientset()
+	cp := &CPUDriver{
+		driverName: testDriverName,
+		nodeName:   testNodeName,
+		kubeClient: client,
+		degradedPartitions: map[string]string{
+			"dataplane": `partition "dataplane" expects at most 1 online thread(s) per core, but 5 are online too`,
+		},
+	}
+
+	cp.reportDegradedPartitions(ctxlog.NewContext(context.Background(), testr.New(t)))
+
+	events, err := client.CoreV1().Events(metav1.NamespaceDefault).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, events.Items, 1)
+	event := events.Items[0]
+	require.Equal(t, "CPUPartitionDegraded", event.Reason)
+	require.Equal(t, corev1.EventTypeWarning, event.Type)
+	require.Equal(t, "Node", event.InvolvedObject.Kind)
+	require.Equal(t, testNodeName, event.InvolvedObject.Name)
+	require.Contains(t, event.Message, "dataplane")
 }
