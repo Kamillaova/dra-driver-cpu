@@ -29,6 +29,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/dynamic-resource-allocation/deviceattribute"
 	"k8s.io/utils/cpuset"
 )
 
@@ -210,6 +211,178 @@ func TestGroupedUncoreCacheAttributesOmittedWhenUnknown(t *testing.T) {
 
 	require.NotContains(t, devices[0].Attributes, device.AttributeLargestUncoreCacheCPUs)
 	require.NotContains(t, devices[0].Attributes, device.AttributeUncoreCachesInGroup)
+}
+
+// fakeFourCacheTopology is sixteen single-thread CPUs on one socket: two NUMA
+// nodes of two uncore caches each, four CPUs per cache. The smallest shape where
+// a device order can take a NUMA node's caches out of one run.
+func fakeFourCacheTopology() *cpuinfo.CPUTopology {
+	details := cpuinfo.CPUDetails{}
+	for cpu := range 16 {
+		details[cpu] = cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        cpu,
+			SocketID:      0,
+			NUMANodeID:    cpu / 8,
+			UncoreCacheID: cpu / 4,
+			SiblingCPUID:  -1,
+			SiblingCPUSet: cpuset.New(cpu),
+		}
+	}
+	return &cpuinfo.CPUTopology{
+		NumCPUs: 16, NumCores: 16, NumSockets: 1, NumNUMANodes: 2, NumUncoreCache: 4,
+		SMTEnabled: false, CPUDetails: details,
+	}
+}
+
+// deviceNames is the published order of a partition's devices.
+func deviceNames(devices []resourceapi.Device) []string {
+	names := make([]string, 0, len(devices))
+	for _, dev := range devices {
+		names = append(names, dev.Name)
+	}
+	return names
+}
+
+// TestGroupedUncoreCacheDevices: the grouping publishes one device per cache,
+// carrying that cache's own allocatable CPUs as capacity and its id as the
+// attribute a claim asking for a particular cache selects on.
+func TestGroupedUncoreCacheDevices(t *testing.T) {
+	topo := fakeCacheTopology()
+	online := topo.CPUDetails.CPUs()
+	reserved := cpuset.New(0)
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+		reserved, store.NewPCIeRootMapper(), true, false, unpartitioned(online.Difference(reserved)))
+	devices := onlyPartition(t, built.ByPartition)
+	require.Equal(t, []string{
+		device.CPUDeviceCacheGroupedPrefix + "000",
+		device.CPUDeviceCacheGroupedPrefix + "001",
+	}, deviceNames(devices))
+
+	cache0, cache1 := devices[0], devices[1]
+	// Reserving CPU 0 takes it out of cache 0's device and out of nothing else.
+	require.Equal(t, cpuset.New(1, 2, 3), built.CPUs[cache0.Name])
+	require.Equal(t, cpuset.New(4, 5, 6, 7), built.CPUs[cache1.Name])
+	cache0Capacity := cache0.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+	cache1Capacity := cache1.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+	require.EqualValues(t, 3, cache0Capacity.Value.Value())
+	require.EqualValues(t, 4, cache1Capacity.Value.Value())
+	require.True(t, *cache0.AllowMultipleAllocations)
+	require.NotNil(t, cache0.NodeAllocatableResources, "a cache device's CPUs are exclusive, like any other grouped device's")
+
+	require.EqualValues(t, 0, *cache0.Attributes[device.AttributeCacheL3ID].IntValue)
+	require.EqualValues(t, 1, *cache1.Attributes[device.AttributeCacheL3ID].IntValue)
+	require.EqualValues(t, 0, *cache0.Attributes[deviceattribute.StandardDeviceAttributeNUMANode].IntValue)
+	require.EqualValues(t, 0, *cache0.Attributes[device.AttributeSocketID].IntValue)
+	require.EqualValues(t, 3, *cache0.Attributes[device.AttributeNumCPUs].IntValue)
+
+	// The group is one cache, so the geometry a claim reads to know whether the
+	// device can align it is that cache's own size.
+	require.EqualValues(t, 3, *cache0.Attributes[device.AttributeLargestUncoreCacheCPUs].IntValue)
+	require.EqualValues(t, 1, *cache0.Attributes[device.AttributeUncoreCachesInGroup].IntValue)
+
+	require.Equal(t, map[string]int{cache0.Name: 0, cache1.Name: 0}, built.NameToID,
+		"a cache device answers for the one NUMA node its cache sits in")
+}
+
+// TestGroupedUncoreCacheDevicesAreContiguousPerNUMANode: the allocator walks
+// devices in slice order and backtracks on a NUMA constraint, which stays
+// bounded only while every device of one NUMA node is one run.
+func TestGroupedUncoreCacheDevicesAreContiguousPerNUMANode(t *testing.T) {
+	topo := fakeFourCacheTopology()
+	online := topo.CPUDetails.CPUs()
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+		cpuset.New(), store.NewPCIeRootMapper(), false, false, unpartitioned(online))
+	devices := onlyPartition(t, built.ByPartition)
+	require.Equal(t, []string{
+		device.CPUDeviceCacheGroupedPrefix + "000",
+		device.CPUDeviceCacheGroupedPrefix + "001",
+		device.CPUDeviceCacheGroupedPrefix + "002",
+		device.CPUDeviceCacheGroupedPrefix + "003",
+	}, deviceNames(devices))
+
+	var numaNodes []int64
+	for _, dev := range devices {
+		numaNodes = append(numaNodes, *dev.Attributes[deviceattribute.StandardDeviceAttributeNUMANode].IntValue)
+	}
+	require.Equal(t, []int64{0, 0, 1, 1}, numaNodes)
+}
+
+// TestGroupedUncoreCacheDevicesPerPartition: a cache split between partitions
+// yields one device per partition, each holding that partition's share, from
+// the commit that publishes cache devices rather than from a later one.
+func TestGroupedUncoreCacheDevicesPerPartition(t *testing.T) {
+	topo := fakeFourCacheTopology()
+	online := topo.CPUDetails.CPUs()
+	vm := cpuset.New(8, 9, 10, 11, 12, 13, 14, 15)
+	partitions := device.WithImplicitDefault([]device.Partition{
+		{Name: "vm", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: vm},
+	}, online)
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+		cpuset.New(), store.NewPCIeRootMapper(), false, false, partitions)
+	require.Len(t, built.ByPartition, 2)
+
+	require.Equal(t, []string{
+		device.CPUDeviceCacheGroupedPrefix + "002-vm",
+		device.CPUDeviceCacheGroupedPrefix + "003-vm",
+	}, deviceNames(built.ByPartition[0]), "the vm partition publishes the caches of the CPUs it holds and no others")
+	require.Equal(t, []resourceapi.DeviceTaint{{
+		Key:    device.PartitionTaintKey,
+		Value:  "vm",
+		Effect: resourceapi.DeviceTaintEffectNoSchedule,
+	}}, built.ByPartition[0][0].Taints)
+	require.Equal(t, "vm", *built.ByPartition[0][0].Attributes[device.AttributePartition].StringValue)
+
+	require.Equal(t, []string{
+		device.CPUDeviceCacheGroupedPrefix + "000",
+		device.CPUDeviceCacheGroupedPrefix + "001",
+	}, deviceNames(built.ByPartition[1]))
+	require.Empty(t, built.ByPartition[1][0].Taints)
+}
+
+// TestGroupedUncoreCacheSkipsCPUsWithoutACache: a device standing for a cache
+// the kernel does not report would promise a locality nothing backs, so those
+// CPUs are left out and the rest of the node is published as usual.
+func TestGroupedUncoreCacheSkipsCPUsWithoutACache(t *testing.T) {
+	topo := fakeCacheTopology()
+	for _, cpu := range []int{4, 5, 6, 7} {
+		info := topo.CPUDetails[cpu]
+		info.UncoreCacheID = -1
+		topo.CPUDetails[cpu] = info
+	}
+	online := topo.CPUDetails.CPUs()
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+		cpuset.New(), store.NewPCIeRootMapper(), false, false, unpartitioned(online))
+	devices := onlyPartition(t, built.ByPartition)
+	require.Equal(t, []string{device.CPUDeviceCacheGroupedPrefix + "000"}, deviceNames(devices))
+	require.Equal(t, cpuset.New(0, 1, 2, 3), built.CPUs[devices[0].Name])
+}
+
+// TestGroupedUncoreCacheWholeCoreRequestPolicy: whole-core allocation is the
+// same promise on a smaller group, so the request policy is the existing one
+// with the device's own capacity as its default.
+func TestGroupedUncoreCacheWholeCoreRequestPolicy(t *testing.T) {
+	topo := fakeSMTCacheTopology()
+	online := topo.CPUDetails.CPUs()
+
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+		cpuset.New(), store.NewPCIeRootMapper(), false, true, unpartitioned(online))
+	devices := onlyPartition(t, built.ByPartition)
+	require.Len(t, devices, 2)
+
+	for _, dev := range devices {
+		capacity := dev.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+		require.EqualValues(t, 8, capacity.Value.Value(), "device %q holds four two-thread cores", dev.Name)
+		require.NotNil(t, capacity.RequestPolicy)
+		require.EqualValues(t, 2, capacity.RequestPolicy.ValidRange.Min.Value())
+		require.EqualValues(t, 2, capacity.RequestPolicy.ValidRange.Step.Value())
+		require.EqualValues(t, 8, capacity.RequestPolicy.Default.Value(), "an omitted request takes this cache, not the node")
+		require.Equal(t, 2, built.ThreadsPerCore[dev.Name])
+	}
 }
 
 func TestIndividualDevicesHaveNoGroupCacheAttributes(t *testing.T) {

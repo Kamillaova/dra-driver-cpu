@@ -2559,6 +2559,52 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 	})
 }
 
+// TestPrepareGroupedClaimOnACacheDevice: under uncore-cache grouping a device
+// is one cache, and Prepare treats it as it treats any other group -- the claim
+// takes CPUs from that device's own set, so a claim allocated on a cache cannot
+// come out spanning two.
+func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
+	logger := testr.New(t)
+	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_2Caches_HT()}
+	topo, err := mockProvider.GetCPUTopology(logger)
+	require.NoError(t, err)
+	online := topo.CPUDetails.CPUs()
+
+	built := devattr.BuildGrouped(logger, devattr.GROUP_BY_UNCORE_CACHE, topo, online, cpuset.New(),
+		store.NewPCIeRootMapper(), false, true, devattr.WithImplicitDefault(nil, online))
+	d := &CPUDriver{
+		driverName:       testDriverName,
+		cpuDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		cpuDeviceGroupBy: devattr.GROUP_BY_UNCORE_CACHE,
+		topology: deviceTopology{
+			cpuTopology:            topo,
+			onlineCPUs:             online,
+			deviceNameToSocketID:   map[string]int{},
+			deviceNameToNUMANodeID: built.NameToID,
+			deviceNameToCPUs:       built.CPUs,
+			deviceNameToRole:       built.Roles,
+			deviceThreadsPerCore:   built.ThreadsPerCore,
+		},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		podConfigStore:     store.NewPodConfig(),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgr(),
+	}
+
+	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
+	require.Contains(t, built.CPUs, cache1)
+	result := d.prepareGroupedResourceClaim(logger,
+		testClaim("claim-cache1", testDriverName, testNodeName, map[string]int64{cache1: 4}))
+	require.NoError(t, result.Err)
+
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-cache1")
+	require.True(t, ok)
+	require.Equal(t, 4, got.Size())
+	require.True(t, got.IsSubsetOf(built.CPUs[cache1]),
+		"claim took %s, which is not inside cache 1's %s", got.String(), built.CPUs[cache1].String())
+	require.Equal(t, got, topo.CPUDetails.CompleteCores(got), "whole cores, as the device's request policy promises")
+}
+
 func TestPreparedEnvSaysDynamicOnlyWhenPlacementCanChange(t *testing.T) {
 	// The variable cannot be rewritten once the container exists, so while the
 	// driver may move the claim it must not name a cpuset. With defragmentation

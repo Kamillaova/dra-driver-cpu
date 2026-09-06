@@ -115,6 +115,7 @@ These carry no fork-only code and are intended to be offered upstream as separat
 
 - physical-core identity helpers in `pkg/cpuinfo`
 - uncore cache geometry device attributes
+- `groupBy: uncorecache`, one device per uncore cache
 - claim-ownership authentication against `Container.CDIDevices` (as an *additive* check)
 - `fullPhysicalCPUsOnly` — upstream issue #45
 - CPU partitions: the `cpuPartitions` list, the devices and taints it publishes, and its
