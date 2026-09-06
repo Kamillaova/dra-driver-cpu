@@ -422,7 +422,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		switch plugin.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET:
 			plugin.topology.deviceNameToSocketID = built.NameToID
-		case device.GROUP_BY_NUMA_NODE:
+		case device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
 			plugin.topology.deviceNameToNUMANodeID = built.NameToID
 		}
 		plugin.topology.numaNodeThreadsPerCore = numaNodeThreadsPerCore(plugin.topology.cpuTopology, plugin.cpuDeviceGroupBy, built.NameToID, built.ThreadsPerCore)
@@ -619,7 +619,7 @@ func numaNodeThreadsPerCore(topo *cpuinfo.CPUTopology, groupBy string, nameToID,
 	}
 
 	switch groupBy {
-	case device.GROUP_BY_NUMA_NODE:
+	case device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
 		return byGroup
 	case device.GROUP_BY_SOCKET:
 		byNUMANode := make(map[int]int, len(byGroup))
