@@ -85,7 +85,9 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
 
-- `internal/driverconfig`: `DefragEnabled` and `validateDefrag`
+- `internal/driverconfig`: `DefragEnabled` and `validateDefrag`; the `Profiles`
+  map, `Profile`, `ProfileLabel`, `DefaultProfileName`, `WithProfile`, `asProfile`,
+  `validateProfiles` and `WarnDeprecatedCPUFields`
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
   behind them
