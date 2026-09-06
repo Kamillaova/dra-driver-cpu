@@ -29,6 +29,7 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
@@ -249,6 +250,7 @@ func TestSeedAllocationStoreFromDiskRecoversPriorPlacements(t *testing.T) {
 		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
 		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 		cdiMgr:             cdiMgr,
+		metrics:            cpumetrics.Noop(),
 	}
 
 	d.seedAllocationStoreFromDisk(logger)
@@ -285,6 +287,7 @@ func TestSeedAllocationStoreFromDiskSkipsAConflictingRecordWithoutFailingStartup
 		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
 		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 		cdiMgr:             cdiMgr,
+		metrics:            cpumetrics.Noop(),
 	}
 
 	d.seedAllocationStoreFromDisk(logger)
@@ -309,6 +312,7 @@ func TestSeedAllocationStoreFromDiskToleratesARefreshFailure(t *testing.T) {
 		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
 		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 		cdiMgr:             cdiMgr,
+		metrics:            cpumetrics.Noop(),
 	}
 
 	require.NotPanics(t, func() { d.seedAllocationStoreFromDisk(logger) })
@@ -534,6 +538,7 @@ func TestStartRefusesARootWithNoRoomForTheSocket(t *testing.T) {
 	cp := &CPUDriver{
 		kubeletRootDir: "/" + strings.Repeat("x", unixPathMax),
 		driverName:     "dra.cpu",
+		metrics:        cpumetrics.Noop(),
 	}
 
 	_, err := cp.Start(context.Background())

@@ -1151,6 +1151,7 @@ func TestSynchronizeKeepsStaleContainersClaimCPUsReserved(t *testing.T) {
 		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 		claimTracker:       store.NewClaimTracker(),
 		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: cpuset.New(4, 5)}),
+		metrics:            cpumetrics.Noop(),
 	}
 
 	updates, err := d.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr})

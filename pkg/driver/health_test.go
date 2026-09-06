@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr/testr"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -33,6 +34,7 @@ func newHealthTestDriver(deviceNames ...string) *CPUDriver {
 		driverName: testDriverName,
 		nodeName:   testNodeName,
 		health:     newHealthTracker(),
+		metrics:    cpumetrics.Noop(),
 	}
 	for _, name := range deviceNames {
 		cp.health.devices[name] = &deviceHealthEntry{status: kubeletplugin.HealthStatusHealthy, message: "device initialized"}
