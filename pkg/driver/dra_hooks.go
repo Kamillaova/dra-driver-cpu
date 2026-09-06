@@ -27,6 +27,7 @@ import (
 
 	"github.com/go-logr/logr"
 	opaqueapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
@@ -107,11 +108,9 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 	for _, claim := range claims {
 		start := time.Now()
 		cLogger := logger.WithValues("claim", ctxlog.KObj(claim), "claimUID", claim.UID)
-		if cp.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-			result[claim.UID] = cp.prepareGroupedResourceClaim(cLogger, claim)
-		} else {
-			result[claim.UID] = cp.prepareResourceClaim(cLogger, claim)
-		}
+		// CCX-FORK: upstream dispatches on the device mode here, having nothing
+		// to check before it.
+		result[claim.UID] = cp.prepareClaim(cLogger, claim)
 		prepareResult := cpumetrics.ResultSuccess
 		if result[claim.UID].Err != nil {
 			prepareResult = cpumetrics.ResultError
@@ -150,6 +149,77 @@ func (cp *CPUDriver) republishOnCacheOrderChange(ctx context.Context) {
 		return
 	}
 	go cp.PublishResources(context.WithoutCancel(ctx))
+}
+
+// prepareClaim checks what a claim says about its own placement and then places
+// it. The check comes first because the answer does not depend on the device
+// mode, and a claim that contradicts itself is the template's error rather than
+// the node's.
+func (cp *CPUDriver) prepareClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+	if _, err := cp.claimConfig(claim); err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+	if cp.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
+		return cp.prepareGroupedResourceClaim(logger, claim)
+	}
+	return cp.prepareResourceClaim(logger, claim)
+}
+
+// claimConfig is what a claim says about its own placement, folded from the
+// configurations its requests carry. Mobility and alignment describe the claim
+// and not one of its requests, so configurations that disagree about them are
+// refused rather than reconciled.
+//
+// Every configuration this driver is named in has to be readable, wherever it
+// came from, or the claim is refused. Only the claim's own are then read for
+// what they say: one attached to a DeviceClass is the cluster administrator's,
+// and whether a workload survives having its CPUs changed is for whoever writes
+// its template to state.
+func (cp *CPUDriver) claimConfig(claim *resourceapi.ResourceClaim) (opaqueapi.ClaimPlacement, error) {
+	placement := opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort}
+	if claim.Status.Allocation == nil {
+		return placement, nil
+	}
+
+	folded := false
+	for _, entry := range claim.Status.Allocation.Devices.Config {
+		if entry.Opaque == nil || entry.Opaque.Driver != cp.driverName || len(entry.Opaque.Parameters.Raw) == 0 {
+			continue
+		}
+		parsed, err := opaqueapi.ParseOpaqueConfig(entry.Opaque.Parameters.Raw)
+		if err != nil {
+			return opaqueapi.ClaimPlacement{}, err
+		}
+		if entry.Source != resourceapi.AllocationConfigSourceClaim {
+			continue
+		}
+		if folded && (parsed.Relocatable != placement.Relocatable || parsed.Alignment != placement.Alignment) {
+			return opaqueapi.ClaimPlacement{}, fmt.Errorf("claim %s/%s carries configurations that disagree about cpuConfig.relocatable or cpuConfig.alignment, which describe the claim rather than one of its requests",
+				claim.Namespace, claim.Name)
+		}
+		placement.Relocatable = parsed.Relocatable
+		placement.Alignment = parsed.Alignment
+		placement.AlignmentSet = placement.AlignmentSet || parsed.AlignmentSet
+		folded = true
+	}
+
+	if placement.AlignmentSet && !claimOffersSplitAlternatives(claim) {
+		return opaqueapi.ClaimPlacement{}, fmt.Errorf("claim %s/%s sets cpuConfig.alignment, but none of its requests offers the allocator alternatives, so it can only be placed whole",
+			claim.Namespace, claim.Name)
+	}
+	return placement, nil
+}
+
+// claimOffersSplitAlternatives reports whether any request of a claim leaves the
+// allocator a choice between placements of different shapes, which is what
+// cpuConfig.alignment answers.
+func claimOffersSplitAlternatives(claim *resourceapi.ResourceClaim) bool {
+	for _, request := range claim.Spec.Devices.Requests {
+		if len(request.FirstAvailable) > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // reservedForPodUIDs returns the pod UIDs claim.Status.ReservedFor names,
@@ -625,12 +695,19 @@ func (cp *CPUDriver) getOpaqueCPUSet(logger logr.Logger, allocation *resourceapi
 
 	// Return the matched config if found
 	if matchedConfig != nil && len(matchedConfig.Opaque.Parameters.Raw) > 0 {
-		parsedCPUSet, err := opaqueapi.ParseOpaqueConfig(matchedConfig.Opaque.Parameters.Raw)
+		parsed, err := opaqueapi.ParseOpaqueConfig(matchedConfig.Opaque.Parameters.Raw)
 		if err != nil {
 			return cpuset.CPUSet{}, false, err
 		}
-		logger.V(4).Info("found cpuset override in opaque config", "request", alloc.Request, "cpuset", parsedCPUSet.String())
-		return parsedCPUSet, true, nil
+		// CCX-FORK: upstream's parse refuses a configuration that names no
+		// cpuset, since to it a configuration is nothing else. One may now say
+		// only what the claim tolerates, so the demand belongs here, where a
+		// cpuset is what is being asked for.
+		if !parsed.HasCPUs {
+			return cpuset.CPUSet{}, false, fmt.Errorf("opaque config: cpuConfig.cpuset is empty or missing")
+		}
+		logger.V(4).Info("found cpuset override in opaque config", "request", alloc.Request, "cpuset", parsed.CPUs.String())
+		return parsed.CPUs, true, nil
 	}
 
 	return cpuset.CPUSet{}, false, nil
