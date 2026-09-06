@@ -1,10 +1,11 @@
 # Custom Opaque CPUSet Allocation Overrides
 
 > [!NOTE]
-> **Audience: scheduler-plugin authors and platform integrators**, not workload authors. This
-> page documents an integration contract for external schedulers; no in-tree scheduler
-> implements it today. Regular workloads should use the default `numanode`/`socket` grouping
-> instead.
+> **Audience for the `cpuset` field: scheduler-plugin authors and platform integrators**, not
+> workload authors. It documents an integration contract for external schedulers; no in-tree
+> scheduler implements it today. Regular workloads should use the default `numanode`/`socket`
+> grouping instead. The `relocatable` and `alignment` fields below are the workload author's,
+> and apply under every grouping.
 
 When using `grouped` device mode with the `groupBy: machine` configuration, the DRA driver does not perform automatic topology-aware CPU allocation. Instead, an explicit core assignment must be provided via the `cpuset` field in the claim's opaque configuration parameters.
 
@@ -14,11 +15,33 @@ The Kubelet driver parses this configuration at prepare time from the claim's al
 
 The `opaque.parameters` field must conform to the following schema:
 
-| Field              | Type   | Description                                                                                |
-| :----------------- | :----- | :----------------------------------------------------------------------------------------- |
-| `apiVersion`       | string | Must be set to `v1alpha1`.                                                                 |
-| `cpuConfig`        | object | Container object for CPU configurations.                                                   |
-| `cpuConfig.cpuset` | string | Specifies the list of CPU cores in standard Linux cpuset format (e.g. `"2-5"`, `"0,4-6"`). |
+| Field                   | Type   | Description                                                                                                          |
+| :---------------------- | :----- | :------------------------------------------------------------------------------------------------------------------- |
+| `apiVersion`            | string | Must be set to `v1alpha1`.                                                                                           |
+| `cpuConfig`             | object | Container object for CPU configurations.                                                                             |
+| `cpuConfig.cpuset`      | string | Specifies the list of CPU cores in standard Linux cpuset format (e.g. `"2-5"`, `"0,4-6"`).                           |
+| `cpuConfig.relocatable` | bool   | Permits the driver to change which CPUs back the claim while its containers run. Defaults to `false`.                |
+| `cpuConfig.alignment`   | string | `BestEffort` or `Repairable`: what the claim asks about being placed across more caches than it needs. Defaults to `BestEffort`. |
+
+### What the claim states about its own placement
+
+`relocatable` is the tenant's answer to a question only the workload can answer: whether it survives
+having its CPUs changed underneath it. A launcher that re-reads its affinity when `cpuset.cpus`
+changes loses nothing; one that pinned its threads once at start keeps running with that pinning
+silently gone. The default is therefore `false`, and a workload that follows the
+[contract](workload-requirements.md) states `true` explicitly. Only a `relocatable: true` claim is
+ever moved by [defragmentation](defragmentation.md).
+
+`alignment` says what to do about landing on more uncore caches than the claim's size requires:
+
+- `BestEffort` runs where the allocator placed it and stays there. This is the plain exclusive
+  request, and the default.
+- `Repairable` runs split and has the driver make the claim whole, which means moving other claims
+  out of the way, so it requires `relocatable: true`.
+
+Neither says anything about a claim the allocator has no choice about. A claim whose requests offer
+no alternatives cannot be split whatever it asks for, so setting `alignment` there is refused rather
+than ignored.
 
 ## Example of a Fully Allocated ResourceClaim with Opaque Configuration
 
@@ -69,4 +92,13 @@ The driver allocates the specified cores directly (after validating that they ar
 > - **CPUSet Validation**: The driver verifies that the custom cpuset is valid for the host machine and is currently allocatable. It checks that:
 >   - The cores are part of the node's online CPUs.
 >   - The cores are not reserved using the driver's `--reserved-cpus` configuration flag.
-> - **Error Handling**: If validation fails (e.g. core conflict, size mismatch, duplicate target, or offline cores), the driver returns a failure immediately in Kubelet's `PrepareResourceClaims` hook, causing pod startup to fail.
+> - **Contradictory placement fields**: `cpuConfig.cpuset` cannot be combined with
+>   `cpuConfig.relocatable: true` — the named cores are what such a claim is for, and permitting the
+>   driver to leave them contradicts naming them. `cpuConfig.alignment: Repairable` requires
+>   `cpuConfig.relocatable: true`, because making a split claim whole moves its own CPUs.
+>   `cpuConfig.alignment` may only be set on a claim whose requests offer the allocator alternatives.
+>   `cpuConfig.relocatable` and `cpuConfig.alignment` describe the claim rather than one of its
+>   requests, so two of a claim's configurations disagreeing about them is an error too.
+> - **Unknown versions and values** are refused: an `apiVersion` this driver does not implement, or an
+>   `alignment` outside the two values above, fails preparation rather than being ignored.
+> - **Error Handling**: If validation fails (e.g. core conflict, size mismatch, duplicate target, or offline cores), the driver returns a failure immediately in Kubelet's `PrepareResourceClaims` hook, causing pod startup to fail. The Kubelet records that as a `FailedPrepareDynamicResources` event on the pod.
