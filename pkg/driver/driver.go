@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
@@ -101,6 +102,7 @@ type CPUDriver struct {
 	// deviceTopology.deviceThreadsPerCore -- since one device's non-uniform
 	// cores must not disable it for another.
 	fullPhysicalCPUsOnly    bool
+	placementPolicy         coreselect.Policy
 	claimTracker            *store.ClaimTracker
 	pcieRootMapper          *store.PCIeRootMapper
 	devicesPerResourceSlice int
@@ -215,6 +217,9 @@ type Config struct {
 	// FullPhysicalCPUsOnly allocates whole physical cores, so a core's SMT siblings are never split
 	// between two claims or between a claim and the shared pool. Grouped mode only.
 	FullPhysicalCPUsOnly bool
+	// CachePlacementStrategy is how a claim choosing among caches that fit it
+	// picks one; empty means coreselect.Pack.
+	CachePlacementStrategy coreselect.Policy
 	// AssumeUnsolicitedUpdatesSafe permits pushing container updates the runtime did not ask for.
 	// Required by every feature that reacts without waiting for a container lifecycle event.
 	AssumeUnsolicitedUpdatesSafe bool
@@ -297,6 +302,10 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		if err := validateReservedCPUsAlignment(topo, config.ReservedCPUs); err != nil {
 			return nil, err
 		}
+	}
+	plugin.placementPolicy = config.CachePlacementStrategy
+	if plugin.placementPolicy == "" {
+		plugin.placementPolicy = coreselect.Pack
 	}
 
 	// Unsolicited updates deadlock runtimes with a pre-nri#301 Adaptation, and
