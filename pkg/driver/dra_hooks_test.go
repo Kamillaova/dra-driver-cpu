@@ -53,7 +53,7 @@ const (
 
 func requirePreparedResourceClaim(t testing.TB, logger logr.Logger, allocationStore *store.CPUAllocation, claimUID types.UID, cpus cpuset.CPUSet) {
 	t.Helper()
-	require.NoError(t, allocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpus, false))
+	require.NoError(t, allocationStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(cpus), false))
 }
 
 // testSysFS enables full isolation and full mocking from the host filesystem.
@@ -101,7 +101,7 @@ func (m *mockKubeletPlugin) Stop() {}
 
 type mockCdiMgr struct {
 	devices      map[string]string
-	cpusets      map[string]cpuset.CPUSet
+	placements   map[string][]store.RequestAllocation
 	addError     error
 	refreshError error
 	getError     error
@@ -111,8 +111,8 @@ type mockCdiMgr struct {
 
 func newMockCdiMgr() *mockCdiMgr {
 	return &mockCdiMgr{
-		devices: make(map[string]string),
-		cpusets: make(map[string]cpuset.CPUSet),
+		devices:    make(map[string]string),
+		placements: make(map[string][]store.RequestAllocation),
 	}
 }
 
@@ -124,35 +124,35 @@ func newMockCdiMgrWithAllocations(allocations map[types.UID]cpuset.CPUSet) *mock
 	return mgr
 }
 
-func (m *mockCdiMgr) AddDevice(_ logr.Logger, deviceName, envVar string, cpus cpuset.CPUSet) error {
+func (m *mockCdiMgr) AddDevice(_ logr.Logger, deviceName string, envVar string, requests []store.RequestAllocation) error {
 	if m.addError != nil {
 		return m.addError
 	}
 	m.devices[deviceName] = envVar
-	m.cpusets[deviceName] = cpus
+	m.placements[deviceName] = requests
 	return nil
 }
 
-func (m *mockCdiMgr) GetDeviceCPUSet(deviceName string) (cpuset.CPUSet, error) {
+func (m *mockCdiMgr) GetDeviceAllocations(deviceName string) ([]store.RequestAllocation, error) {
 	if m.getError != nil {
-		return cpuset.CPUSet{}, m.getError
+		return nil, m.getError
 	}
-	if cpus, ok := m.cpusets[deviceName]; ok {
-		return cpus, nil
+	if requests, ok := m.placements[deviceName]; ok {
+		return requests, nil
 	}
 	// Mirror the real manager's fallback for specs that predate the annotation.
 	env, ok := m.devices[deviceName]
 	if !ok {
-		return cpuset.CPUSet{}, fmt.Errorf("device %q not found", deviceName)
+		return nil, fmt.Errorf("device %q not found", deviceName)
 	}
 	allocations, err := parseDRAEnvToClaimAllocations(logr.Discard(), []string{env})
 	if err != nil {
-		return cpuset.CPUSet{}, err
+		return nil, err
 	}
 	for _, cpus := range allocations {
-		return cpus, nil
+		return []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}}, nil
 	}
-	return cpuset.CPUSet{}, fmt.Errorf("device %q records no placement", deviceName)
+	return nil, fmt.Errorf("device %q records no placement", deviceName)
 }
 
 func (m *mockCdiMgr) Refresh() error {
@@ -171,15 +171,15 @@ func (m *mockCdiMgr) GetDeviceEnv(deviceName string) ([]string, error) {
 	return []string{env}, nil
 }
 
-func (m *mockCdiMgr) PreparedClaimAllocations(logr.Logger) map[types.UID]cpuset.CPUSet {
-	allocations := make(map[types.UID]cpuset.CPUSet)
+func (m *mockCdiMgr) PreparedClaimAllocations(logr.Logger) map[types.UID][]store.RequestAllocation {
+	allocations := make(map[types.UID][]store.RequestAllocation)
 	for deviceName := range m.devices {
 		claimUID, ok := claimUIDFromDeviceName(deviceName)
 		if !ok {
 			continue
 		}
-		if cpus, err := m.GetDeviceCPUSet(deviceName); err == nil {
-			allocations[claimUID] = cpus
+		if requests, err := m.GetDeviceAllocations(deviceName); err == nil {
+			allocations[claimUID] = requests
 		}
 	}
 	return allocations
@@ -190,7 +190,7 @@ func (m *mockCdiMgr) RemoveDevice(_ logr.Logger, deviceName string) error {
 		return m.removeError
 	}
 	delete(m.devices, deviceName)
-	delete(m.cpusets, deviceName)
+	delete(m.placements, deviceName)
 	return nil
 }
 
@@ -2579,4 +2579,59 @@ func TestTakeCPUsForDeviceHonoursThePlacementPolicy(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, 0, topo.CPUDetails[got.List()[0]].UncoreCacheID,
 		"spread must open an untouched cache, got %s", got.String())
+}
+
+func TestPrepareRecordsEachRequestOfAClaim(t *testing.T) {
+	logger := testr.New(t)
+	cpuInfos := mockCPUInfos_SingleSocket_4CPUS_HT
+	driver, err := New(logger, Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: cpuInfos},
+		SysFS:   testSysFS(cpuInfos),
+	}, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+	})
+	require.NoError(t, err)
+	mockCdi := newMockCdiMgr()
+	driver.cdiMgr = mockCdi
+
+	claimUID := types.UID("claim-two-requests")
+	claim := testClaimWithResults(claimUID, []resourceapi.DeviceRequestAllocationResult{
+		{
+			Driver:           testDriverName,
+			Pool:             testNodeName,
+			Device:           "cpudevnuma000",
+			Request:          "vcpus",
+			ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: *resource.NewQuantity(2, resource.DecimalSI)},
+		},
+		{
+			Driver:           testDriverName,
+			Pool:             testNodeName,
+			Device:           "cpudevnuma000",
+			Request:          "helpers",
+			ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: *resource.NewQuantity(1, resource.DecimalSI)},
+		},
+	})
+
+	results, err := driver.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.NoError(t, results[claimUID].Err)
+
+	requests, ok := driver.cpuAllocationStore.GetResourceClaimRequests(claimUID)
+	require.True(t, ok)
+	require.Len(t, requests, 2)
+	require.Equal(t, "helpers", requests[0].Request)
+	require.Equal(t, 1, requests[0].CPUs.Size())
+	require.Equal(t, store.RoleExclusive, requests[0].Role)
+	require.Equal(t, "vcpus", requests[1].Request)
+	require.Equal(t, 2, requests[1].CPUs.Size())
+	require.Equal(t, store.RoleExclusive, requests[1].Role)
+	require.True(t, requests[0].CPUs.Intersection(requests[1].CPUs).IsEmpty(),
+		"two requests of one claim never share a CPU")
+	require.Equal(t, store.UnionOf(requests), driver.cpuAllocationStore.GetPreparedCPUs())
+
+	require.Equal(t, requests, mockCdi.placements[getCDIDeviceName(claimUID)],
+		"the device spec records the same split")
 }
