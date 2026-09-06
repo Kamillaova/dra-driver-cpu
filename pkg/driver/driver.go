@@ -432,7 +432,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		switch plugin.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET:
 			plugin.topology.deviceNameToSocketID = built.NameToID
-		case device.GROUP_BY_NUMA_NODE:
+		case device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
 			plugin.topology.deviceNameToNUMANodeID = built.NameToID
 		}
 		plugin.topology.numaNodeThreadsPerCore = numaNodeThreadsPerCore(plugin.topology.cpuTopology, plugin.cpuDeviceGroupBy, built.NameToID, built.ThreadsPerCore)
@@ -625,6 +625,23 @@ func numaNodeThreadsPerCore(topo *cpuinfo.CPUTopology, groupBy string, nameToID,
 		}
 		if byGroup[id] != threads {
 			byGroup[id] = 0
+		}
+	case device.GROUP_BY_UNCORE_CACHE:
+		// Several devices share a NUMA node here, so the node has a step only
+		// where they agree on one. Disagreement gives zero, which is what
+		// UniformThreadsPerCore means by "no single answer" and what a caller
+		// planning by NUMA node reads as no whole-core promise.
+		seen := make(map[int]bool, len(nameToID))
+		for name, numaID := range nameToID {
+			threads := deviceThreadsPerCore[name]
+			if !seen[numaID] {
+				byNUMANode[numaID] = threads
+				seen[numaID] = true
+				continue
+			}
+			if byNUMANode[numaID] != threads {
+				byNUMANode[numaID] = 0
+			}
 		}
 	}
 
