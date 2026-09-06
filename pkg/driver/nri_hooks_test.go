@@ -289,7 +289,11 @@ func TestCreateContainer(t *testing.T) {
 			),
 		},
 		{
-			name:           "container with DRA env that differs from prepared allocation fails closed",
+			// A container's environment is fixed when it is created, so once a
+			// claim can move the env names where the claim used to be. The store
+			// is the live record and decides; disagreeing with it would leave a
+			// moved claim unable to start or restart its container.
+			name:           "container is pinned to the prepared allocation, not to its DRA env",
 			podConfigStore: store.NewPodConfig(),
 			cpuAllocationStore: func() *store.CPUAllocation {
 				store := store.NewCPUAllocation(topo, cpuset.New())
@@ -298,12 +302,34 @@ func TestCreateContainer(t *testing.T) {
 			}(),
 			claimTracker: reservedForPod(claimUID),
 			container:    newTestContainer(claimUID, "0-3"),
-			expectedErrorContains: fmt.Sprintf(
-				"validation failed for claim %q: cpuset mismatch (expected %q, got %q)",
-				claimUID,
-				"0-1",
-				"0-3",
-			),
+			expectedContainerAdjustment: &api.ContainerAdjustment{
+				Linux: &api.LinuxContainerAdjustment{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1"}}},
+			},
+			expectedContainerUpdates: []*api.ContainerUpdate{},
+		},
+		{
+			name:           "container holding several claims gets the union of their allocations",
+			podConfigStore: store.NewPodConfig(),
+			cpuAllocationStore: func() *store.CPUAllocation {
+				store := store.NewCPUAllocation(topo, cpuset.New())
+				requirePreparedResourceClaim(t, logger, store, "claim-uid-1", cpuset.New(0, 1))
+				requirePreparedResourceClaim(t, logger, store, "claim-uid-2", cpuset.New(5))
+				return store
+			}(),
+			claimTracker: reservedForPod("claim-uid-1", "claim-uid-2"),
+			container: &api.Container{
+				Id:           "ctr-id-1",
+				PodSandboxId: pod.Id,
+				Name:         "my-ctr",
+				Env: []string{
+					fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-uid-1", "6"),
+					fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-uid-2", "7"),
+				},
+			},
+			expectedContainerAdjustment: &api.ContainerAdjustment{
+				Linux: &api.LinuxContainerAdjustment{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1,5"}}},
+			},
+			expectedContainerUpdates: []*api.ContainerUpdate{},
 		},
 	}
 
