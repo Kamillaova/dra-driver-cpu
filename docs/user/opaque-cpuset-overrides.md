@@ -39,6 +39,9 @@ ever moved by [defragmentation](defragmentation.md).
 - `Repairable` runs split and has the driver make the claim whole, which means moving other claims
   out of the way, so it requires `relocatable: true`.
 
+Both are read back to the container in its request's [device metadata file](device-metadata.md), so a
+workload sees the contract it is running under.
+
 Neither says anything about a claim the allocator has no choice about. A claim whose requests offer
 no alternatives cannot be split whatever it asks for, so setting `alignment` there is refused rather
 than ignored.
