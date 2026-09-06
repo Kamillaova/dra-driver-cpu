@@ -128,6 +128,12 @@ DRACPU_E2E_FULL_PCPUS_ONLY ?= false
 # of one online thread per core on those CPUs. Their SMT siblings must already
 # be offline: the suite verifies that state, it never creates it.
 DRACPU_E2E_NOSMT_PARTITION_CPUS ?=
+# Set to a cpuset to have ci-kind-setup deploy the driver with a CPU pool on
+# those CPUs, which claims reach by asking for its device class.
+DRACPU_E2E_POOL_PARTITION_CPUS ?=
+# helm --set fills the gap before an index with null, which the values schema
+# rejects, so the pool takes the first free index rather than always the second.
+DRACPU_E2E_POOL_PARTITION_INDEX := $(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),1,0)
 comma := ,
 # Extra arguments passed to golangci-lint in the lint target.
 # For example, set GOLANGCI_LINT_EXTRA_ARGS=--fix to auto-fix issues.
@@ -229,7 +235,8 @@ endif
 		--set driverConfig.fullPhysicalCPUsOnly=$(DRACPU_E2E_FULL_PCPUS_ONLY) \
 		--set driverConfig.defragEnabled=$(DRACPU_E2E_DEFRAG) \
 		--set driverConfig.assumeUnsolicitedUpdatesSafe=$(DRACPU_E2E_DEFRAG) \
-		$(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),--set-string 'driverConfig.cpuPartitions[0].name=nosmt' --set-string 'driverConfig.cpuPartitions[0].role=exclusive' --set 'driverConfig.cpuPartitions[0].smt=false' --set-string 'driverConfig.cpuPartitions[0].cpus=$(subst $(comma),\$(comma),$(DRACPU_E2E_NOSMT_PARTITION_CPUS))')
+		$(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),--set-string 'driverConfig.cpuPartitions[0].name=nosmt' --set-string 'driverConfig.cpuPartitions[0].role=exclusive' --set 'driverConfig.cpuPartitions[0].smt=false' --set-string 'driverConfig.cpuPartitions[0].cpus=$(subst $(comma),\$(comma),$(DRACPU_E2E_NOSMT_PARTITION_CPUS))') \
+		$(if $(DRACPU_E2E_POOL_PARTITION_CPUS),--set-string 'driverConfig.cpuPartitions[$(DRACPU_E2E_POOL_PARTITION_INDEX)].name=helpers' --set-string 'driverConfig.cpuPartitions[$(DRACPU_E2E_POOL_PARTITION_INDEX)].role=shared' --set-string 'driverConfig.cpuPartitions[$(DRACPU_E2E_POOL_PARTITION_INDEX)].cpus=$(subst $(comma),\$(comma),$(DRACPU_E2E_POOL_PARTITION_CPUS))')
 	hack/ci/wait-resourcelices.sh
 
 build-test-image: ## build tests image
