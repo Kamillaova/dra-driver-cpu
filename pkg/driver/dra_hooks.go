@@ -431,9 +431,12 @@ func (cp *CPUDriver) unprepareResourceClaim(logger logr.Logger, claim kubeletplu
 	}
 	cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 	cp.claimTracker.Cleanup(claim.UID)
-	// TODO(#279): Update existing shared containers here once all supported runtimes can
-	// safely process unsolicited NRI UpdateContainers calls. Until then, each container
-	// picks up the expanded cpuset on its next CreateContainer or Synchronize.
+	// The released CPUs are back in the shared pool now, but the containers
+	// entitled to them still hold the narrower cpuset. Hand that off to the
+	// worker rather than doing it here: kubelet must not wait on an NRI round
+	// trip, and an unsolicited update issued from inside a hook is what
+	// deadlocks a runtime with a pre-nri#301 Adaptation.
+	cp.requestReconcile()
 	return nil
 }
 
