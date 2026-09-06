@@ -18,6 +18,7 @@ package driver
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -49,6 +50,13 @@ const (
 	// which request holds them. Specs written before the driver recorded
 	// placement per request carry this one instead.
 	cdiCPUSetAnnotation = "dra.cpu/cpuset"
+
+	// cdiRelocatableAnnotation records whether the claim's own configuration
+	// permits its CPUs to change. The driver does not watch ResourceClaims, so
+	// after a restart this is where that answer comes from; absent means false,
+	// which is both the field's default and the right reading of a spec written
+	// before the driver recorded it.
+	cdiRelocatableAnnotation = "dra.cpu/relocatable"
 
 	// cdiEnvDynamicValue stands in for a cpuset in the injected variable when a
 	// claim's placement may change while its container runs.
@@ -100,18 +108,18 @@ func (c *CdiManager) getSpecName(deviceName string) string {
 	return cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, deviceName) + ".json"
 }
 
-// AddDevice writes a dedicated CDI spec file for a single claim, recording
-// requests as its current placement and injecting envVar into the container.
+// AddDevice writes a dedicated CDI spec file for a single claim, recording the
+// claim's record as its current state and injecting envVar into the container.
 // One device carries every request of the claim.
 //
 // The spec is written atomically by the CDI cache, so a concurrent reader sees
 // either the previous placement or this one, never a mixture.
 //
-// CCX-FORK: upstream takes no requests argument and records no placement.
-func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar string, requests []store.RequestAllocation) error {
+// CCX-FORK: upstream takes no record argument and records nothing of its own.
+func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar string, record store.ClaimRecord) error {
 	specName := c.getSpecName(deviceName)
 
-	placements, err := encodePlacements(requests)
+	placements, err := encodePlacements(record.Requests)
 	if err != nil {
 		return fmt.Errorf("failed to record the placement of CDI device %q: %w", deviceName, err)
 	}
@@ -123,7 +131,8 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 			{
 				Name: deviceName,
 				Annotations: map[string]string{
-					cdiPlacementsAnnotation: placements,
+					cdiPlacementsAnnotation:  placements,
+					cdiRelocatableAnnotation: strconv.FormatBool(record.Relocatable),
 				},
 				ContainerEdits: cdiSpec.ContainerEdits{
 					Env: []string{envVar},
@@ -136,7 +145,8 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 		return fmt.Errorf("failed to write CDI spec %q: %w", specName, err)
 	}
 
-	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVar, "placements", placements)
+	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVar,
+		"placements", placements, "relocatable", record.Relocatable)
 	return nil
 }
 
@@ -182,53 +192,62 @@ func decodePlacements(recorded string) ([]store.RequestAllocation, error) {
 	return requests, nil
 }
 
-// GetDeviceAllocations returns what each request of a claim was given, as its
-// device allocation records it. Call Refresh before lookup to load the latest
+// GetDeviceAllocations returns what the driver recorded for a claim, as its
+// device allocation carries it. Call Refresh before lookup to load the latest
 // on-disk specs.
 //
 // A spec written before the driver recorded placement per request names one
 // cpuset for the whole claim, or carries it only in the injected env var; both
 // describe a single exclusive request without a name. The spec file is
 // driver-owned, so unlike a container's environment its env value is current.
-func (c *CdiManager) GetDeviceAllocations(deviceName string) ([]store.RequestAllocation, error) {
+// A missing or unparsable mobility annotation reads as immobile, which is the
+// field's default and cannot cost a claim anything but a move.
+func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord, error) {
 	device := c.cache.GetDevice(cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName))
 	if device == nil {
-		return nil, fmt.Errorf("failed to find CDI device %q", deviceName)
+		return store.ClaimRecord{}, fmt.Errorf("failed to find CDI device %q", deviceName)
 	}
+	relocatable, _ := strconv.ParseBool(device.Annotations[cdiRelocatableAnnotation])
 
 	if recorded, ok := device.Annotations[cdiPlacementsAnnotation]; ok {
 		requests, err := decodePlacements(recorded)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiPlacementsAnnotation, recorded, deviceName, err)
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiPlacementsAnnotation, recorded, deviceName, err)
 		}
-		return requests, nil
+		return store.ClaimRecord{Requests: requests, Relocatable: relocatable}, nil
 	}
 
 	if recorded, ok := device.Annotations[cdiCPUSetAnnotation]; ok {
 		cpus, err := cpuset.Parse(recorded)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiCPUSetAnnotation, recorded, deviceName, err)
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiCPUSetAnnotation, recorded, deviceName, err)
 		}
-		return []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}}, nil
+		return store.ClaimRecord{
+			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
+			Relocatable: relocatable,
+		}, nil
 	}
 
 	allocations, err := parseDRAEnvToClaimAllocations(logr.Discard(), device.ContainerEdits.Env)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse CDI device %q: %w", deviceName, err)
+		return store.ClaimRecord{}, fmt.Errorf("failed to parse CDI device %q: %w", deviceName, err)
 	}
 	for _, cpus := range allocations {
-		return []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}}, nil
+		return store.ClaimRecord{
+			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
+			Relocatable: relocatable,
+		}, nil
 	}
-	return nil, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
+	return store.ClaimRecord{}, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
 }
 
-// PreparedClaimAllocations returns the placement recorded on disk for every
-// claim this driver previously prepared, keyed by claim UID. Call Refresh
-// first to load the latest specs. A device this driver would not itself have
-// generated, or whose recorded placement fails to parse, is skipped and
-// logged rather than aborting recovery of every other claim.
-func (c *CdiManager) PreparedClaimAllocations(logger logr.Logger) map[types.UID][]store.RequestAllocation {
-	allocations := make(map[types.UID][]store.RequestAllocation)
+// PreparedClaimAllocations returns what was recorded on disk for every claim
+// this driver previously prepared, keyed by claim UID. Call Refresh first to
+// load the latest specs. A device this driver would not itself have generated,
+// or whose recorded placement fails to parse, is skipped and logged rather than
+// aborting recovery of every other claim.
+func (c *CdiManager) PreparedClaimAllocations(logger logr.Logger) map[types.UID]store.ClaimRecord {
+	allocations := make(map[types.UID]store.ClaimRecord)
 	for _, qualified := range c.cache.ListDevices() {
 		vendor, class, name, err := cdiparser.ParseQualifiedName(qualified)
 		if err != nil || vendor != cdiVendor || class != cdiClass {
@@ -239,12 +258,12 @@ func (c *CdiManager) PreparedClaimAllocations(logger logr.Logger) map[types.UID]
 			logger.V(2).Info("ignoring CDI device this driver would not have generated", "device", qualified)
 			continue
 		}
-		requests, err := c.GetDeviceAllocations(name)
+		record, err := c.GetDeviceAllocations(name)
 		if err != nil {
 			logger.Error(err, "ignoring CDI device with an unrecoverable placement", "device", qualified)
 			continue
 		}
-		allocations[claimUID] = requests
+		allocations[claimUID] = record
 	}
 	return allocations
 }
