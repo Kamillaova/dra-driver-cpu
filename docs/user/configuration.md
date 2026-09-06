@@ -204,6 +204,10 @@ on - is configured through other Helm values, not through this file.
   whole-core allocation is what actually forbids that, and isolation-minded deployments should run
   both. Requires `cpuDeviceMode: grouped`: in individual mode the scheduler names exact CPU devices
   and the driver picks nothing.
+- Under `groupBy: uncorecache` the cache is the allocator's to choose, not the driver's, so the
+  strategy acts through the order the devices are published in: `pack` offers the caches that already
+  hold a claim first, `spread` the ones that hold none. The order is republished whenever a cache
+  changes between the two, and the devices of one NUMA node always stay together in it.
 
 `cpuPartitions` (list of partition, default: empty)
 
