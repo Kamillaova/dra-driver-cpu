@@ -170,6 +170,9 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 		return nil, err
 	}
 	containerUpdates = append(containerUpdates, sharedContainerUpdates...)
+	// CCX-FORK: the store was just rebuilt from what is actually running, which
+	// is the other way a cache stops being empty.
+	cp.republishOnCacheOrderChange(ctx)
 	return containerUpdates, nil
 }
 
