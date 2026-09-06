@@ -28,14 +28,27 @@ changes inotify cannot see: CPU hotplug and a parent cgroup shrinking. The CPU
 
 QEMU is more than its vCPUs: the main loop, iothreads, vhost workers and RCU
 threads all need CPU time, and left unpinned beside the vCPUs they steal it
-from them. Control threads cannot leave the claim -- a container's threads
-cannot be pinned outside its own cgroup cpuset -- so set `CONTROL_CPUS` and size
-the claim vCPUs *plus one core*: the launcher carves the cache-ordered tail, a
-whole core, out of the claim itself.
+from them.
 
-It must be one claim, not a vcpus claim plus a control claim: a container
-holding two claims is pinned to their union, and nothing inside the container
-can tell which CPUs belong to which -- both identity variables say `dynamic`.
+**With a shared partition on the node (recommended):** the claim carries a
+second request for a share of that pool, and the launcher reads the CPUs it was
+given from that request's own device metadata file, mounted for these templates at
+`/var/run/kubernetes.io/dra-device-attributes/resourceclaimtemplates/vcpus/helpers/dra.cpu-metadata.json`
+(`vcpus` being the name the pod gives the claim; a claim referenced by name instead sits under
+`resourceclaims/<claim>/`).
+Every thread that is not a vCPU goes there, alongside whatever else shares the
+pool. A pool never moves, so unlike an exclusive placement those CPUs are safe
+to read once and keep.
+
+**Without one:** control threads cannot leave the claim -- a container's threads
+cannot be pinned outside its own cgroup cpuset -- so drop the helpers request,
+set `CONTROL_CPUS` and size the vCPU request *plus one core*: the launcher
+carves the cache-ordered tail, a whole core, out of the claim itself.
+
+It must be one claim with two requests either way, not a vcpus claim plus a
+helpers claim: a container holding two claims is pinned to their union, and
+nothing inside the container can tell which CPUs belong to which -- both
+identity variables say `dynamic`.
 
 ## Sizing rules worth knowing
 
