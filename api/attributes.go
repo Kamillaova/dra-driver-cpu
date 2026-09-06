@@ -59,6 +59,13 @@ const (
 	// given, published for a request whose CPUs cannot change while its
 	// container runs.
 	AttributeCPUSet = "dra.cpu/cpuset"
+	// AttributeRelocatable is a metadata-only attribute saying whether the claim
+	// permits the driver to change its CPUs while its containers run, so a
+	// workload can tell whether it has to watch its own cpuset.
+	AttributeRelocatable = "dra.cpu/relocatable"
+	// AttributeAlignment is a metadata-only attribute carrying what the claim
+	// asked about landing split.
+	AttributeAlignment = "dra.cpu/alignment"
 )
 
 // The repair frontier a driver publishes per NUMA node, which a scheduler reads
