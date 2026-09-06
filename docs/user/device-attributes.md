@@ -15,6 +15,9 @@ Which attributes a device carries depends on the driver's device mode
 (`cpuDeviceMode` in [Configuration](configuration.md)): `grouped` exposes one device per
 CPU group, `individual` one device per CPU.
 
+A container also receives these attributes at runtime, per request, in a
+[device metadata file](device-metadata.md), together with a few that exist only there.
+
 ### Grouped mode (default)
 
 #### Currently supported attributes
