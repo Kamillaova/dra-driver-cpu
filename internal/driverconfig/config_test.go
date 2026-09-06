@@ -910,3 +910,26 @@ defragClaimCooldownSeconds: 0
 	assert.Equal(t, 3, result.DefragMinGain)
 	assert.Equal(t, 0, result.DefragClaimCooldownSeconds)
 }
+
+// TestValidate_CachePlacementPolicy: only the two named policies exist, and
+// the policy governs which CPUs the driver picks, so it is rejected where the
+// driver does not pick.
+func TestValidate_CachePlacementPolicy(t *testing.T) {
+	cfg := driverconfig.Default()
+	assert.Equal(t, "pack", cfg.CachePlacementPolicy, "the default must be upstream's behaviour")
+	assert.NoError(t, cfg.Validate())
+
+	cfg.CachePlacementPolicy = "spread"
+	assert.NoError(t, cfg.Validate(), "spread must not demand whole-core allocation")
+
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires cpuDeviceMode")
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_GROUPED
+
+	cfg.CachePlacementPolicy = "sprinkle"
+	err = cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"sprinkle"`)
+}
