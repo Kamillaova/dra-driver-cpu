@@ -74,6 +74,17 @@ type Config struct {
 	// AssumeUnsolicitedUpdatesSafe, since a move is pushed to the runtime
 	// unprompted. Defaults to false.
 	DefragEnabled bool `json:"defragEnabled,omitempty"`
+	// CachePlacementStrategy is how a claim that fits inside one uncore cache
+	// chooses among the caches that can hold it. "pack" (the default) fills
+	// the fullest cache that fits, keeping clean caches whole for larger
+	// claims; "spread" fills the emptiest, giving each claim a cache of its
+	// own while there is slack and relying on defragmentation to consolidate
+	// the small tenants when a whole-cache claim actually arrives. Without
+	// fullPhysicalCPUsOnly, spread still avoids splitting a physical core
+	// where it can, but two claims may end up on one core's siblings once a
+	// cache offers nothing better -- whole-core allocation is what actually
+	// forbids that.
+	CachePlacementStrategy string `json:"cachePlacementStrategy,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -93,6 +104,7 @@ func (c Config) LogValues() []any {
 		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
 		"reconcileSharedOnUnprepare", c.ReconcileSharedOnUnprepare,
 		"defragEnabled", c.DefragEnabled,
+		"cachePlacementStrategy", c.CachePlacementStrategy,
 	}
 }
 
@@ -113,6 +125,7 @@ type dumpConfig struct {
 	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe"`
 	ReconcileSharedOnUnprepare            bool   `json:"reconcileSharedOnUnprepare"`
 	DefragEnabled                         bool   `json:"defragEnabled"`
+	CachePlacementStrategy                string `json:"cachePlacementStrategy"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
