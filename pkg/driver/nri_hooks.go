@@ -111,6 +111,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					cp.metricsRecorder().RecordSynchronizeSkippedClaim()
 					continue
 				}
+				cp.checkClaimPartition(caLogger, desired)
 				claimUIDs = append(claimUIDs, uid)
 			}
 
@@ -170,6 +171,29 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	}
 	containerUpdates = append(containerUpdates, sharedContainerUpdates...)
 	return containerUpdates, nil
+}
+
+// checkClaimPartition reports a restored claim whose CPUs no single partition
+// holds, which is what a partition list edited under a running node looks like
+// from here. The claim is kept: its container is running on those CPUs, and
+// taking them away would stop a workload to enforce a description that changed
+// after it started. A pass moves it home once one may.
+//
+// It checks that the claim sits inside some one partition, not that it sits
+// inside its own: the driver's record of a restored claim is per request and
+// carries no device name, so which partition granted it is not recoverable
+// here. A claim that drifted wholly into another partition therefore passes.
+func (cp *CPUDriver) checkClaimPartition(logger logr.Logger, cpus cpuset.CPUSet) {
+	if cpus.IsEmpty() {
+		return
+	}
+	for _, partition := range cp.partitions {
+		if cpus.IsSubsetOf(partition.CPUs) {
+			return
+		}
+	}
+	logger.Info("restored claim is held by no single partition, leaving it where it is", "cpus", cpus.String())
+	cp.metricsRecorder().RecordMisplacedClaim()
 }
 
 // A claim given no CPUs of its own takes nothing away from anything else, so it
@@ -283,9 +307,28 @@ func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types
 	return allocations, nil
 }
 
+// sharedContainerCPUs is the mask a container without a claim is confined to:
+// whatever the claims have left over inside the partitions such a container may
+// run in.
+//
+// CCX-FORK: upstream's dynamic pool spans the whole node, with no partition to
+// keep a claimless container out of the cores claims are meant to have.
+func (cp *CPUDriver) sharedContainerCPUs() cpuset.CPUSet {
+	shared := cp.cpuAllocationStore.GetSharedCPUs()
+	// A driver whose cores have not been resolved into partitions has no
+	// description to enforce and keeps upstream's node-wide pool. On a node
+	// whose cores nobody described the resolution is one default partition over
+	// every allocatable CPU, so that is upstream's pool too; where an exclusive
+	// partition exists, its free CPUs are not the pool's to hand out.
+	if len(cp.partitions) == 0 {
+		return shared
+	}
+	return shared.Intersection(cp.defaultPartitionCPUs)
+}
+
 func (cp *CPUDriver) getSharedContainerUpdates(logger logr.Logger, excludeID types.UID) ([]*api.ContainerUpdate, error) {
 	updates := []*api.ContainerUpdate{}
-	sharedCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+	sharedCPUs := cp.sharedContainerCPUs()
 	preparedCPUs := cp.cpuAllocationStore.GetPreparedCPUs()
 	sharedCPUContainers := cp.podConfigStore.GetContainersWithSharedCPUs()
 	// An empty CPUSet is serialized by NRI as Cpus="", which means "do not
@@ -335,7 +378,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 
 	if len(entries) == 0 {
 		// This is a shared container.
-		sharedCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+		sharedCPUs := cp.sharedContainerCPUs()
 		if sharedCPUs.IsEmpty() && !cp.cpuAllocationStore.GetPreparedCPUs().IsEmpty() {
 			// NRI cannot represent an empty CPUSet as a ContainerAdjustment. Fail
 			// closed instead of allowing the runtime to keep its default affinity.
