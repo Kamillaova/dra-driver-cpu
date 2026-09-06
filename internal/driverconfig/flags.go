@@ -128,6 +128,9 @@ func (c Config) Validate() error {
 	if err := c.validateCachePlacementPolicy(); err != nil {
 		return err
 	}
+	if err := c.validateCPUPartitions(); err != nil {
+		return err
+	}
 	if err := c.validateProfiles(); err != nil {
 		return err
 	}

@@ -973,3 +973,216 @@ func TestValidate_CachePlacementPolicy(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `"sprinkle"`)
 }
+
+// TestValidate_CPUPartitions covers the checks that need no topology, which are
+// the ones every node runs for every profile.
+func TestValidate_CPUPartitions(t *testing.T) {
+	valid := []driverconfig.CPUPartition{
+		{Name: "system", Role: "reserved", CPUs: "0,16"},
+		{Name: "dataplane", Role: "exclusive", CPUs: "8-11", SMT: &driverconfig.SMT{Threads: 1}},
+	}
+	testCases := []struct {
+		name          string
+		mutate        func(*driverconfig.Config)
+		expectedError string
+	}{
+		{
+			name:   "a valid list",
+			mutate: func(c *driverconfig.Config) { c.CPUPartitions = valid },
+		},
+		{
+			name: "individual mode",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = valid
+				c.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+			},
+			expectedError: "requires cpuDeviceMode",
+		},
+		{
+			name: "beside reservedCPUs",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = valid
+				c.ReservedCPUs = "0"
+			},
+			expectedError: "names CPUs in the same scope",
+		},
+		{
+			name: "an unknown role",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "vm", Role: "burst", CPUs: "1"}}
+			},
+			expectedError: `invalid role "burst" of partition "vm"`,
+		},
+		{
+			name: "the implicit partition's name",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "default", Role: "exclusive", CPUs: "1"}}
+			},
+			expectedError: "never declared",
+		},
+		{
+			name: "a name that is not a DNS label",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "Data Plane", Role: "exclusive", CPUs: "1"}}
+			},
+			expectedError: `invalid partition name "Data Plane"`,
+		},
+		{
+			name: "a name too long for a device name",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: strings.Repeat("a", 47), Role: "exclusive", CPUs: "1"}}
+			},
+			expectedError: "at most 46 characters",
+		},
+		{
+			name: "a duplicate name",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{
+					{Name: "vm", Role: "exclusive", CPUs: "1"},
+					{Name: "vm", Role: "exclusive", CPUs: "2"},
+				}
+			},
+			expectedError: `partition "vm" is declared twice`,
+		},
+		{
+			name: "unparseable cpus",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "a-b"}}
+			},
+			expectedError: `invalid cpus "a-b" of partition "vm"`,
+		},
+		{
+			name: "no cpus",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: ""}}
+			},
+			expectedError: "names no CPUs",
+		},
+		{
+			name: "overlapping partitions",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{
+					{Name: "vm", Role: "exclusive", CPUs: "4-7"},
+					{Name: "dataplane", Role: "exclusive", CPUs: "6-9"},
+				}
+			},
+			expectedError: `partitions "vm" and "dataplane" both claim 6-7`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestResolve_CPUPartitionsFromFile: the three spellings of the thread-arity
+// expectation all parse, and the dump reads back as the operator wrote it.
+func TestResolve_CPUPartitionsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+cpuPartitions:
+  - name: system
+    role: reserved
+    cpus: "0,16"
+  - name: helpers
+    role: shared
+    cpus: "1-3"
+    smt: true
+  - name: dataplane
+    role: exclusive
+    cpus: "8-11"
+    smt: false
+  - name: vm
+    role: exclusive
+    cpus: "4-7"
+    smt: 2
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.CPUPartitions, 4)
+	assert.Equal(t, 0, result.CPUPartitions[0].ThreadsPerCore(), "an absent smt means the platform's own arity")
+	assert.Equal(t, 0, result.CPUPartitions[1].ThreadsPerCore())
+	assert.Equal(t, 1, result.CPUPartitions[2].ThreadsPerCore())
+	assert.Equal(t, 2, result.CPUPartitions[3].ThreadsPerCore())
+
+	dump := result.Dump()
+	assert.Contains(t, dump, "smt: true")
+	assert.Contains(t, dump, "smt: false")
+	assert.Contains(t, dump, "smt: 2")
+}
+
+// TestResolve_CPUPartitionsRejectUnknownFields: a misspelled partition field is
+// a typo the operator must see, not a silently ignored key.
+func TestResolve_CPUPartitionsRejectUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+cpuPartitions:
+  - name: vm
+    role: exclusive
+    cpuset: "4-7"
+`)
+
+	_, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cpuset")
+}
+
+// TestResolve_CPUPartitionsRejectBadSMT: smt takes true, false or a thread
+// count, and anything else fails the file rather than defaulting.
+func TestResolve_CPUPartitionsRejectBadSMT(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+cpuPartitions:
+  - name: vm
+    role: exclusive
+    cpus: "4-7"
+    smt: "off"
+`)
+
+	_, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be true, false or a thread count")
+}
+
+// TestValidate_ProfilesValidateEverywhere: every profile is checked on every
+// node, so a typo in the epyc profile fails a fleet's x3d nodes too -- the
+// operator learns at rollout, not when the one epyc node reboots.
+func TestValidate_ProfilesValidateEverywhere(t *testing.T) {
+	partitions := []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "2-3"}}
+
+	t.Run("a valid override", func(t *testing.T) {
+		cfg := driverconfig.Default()
+		cfg.Profiles = map[string]driverconfig.Profile{"under-test": {ReservedCPUs: ptr.To("0-1")}}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("an override the fleet-wide fields contradict", func(t *testing.T) {
+		cfg := driverconfig.Default()
+		cfg.CPUPartitions = partitions
+		cfg.Profiles = map[string]driverconfig.Profile{"under-test": {ReservedCPUs: ptr.To("0-1")}}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `config profile "under-test" does not validate`)
+		assert.Contains(t, err.Error(), "names CPUs in the same scope")
+	})
+}
