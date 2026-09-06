@@ -35,11 +35,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("invalid cpuDeviceMode %q: must be %q or %q",
 			c.CPUDeviceMode, device.CPU_DEVICE_MODE_GROUPED, device.CPU_DEVICE_MODE_INDIVIDUAL)
 	}
-	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-		if c.GroupBy != device.GROUP_BY_SOCKET && c.GroupBy != device.GROUP_BY_NUMA_NODE && c.GroupBy != device.GROUP_BY_MACHINE {
-			return fmt.Errorf("invalid groupBy %q: must be %q, %q, or %q",
-				c.GroupBy, device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_MACHINE)
-		}
+	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED && !slices.Contains(groupings, c.GroupBy) {
+		return fmt.Errorf("invalid groupBy %q: must be one of %q", c.GroupBy, groupings)
 	}
 	if c.Allocator != AllocatorExternal && c.Allocator != AllocatorCPUManager {
 		return fmt.Errorf("invalid allocator %q: must be %q or %q",
@@ -115,6 +112,14 @@ func (c Config) validateDefrag() error {
 	if c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
 		return fmt.Errorf("invalid defragEnabled: requires cpuDeviceMode %q, got %q",
 			device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
+	}
+	// Grouping by uncore cache is the case where the driver does choose the CPUs
+	// and still may not move them: a device is one cache there, so a claim moved
+	// to another cache no longer sits on the device its allocation names, and the
+	// scheduler's per-device accounting stops describing the node.
+	if c.GroupBy == device.GROUP_BY_UNCORE_CACHE {
+		return fmt.Errorf("invalid defragEnabled: with groupBy %q a device is one uncore cache, so a move between caches would leave the device the claim was allocated on",
+			device.GROUP_BY_UNCORE_CACHE)
 	}
 	if c.GroupBy != device.GROUP_BY_NUMA_NODE && c.GroupBy != device.GROUP_BY_SOCKET {
 		return fmt.Errorf("invalid defragEnabled: requires groupBy %q or %q, got %q",
