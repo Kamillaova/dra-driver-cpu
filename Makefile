@@ -72,6 +72,7 @@ clean: ## clean
 
 test-unit: ## run tests
 	CGO_ENABLED=1 GOTOOLCHAIN=${TOOOLCHAIN_MODE} go test -v -race -count 1 -coverprofile=coverage.out ./pkg/... ./internal/...
+	cd api && CGO_ENABLED=1 GOTOOLCHAIN=${TOOOLCHAIN_MODE} go test -v -race -count 1 ./...
 
 test-e2e-local: ## run e2e local tests (binary must be pre-built)
 	go test -v -count 1 ./test/e2e_local/...
@@ -259,12 +260,15 @@ test-e2e-kind: ci-kind-setup test-e2e ## run e2e test against a purpose-built ki
 
 lint:  ## run the linter against the codebase
 	$(GOLANGCI_LINT) run ./... $(GOLANGCI_LINT_EXTRA_ARGS)
+	cd api && $(GOLANGCI_LINT) run ./... $(GOLANGCI_LINT_EXTRA_ARGS)
 
 modernize: ## run modernize to report suggested code modernizations
 	go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(GOPLS_VERSION) -diff ./...
+	cd api && go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(GOPLS_VERSION) -diff ./...
 
 modernize-fix: ## apply modernize suggestions
 	go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(GOPLS_VERSION) -fix ./...
+	cd api && go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(GOPLS_VERSION) -fix ./...
 
 # dependencies
 .PHONY: install-yq

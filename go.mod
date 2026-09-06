@@ -8,6 +8,7 @@ require (
 	github.com/go-logr/stdr v1.2.2
 	github.com/google/go-cmp v0.7.0
 	github.com/google/jsonschema-go v0.4.3
+	github.com/kubernetes-sigs/dra-driver-cpu/api v0.0.0
 	github.com/onsi/ginkgo/v2 v2.28.1
 	github.com/onsi/gomega v1.40.0
 	github.com/prometheus/client_golang v1.24.0
@@ -98,3 +99,5 @@ require (
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
 )
+
+replace github.com/kubernetes-sigs/dra-driver-cpu/api => ./api
