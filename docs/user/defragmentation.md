@@ -76,6 +76,12 @@ cannot track a claim that moves. With `defragEnabled` its value is the literal s
 than a cpuset, so a workload that parses it fails loudly instead of quietly pinning itself to CPUs its
 claim has left.
 
+With [`sharedPoolCPUs`](configuration.md#driver-configuration) configured, the driver also injects
+`DRA_SHARED_CPUS`: the static pool CPUs of the claim's NUMA nodes, which the container has appended to
+its cpuset for its auxiliary threads. That variable **is** safe to read — the pool is static and a
+move preserves the claim's NUMA footprint, so it cannot go stale. A workload's exclusive CPUs are then
+`sched_getaffinity(2)` minus `DRA_SHARED_CPUS`.
+
 Read the current CPUs from the kernel instead:
 
 - `sched_getaffinity(2)`, which the kernel keeps current through a move; or
