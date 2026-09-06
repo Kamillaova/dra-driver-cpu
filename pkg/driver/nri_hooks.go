@@ -27,6 +27,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
+	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 )
 
 // Synchronize is called by the NRI to synchronize the state of the driver during bootstrap.
@@ -61,8 +62,13 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 			var claimUIDs []types.UID
 			allGuaranteedCPUs := cpuset.New()
 			validatedClaimAllocations := make(map[types.UID]cpuset.CPUSet)
+			reportedCDIDevices := runtimeCDIDevices(container)
 			for uid, cpus := range claimAllocations {
 				caLogger := cLogger.WithValues("claimUID", uid)
+				if !claimInjectedByRuntime(reportedCDIDevices, uid) {
+					caLogger.Info("ignoring claim the runtime injected no CDI device for during synchronize")
+					continue
+				}
 				if !cdiCacheRefreshAttempted {
 					err = cp.cdiMgr.Refresh()
 					cdiCacheRefreshAttempted = true
@@ -104,6 +110,14 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					cLogger.Error(err, "treating container as unclaimed: its claim ownership conflicts with an earlier one during synchronize")
 					cp.metricsRecorder().RecordSynchronizeSkippedClaim()
 					claimUIDs = nil
+				} else {
+					// This container is exactly as trustworthy a source as a fresh
+					// Prepare: CreateContainer's CRI-O fallback reads this to
+					// authenticate a container recreated after this driver
+					// restarts, on a runtime that never reports CDI devices.
+					for _, uid := range claimUIDs {
+						claimTracker.SetReservedFor(uid, []types.UID{types.UID(pod.Uid)})
+					}
 				}
 			}
 
@@ -142,6 +156,41 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	}
 	containerUpdates = append(containerUpdates, sharedContainerUpdates...)
 	return containerUpdates, nil
+}
+
+// runtimeCDIDevices returns the CDI device names the runtime reports for the
+// container, or nil when it reports none.
+//
+// A nil result means "unknown", not "none": not every runtime fills the field
+// in. Callers must treat nil as inconclusive rather than as a rejection.
+func runtimeCDIDevices(ctr *api.Container) map[string]struct{} {
+	devices := ctr.GetCDIDevices()
+	if len(devices) == 0 {
+		return nil
+	}
+	names := make(map[string]struct{}, len(devices))
+	for _, dev := range devices {
+		names[dev.GetName()] = struct{}{}
+	}
+	return names
+}
+
+// claimInjectedByRuntime reports whether the runtime confirms this driver's CDI
+// device for claimUID was injected into the container.
+//
+// The DRA_CPUSET entry a container carries comes from its own pod spec, so a pod
+// can name another pod's claim and, by winning the race to CreateContainer, take
+// that claim's CPUs. The runtime's own record of the CDI devices kubelet asked it
+// to inject cannot be forged that way, which makes it the stronger signal.
+//
+// reported must come from runtimeCDIDevices. A nil map means the runtime does not
+// report CDI devices, and this returns true so the remaining checks decide.
+func claimInjectedByRuntime(reported map[string]struct{}, claimUID types.UID) bool {
+	if reported == nil {
+		return true
+	}
+	_, ok := reported[cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName(claimUID))]
+	return ok
 }
 
 func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types.UID]cpuset.CPUSet, error) {
@@ -255,7 +304,19 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		// entries that match a claim prepared by this driver.
 		guaranteedCPUs := cpuset.New()
 		claimUIDs := []types.UID{}
+		reportedCDIDevices := runtimeCDIDevices(ctr)
 		for uid, cpus := range claimAllocations {
+			if !claimInjectedByRuntime(reportedCDIDevices, uid) {
+				return nil, nil, fmt.Errorf("container claims %q but the runtime injected no CDI device for it", uid)
+			}
+			if reportedCDIDevices == nil {
+				// The runtime reports no CDI devices at all (CRI-O today); fall
+				// back to the claim's own API-server reservation, which a pod
+				// spec cannot forge the way it can a DRA_CPUSET_* env value.
+				if reserved, recorded := cp.claimTracker.ReservedFor(uid, podUID); !reserved || !recorded {
+					return nil, nil, fmt.Errorf("container claims %q but the pod is not in its reservation", uid)
+				}
+			}
 			guaranteedCPUs = guaranteedCPUs.Union(cpus)
 			claimUIDs = append(claimUIDs, uid)
 		}
