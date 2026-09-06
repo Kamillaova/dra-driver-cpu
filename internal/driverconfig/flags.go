@@ -28,6 +28,17 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 )
 
+// groupings are the values groupBy takes. One list, because the config file's
+// validator, the deprecated flag's and the generated schema have to accept the
+// same set, and a value added to one of them alone is a value the driver either
+// refuses or never hears about.
+var groupings = []string{
+	device.GROUP_BY_NUMA_NODE,
+	device.GROUP_BY_SOCKET,
+	device.GROUP_BY_MACHINE,
+	device.GROUP_BY_UNCORE_CACHE,
+}
+
 type FlagSource struct {
 	overrides map[string]any
 }
@@ -70,7 +81,7 @@ func (c *Config) AddFlags(fs *flag.FlagSet) {
 	fs.Var(newCPUDeviceModeValue(&c.CPUDeviceMode, c.CPUDeviceMode), "cpu-device-mode", deprecatedUsage("cpuDeviceMode",
 		"Sets the mode for exposing CPU devices. 'grouped' exposes a single device per socket or numa node (based on --group-by). 'individual' exposes each CPU as a separate device."))
 	fs.Var(newGroupByValue(&c.GroupBy, c.GroupBy), "group-by", deprecatedUsage("groupBy",
-		"When --cpu-device-mode=grouped, sets the criteria for grouping CPUs. Can be set to 'socket', 'numanode', or 'machine' (machine mode requires an external scheduler to include cpuset configuration in claim allocation results)."))
+		"When --cpu-device-mode=grouped, sets the criteria for grouping CPUs. Can be set to 'socket', 'numanode', 'uncorecache', or 'machine' (machine mode requires an external scheduler to include cpuset configuration in claim allocation results)."))
 	fs.StringVar(&c.ReservedCPUs, "reserved-cpus", c.ReservedCPUs, deprecatedUsage("reservedCPUs",
 		"cpuset of CPUs to be excluded from ResourceSlice."))
 	fs.StringVar(&c.HostnameOverride, "hostname-override", c.HostnameOverride, deprecatedUsage("hostnameOverride",
@@ -108,11 +119,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("invalid cpuDeviceMode %q: must be %q or %q",
 			c.CPUDeviceMode, device.CPU_DEVICE_MODE_GROUPED, device.CPU_DEVICE_MODE_INDIVIDUAL)
 	}
-	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-		if c.GroupBy != device.GROUP_BY_SOCKET && c.GroupBy != device.GROUP_BY_NUMA_NODE && c.GroupBy != device.GROUP_BY_MACHINE {
-			return fmt.Errorf("invalid groupBy %q: must be %q, %q, or %q",
-				c.GroupBy, device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_MACHINE)
-		}
+	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED && !slices.Contains(groupings, c.GroupBy) {
+		return fmt.Errorf("invalid groupBy %q: must be one of %q", c.GroupBy, groupings)
 	}
 	// Whole-core allocation is only the driver's to enforce when the driver
 	// chooses which CPUs back a claim. In individual mode the scheduler picks
@@ -164,6 +172,14 @@ func (c Config) validateDefrag() error {
 	if c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
 		return fmt.Errorf("invalid defragEnabled: requires cpuDeviceMode %q, got %q",
 			device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
+	}
+	// Grouping by uncore cache is the case where the driver does choose the CPUs
+	// and still may not move them: a device is one cache there, so a claim moved
+	// to another cache no longer sits on the device its allocation names, and the
+	// scheduler's per-device accounting stops describing the node.
+	if c.GroupBy == device.GROUP_BY_UNCORE_CACHE {
+		return fmt.Errorf("invalid defragEnabled: with groupBy %q a device is one uncore cache, so a move between caches would leave the device the claim was allocated on",
+			device.GROUP_BY_UNCORE_CACHE)
 	}
 	if c.GroupBy != device.GROUP_BY_NUMA_NODE && c.GroupBy != device.GROUP_BY_SOCKET {
 		return fmt.Errorf("invalid defragEnabled: requires groupBy %q or %q, got %q",
@@ -267,8 +283,8 @@ func (v *groupByValue) String() string {
 }
 
 func (v *groupByValue) Set(s string) error {
-	if s != device.GROUP_BY_SOCKET && s != device.GROUP_BY_NUMA_NODE && s != device.GROUP_BY_MACHINE {
-		return fmt.Errorf("invalid value: %q, must be %s, %s or %s", s, device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_MACHINE)
+	if !slices.Contains(groupings, s) {
+		return fmt.Errorf("invalid value: %q, must be one of %q", s, groupings)
 	}
 	*v.value = s
 	return nil

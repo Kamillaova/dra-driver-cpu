@@ -28,13 +28,14 @@
           "type": "boolean"
         },
         "groupBy": {
-          "description": "**Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.groupBy` instead. Grouping criteria when `cpuDeviceMode=grouped`: `numanode`, `socket` or `machine`; defaults to `numanode` when empty.",
+          "description": "**Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.groupBy` instead. Grouping criteria when `cpuDeviceMode=grouped`: `numanode`, `socket`, `machine` or `uncorecache`; defaults to `numanode` when empty.",
           "type": "string",
           "enum": [
             "",
             "numanode",
             "socket",
-            "machine"
+            "machine",
+            "uncorecache"
           ]
         },
         "hostnameOverride": {
@@ -303,7 +304,8 @@
           "enum": [
             "numanode",
             "socket",
-            "machine"
+            "machine",
+            "uncorecache"
           ]
         },
         "hostnameOverride": {
