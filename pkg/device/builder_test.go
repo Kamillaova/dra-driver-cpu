@@ -144,9 +144,9 @@ func TestMachineGroupedUsesTopologyValidatedCPUs(t *testing.T) {
 	// CPU 4 was omitted from CPUDetails because topology discovery could not
 	// validate it.
 
-	devices, _ := device.BuildGrouped(
+	devices, _, _ := device.BuildGrouped(
 		logr.Discard(), device.GROUP_BY_MACHINE, topo, cpuset.New(),
-		store.NewPCIeRootMapper(), false,
+		store.NewPCIeRootMapper(), false, false,
 	)
 	require.Len(t, devices, 1)
 
@@ -248,11 +248,10 @@ func fakeSMTCacheTopology() *cpuinfo.CPUTopology {
 
 func TestGroupedFullPhysicalCPUsOnly(t *testing.T) {
 	topo := fakeSMTCacheTopology()
-	online := topo.CPUDetails.CPUs()
 
 	buildOne := func(t *testing.T, reserved cpuset.CPUSet, fullPhysicalCPUsOnly bool) resourceapi.Device {
 		t.Helper()
-		devices, _, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo, online,
+		devices, _, _ := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
 			reserved, store.NewPCIeRootMapper(), false, fullPhysicalCPUsOnly)
 		require.Len(t, devices, 1)
 		return devices[0]
@@ -316,7 +315,7 @@ func TestGroupedFullPhysicalCPUsOnlyIsANoOpWithoutSMT(t *testing.T) {
 	// which is disabled rather than a no-op.
 	topo := fakeCacheTopology()
 	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
-		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true)
+		cpuset.New(), store.NewPCIeRootMapper(), false, true)
 	require.Len(t, devices, 1)
 
 	capacity, ok := devices[0].Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
@@ -358,7 +357,7 @@ func twoNUMANodesOneNonUniform() *cpuinfo.CPUTopology {
 func TestGroupedFullPhysicalCPUsOnlyIsPerDevice(t *testing.T) {
 	topo := twoNUMANodesOneNonUniform()
 	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
-		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true)
+		cpuset.New(), store.NewPCIeRootMapper(), false, true)
 	require.Len(t, devices, 2)
 
 	byName := make(map[string]resourceapi.Device, len(devices))
@@ -386,7 +385,7 @@ func TestGroupedThreadsPerCoreIndependentOfFullPhysicalCPUsOnly(t *testing.T) {
 	// turned on whole-core allocation.
 	topo := fakeSMTCacheTopology()
 	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, topo,
-		topo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, false)
+		cpuset.New(), store.NewPCIeRootMapper(), false, false)
 	require.Len(t, devices, 1)
 
 	require.True(t, *devices[0].Attributes[device.AttributeSMTEnabled].BoolValue)
@@ -411,7 +410,7 @@ func TestGroupedNonUniformDeviceHasNoSMTAttribute(t *testing.T) {
 	}
 
 	devices, _, deviceThreadsPerCore := device.BuildGrouped(logr.Discard(), device.GROUP_BY_NUMA_NODE, hybridTopo,
-		hybridTopo.CPUDetails.CPUs(), cpuset.New(), store.NewPCIeRootMapper(), false, true)
+		cpuset.New(), store.NewPCIeRootMapper(), false, true)
 	require.Len(t, devices, 1)
 
 	require.EqualValues(t, 0, *devices[0].Attributes[device.AttributeThreadsPerCore].IntValue)

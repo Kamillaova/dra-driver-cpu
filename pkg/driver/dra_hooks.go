@@ -25,6 +25,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	resourceapi "k8s.io/api/resource/v1"
@@ -176,6 +178,17 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		}
 
 		claimCPUCount := int(count)
+		// The device's requestPolicy makes the scheduler round a request up to
+		// whole cores, so an amount that is not a multiple means the policy was
+		// not applied -- most likely DRAConsumableCapacity is enabled on the
+		// apiserver but not on kube-scheduler. Say so, because the alternative
+		// is an obscure allocation failure below. Read per device: another
+		// device's non-uniform cores must not excuse this one's mismatch.
+		threadsPerCore := cp.topology.deviceThreadsPerCore[alloc.Device]
+		if threadsPerCore > 1 && claimCPUCount%threadsPerCore != 0 {
+			return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q consumed %d CPUs, which is not a multiple of the %d-CPU core size: the scheduler did not honour the capacity requestPolicy, check that the DRAConsumableCapacity feature gate is enabled on kube-scheduler",
+				alloc.Device, claimCPUCount, threadsPerCore)}
+		}
 		logger.V(4).Info("found CPU request", "numCPUs", claimCPUCount, "device", alloc.Device)
 
 		topo := cp.topology.cpuTopology
@@ -198,7 +211,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 			socketCPUs := topo.CPUDetails.CPUsInSockets(socketID)
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(socketCPUs)
 			logger.V(4).Info("socket CPU availability", "socketID", socketID, "socketCPUs", socketCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.cpuAllocator.Allocate(logger, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			cur, err = cp.takeCPUsForDevice(logger, topo, availableCPUsForDevice, preferredCPUs, claimCPUCount, threadsPerCore)
 		case device.GROUP_BY_NUMA_NODE:
 			numaNodeID, ok := cp.topology.deviceNameToNUMANodeID[alloc.Device]
 			if !ok {
@@ -207,7 +220,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 			numaCPUs := topo.CPUDetails.CPUsInNUMANodes(numaNodeID)
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(numaCPUs)
 			logger.V(4).Info("NUMA node CPU availability", "numaNodeID", numaNodeID, "numaCPUs", numaCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.cpuAllocator.Allocate(logger, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			cur, err = cp.takeCPUsForDevice(logger, topo, availableCPUsForDevice, preferredCPUs, claimCPUCount, threadsPerCore)
 		case device.GROUP_BY_MACHINE:
 			// no mapping needed in machine mode - just one device = the whole machine
 			availableCPUs := topo.CPUDetails.CPUs().Difference(cp.topology.reservedCPUs)
@@ -243,6 +256,22 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 	cp.metrics.RecordClaimAllocatedCPUs(assignedCPUs.Size())
 	cp.refreshAllocationMetrics()
 	return result
+}
+
+// takeCPUsForDevice picks the CPUs backing one device's share of a claim.
+// threadsPerCore is this specific device's own effective allocation step (0
+// when whole-core allocation is off or this device has no single thread
+// count), not a node-wide answer: a different device's non-uniform cores must
+// not change what this call does.
+//
+// With whole-core allocation in effect it takes complete physical cores, which
+// also keeps the claim inside as few uncore caches as possible. Otherwise it uses
+// the CPU-granular allocator, so behaviour is unchanged when the option is off.
+func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, topo *cpuinfo.CPUTopology, available, preferred cpuset.CPUSet, numCPUs int, threadsPerCore int) (cpuset.CPUSet, error) {
+	if threadsPerCore > 1 {
+		return coreselect.TakeWholeCores(topo, available, numCPUs)
+	}
+	return cp.cpuAllocator.Allocate(logger, available, preferred, numCPUs)
 }
 
 func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
