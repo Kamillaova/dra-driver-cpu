@@ -29,13 +29,22 @@ See [docs/user/defragmentation.md](docs/user/defragmentation.md) for how to enab
 The `DRA_CPUSET_<claimUID>` variable keeps upstream's name and format, so neither direction needs a
 reader for a legacy format and a claim's identity survives either swap.
 
-With `defragEnabled` the injected value is the literal string `dynamic` rather than a cpuset,
-because a claim whose placement may change has none to name for the life of its container.
+For a claim stating `cpuConfig.relocatable: true` the injected value is the literal string `dynamic`
+rather than a cpuset, because a claim whose placement may change has none to name for the life of its
+container. A claim that permits no move keeps its cpuset there, whatever the node's configuration.
 
 **upstream → fork: no drain.** Identity comes from the variable's name. A spec written by upstream
 carries no `dra.cpu/placements` annotation, so the fork falls back to parsing that spec's own env value,
 which for an upstream spec is the real placement. Each claim gains an annotation the next time its spec
 is written.
+
+**Within the fork, a claim's mobility does not survive the driver version that introduced it.** A spec
+written before `dra.cpu/relocatable` existed carries no such annotation, and an absent one reads as
+immobile — the field's default, and the safe reading. So upgrading a node past that version leaves its
+already-running claims unmovable, however their templates were written, until their pods are recreated:
+nothing rewrites a spec except a Prepare or a move, and a move is what the claim can no longer have.
+Defragmentation therefore appears to stop on that node and resume as its pods turn over. Recreate the
+pods to have it resume at once.
 
 **fork → upstream: no drain while nothing moves a claim**, which holds until the defragmenter lands.
 The annotation always agrees with the env value, so an upstream driver reading these specs behaves
@@ -67,8 +76,9 @@ DaemonSet.
 Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
-- `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`,
-  `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`, `decodePlacements`
+- `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiRelocatableAnnotation`,
+  `cdiEnvDynamicValue`, `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`,
+  `decodePlacements`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries` and
   `defragRetryDue` fields, and `Config.DefragEnabled`
@@ -85,7 +95,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
   `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
-  `GetRebindOrigin`, `GetResourceClaimRequests`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
+  `GetRebindOrigin`, `ClaimRecord`, `GetClaimRecord`, `IsRelocatable`, `HoldsExclusiveCPUs`,
+  `ExclusiveClaimAllocations`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 
@@ -171,7 +182,12 @@ behaviour) rather than silently adapting.
   reshaped the planner: the ideal packing is a repair target for misaligned claims only, and a claim
   already spread as little as its size allows is never herded into the ideal's preferred slots for
   tidiness (watched on hardware: six moves where three were needed, one of them intra-cache).
+- **The opt-out of being moved is the claim's, not the pod's.** The design put it on the pod, as an
+  annotation carried through `ContainerState`. It belongs on the claim: mobility is a property of the
+  CPUs a claim holds, the claim already carries a configuration the tenant writes, and a pod
+  annotation would have said nothing about a claim two pods share. It is also an opt-*in* rather than
+  an opt-out, because a wrong `true` silently costs a workload its per-vCPU pinning while a wrong
+  `false` costs only capacity, and visibly.
 - **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
-  node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
-  which needs a flag carried through `ContainerState`. Neither affects correctness — the first only
-  lets a pass do avoidable work on a node about to be emptied.
+  node informer and the RBAC for it. It does not affect correctness — it only lets a pass do avoidable
+  work on a node about to be emptied.

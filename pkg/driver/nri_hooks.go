@@ -94,7 +94,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					caLogger.Error(err, "ignoring claim not prepared by this driver during synchronize")
 					continue
 				}
-				desired := store.UnionOf(recorded)
+				desired := store.UnionOf(recorded.Requests)
 				if !entry.dynamic && !desired.Equals(entry.cpus) {
 					// Expected whenever the claim was moved after its container
 					// started. The ContainerUpdate below carries the container to
