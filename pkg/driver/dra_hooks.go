@@ -255,11 +255,12 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 
 		// CCX-FORK: upstream takes the CPUs of the socket or NUMA node the device
 		// groups. A device answers for its partition's share of that group, so
-		// its own published CPUs are the set a claim on it may take from.
+		// its own published CPUs are the set a claim on it may take from, and
+		// that holds however small the group is -- a whole cache included.
 		deviceCPUs, published := cp.topology.deviceNameToCPUs[alloc.Device]
 
 		switch cp.cpuDeviceGroupBy {
-		case device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE:
+		case device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
 			if !published {
 				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
 			}
