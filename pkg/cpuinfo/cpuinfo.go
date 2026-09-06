@@ -51,6 +51,21 @@ func OnlineCPUs(logger logr.Logger, sysfs fs.ReadLinkFS) (cpuset.CPUSet, error) 
 	return allCPUs, nil
 }
 
+// PresentCPUs returns the kernel's cpu_present_mask: every CPU the kernel knows
+// about, online or not. An offline CPU has no topology or cache sysfs at all, so
+// it can be counted here and nowhere else.
+func PresentCPUs(logger logr.Logger, sysfs fs.ReadLinkFS) (cpuset.CPUSet, error) {
+	cpuData, err := fs.ReadFile(sysfs, filepath.Join("devices", "system", "cpu", "present"))
+	if err != nil {
+		return cpuset.New(), err
+	}
+	presentCPUs, err := cpuset.Parse(strings.TrimSpace(string(cpuData)))
+	if err != nil {
+		return cpuset.New(), err
+	}
+	return presentCPUs, nil
+}
+
 // CoreType is an enum for the type of CPU core.
 type CoreType int
 
