@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/containerd/nri/pkg/stub"
@@ -114,6 +115,16 @@ type CPUDriver struct {
 	// reconcileSharedOnUnprepare widens shared containers as soon as a claim is
 	// released rather than at their next lifecycle event.
 	reconcileSharedOnUnprepare bool
+	// applyMu serializes the work that decides which CPUs back a claim: the DRA
+	// prepare and unprepare hooks, the NRI hooks that read a placement or record
+	// container state, and the background worker's local phases. It also covers
+	// the store pointers themselves, which Synchronize replaces wholesale.
+	//
+	// It must never be held across a call into the runtime. The runtime may be
+	// holding, on behalf of an inbound hook of ours, the lock our outbound call
+	// needs; if that hook is waiting here meanwhile, neither side can proceed.
+	// Inbound hooks may hold it freely, since answering one makes no call out.
+	applyMu sync.Mutex
 
 	kubeletRootDir string
 }

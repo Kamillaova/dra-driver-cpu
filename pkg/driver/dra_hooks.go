@@ -85,6 +85,13 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 		return result, nil
 	}
 
+	// Held across the whole batch: a claim's CPUs are chosen from what the store
+	// says is free and then written to its CDI spec, and the two must not be
+	// separated. Both prepare paths also reuse an existing allocation when they
+	// find one, so the read belongs inside as well.
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
 	for _, claim := range claims {
 		start := time.Now()
 		cLogger := logger.WithValues("claim", ctxlog.KObj(claim), "claimUID", claim.UID)
@@ -394,6 +401,9 @@ func (cp *CPUDriver) UnprepareResourceClaims(ctx context.Context, claims []kubel
 	if len(claims) == 0 {
 		return result, nil
 	}
+
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
 
 	for _, claim := range claims {
 		// note kubeletplugin.NamespacedObject doesn't implement KMetadata
