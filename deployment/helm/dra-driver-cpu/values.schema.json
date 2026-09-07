@@ -293,6 +293,9 @@
             "additionalProperties": false
           }
         },
+        "defragAllowTransientOverlap": {
+          "type": "boolean"
+        },
         "defragEnabled": {
           "type": "boolean"
         },
