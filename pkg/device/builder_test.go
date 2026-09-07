@@ -625,7 +625,7 @@ func TestPoolPartitionPublishesOneDevicePerNUMANode(t *testing.T) {
 		{Name: "helpers", Role: device.PARTITION_ROLE_SHARED, CPUs: pool},
 	}, online.Difference(pool))
 
-	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_MACHINE, topo, online,
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_MACHINE, topo,
 		pool, store.NewPCIeRootMapper(), true, false, partitions)
 
 	require.Len(t, built.ByPartition, 2)
