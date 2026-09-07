@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpumanager"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -150,9 +152,28 @@ func claimUIDFromDeviceName(name string) (types.UID, bool) {
 // the shared-pool guard for currently running shared containers. A shared
 // container from the same pod may not have been created yet when this DRA hook
 // runs, so that case is detected later by the NRI CreateContainer check.
-func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet) error {
+func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, requests []store.RequestAllocation) error {
 	hasSharedContainers := len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
-	return cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpus, hasSharedContainers)
+	return cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, requests, hasSharedContainers)
+}
+
+// Every device this driver publishes grants CPUs its claim holds alone, so
+// every request of a claim it prepares is exclusive.
+func requestAllocations(byRequest map[string]cpuset.CPUSet) []store.RequestAllocation {
+	names := make([]string, 0, len(byRequest))
+	for name := range byRequest {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	requests := make([]store.RequestAllocation, 0, len(names))
+	for _, name := range names {
+		requests = append(requests, store.RequestAllocation{
+			Request: name,
+			CPUs:    byRequest[name],
+			Role:    store.RoleExclusive,
+		})
+	}
+	return requests
 }
 
 func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
@@ -164,17 +185,18 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		}
 	}
 
-	if existingCPUs, ok := cp.cpuAllocationStore.GetResourceClaimAllocation(claim.UID); ok {
-		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", existingCPUs.String())
+	if existing, ok := cp.cpuAllocationStore.GetResourceClaimRequests(claim.UID); ok {
+		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", store.UnionOf(existing).String())
 		// Even if the claim is already allocated in our in-memory store (which happens when a duplicate prepare
 		// call is invoked without an intermediate unprepare), we must call prepareDevices and return the result back to Kubelet.
 		// If the CDI file is already created on disk, the CDI manager will safely overwrite it with the same configuration.
 		// This ensures that the CDI specification file is written/recreated on disk (for example, if the driver
 		// pod restarted and synchronized its memory store from the runtime but did not recreate the CDI files on disk).
-		return cp.prepareDevices(logger, claim, existingCPUs)
+		return cp.prepareDevices(logger, claim, existing)
 	}
 
 	var cpuAssignment cpuset.CPUSet
+	byRequest := map[string]cpuset.CPUSet{}
 	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs()
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != cp.driverName {
@@ -248,6 +270,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 			return kubeletplugin.PrepareResult{Err: err}
 		}
 		cpuAssignment = cpuAssignment.Union(cur)
+		byRequest[alloc.Request] = byRequest[alloc.Request].Union(cur)
 		logger.V(2).Info("CPU assignment for device", "device", alloc.Device, "assigned", cur.String(), "allAssigned", cpuAssignment.String())
 	}
 
@@ -256,11 +279,12 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		return kubeletplugin.PrepareResult{}
 	}
 
+	requests := requestAllocations(byRequest)
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
-	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, cpuAssignment); err != nil {
+	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, requests); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, cpuAssignment)
+	result := cp.prepareDevices(logger, claim, requests)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 		return result
@@ -299,6 +323,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	}
 
 	claimCPUIDs := []int{}
+	byRequest := map[string]cpuset.CPUSet{}
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != cp.driverName {
 			continue
@@ -310,6 +335,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 			}
 		}
 		claimCPUIDs = append(claimCPUIDs, cpuID)
+		byRequest[alloc.Request] = byRequest[alloc.Request].Union(cpuset.New(cpuID))
 	}
 
 	if len(claimCPUIDs) == 0 {
@@ -318,7 +344,8 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	}
 
 	claimCPUSet := cpuset.New(claimCPUIDs...)
-	if existingCPUs, ok := cp.cpuAllocationStore.GetResourceClaimAllocation(claim.UID); ok {
+	if existing, ok := cp.cpuAllocationStore.GetResourceClaimRequests(claim.UID); ok {
+		existingCPUs := store.UnionOf(existing)
 		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", existingCPUs.String())
 		if !existingCPUs.Equals(claimCPUSet) {
 			// This should realistically never happen as the claim is immutable.
@@ -326,7 +353,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 				Err: fmt.Errorf("claim %s/%s is already prepared with different CPUs %s (requested %s)", claim.Namespace, claim.Name, existingCPUs.String(), claimCPUSet.String()),
 			}
 		}
-		return cp.prepareDevices(logger, claim, existingCPUs)
+		return cp.prepareDevices(logger, claim, existing)
 	}
 
 	// All the CPUs allocated to a claim must not be prepared for another claim.
@@ -337,11 +364,12 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 		}
 	}
 
+	requests := requestAllocations(byRequest)
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
-	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, claimCPUSet); err != nil {
+	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, requests); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, claimCPUSet)
+	result := cp.prepareDevices(logger, claim, requests)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 		return result
@@ -363,11 +391,11 @@ func (cp *CPUDriver) cdiEnvValue(cpus cpuset.CPUSet) string {
 	return cpus.String()
 }
 
-func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, claimCPUSet cpuset.CPUSet) kubeletplugin.PrepareResult {
+func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, requests []store.RequestAllocation) kubeletplugin.PrepareResult {
 	deviceName := getCDIDeviceName(claim.UID)
-	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, cp.cdiEnvValue(claimCPUSet))
-	// CCX-FORK: the cpuset argument is the fork's placement record.
-	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar, claimCPUSet); err != nil {
+	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, cp.cdiEnvValue(store.UnionOf(requests)))
+	// CCX-FORK: the requests argument is the fork's placement record.
+	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar, requests); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
 
