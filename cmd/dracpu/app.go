@@ -160,6 +160,19 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	})
 	// Add metrics handler
 	mux.Handle("/metrics", promhttp.Handler())
+	// CCX-FORK: which CPUs back each claim is the driver's own answer and is
+	// published nowhere else, so it is served on request. Registered before the
+	// driver exists, because the server comes up first so that healthz can answer
+	// while the driver initializes.
+	var placements atomic.Pointer[driver.CPUDriver]
+	mux.HandleFunc("/placements", func(w http.ResponseWriter, r *http.Request) {
+		dracpu := placements.Load()
+		if dracpu == nil {
+			http.Error(w, "driver has not started yet", http.StatusServiceUnavailable)
+			return
+		}
+		dracpu.ServePlacements(w, r.WithContext(ctxlog.NewContext(r.Context(), logger)))
+	})
 	server := &http.Server{
 		Addr:              cfg.BindAddress,
 		Handler:           mux,
@@ -234,6 +247,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	if err != nil {
 		return fmt.Errorf("driver failed to initialize: %w", err)
 	}
+	placements.Store(dracpu)
 	asyncErr, err := dracpu.Start(ctx)
 	if err != nil {
 		return fmt.Errorf("driver failed to start: %w", err)
