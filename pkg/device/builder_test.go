@@ -269,7 +269,7 @@ func TestGroupedUncoreCacheDevices(t *testing.T) {
 	online := topo.CPUDetails.CPUs()
 	reserved := cpuset.New(0)
 
-	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo,
 		reserved, store.NewPCIeRootMapper(), true, false, unpartitioned(online.Difference(reserved)))
 	devices := onlyPartition(t, built.ByPartition)
 	require.Equal(t, []string{
@@ -310,7 +310,7 @@ func TestGroupedUncoreCacheDevicesAreContiguousPerNUMANode(t *testing.T) {
 	topo := fakeFourCacheTopology()
 	online := topo.CPUDetails.CPUs()
 
-	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo,
 		cpuset.New(), store.NewPCIeRootMapper(), false, false, unpartitioned(online))
 	devices := onlyPartition(t, built.ByPartition)
 	require.Equal(t, []string{
@@ -338,7 +338,7 @@ func TestGroupedUncoreCacheDevicesPerPartition(t *testing.T) {
 		{Name: "vm", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: vm},
 	}, online)
 
-	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo,
 		cpuset.New(), store.NewPCIeRootMapper(), false, false, partitions)
 	require.Len(t, built.ByPartition, 2)
 
@@ -372,7 +372,7 @@ func TestGroupedUncoreCacheSkipsCPUsWithoutACache(t *testing.T) {
 	}
 	online := topo.CPUDetails.CPUs()
 
-	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo,
 		cpuset.New(), store.NewPCIeRootMapper(), false, false, unpartitioned(online))
 	devices := onlyPartition(t, built.ByPartition)
 	require.Equal(t, []string{device.CPUDeviceCacheGroupedPrefix + "000"}, deviceNames(devices))
@@ -386,7 +386,7 @@ func TestGroupedUncoreCacheWholeCoreRequestPolicy(t *testing.T) {
 	topo := fakeSMTCacheTopology()
 	online := topo.CPUDetails.CPUs()
 
-	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo, online,
+	built := device.BuildGrouped(logr.Discard(), device.GROUP_BY_UNCORE_CACHE, topo,
 		cpuset.New(), store.NewPCIeRootMapper(), false, true, unpartitioned(online))
 	devices := onlyPartition(t, built.ByPartition)
 	require.Len(t, devices, 2)

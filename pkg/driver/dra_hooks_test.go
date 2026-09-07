@@ -78,6 +78,9 @@ func testSysFS(infos []cpuinfo.CPUInfo) fstest.MapFS {
 type mockKubeletPlugin struct {
 	publishedResources *resourceslice.DriverResources
 	publishError       error
+	// publishCalls counts publications, so a test can tell a republished order
+	// from an unchanged one. Atomic because the driver republishes on its own.
+	publishCalls atomic.Int32
 	// statusFunc answers one registration poll, and is given the number of the
 	// call so a test can change kubelet's answer over time. Left nil by the
 	// tests that do not exercise registration.
@@ -87,6 +90,7 @@ type mockKubeletPlugin struct {
 
 func (m *mockKubeletPlugin) PublishResources(ctx context.Context, resources resourceslice.DriverResources) error {
 	m.publishedResources = &resources
+	m.publishCalls.Add(1)
 	if m.publishError != nil {
 		return m.publishError
 	}
@@ -2676,7 +2680,7 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 	require.NoError(t, err)
 	online := topo.CPUDetails.CPUs()
 
-	built := devattr.BuildGrouped(logger, devattr.GROUP_BY_UNCORE_CACHE, topo, online, cpuset.New(),
+	built := devattr.BuildGrouped(logger, devattr.GROUP_BY_UNCORE_CACHE, topo, cpuset.New(),
 		store.NewPCIeRootMapper(), false, true, devattr.WithImplicitDefault(nil, online))
 	d := &CPUDriver{
 		driverName:       testDriverName,
@@ -2684,7 +2688,6 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 		cpuDeviceGroupBy: devattr.GROUP_BY_UNCORE_CACHE,
 		topology: deviceTopology{
 			cpuTopology:            topo,
-			onlineCPUs:             online,
 			deviceNameToSocketID:   map[string]int{},
 			deviceNameToNUMANodeID: built.NameToID,
 			deviceNameToCPUs:       built.CPUs,
@@ -2695,6 +2698,8 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 		podConfigStore:     store.NewPodConfig(),
 		claimTracker:       store.NewClaimTracker(),
 		cdiMgr:             newMockCdiMgr(),
+		metrics:            cpumetrics.Noop(),
+		cpuAllocator:       cpuallocator.NewCPUManager(testDriverName, topo),
 	}
 
 	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
