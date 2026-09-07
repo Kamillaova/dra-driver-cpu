@@ -170,6 +170,7 @@ when filing an issue — it collects the CPU topology and driver configuration n
 - [Matching Kubelet CPU Manager Options](docs/user/feature-support.md#matching-cpu-manager-options) - kubelet cpumanager policy options and their driver equivalents.
 - [Workload Configuration Requirements](docs/user/workload-requirements.md) - how to set pod/container CPU requests alongside DRA claims.
 - [Custom Opaque CPUSet Allocation Overrides](docs/user/opaque-cpuset-overrides.md) - explicit core assignment for `groupBy: machine` mode.
+- [CPU Partitions](docs/user/cpu-partitions.md) - describing a node's cores as named partitions with roles and a thread arity (this fork only).
 - [CPU Defragmentation](docs/user/defragmentation.md) - recovering uncore cache alignment of running claims (this fork only).
 - [Metrics](docs/user/metrics.md) - Prometheus metrics exposed by the driver.
 - [Device Attributes and Selectors](docs/user/device-attributes.md) - selectable device attributes, CEL selector examples, and sample `ResourceSlice` output in each mode.
