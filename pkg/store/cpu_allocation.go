@@ -86,21 +86,24 @@ func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claim
 	return nil
 }
 
-// ValidateResourceClaimAllocations verifies that a container's claims match prepared allocations.
-func (s *CPUAllocation) ValidateResourceClaimAllocations(expected map[types.UID]cpuset.CPUSet) error {
+// GetResourceClaimAllocationUnion returns the union of the prepared cpusets of
+// the given claims, failing if any of them is not prepared by this driver.
+//
+// CCX-FORK: replaces upstream's ValidateResourceClaimAllocations, which compared
+// the store against caller-supplied cpusets instead of supplying them.
+func (s *CPUAllocation) GetResourceClaimAllocationUnion(claimUIDs ...types.UID) (cpuset.CPUSet, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	for claimUID, cpus := range expected {
+	union := cpuset.New()
+	for _, claimUID := range claimUIDs {
 		allocation, ok := s.resourceClaimAllocations[claimUID]
 		if !ok {
-			return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
+			return cpuset.New(), fmt.Errorf("claim %q is not prepared by this driver", claimUID)
 		}
-		if !allocation.Equals(cpus) {
-			return fmt.Errorf("validation failed for claim %q: cpuset mismatch (expected %q, got %q)", claimUID, allocation.String(), cpus.String())
-		}
+		union = union.Union(allocation)
 	}
-	return nil
+	return union, nil
 }
 
 // RemoveResourceClaimAllocation removes a resource claim allocation from the store.
