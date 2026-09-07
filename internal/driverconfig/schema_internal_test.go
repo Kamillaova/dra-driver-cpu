@@ -199,3 +199,54 @@ func TestGenerateDriverConfigSchema_PartitionItemConstraints(t *testing.T) {
 		t.Errorf("partition item requires smt, which is optional: %v", item.Required)
 	}
 }
+
+// TestGenerateDriverConfigSchema_ProfilePartitionConstraints: the partitions of
+// a profile are the same partitions, so a file the fleet-wide list would be
+// rejected for must be rejected inside a profile too.
+func TestGenerateDriverConfigSchema_ProfilePartitionConstraints(t *testing.T) {
+	out, err := GenerateDriverConfigSchema()
+	if err != nil {
+		t.Fatalf("GenerateDriverConfigSchema() error: %v", err)
+	}
+
+	type partitionItem struct {
+		Properties struct {
+			Role struct {
+				Enum []string `json:"enum"`
+			} `json:"role"`
+			SMT struct {
+				OneOf []struct {
+					Type string `json:"type"`
+				} `json:"oneOf"`
+			} `json:"smt"`
+		} `json:"properties"`
+	}
+	var doc struct {
+		Properties struct {
+			CPUPartitions struct {
+				Items partitionItem `json:"items"`
+			} `json:"cpuPartitions"`
+			Profiles struct {
+				AdditionalProperties struct {
+					Properties struct {
+						CPUPartitions struct {
+							Items partitionItem `json:"items"`
+						} `json:"cpuPartitions"`
+					} `json:"properties"`
+				} `json:"additionalProperties"`
+			} `json:"profiles"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshaling generated schema: %v", err)
+	}
+
+	fleetWide := doc.Properties.CPUPartitions.Items
+	inProfile := doc.Properties.Profiles.AdditionalProperties.Properties.CPUPartitions.Items
+	if !reflect.DeepEqual(fleetWide, inProfile) {
+		t.Errorf("a partition inside a profile is constrained as %+v, want the fleet-wide %+v", inProfile, fleetWide)
+	}
+	if len(inProfile.Properties.Role.Enum) == 0 || len(inProfile.Properties.SMT.OneOf) == 0 {
+		t.Errorf("a partition inside a profile carries no role enum or smt branches: %+v", inProfile)
+	}
+}

@@ -19,7 +19,9 @@ package driverconfig
 import (
 	"flag"
 	"fmt"
+	"maps"
 	"path/filepath"
+	"slices"
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
@@ -129,6 +131,9 @@ func (c Config) Validate() error {
 	if err := c.validateCPUPartitions(); err != nil {
 		return err
 	}
+	if err := c.validateProfiles(); err != nil {
+		return err
+	}
 	// The kubelet root becomes socket and mount locations, so a relative path
 	// would resolve against the working directory and silently break
 	// registration.
@@ -185,6 +190,36 @@ func (c Config) validateCachePlacementStrategy() error {
 		}
 	default:
 		return fmt.Errorf("invalid cachePlacementStrategy %q: must be %q or %q", c.CachePlacementStrategy, coreselect.Pack, coreselect.Spread)
+	}
+	return nil
+}
+
+// validateProfiles checks the profiles themselves and the scope rule around
+// them: once one node type describes its cores, every node type describes its
+// own, and a description outside a profile has no node it belongs to.
+func (c Config) validateProfiles() error {
+	if len(c.Profiles) == 0 {
+		return nil
+	}
+	if c.ReservedCPUs != "" {
+		return fmt.Errorf("invalid reservedCPUs %q: with profiles declared, the CPUs a node keeps from workloads are a partition with role %q inside that node's own profile",
+			c.ReservedCPUs, device.PARTITION_ROLE_RESERVED)
+	}
+	if len(c.CPUPartitions) > 0 {
+		return fmt.Errorf("invalid cpuPartitions: with profiles declared, the partitions belong to the profiles, one complete description per node type")
+	}
+	for _, name := range slices.Sorted(maps.Keys(c.Profiles)) {
+		if name == DefaultProfileName {
+			return fmt.Errorf("invalid profile %q: it names the implicit profile of a node whose cores are all interchangeable, which is never declared and is selected with the label %s=%s",
+				name, ProfileLabel, DefaultProfileName)
+		}
+		if len(c.Profiles[name].CPUPartitions) == 0 {
+			return fmt.Errorf("invalid profile %q: it describes no cores; a node type that carves out none is labelled %s=%s instead",
+				name, ProfileLabel, DefaultProfileName)
+		}
+		if _, err := c.asProfile(name, c.Profiles[name]); err != nil {
+			return err
+		}
 	}
 	return nil
 }
