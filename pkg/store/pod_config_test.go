@@ -234,3 +234,18 @@ func BenchmarkGetContainersWithSharedCPUs(b *testing.B) {
 		})
 	}
 }
+
+func TestContainerStateAccessors(t *testing.T) {
+	state := NewContainerState("ctr-1", "ctr-uid-1", "claim-1", "claim-2")
+	require.Equal(t, types.UID("ctr-uid-1"), state.ContainerUID())
+	require.Equal(t, []types.UID{"claim-1", "claim-2"}, state.ClaimUIDs())
+
+	// The returned slice must not alias the state's own.
+	claims := state.ClaimUIDs()
+	claims[0] = "tampered"
+	require.Equal(t, []types.UID{"claim-1", "claim-2"}, state.ClaimUIDs())
+
+	shared := NewContainerState("ctr-2", "ctr-uid-2")
+	require.Empty(t, shared.ClaimUIDs())
+	require.Equal(t, types.UID("ctr-uid-2"), shared.ContainerUID())
+}
