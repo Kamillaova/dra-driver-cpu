@@ -21,8 +21,9 @@ CPU group, `individual` one device per CPU.
 
 | Attribute                         | Type    | Description                                                                                                    |
 | --------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `resource.kubernetes.io/numaNode` | int     | Standard NUMA node of the group (published when grouping by NUMA node)                                         |
-| `dra.cpu/socketID`                | int     | CPU socket of the group (published when grouping by NUMA node or socket)                                       |
+| `resource.kubernetes.io/numaNode` | int     | Standard NUMA node of the group (published when grouping by NUMA node or uncore cache)                         |
+| `dra.cpu/socketID`                | int     | CPU socket of the group (published when grouping by NUMA node, socket or uncore cache)                         |
+| `dra.cpu/cacheL3ID`               | int     | The uncore (L3/CCX) cache the group is (published when grouping by uncore cache)                               |
 | `dra.cpu/numCPUs`                 | int     | CPUs available in the group                                                                                    |
 | `dra.cpu/partition`               | string  | The CPU partition the group's CPUs belong to, `default` on a node with no `cpuPartitions`                      |
 | `dra.cpu/role`                    | string  | That partition's role: `default` or `exclusive` for a group that publishes devices                             |
@@ -47,6 +48,12 @@ selectors:
 Both are counts of *allocatable* CPUs, so CPUs excluded by `reservedCPUs` are not included — a
 cache half-consumed by the reservation cannot host a full-size claim. Both are omitted entirely
 when the node reports no uncore cache information.
+
+Under `groupBy: uncorecache` the group is a single cache, so `uncoreCachesInGroup` is always 1 and
+`largestUncoreCacheCPUs` equals `numCPUs`: what the allocator can hand out from that device and what
+fits in one cache are then the same number, and the selector above becomes a capacity request. The
+cache itself is named by `dra.cpu/cacheL3ID`, the same identifier the individual-mode devices of
+that cache carry.
 
 #### Legacy attributes (deprecated)
 

@@ -38,6 +38,7 @@ const (
 	CPUDeviceNUMAGroupedPrefix   = "cpudevnuma"
 	CPUDeviceMachineGrouped      = "cpudevmachine"
 	CPUDevicePoolPrefix          = "cpudevpool"
+	CPUDeviceCacheGroupedPrefix  = "cpudevcache"
 )
 
 // poolShareMilliCPUs is the smallest share of a pool a request may take, and
@@ -62,8 +63,10 @@ type GroupedDevices struct {
 	// ByPartition holds each publishing partition's devices, in the order the
 	// partitions were given.
 	ByPartition [][]resourceapi.Device
-	// NameToID maps a device name to the socket or NUMA node it groups, and is
-	// empty under the other groupings.
+	// NameToID maps a device name to the socket or NUMA node it answers for --
+	// the group itself under socket and NUMA-node grouping, the group's NUMA node
+	// under uncore-cache grouping, where several devices share one -- and is
+	// empty under the groupings that have neither.
 	NameToID map[string]int
 	// ThreadsPerCore is each device's effective whole-core allocation step, and
 	// holds no entry for a device where whole-core allocation is off or has no
@@ -121,7 +124,7 @@ func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology,
 			switch groupBy {
 			case GROUP_BY_SOCKET:
 				built.NameToID[dev.name] = dev.socketID
-			case GROUP_BY_NUMA_NODE:
+			case GROUP_BY_NUMA_NODE, GROUP_BY_UNCORE_CACHE:
 				built.NameToID[dev.name] = dev.numaNodeID
 			}
 			if fullPhysicalCPUsOnly && dev.threadsPerCore > 1 {
@@ -176,10 +179,11 @@ func individualCPUNodeAllocatable(enabled bool) map[v1.ResourceName]resourceapi.
 }
 
 type groupedCPUDeviceInfo struct {
-	name       string
-	cpus       cpuset.CPUSet
-	socketID   int
-	numaNodeID int
+	name          string
+	cpus          cpuset.CPUSet
+	socketID      int
+	numaNodeID    int
+	uncoreCacheID int
 	// threadsPerCore is this device's own uniform thread-per-core count (0 when
 	// its cores do not all agree), independent of fullPhysicalCPUsOnly: it is a
 	// hardware fact published on every device, whether or not whole-core
@@ -336,6 +340,30 @@ func groupedCPUDeviceInfos(logger logr.Logger, groupBy string, topo *cpuinfo.CPU
 				threadsPerCore: threadsPerCore,
 			})
 		}
+	case GROUP_BY_UNCORE_CACHE:
+		caches, unplaceable := uncoreCaches(topo)
+		if outside := allocatableIn(unplaceable); !outside.IsEmpty() {
+			logger.Info("CPUs stay unpublished under uncore-cache grouping: no single uncore cache of one NUMA node holds them",
+				"partition", partition.Name, "cpus", outside.String())
+		}
+		for _, cache := range caches {
+			name := partitionDeviceName(fmt.Sprintf("%s%03d", CPUDeviceCacheGroupedPrefix, cache.id), partition)
+			allocatableCPUs, threadsPerCore := build(name, allocatableIn(cache.cpus))
+			if allocatableCPUs.IsEmpty() {
+				continue
+			}
+			// A cache listed here lies in one NUMA node, and a NUMA node in one
+			// socket, so any of its CPUs answers for the socket.
+			anyCPU := allocatableCPUs.UnsortedList()[0]
+			devices = append(devices, groupedCPUDeviceInfo{
+				name:           name,
+				cpus:           allocatableCPUs,
+				socketID:       topo.CPUDetails[anyCPU].SocketID,
+				numaNodeID:     cache.numaNodeID,
+				uncoreCacheID:  cache.id,
+				threadsPerCore: threadsPerCore,
+			})
+		}
 	case GROUP_BY_MACHINE:
 		name := partitionDeviceName(CPUDeviceMachineGrouped, partition)
 		rawCPUs := allocatableIn(onlineCPUs)
@@ -354,6 +382,54 @@ func groupedCPUDeviceInfos(logger logr.Logger, groupBy string, topo *cpuinfo.CPU
 		})
 	}
 	return devices
+}
+
+// uncoreCache is one of the node's uncore caches: its kernel id, the CPUs that
+// share it and the NUMA node they sit in.
+type uncoreCache struct {
+	id         int
+	numaNodeID int
+	cpus       cpuset.CPUSet
+}
+
+// uncoreCaches lists the node's uncore caches, ordered by NUMA node and then by
+// cache id, so that the devices of one NUMA node are published as one run: the
+// allocator walks devices in slice order and backtracks on a NUMA constraint,
+// which stays bounded only while a node's devices are contiguous.
+//
+// The second return is the CPUs no listed cache holds, which this grouping has
+// nothing to publish: a device standing for a cache the kernel does not report,
+// or for one reaching into two NUMA nodes, would promise a locality nothing
+// backs. The rest of the node is published as usual.
+func uncoreCaches(topo *cpuinfo.CPUTopology) ([]uncoreCache, cpuset.CPUSet) {
+	cpusByCache := make(map[int][]int)
+	var unplaceableIDs []int
+	for cpuID, info := range topo.CPUDetails {
+		if info.UncoreCacheID == -1 {
+			unplaceableIDs = append(unplaceableIDs, cpuID)
+			continue
+		}
+		cpusByCache[info.UncoreCacheID] = append(cpusByCache[info.UncoreCacheID], cpuID)
+	}
+	unplaceable := cpuset.New(unplaceableIDs...)
+
+	caches := make([]uncoreCache, 0, len(cpusByCache))
+	for cacheID, cpuIDs := range cpusByCache {
+		cpus := cpuset.New(cpuIDs...)
+		numaNodes := topo.CPUDetails.KeepOnly(cpus).NUMANodes()
+		if numaNodes.Size() != 1 {
+			unplaceable = unplaceable.Union(cpus)
+			continue
+		}
+		caches = append(caches, uncoreCache{id: cacheID, numaNodeID: numaNodes.List()[0], cpus: cpus})
+	}
+	sort.Slice(caches, func(i, j int) bool {
+		if caches[i].numaNodeID != caches[j].numaNodeID {
+			return caches[i].numaNodeID < caches[j].numaNodeID
+		}
+		return caches[i].id < caches[j].id
+	})
+	return caches, unplaceable
 }
 
 // cpuDeviceInfos returns the stable individual CPU device enumeration used by
@@ -474,6 +550,32 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 				deviceattribute.StandardDeviceAttributeNUMANode: {IntValue: new(int64(deviceInfo.numaNodeID))},
 				// Driver-specific/non-standard attributes next
 				AttributeSocketID:       {IntValue: new(int64(deviceInfo.socketID))},
+				AttributeSMTEnabled:     {BoolValue: new(smtEnabled)},
+				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
+				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
+			}
+			addCompatibilityAttributes(deviceAttrs, int64(deviceInfo.numaNodeID))
+			addPartitionAttributes(deviceAttrs, partition)
+			addUncoreCacheAttributes(topo, deviceAttrs, deviceInfo.cpus)
+			addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...)
+
+			devices = append(devices, resourceapi.Device{
+				Name:                     deviceInfo.name,
+				Attributes:               deviceAttrs,
+				Capacity:                 deviceCapacity,
+				AllowMultipleAllocations: new(true),
+				NodeAllocatableResources: groupedCPUNodeAllocatable(nodeAllocatableResources),
+				Taints:                   partitionTaints(partition),
+			})
+		case GROUP_BY_UNCORE_CACHE:
+			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				// DRA standard attributes first
+				deviceattribute.StandardDeviceAttributeNUMANode: {IntValue: new(int64(deviceInfo.numaNodeID))},
+				// Driver-specific/non-standard attributes next
+				AttributeSocketID: {IntValue: new(int64(deviceInfo.socketID))},
+				// The identifier a claim asking for a particular cache selects on,
+				// and the one the individual-mode devices of the same cache carry.
+				AttributeCacheL3ID:      {IntValue: new(int64(deviceInfo.uncoreCacheID))},
 				AttributeSMTEnabled:     {BoolValue: new(smtEnabled)},
 				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
 				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
