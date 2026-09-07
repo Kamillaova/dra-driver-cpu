@@ -9,8 +9,8 @@ end up one per cache, so no cache can be handed to a future claim whole. Neither
 placement is chosen once, when the claim is prepared.
 
 Defragmentation moves a **running** claim onto different CPUs to recover that alignment, without
-restarting its container. The claim keeps its CPU count and its NUMA node; only which CPUs back it
-change.
+restarting its container. The claim keeps its CPU count, its NUMA node and the CPU partition it was
+allocated from; only which CPUs back it change.
 
 ```yaml
 # values.yaml
@@ -45,6 +45,12 @@ outcome and is visible in `dra_cpu_defrag_excess_uncore_caches`.
 - **It does not change a claim's size.** A claim allocated 4 CPUs always has 4.
 - **It does not move a claim between NUMA nodes.** The driver never sets `cpuset.mems`, so a claim's
   memory locality is exactly its CPUs' NUMA footprint, and a move preserves it.
+- **It does not move a claim between [CPU partitions](cpu-partitions.md).** A repair may only use the
+  CPUs of the partition the claim already sits in, so the cores set aside for a dataplane and the
+  cores the virtual machines run on are never mixed by a pass. This is by construction rather than by
+  policy: the free CPUs a round may take and the claims it may shuffle are both cut to one partition
+  of one NUMA node before planning starts. A partition whose claims all decline to move therefore has
+  nothing to plan, and the spread it keeps is reported rather than repaired.
 - **It coexists with in-place pod resize (KEP-1287).** A resize reaches the runtime as the same CRI
   call a move uses, and applies against the container's current state: a claim's cpuset survives a
   resize, including a resize issued after the claim has been moved. Verified on containerd
@@ -117,14 +123,14 @@ was not running on. A round that committed anything asks for the next pass itsel
 it freed are what the following move needs, so a repair that needs several rounds runs them back to
 back rather than waiting between them.
 
-A pass plans and applies one round per NUMA node, which is what bounds how much of a machine one
-batch disturbs; a claim is never moved between NUMA nodes anyway. A node whose round the runtime
-refused or never confirmed is tried again on its own, after a delay that grows while it keeps
-failing and resets when it succeeds, and it holds up no other node meanwhile. A quiet node runs no
-passes at all.
+A pass plans and applies one round per NUMA node and CPU partition, which is what bounds how much of
+a machine one batch disturbs; a claim is never moved across either boundary anyway. A region whose
+round the runtime refused or never confirmed is tried again on its own, after a delay that grows
+while it keeps failing and resets when it succeeds, and it holds up no other region meanwhile. A
+quiet node runs no passes at all.
 
 A pass is one read of the online CPU set and then pure computation over the claims the node already
-holds, and it stops as soon as it finds a NUMA node as well packed as its claims allow, so an arrival
+holds, and it stops as soon as it finds a region as well packed as its claims allow, so an arrival
 that lands aligned — the normal case on a node with free caches — costs about a millisecond and moves
 nothing.
 
@@ -154,9 +160,11 @@ kubectl get --raw \
      --field-selector spec.nodeName=<node> -o jsonpath='{.items[0].metadata.name}'):8080/proxy/placements?dryrun=1"
 ```
 
-A `plan.reason` of `all N moves towards the ideal are blocked` means the claims in the way never
-asked to be moved, or there is no slack to move them through. A `movingFrom` is a move still in
-flight: the claim holds both sets of CPUs until the runtime confirms it.
+Each NUMA node carries one entry under `plans` per partition, which is one round, with the CPUs that
+partition holds and what is free in them. A `reason` of `all N moves towards the ideal are blocked`
+means the claims in the way never asked to be moved, or there is no slack inside that partition to
+move them through. A `movingFrom` is a move still in flight: the claim holds both sets of CPUs until
+the runtime confirms it.
 
 ## Worked example
 
