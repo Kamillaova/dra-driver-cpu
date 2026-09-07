@@ -137,6 +137,14 @@ A `plan.reason` of `all N moves towards the ideal are blocked` means the claims 
 themselves pinned, or there is no slack to move them through. A `movingFrom` is a move still in
 flight: the claim holds both sets of CPUs until the runtime confirms it.
 
+## Worked example
+
+[`hack/examples/qemu-ccx-vm/`](../../hack/examples/qemu-ccx-vm/) carries a complete pair of QEMU VM
+classes against this driver -- a whole-cache VM selected onto capable nodes via
+`largestUncoreCacheCPUs`, and a flexible small VM the defragmenter may re-home -- together with the
+in-pod launcher that implements the workload contract above: live CPUs from the cgroup, per-vCPU
+pinning over QMP, and inotify-driven re-pinning on every move.
+
 ## Rolling out
 
 Passes are node-local and write nothing to the API, so 100 nodes are 100 independent instances with no
