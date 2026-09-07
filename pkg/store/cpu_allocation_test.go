@@ -18,6 +18,8 @@ package store
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -443,4 +445,257 @@ func TestGetResourceClaimAllocationUnion(t *testing.T) {
 			require.Equal(t, tc.expected, got)
 		})
 	}
+}
+
+func TestRebindLifecycle(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	claimUID := types.UID("claim-1")
+
+	testCases := []struct {
+		name string
+		// target of the rebind begun on claimUID, which starts on 0-1.
+		target cpuset.CPUSet
+		// commit, otherwise abort.
+		commit           bool
+		expectedCPUs     cpuset.CPUSet
+		expectedShared   cpuset.CPUSet
+		expectedInFlight cpuset.CPUSet
+	}{
+		{
+			name:             "commit keeps the target and releases the origin",
+			target:           cpuset.New(2, 3),
+			commit:           true,
+			expectedCPUs:     cpuset.New(2, 3),
+			expectedShared:   cpuset.New(0, 1, 4, 5, 6, 7),
+			expectedInFlight: cpuset.New(4, 5, 6, 7),
+		},
+		{
+			name:             "abort keeps the origin and releases the target",
+			target:           cpuset.New(2, 3),
+			commit:           false,
+			expectedCPUs:     cpuset.New(0, 1),
+			expectedShared:   cpuset.New(2, 3, 4, 5, 6, 7),
+			expectedInFlight: cpuset.New(4, 5, 6, 7),
+		},
+		{
+			// The halves overlap, so only the CPUs actually left behind may be
+			// released -- CPU 1 belongs to the claim before and after.
+			name:             "commit of an overlapping move releases only the CPUs left behind",
+			target:           cpuset.New(1, 2),
+			commit:           true,
+			expectedCPUs:     cpuset.New(1, 2),
+			expectedShared:   cpuset.New(0, 3, 4, 5, 6, 7),
+			expectedInFlight: cpuset.New(3, 4, 5, 6, 7),
+		},
+		{
+			name:             "abort of an overlapping move releases only the CPUs not yet held",
+			target:           cpuset.New(1, 2),
+			commit:           false,
+			expectedCPUs:     cpuset.New(0, 1),
+			expectedShared:   cpuset.New(2, 3, 4, 5, 6, 7),
+			expectedInFlight: cpuset.New(3, 4, 5, 6, 7),
+		},
+		{
+			name:             "a move to the same CPUs commits without releasing anything",
+			target:           cpuset.New(0, 1),
+			commit:           true,
+			expectedCPUs:     cpuset.New(0, 1),
+			expectedShared:   cpuset.New(2, 3, 4, 5, 6, 7),
+			expectedInFlight: cpuset.New(2, 3, 4, 5, 6, 7),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestCPUAllocation(logger, allCPUs, cpuset.New())
+			requirePreparedAllocation(t, logger, store, claimUID, cpuset.New(0, 1))
+
+			require.NoError(t, store.BeginRebind(logger, claimUID, tc.target))
+
+			// While in flight the claim holds both halves, so neither is offered
+			// to a shared container or to another claim.
+			require.Equal(t, tc.expectedInFlight, store.GetSharedCPUs())
+			origin, ok := store.GetRebindOrigin(claimUID)
+			require.True(t, ok)
+			require.Equal(t, cpuset.New(0, 1), origin)
+			current, ok := store.GetResourceClaimAllocation(claimUID)
+			require.True(t, ok)
+			require.Equal(t, tc.target, current, "the claim reads as being on its target while in flight")
+
+			if tc.commit {
+				require.NoError(t, store.CommitRebind(logger, claimUID))
+			} else {
+				require.NoError(t, store.AbortRebind(logger, claimUID))
+			}
+
+			got, ok := store.GetResourceClaimAllocation(claimUID)
+			require.True(t, ok)
+			require.Equal(t, tc.expectedCPUs, got)
+			require.Equal(t, tc.expectedShared, store.GetSharedCPUs())
+			require.Equal(t, tc.expectedCPUs, store.GetPreparedCPUs())
+
+			_, ok = store.GetRebindOrigin(claimUID)
+			require.False(t, ok, "the rebind must no longer be in flight")
+		})
+	}
+}
+
+func TestBeginRebindRejections(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+
+	testCases := []struct {
+		name          string
+		claimUID      types.UID
+		target        cpuset.CPUSet
+		beginFirst    cpuset.CPUSet
+		expectedError string
+	}{
+		{
+			name:          "unprepared claim",
+			claimUID:      "claim-absent",
+			target:        cpuset.New(4, 5),
+			expectedError: `claim "claim-absent" is not prepared by this driver`,
+		},
+		{
+			name:          "growing the claim",
+			claimUID:      "claim-1",
+			target:        cpuset.New(4, 5, 6),
+			expectedError: `rebind of claim "claim-1" would change its CPU count from 2 to 3`,
+		},
+		{
+			name:          "shrinking the claim",
+			claimUID:      "claim-1",
+			target:        cpuset.New(4),
+			expectedError: `rebind of claim "claim-1" would change its CPU count from 2 to 1`,
+		},
+		{
+			name:          "onto another claim's CPUs",
+			claimUID:      "claim-1",
+			target:        cpuset.New(2, 3),
+			expectedError: `rebind target "2-3" for claim "claim-1" is not free`,
+		},
+		{
+			name:          "partly onto another claim's CPUs",
+			claimUID:      "claim-1",
+			target:        cpuset.New(3, 4),
+			expectedError: `rebind target "3-4" for claim "claim-1" is not free`,
+		},
+		{
+			name:          "onto reserved CPUs",
+			claimUID:      "claim-1",
+			target:        cpuset.New(6, 7),
+			expectedError: `rebind target "6-7" for claim "claim-1" is not free`,
+		},
+		{
+			// The origin would be lost, leaving the abort path with nothing to
+			// fall back to.
+			name:          "while a rebind is already in flight",
+			claimUID:      "claim-1",
+			beginFirst:    cpuset.New(4, 5),
+			target:        cpuset.New(0, 1),
+			expectedError: `claim "claim-1" is already rebinding from "0-1" to "4-5"`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestCPUAllocation(logger, allCPUs, cpuset.New(6, 7))
+			requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+			requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2, 3))
+			sharedBefore := store.GetSharedCPUs()
+
+			if !tc.beginFirst.IsEmpty() {
+				require.NoError(t, store.BeginRebind(logger, tc.claimUID, tc.beginFirst))
+				sharedBefore = store.GetSharedCPUs()
+			}
+
+			err := store.BeginRebind(logger, tc.claimUID, tc.target)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.expectedError)
+			require.Equal(t, sharedBefore, store.GetSharedCPUs(), "a rejected rebind must not change accounting")
+		})
+	}
+}
+
+func TestCommitAndAbortRebindWithoutBegin(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+
+	require.EqualError(t, store.CommitRebind(logger, "claim-1"), `claim "claim-1" has no rebind in flight`)
+	require.EqualError(t, store.AbortRebind(logger, "claim-1"), `claim "claim-1" has no rebind in flight`)
+	require.EqualError(t, store.CommitRebind(logger, "claim-absent"), `claim "claim-absent" has no rebind in flight`)
+	require.EqualError(t, store.AbortRebind(logger, "claim-absent"), `claim "claim-absent" has no rebind in flight`)
+
+	// A second commit must not release the origin twice.
+	require.NoError(t, store.BeginRebind(logger, "claim-1", cpuset.New(2, 3)))
+	require.NoError(t, store.CommitRebind(logger, "claim-1"))
+	require.EqualError(t, store.CommitRebind(logger, "claim-1"), `claim "claim-1" has no rebind in flight`)
+	require.Equal(t, cpuset.New(0, 1), store.GetSharedCPUs())
+}
+
+func TestReserveIsBlockedByBothHalvesOfARebind(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	require.NoError(t, store.BeginRebind(logger, "claim-1", cpuset.New(2, 3)))
+
+	require.Error(t, store.ReserveResourceClaimAllocation(logger, "claim-2", cpuset.New(0), false),
+		"the CPUs the container still runs on are not available")
+	require.Error(t, store.ReserveResourceClaimAllocation(logger, "claim-2", cpuset.New(3), false),
+		"the CPUs the claim is moving onto are not available")
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-2", cpuset.New(4, 5), false))
+}
+
+func TestRemoveDuringRebindReleasesBothHalves(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	store := newTestCPUAllocation(logger, allCPUs, cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	require.NoError(t, store.BeginRebind(logger, "claim-1", cpuset.New(2, 3)))
+
+	store.RemoveResourceClaimAllocation(logger, "claim-1")
+
+	require.Equal(t, allCPUs, store.GetSharedCPUs())
+	require.True(t, store.GetPreparedCPUs().IsEmpty())
+	_, ok := store.GetRebindOrigin("claim-1")
+	require.False(t, ok)
+	require.Equal(t, 0, store.Snapshot().ActiveResourceClaims)
+}
+
+func TestConcurrentRebindsAndReserves(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+
+	// Everyone contends for the same two CPUs: claim-1 wants to move onto them,
+	// and other claims want to be prepared on them. Whoever wins, the CPUs must
+	// end up with exactly one owner.
+	contested := cpuset.New(2, 3)
+	const racers = 8
+	var wg sync.WaitGroup
+	var winners atomic.Int64
+
+	for i := range racers {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if store.BeginRebind(logger, "claim-1", contested) == nil {
+				winners.Add(1)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if store.ReserveResourceClaimAllocation(logger, types.UID(fmt.Sprintf("claim-r%d", i)), contested, false) == nil {
+				winners.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, int64(1), winners.Load(), "exactly one claim may take the contested CPUs")
+	// Held either way: 0-1 by claim-1, and 2-3 by whichever racer won.
+	require.Equal(t, cpuset.New(4, 5, 6, 7), store.GetSharedCPUs())
 }
