@@ -35,7 +35,7 @@ uncore cache per NUMA node has no spread to recover, so its excess is permanentl
 | Metric                                       | Type      | Labels      | Description                                                                                                                        |
 | -------------------------------------------- | --------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `dra_cpu_defrag_excess_uncore_caches`        | Gauge     | none        | Uncore caches the node's claims span beyond the fewest their sizes allow. Zero means every claim is as well placed as it can be.   |
-| `dra_cpu_defrag_largest_alignable_free_cpus` | Gauge     | `numa_node` | Most CPUs still free within a single uncore cache of that node: the largest claim it can take unsplit.                             |
+| `dra_cpu_defrag_largest_alignable_free_cpus` | Gauge     | `numa_node` | Largest claim that node can still take inside a single uncore cache, which is the best any one of its CPU partitions can offer.     |
 | `dra_cpu_defrag_passes_total`                | Counter   | `result`    | Defragmentation passes. `error` covers a pass that reverted a move the runtime refused, or could not confirm what the runtime did. |
 | `dra_cpu_defrag_moves_total`                 | Counter   | `result`    | Claim moves attempted. `error` is a move the runtime refused and the driver reverted.                                              |
 | `dra_cpu_defrag_blocked_moves_total`         | Counter   | none        | Moves a better placement called for that a pass could not make, usually because another claim is in the way.                       |
