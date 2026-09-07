@@ -27,6 +27,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
+	opaqueapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
@@ -2788,4 +2790,192 @@ func TestPrepareRecordsEachRequestOfAClaim(t *testing.T) {
 
 	require.Equal(t, requests, mockCdi.placements[getCDIDeviceName(claimUID)],
 		"the device spec records the same split")
+}
+
+// claimWithRawConfigs attaches opaque configurations of the claim's own verbatim,
+// for the cases the typed helpers cannot express.
+func claimWithRawConfigs(claim *resourceapi.ResourceClaim, driverName string, raws ...string) *resourceapi.ResourceClaim {
+	for _, raw := range raws {
+		claim.Status.Allocation.Devices.Config = append(claim.Status.Allocation.Devices.Config,
+			resourceapi.DeviceAllocationConfiguration{
+				Source: resourceapi.AllocationConfigSourceClaim,
+				DeviceConfiguration: resourceapi.DeviceConfiguration{
+					Opaque: &resourceapi.OpaqueDeviceConfiguration{
+						Driver:     driverName,
+						Parameters: runtime.RawExtension{Raw: []byte(raw)},
+					},
+				},
+			})
+	}
+	return claim
+}
+
+// withSplitAlternatives gives a claim a request the allocator has a choice
+// about, which is what makes cpuConfig.alignment mean anything.
+func withSplitAlternatives(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+	claim.Spec.Devices.Requests = []resourceapi.DeviceRequest{{
+		Name: "vcpus",
+		FirstAvailable: []resourceapi.DeviceSubRequest{
+			{Name: "aligned"},
+			{Name: "split2"},
+		},
+	}}
+	return claim
+}
+
+func TestClaimConfig(t *testing.T) {
+	d := &CPUDriver{driverName: testDriverName}
+	claim := func() *resourceapi.ResourceClaim {
+		return testClaim("claim-1", testDriverName, testNodeName,
+			map[string]int64{devattr.CPUDeviceMachineGrouped: 2})
+	}
+	deviceClassConfig := func(c *resourceapi.ResourceClaim, raw string) *resourceapi.ResourceClaim {
+		c = claimWithRawConfigs(c, testDriverName, raw)
+		c.Status.Allocation.Devices.Config[0].Source = resourceapi.AllocationConfigSourceClass
+		return c
+	}
+
+	testCases := []struct {
+		name          string
+		claim         *resourceapi.ResourceClaim
+		expected      opaqueapi.ClaimPlacement
+		expectedError string
+	}{
+		{
+			name:     "a claim that says nothing is not moved",
+			claim:    claim(),
+			expected: opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			name:     "no allocation yet",
+			claim:    &resourceapi.ResourceClaim{},
+			expected: opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			name:     "relocatable stated",
+			claim:    claimWithRawConfigs(claim(), testDriverName, `{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`),
+			expected: opaqueapi.ClaimPlacement{Relocatable: true, Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			// Only this driver's configurations say anything to this driver.
+			name:     "another driver's configuration is not read",
+			claim:    claimWithRawConfigs(claim(), "other.example.com", `{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`),
+			expected: opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			// Mobility is what the workload tolerates, which the administrator
+			// who writes a DeviceClass does not know.
+			name:     "a DeviceClass configuration cannot grant mobility",
+			claim:    deviceClassConfig(claim(), `{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`),
+			expected: opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			// Ignored for what it says, still refused for being unreadable: a
+			// version this driver does not know may mean anything at all.
+			name:          "a DeviceClass configuration of an unknown version is refused",
+			claim:         deviceClassConfig(claim(), `{"apiVersion":"v1beta1","cpuConfig":{}}`),
+			expectedError: "unsupported opaque config apiVersion",
+		},
+		{
+			name: "two configurations agreeing",
+			claim: claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`),
+			expected: opaqueapi.ClaimPlacement{Relocatable: true, Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			// Whether the claim may be moved is one answer for the claim, so
+			// there is nothing to reconcile between two of them.
+			name: "two configurations disagreeing",
+			claim: claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":false}}`),
+			expectedError: "disagree about cpuConfig.relocatable or cpuConfig.alignment",
+		},
+		{
+			name: "alignment on a claim the allocator has no choice about",
+			claim: claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"alignment":"BestEffort"}}`),
+			expectedError: "none of its requests offers the allocator alternatives",
+		},
+		{
+			name: "alignment on a claim offering alternatives",
+			claim: withSplitAlternatives(claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"alignment":"Repairable","relocatable":true}}`)),
+			expected: opaqueapi.ClaimPlacement{
+				Relocatable:  true,
+				Alignment:    v1alpha1.AlignmentRepairable,
+				AlignmentSet: true,
+			},
+		},
+		{
+			name: "repairable without relocatable",
+			claim: withSplitAlternatives(claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"alignment":"Repairable"}}`)),
+			expectedError: "requires cpuConfig.relocatable",
+		},
+		{
+			name:          "an unknown configuration version is refused",
+			claim:         claimWithRawConfigs(claim(), testDriverName, `{"apiVersion":"v1beta1","cpuConfig":{}}`),
+			expectedError: "unsupported opaque config apiVersion",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := d.claimConfig(tc.claim)
+			if tc.expectedError != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.expectedError)
+				require.Equal(t, opaqueapi.ClaimPlacement{}, got)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+// TestPrepareFailsClosedOnAContradictoryConfig: a claim whose configuration the
+// driver cannot honour must fail Prepare rather than be placed as if it had said
+// nothing. Failing Prepare is what makes the kubelet record
+// FailedPrepareDynamicResources against the pod, which is the only channel this
+// driver has for telling an operator about a claim it refused.
+func TestPrepareFailsClosedOnAContradictoryConfig(t *testing.T) {
+	infos := mockCPUInfos_DualSocket_4CPUsPerSocket_HT
+
+	testCases := []struct {
+		name          string
+		claim         *resourceapi.ResourceClaim
+		expectedError string
+	}{
+		{
+			name: "unknown configuration version",
+			claim: claimWithRawConfigs(testClaim("claim-version", testDriverName, testNodeName,
+				map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}),
+				testDriverName, `{"apiVersion":"v1beta1","cpuConfig":{}}`),
+			expectedError: "unsupported opaque config apiVersion",
+		},
+		{
+			name: "a named cpuset that may move",
+			claim: claimWithRawConfigs(testClaim("claim-cpuset", testDriverName, testNodeName,
+				map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}),
+				testDriverName, `{"apiVersion":"v1alpha1","cpuConfig":{"cpuset":"0,4","relocatable":true}}`),
+			expectedError: "cannot be combined with cpuConfig.relocatable",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
+
+			result, err := d.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{tc.claim})
+			require.NoError(t, err, "the batch itself does not fail")
+			require.Error(t, result[tc.claim.UID].Err)
+			require.Contains(t, result[tc.claim.UID].Err.Error(), tc.expectedError)
+
+			// Nothing was placed, so the CPUs stay available.
+			require.True(t, d.cpuAllocationStore.GetPreparedCPUs().IsEmpty())
+		})
+	}
 }
