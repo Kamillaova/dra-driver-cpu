@@ -55,6 +55,12 @@ Reference: [kubernetes 1.35.0](https://github.com/kubernetes/kubernetes/blob/v1.
 | FullPCPUsOnly             | GA       | N/A                        | `fullPhysicalCPUsOnly: true` config option                             | see note below        |
 | StrictCPUReservation      | GA       | N/A                        | builtin; enabled by default                                            |                       |
 
+### Uncore cache defragmentation
+
+`defragEnabled: true` lets the driver move a running claim onto different CPUs to recover uncore cache
+alignment lost to claim churn, without restarting its container. This is a fork-only feature; see
+[CPU Defragmentation](defragmentation.md).
+
 ### Whole physical cores (FullPCPUsOnly)
 
 `fullPhysicalCPUsOnly: true` allocates whole physical cores, so a core's SMT siblings are never
