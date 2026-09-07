@@ -252,3 +252,27 @@ func TestLen(t *testing.T) {
 	bnd.Cleanup("claim-123", "claim-456", "claim-789")
 	require.Equal(t, bnd.Len(), 0)
 }
+
+func TestClaimTrackerOwner(t *testing.T) {
+	logger := testr.New(t)
+	tracker := NewClaimTracker()
+
+	_, ok := tracker.Owner("claim-1")
+	require.False(t, ok, "an unbound claim has no owner")
+
+	_, err := tracker.SetOwner(logger, "pod-1", "ctr-1", "claim-1", "claim-2")
+	require.NoError(t, err)
+
+	owner, ok := tracker.Owner("claim-1")
+	require.True(t, ok)
+	require.Equal(t, OwnerIdent{PodUID: "pod-1", ContainerName: "ctr-1"}, owner)
+	owner, ok = tracker.Owner("claim-2")
+	require.True(t, ok)
+	require.Equal(t, OwnerIdent{PodUID: "pod-1", ContainerName: "ctr-1"}, owner)
+
+	tracker.Cleanup("claim-1")
+	_, ok = tracker.Owner("claim-1")
+	require.False(t, ok)
+	_, ok = tracker.Owner("claim-2")
+	require.True(t, ok, "cleaning up one claim must not unbind the others")
+}
