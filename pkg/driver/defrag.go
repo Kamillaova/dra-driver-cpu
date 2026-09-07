@@ -24,7 +24,6 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
-	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpumanager"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
@@ -307,7 +306,7 @@ func largestAlignableFreeCPUs(nodeTopo *defrag.Topology, free cpuset.CPUSet) int
 // Selector call carries no device identity of its own.
 func (cp *CPUDriver) defragSelector(logger logr.Logger, threadsPerCore int) defrag.Selector {
 	return func(available cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
-		return selectMoveCPUs(logger, cp.topology.cpuTopology, available, numCPUs, threadsPerCore)
+		return cp.selectMoveCPUs(logger, cp.topology.cpuTopology, available, numCPUs, threadsPerCore)
 	}
 }
 
@@ -318,9 +317,9 @@ func (cp *CPUDriver) defragSelector(logger logr.Logger, threadsPerCore int) defr
 // the destination is whatever the planner found free -- and the external
 // allocator refuses an allocation whose hint is empty, so routing moves through
 // it would fail every move on a node configured that way.
-func selectMoveCPUs(logger logr.Logger, topo *cpuinfo.CPUTopology, available cpuset.CPUSet, numCPUs, threadsPerCore int) (cpuset.CPUSet, error) {
-	if threadsPerCore > 1 {
-		return coreselect.TakeWholeCores(topo, available, numCPUs)
+func (cp *CPUDriver) selectMoveCPUs(logger logr.Logger, topo *cpuinfo.CPUTopology, available cpuset.CPUSet, numCPUs, threadsPerCore int) (cpuset.CPUSet, error) {
+	if got, ok, err := cp.placedCPUs(topo, available, numCPUs, threadsPerCore); ok {
+		return got, err
 	}
 	return cpumanager.TakeByTopologyNUMAPacked(logger, topo, available, numCPUs, cpumanager.CPUSortingStrategyPacked, true)
 }
