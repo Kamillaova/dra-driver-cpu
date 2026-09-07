@@ -281,7 +281,10 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 // the CPU-granular allocator, so behaviour is unchanged when the option is off.
 func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, topo *cpuinfo.CPUTopology, available cpuset.CPUSet, numCPUs int, threadsPerCore int) (cpuset.CPUSet, error) {
 	if threadsPerCore > 1 {
-		return coreselect.TakeWholeCores(topo, available, numCPUs)
+		return coreselect.TakeWholeCoresPolicy(topo, available, numCPUs, cp.placementPolicy, cp.topology.reservedCPUs)
+	}
+	if cp.placementPolicy == coreselect.Spread {
+		return coreselect.TakeSpreadCPUs(topo, available, numCPUs, cp.topology.reservedCPUs)
 	}
 	return cpumanager.TakeByTopologyNUMAPacked(logger, topo, available, numCPUs, cpumanager.CPUSortingStrategyPacked, true)
 }
