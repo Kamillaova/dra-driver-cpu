@@ -60,7 +60,24 @@ func requireValidPlan(t *testing.T, dtopo *defrag.Topology, placements []defrag.
 		current[p.ClaimUID] = p.CPUs
 	}
 
+	// An exchange's moves are legal only together, so each one's target is
+	// checked against what the whole exchange holds rather than against free
+	// CPUs, and the exchange as a whole must occupy exactly what it started on.
+	exchangeHeld := map[int]cpuset.CPUSet{}
+	exchangeTaken := map[int]cpuset.CPUSet{}
+	for _, move := range plan.Moves {
+		if move.Exchange == 0 {
+			continue
+		}
+		if _, ok := exchangeHeld[move.Exchange]; !ok {
+			exchangeHeld[move.Exchange], exchangeTaken[move.Exchange] = cpuset.New(), cpuset.New()
+		}
+		exchangeHeld[move.Exchange] = exchangeHeld[move.Exchange].Union(move.From)
+		exchangeTaken[move.Exchange] = exchangeTaken[move.Exchange].Union(move.To)
+	}
+
 	seenTargets := cpuset.New()
+	movedClaims := map[types.UID]struct{}{}
 	for _, move := range plan.Moves {
 		from, ok := current[move.ClaimUID]
 		require.True(t, ok, "plan moves unknown claim %q", move.ClaimUID)
@@ -70,13 +87,25 @@ func requireValidPlan(t *testing.T, dtopo *defrag.Topology, placements []defrag.
 			"move of %q changes its CPU count", move.ClaimUID)
 		require.True(t, move.To.IsSubsetOf(dtopo.CPUs()),
 			"move of %q targets CPUs outside the node", move.ClaimUID)
-		require.True(t, move.To.IsSubsetOf(free.Union(from)),
-			"move of %q to %q is not independent: free is %q", move.ClaimUID, move.To.String(), free.String())
+		reachable := free.Union(from)
+		if move.Exchange != 0 {
+			reachable = exchangeHeld[move.Exchange]
+		}
+		require.True(t, move.To.IsSubsetOf(reachable),
+			"move of %q to %q is not independent: it may only reach %q", move.ClaimUID, move.To.String(), reachable.String())
 		require.True(t, move.To.Intersection(seenTargets).IsEmpty(),
 			"move of %q to %q overlaps another move's target", move.ClaimUID, move.To.String())
 		require.LessOrEqual(t, dtopo.ExcessSpread(move.To), dtopo.ExcessSpread(from),
 			"move of %q leaves it worse placed", move.ClaimUID)
+		_, twice := movedClaims[move.ClaimUID]
+		require.False(t, twice, "claim %q is moved twice in one plan", move.ClaimUID)
+		movedClaims[move.ClaimUID] = struct{}{}
 		seenTargets = seenTargets.Union(move.To)
+	}
+
+	for exchange, held := range exchangeHeld {
+		require.True(t, held.Equals(exchangeTaken[exchange]),
+			"exchange %d moves from %q onto %q, which is not the same set of CPUs", exchange, held.String(), exchangeTaken[exchange].String())
 	}
 }
 
@@ -265,8 +294,9 @@ func TestPlanNodeEscapesTheBlockedLargeClaimDeadlock(t *testing.T) {
 
 func TestPlanNodeSkipsAZeroSlackCycle(t *testing.T) {
 	// Two claims each sit exactly where the other belongs and there is no free
-	// CPU to stage a swap through, so neither move can be made independently.
-	// Nothing is emitted and the impossibility is reported.
+	// CPU to stage a move through, so neither can be made independently. Without
+	// the exchange nothing is emitted, and the plan says an exchange is what it
+	// would have taken rather than only that the moves are blocked.
 	topo := topologyOf([]int{2, 2})
 	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
 
@@ -281,7 +311,7 @@ func TestPlanNodeSkipsAZeroSlackCycle(t *testing.T) {
 	requireValidPlan(t, dtopo, placements, free, plan)
 	require.Empty(t, plan.Moves)
 	require.Positive(t, plan.Blocked)
-	require.Contains(t, plan.Reason, "blocked")
+	require.Contains(t, plan.Reason, "transient overlap is not permitted")
 }
 
 func TestPlanNodeConsolidatesCheckerboardedFreeSpace(t *testing.T) {
@@ -713,5 +743,175 @@ func TestPlanNodeDisplacedClaimsFollowTheSpreadPolicy(t *testing.T) {
 	}
 	for cache, n := range tenants {
 		require.Equal(t, 1, n, "cache %d hosts %d smalls; with six caches and a two-cache claim, spread has room for one each", cache, n)
+	}
+}
+
+// TestPlanNodeExchangesOnAFullNode is the case exchanges exist for, and the
+// shape the design was written from: an eight-CPU claim straddling two caches
+// while a four-CPU tenant holds the rest of the one it could fill. Nothing is
+// free, so neither can move on its own; together they re-cut the twelve CPUs
+// they already hold and the large claim ends up whole.
+func TestPlanNodeExchangesOnAFullNode(t *testing.T) {
+	topo := topologyOf([]int{8, 8})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	placements := []defrag.Placement{
+		placement("big", 0, 1, 2, 3, 8, 9, 10, 11),
+		placement("small", 4, 5, 6, 7),
+		placement("bystander", 12, 13, 14, 15),
+	}
+	free := cpuset.New()
+
+	plan, err := defrag.PlanNode(dtopo, placements, free, selectorFor(topo), defrag.Options{AllowSwaps: true})
+	require.NoError(t, err)
+	requireValidPlan(t, dtopo, placements, free, plan)
+
+	require.Len(t, plan.Moves, 2, "an exchange, not a move")
+	require.Equal(t, plan.Moves[0].Exchange, plan.Moves[1].Exchange)
+	require.NotZero(t, plan.Moves[0].Exchange)
+
+	next, nextFree := applyPlan(placements, free, plan)
+	require.Equal(t, 0, dtopo.Cost(next), "the large claim ends up inside one cache")
+	require.True(t, nextFree.IsEmpty(), "an exchange takes no free CPUs and leaves none behind")
+	for _, p := range next {
+		if p.ClaimUID == "bystander" {
+			require.Equal(t, cpuset.New(12, 13, 14, 15), p.CPUs, "a claim outside the exchange is not touched")
+		}
+	}
+}
+
+// TestPlanNodeExchangesAZeroSlackCycle: two claims each sitting exactly where
+// the other belongs. There is nothing to stage a move through, so the exchange
+// is the only repair, and one round of it is enough.
+func TestPlanNodeExchangesAZeroSlackCycle(t *testing.T) {
+	topo := topologyOf([]int{2, 2})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	placements := []defrag.Placement{
+		placement("claim-1", 0, 3),
+		placement("claim-2", 1, 2),
+	}
+	free := cpuset.New()
+
+	plan, err := defrag.PlanNode(dtopo, placements, free, selectorFor(topo), defrag.Options{AllowSwaps: true})
+	require.NoError(t, err)
+	requireValidPlan(t, dtopo, placements, free, plan)
+	require.Len(t, plan.Moves, 2)
+	require.Equal(t, plan.Moves[0].Exchange, plan.Moves[1].Exchange)
+	require.NotZero(t, plan.Moves[0].Exchange)
+
+	next, nextFree := applyPlan(placements, free, plan)
+	require.Equal(t, 0, dtopo.Cost(next))
+	require.True(t, nextFree.IsEmpty())
+}
+
+// TestPlanNodeExchangeNeedsBothClaimsMovable: an exchange disturbs two
+// workloads, so a claim that never asked to be moved is no more a partner than
+// it is a mover. It is then a fixed obstacle the ideal is built around, and the
+// node reports itself as well packed as its claims allow rather than blocked.
+func TestPlanNodeExchangeNeedsBothClaimsMovable(t *testing.T) {
+	topo := topologyOf([]int{4, 4})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	placements := []defrag.Placement{
+		placement("big", 0, 1, 4, 5),
+		placement("partner", 6, 7),
+		placement("blocker", 2, 3),
+	}
+	free := cpuset.New()
+
+	movable := defrag.Options{AllowSwaps: true}
+	plan, err := defrag.PlanNode(dtopo, placements, free, selectorFor(topo), movable)
+	require.NoError(t, err)
+	requireValidPlan(t, dtopo, placements, free, plan)
+	require.Len(t, plan.Moves, 2, "with both movable the split claim is repaired by an exchange")
+
+	fixed := defrag.Options{
+		AllowSwaps: true,
+		Eligible:   func(claimUID types.UID) bool { return claimUID == "big" },
+	}
+	plan, err = defrag.PlanNode(dtopo, placements, free, selectorFor(topo), fixed)
+	require.NoError(t, err)
+	requireValidPlan(t, dtopo, placements, free, plan)
+	require.Empty(t, plan.Moves)
+	require.Equal(t, "node is already packed as well as its claims allow", plan.Reason)
+}
+
+// TestPlanNodeExchangesConverge: the pass measure falls on an exchange as it
+// does on a move, so a node repaired by exchanges settles rather than trading
+// claims back and forth.
+func TestPlanNodeExchangesConverge(t *testing.T) {
+	topo := topologyOf([]int{4, 4, 4})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	placements := []defrag.Placement{
+		placement("claim-1", 0, 1, 4, 5),
+		placement("claim-2", 2, 3, 8, 9),
+		placement("claim-3", 6, 7, 10, 11),
+	}
+	free := cpuset.New()
+
+	passes, final, nextFree := converge(t, topo, dtopo, placements, free, defrag.Options{AllowSwaps: true})
+	require.Equal(t, 0, dtopo.Cost(final))
+	require.LessOrEqual(t, passes, 3)
+	require.True(t, nextFree.IsEmpty())
+}
+
+// TestPlanNodeExchangesAlwaysConvergeFromRandomLayouts is the counterpart of the
+// random layout test above with exchanges permitted, and it is what pins the
+// guarantees an exchange must keep across shapes nobody wrote down: converge
+// checks on every pass that the node still accounts for the same CPUs, that no
+// claim shares one with another and that the measure falls, and requireValidPlan
+// checks that every exchange occupies exactly the CPUs it started on and that no
+// participant is left spanning more caches than it did.
+//
+// Half the rounds leave no free CPU at all, which the other test cannot produce
+// and which is where an exchange is the only move there is.
+func TestPlanNodeExchangesAlwaysConvergeFromRandomLayouts(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 4)) //nolint:gosec // a fixed seed is the point: failures must be reproducible
+
+	for round := range 300 {
+		caches := make([]int, 2+rng.IntN(3))
+		for i := range caches {
+			caches[i] = 2 + rng.IntN(7)
+		}
+		topo := topologyOf(caches)
+		dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+		all := topo.CPUDetails.CPUs().List()
+		rng.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
+
+		full := round%2 == 0
+		var placements []defrag.Placement
+		taken := 0
+		for claim := range 6 {
+			size := 1 + rng.IntN(max(2, len(all)/2))
+			if taken+size > len(all)-1 {
+				break
+			}
+			placements = append(placements, defrag.Placement{
+				ClaimUID: types.UID(fmt.Sprintf("claim-%d", claim)),
+				CPUs:     cpuset.New(all[taken : taken+size]...),
+			})
+			taken += size
+		}
+		if len(placements) == 0 {
+			continue
+		}
+		if full {
+			// Hand the remainder to the last claim, so nothing is free.
+			last := len(placements) - 1
+			placements[last] = defrag.Placement{
+				ClaimUID: placements[last].ClaimUID,
+				CPUs:     placements[last].CPUs.Union(cpuset.New(all[taken:]...)),
+			}
+			taken = len(all)
+		}
+		free := cpuset.New(all[taken:]...)
+
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			_, final, finalFree := converge(t, topo, dtopo, placements, free, defrag.Options{AllowSwaps: true})
+			require.LessOrEqual(t, dtopo.Cost(final), dtopo.Cost(placements))
+			require.Equal(t, free.Size(), finalFree.Size())
+		})
 	}
 }

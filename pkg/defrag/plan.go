@@ -35,6 +35,12 @@ type Move struct {
 	ClaimUID types.UID
 	From     cpuset.CPUSet
 	To       cpuset.CPUSet
+	// Exchange is which exchange this move belongs to, and zero for a move into
+	// CPUs nothing holds. The moves sharing a non-zero value are re-cut over the
+	// CPUs they hold between them and are legal only together: each takes CPUs
+	// another is still running on, so applying one without the rest would leave
+	// two claims on the same CPUs for good.
+	Exchange int
 }
 
 // Plan is what one pass would do to one NUMA node.
@@ -65,6 +71,16 @@ type Options struct {
 	// is built around it, so it stays a fixed obstacle rather than a claim the
 	// ideal keeps calling to be moved and the plan can never move.
 	Eligible func(types.UID) bool
+	// AllowSwaps permits an exchange, in which claims are re-cut over the CPUs
+	// they hold between them instead of moving into free ones. It is the only
+	// repair a node with no usable free space has, and it costs the instant
+	// between the two container updates, during which both claims sit on the
+	// CPUs one of them is leaving.
+	//
+	// With it off a claim moves only into CPUs nothing holds, so a full node
+	// keeps the placement it has. The plan still says an exchange would have
+	// helped, since that is the answer to why the claim is still split.
+	AllowSwaps bool
 	// KeepFreePoolNonEmpty drops moves until at least one free CPU is left over.
 	// Set it whenever a container without a claim is running on the node: while
 	// a move is in flight its claim holds both its old and its new CPUs, so a
@@ -233,8 +249,13 @@ func plannedMoves(topo *Topology, placements []Placement, ideal map[types.UID]cp
 	blocked := 0
 	reason := ""
 	avail := free
+	moved := map[types.UID]struct{}{}
+	exchanges := 0
 
 	for _, p := range packingOrder(placements) {
+		if _, done := moved[p.ClaimUID]; done {
+			continue
+		}
 		wanted := ideal[p.ClaimUID]
 		if wanted.Equals(p.CPUs) {
 			continue
@@ -244,24 +265,116 @@ func plannedMoves(topo *Topology, placements []Placement, ideal map[types.UID]cp
 		}
 		othersIdeal := allIdeal.Difference(wanted)
 		target, ok := reachableTarget(topo, p.CPUs, wanted, spare, avail, othersIdeal, sel)
-		if !ok {
-			blocked++
-			continue
-		}
-		if moveScore(topo, target, othersIdeal) >= moveScore(topo, p.CPUs, othersIdeal) {
-			blocked++
-			continue
-		}
-		if opts.KeepFreePoolNonEmpty && avail.Difference(target).IsEmpty() {
-			blocked++
-			reason = "held back a move to keep a CPU in the shared pool"
+		if ok && moveScore(topo, target, othersIdeal) < moveScore(topo, p.CPUs, othersIdeal) {
+			if opts.KeepFreePoolNonEmpty && avail.Difference(target).IsEmpty() {
+				blocked++
+				reason = "held back a move to keep a CPU in the shared pool"
+				continue
+			}
+			moves = append(moves, Move{ClaimUID: p.ClaimUID, From: p.CPUs, To: target})
+			avail = avail.Difference(target)
+			moved[p.ClaimUID] = struct{}{}
 			continue
 		}
 
-		moves = append(moves, Move{ClaimUID: p.ClaimUID, From: p.CPUs, To: target})
-		avail = avail.Difference(target)
+		// No free CPUs this claim can use, which on a node packing has filled is
+		// every claim. Exchanging with a claim that is in the way needs none.
+		exchange, found := exchangeFor(topo, p, placements, ideal, allIdeal, moved, sel, opts)
+		if !found {
+			blocked++
+			continue
+		}
+		if !opts.AllowSwaps {
+			blocked++
+			reason = "an exchange of two claims would help, but transient overlap is not permitted"
+			continue
+		}
+		exchanges++
+		for _, move := range exchange {
+			move.Exchange = exchanges
+			moves = append(moves, move)
+			moved[move.ClaimUID] = struct{}{}
+		}
 	}
 	return moves, blocked, reason
+}
+
+// exchangeFor looks for the exchange that best improves a claim no move into
+// free CPUs can help: some other claim's CPUs are re-cut together with this
+// one's, each keeping its own count, so the pair ends up better placed on
+// exactly the CPUs it already occupied.
+//
+// It is offered every claim rather than only the ones in the way, because which
+// partner helps is what the selector decides and not something the caller can
+// see in advance; a partner that cannot improve the pair is dropped by the score
+// below anyway.
+//
+// Two conditions, both needed. The pair's total score must strictly fall, which
+// is the same measure a plain move is held to and is what keeps a pass from
+// churning: the total over all claims is a non-negative integer that falls
+// whenever anything moves. And neither participant may end up spanning more
+// caches than it does now, so an exchange never pays for one claim's alignment
+// with another's.
+func exchangeFor(topo *Topology, p Placement, placements []Placement, ideal map[types.UID]cpuset.CPUSet, allIdeal cpuset.CPUSet, moved map[types.UID]struct{}, sel Selector, opts Options) ([]Move, bool) {
+	if !opts.eligible(p.ClaimUID) {
+		return nil, false
+	}
+	var best []Move
+	bestGain := 0
+	for _, q := range packingOrder(placements) {
+		if q.ClaimUID == p.ClaimUID || !opts.eligible(q.ClaimUID) {
+			continue
+		}
+		if _, done := moved[q.ClaimUID]; done {
+			continue
+		}
+		pair := []Placement{p, q}
+		targets, ok := recut(pair, sel)
+		if !ok {
+			continue
+		}
+		gain := 0
+		worsened := false
+		for _, member := range pair {
+			target := targets[member.ClaimUID]
+			if topo.ExcessSpread(target) > topo.ExcessSpread(member.CPUs) {
+				worsened = true
+				break
+			}
+			othersIdeal := allIdeal.Difference(ideal[member.ClaimUID])
+			gain += moveScore(topo, member.CPUs, othersIdeal) - moveScore(topo, target, othersIdeal)
+		}
+		if worsened || gain <= bestGain {
+			continue
+		}
+		bestGain = gain
+		best = nil
+		for _, member := range pair {
+			best = append(best, Move{ClaimUID: member.ClaimUID, From: member.CPUs, To: targets[member.ClaimUID]})
+		}
+	}
+	return best, best != nil
+}
+
+// recut divides the CPUs a group of claims holds between them back among the
+// same claims, largest first, each keeping its own count. It reports false when
+// the selector cannot serve one of them, which is how a group whose CPUs cannot
+// be cut into the shapes it needs -- whole cores, for one -- drops out.
+func recut(group []Placement, sel Selector) (map[types.UID]cpuset.CPUSet, bool) {
+	remaining := cpuset.New()
+	for _, p := range group {
+		remaining = remaining.Union(p.CPUs)
+	}
+	targets := make(map[types.UID]cpuset.CPUSet, len(group))
+	for _, p := range packingOrder(group) {
+		target, err := sel(remaining, p.CPUs.Size())
+		if err != nil {
+			return nil, false
+		}
+		targets[p.ClaimUID] = target
+		remaining = remaining.Difference(target)
+	}
+	return targets, true
 }
 
 // reachableTarget returns the best CPUs a claim can take right now: its ideal
