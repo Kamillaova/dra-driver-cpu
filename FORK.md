@@ -29,19 +29,32 @@ See [docs/user/defragmentation.md](docs/user/defragmentation.md) for how to enab
 The `DRA_CPUSET_<claimUID>` variable keeps upstream's name and format, so neither direction needs a
 reader for a legacy format and a claim's identity survives either swap.
 
-With `defragEnabled` the injected value is the literal string `dynamic` rather than a cpuset,
-because a claim whose placement may change has none to name for the life of its container.
+For a claim stating `cpuConfig.relocatable: true` the injected value is the literal string `dynamic`
+rather than a cpuset, because a claim whose placement may change has none to name for the life of its
+container. A claim that permits no move keeps its cpuset there, whatever the node's configuration.
 
 **upstream → fork: no drain.** Identity comes from the variable's name. A spec written by upstream
 carries no `dra.cpu/placements` annotation, so the fork falls back to parsing that spec's own env value,
 which for an upstream spec is the real placement. Each claim gains an annotation the next time its spec
 is written.
 
-**fork → upstream: no drain while nothing moves a claim**, which holds while `defragEnabled` is off.
-The annotation always agrees with the env value, so an upstream driver reading these specs behaves
-exactly as it does with its own.
+**Within the fork, a claim's mobility does not survive the driver version that introduced it.** A spec
+written before `dra.cpu/relocatable` existed carries no such annotation, and an absent one reads as
+immobile — the field's default, and the safe reading. So upgrading a node past that version leaves its
+already-running claims unmovable, however their templates were written, until their pods are recreated:
+nothing rewrites a spec except a Prepare or a move, and a move is what the claim can no longer have.
+Defragmentation therefore appears to stop on that node and resume as its pods turn over. Recreate the
+pods to have it resume at once.
 
-Once claims can move, **a rollback requires draining the node first.** An upstream driver treats the
+**fork → upstream: no drain while no running claim is relocatable.** The condition is the claim's, not
+the node's: an immobile claim's annotation always agrees with its env value, which names a cpuset, so an
+upstream driver reading that spec behaves exactly as it does with its own. Turning `defragEnabled` off
+does not make the node safe to roll back, because a relocatable claim's variable says `dynamic` whatever
+the node's configuration — the value is fixed when the container is created, and the claim is what
+decides it. Check the claims, not the switch: a node is safe to roll back while no running pod holds a
+claim stating `cpuConfig.relocatable: true`.
+
+With such a claim running, **a rollback requires draining the node first.** An upstream driver treats the
 env value as the claim's placement, and a moved claim's value no longer describes its container.
 `dynamic` is the value it does least harm with: it cannot parse it, so it passes the container over
 and leaves its cpuset alone, and only the CPUs that claim holds are then handed out to others as well.
@@ -67,8 +80,9 @@ DaemonSet.
 Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
-- `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiEnvDynamicValue`,
-  `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`, `decodePlacements`
+- `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiRelocatableAnnotation`,
+  `cdiEnvDynamicValue`, `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`,
+  `decodePlacements`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries` and
   `defragRetryDue` and `placementPolicy` fields, and `Config.DefragEnabled`
@@ -85,7 +99,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
   `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
-  `GetRebindOrigin`, `GetResourceClaimRequests`, `GetResourceClaimAllocationUnion`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
+  `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `ClaimRecord`, `GetClaimRecord`,
+  `IsRelocatable`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 
@@ -172,7 +187,12 @@ behaviour) rather than silently adapting.
   reshaped the planner: the ideal packing is a repair target for misaligned claims only, and a claim
   already spread as little as its size allows is never herded into the ideal's preferred slots for
   tidiness (watched on hardware: six moves where three were needed, one of them intra-cache).
+- **The opt-out of being moved is the claim's, not the pod's.** The design put it on the pod, as an
+  annotation carried through `ContainerState`. It belongs on the claim: mobility is a property of the
+  CPUs a claim holds, the claim already carries a configuration the tenant writes, and a pod
+  annotation would have said nothing about a claim two pods share. It is also an opt-*in* rather than
+  an opt-out, because a wrong `true` silently costs a workload its per-vCPU pinning while a wrong
+  `false` costs only capacity, and visibly.
 - **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
-  node informer and the RBAC for it; and the per-pod annotation opting a workload out of being moved,
-  which needs a flag carried through `ContainerState`. Neither affects correctness — the first only
-  lets a pass do avoidable work on a node about to be emptied.
+  node informer and the RBAC for it. It does not affect correctness — it only lets a pass do avoidable
+  work on a node about to be emptied.

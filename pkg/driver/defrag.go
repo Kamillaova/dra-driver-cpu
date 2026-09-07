@@ -332,6 +332,11 @@ func (cp *CPUDriver) claimMovable(claimUID types.UID) bool {
 // claimMovableIn answers the same question against a given store, so a caller
 // that captured one under applyMu can ask after releasing it.
 func claimMovableIn(allocations *store.CPUAllocation, claimUID types.UID) bool {
+	// A move changes the CPUs under a running workload, and only the workload
+	// knows whether it survives that, so nothing is moved that has not said so.
+	if !allocations.IsRelocatable(claimUID) {
+		return false
+	}
 	_, inFlight := allocations.GetRebindOrigin(claimUID)
 	return !inFlight
 }
@@ -345,12 +350,12 @@ func claimMovableIn(allocations *store.CPUAllocation, claimUID types.UID) bool {
 // which only learns of a spec when it is refreshed and so cannot be relied on to
 // know about a claim this driver prepared itself.
 func (cp *CPUDriver) writeClaimPlacement(logger logr.Logger, claimUID types.UID) error {
-	requests, ok := cp.cpuAllocationStore.GetResourceClaimRequests(claimUID)
+	record, ok := cp.cpuAllocationStore.GetClaimRecord(claimUID)
 	if !ok {
 		return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
 	}
-	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cp.cdiEnvValue(store.UnionOf(requests)))
-	return cp.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), envVar, requests)
+	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cp.cdiEnvValue(record))
+	return cp.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), envVar, record)
 }
 
 // roundUpdates builds the one batch of container updates a round consists of: the
