@@ -6,7 +6,7 @@ correct while the defragmenter moves claims under it.
 | File                           | Shows                                                                                                     |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------- |
 | `vm-whole-ccx.yaml`            | A VM owning one whole uncore cache: capacity sized to the cache, CEL selector on `largestUncoreCacheCPUs` |
-| `vm-small-flexible.yaml`       | The movable class: two whole cores, no selector, re-homed by the defragmenter when it helps a larger VM   |
+| `vm-small-flexible.yaml`       | The movable class: two whole cores, no selector, `relocatable: true` so the defragmenter may re-home it   |
 | `qemu-launcher-configmap.yaml` | The workload contract in code: live CPUs from the cgroup, per-vCPU pinning via QMP, inotify re-pinning    |
 
 The image is yours to build; the shim needs `qemu-system-x86_64`, `python3` and
@@ -15,8 +15,9 @@ device plugin in production.
 
 ## The contract, in one paragraph
 
-Never parse `DRA_CPUSET_*`: with `defragEnabled` its value is the literal string
-`dynamic`, and without it it is only a snapshot from container creation. Read
+Never parse `DRA_CPUSET_*`: for a claim stating `relocatable: true` its value is
+the literal string `dynamic`, and otherwise it is only a snapshot from container
+creation. Read
 the live set from `cpuset.cpus.effective` (or `sched_getaffinity(2)`), pin vCPU
 k to the k-th CPU of the cache-ordered set, and watch `cpuset.cpus` with inotify — the
 writable file generates events on every move, the derived `.effective` does
