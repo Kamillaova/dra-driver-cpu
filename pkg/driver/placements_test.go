@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr/testr"
+	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/stretchr/testify/require"
 	"k8s.io/utils/cpuset"
 )
@@ -70,7 +71,7 @@ func TestServePlacementsReportsWhereClaimsAre(t *testing.T) {
 	require.Equal(t, "2-3,5-7", node.FreeCPUs)
 	require.Equal(t, 1, node.ExcessUncoreCaches, "claim-1 spans two caches where one would do")
 	require.Equal(t, 3, node.LargestAlignableFreeCPUs)
-	require.Nil(t, node.Plan, "a plan is only reported for a dry run")
+	require.Nil(t, node.Plans, "a plan is only reported for a dry run")
 
 	require.Equal(t, []cacheReport{
 		{CacheID: 0, CPUs: "0-3", FreeCPUs: "2-3"},
@@ -86,8 +87,11 @@ func TestServePlacementsDryRunShowsWhatAPassWouldDo(t *testing.T) {
 	report := getPlacements(t, d, "?dryrun=1")
 
 	require.Len(t, report.NUMANodes, 1)
-	plan := report.NUMANodes[0].Plan
-	require.NotNil(t, plan)
+	require.Len(t, report.NUMANodes[0].Plans, 1, "an undescribed node has one partition, so one round")
+	plan := report.NUMANodes[0].Plans[0]
+	require.Equal(t, devattr.DefaultPartitionName, plan.Partition)
+	require.Equal(t, "0-7", plan.CPUs)
+	require.Equal(t, "1-3,5-7", plan.FreeCPUs)
 	require.Equal(t, 1, plan.CurrentCost)
 	require.Equal(t, 0, plan.IdealCost)
 	require.Equal(t, []moveReport{{ClaimUID: "claim-1", From: "0,4", To: "0-1"}}, plan.Moves)
@@ -115,16 +119,16 @@ func TestPlacementsPlansWithApplyMuReleased(t *testing.T) {
 
 	online, err := d.currentOnlineCPUs(testr.New(t))
 	require.NoError(t, err)
-	report, planning := d.placementsSnapshot(online, true)
-	require.Len(t, planning, 1, "a dry run must hand back one planning input per measurable node")
-	require.Nil(t, report.NUMANodes[0].Plan, "the snapshot must not plan")
+	report, planning := d.placementsSnapshot(testr.New(t), online, true)
+	require.Len(t, planning, 1, "a dry run must hand back one planning input per measurable scope")
+	require.Len(t, report.NUMANodes[0].Plans, 1)
+	require.Empty(t, report.NUMANodes[0].Plans[0].Moves, "the snapshot must not plan")
 
 	require.True(t, d.applyMu.TryLock(), "applyMu was still held after the snapshot returned")
 	d.applyMu.Unlock()
 
-	d.planNodeReport(testr.New(t), planning[0])
-	require.NotNil(t, report.NUMANodes[0].Plan)
-	require.Equal(t, []moveReport{{ClaimUID: "claim-1", From: "0,4", To: "0-1"}}, report.NUMANodes[0].Plan.Moves)
+	d.planPartitionReport(testr.New(t), planning[0])
+	require.Equal(t, []moveReport{{ClaimUID: "claim-1", From: "0,4", To: "0-1"}}, report.NUMANodes[0].Plans[0].Moves)
 }
 
 func TestServePlacementsDryRunSaysWhyNothingWouldMove(t *testing.T) {
@@ -136,8 +140,9 @@ func TestServePlacementsDryRunSaysWhyNothingWouldMove(t *testing.T) {
 	d.runContainer(t, "pod-uid-1", "ctr-1", "ctr-uid-1", "claim-1")
 	d.runContainer(t, "pod-uid-2", "ctr-2", "ctr-uid-2", "claim-2")
 
-	plan := getPlacements(t, d, "?dryrun=1").NUMANodes[0].Plan
-	require.NotNil(t, plan)
+	plans := getPlacements(t, d, "?dryrun=1").NUMANodes[0].Plans
+	require.Len(t, plans, 1)
+	plan := plans[0]
 	require.Empty(t, plan.Moves)
 	require.Positive(t, plan.Blocked)
 	require.Contains(t, plan.Reason, "blocked")

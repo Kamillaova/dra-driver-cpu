@@ -91,12 +91,15 @@ type AllocationState struct {
 type DefragState struct {
 	// ExcessUncoreCaches is how many uncore caches the node's claims span beyond
 	// the fewest their sizes allow. Zero means every claim is as well placed as
-	// it can be.
+	// it can be. Every claim on the node counts, including the ones no pass can
+	// repair.
 	ExcessUncoreCaches int
-	// LargestAlignableFreeCPUs is, per NUMA node, the most CPUs still free inside
-	// a single uncore cache: the largest claim that node could take without
-	// splitting it. It leads the excess count, since it says whether the next
-	// claim will land aligned rather than whether the last ones did.
+	// LargestAlignableFreeCPUs is, per NUMA node, the largest claim that node
+	// could take without splitting it across uncore caches. It is the best of the
+	// node's CPU partitions rather than the free space in a cache, because a claim
+	// lands inside one partition and a cache may be divided between two. It leads
+	// the excess count, since it says whether the next claim will land aligned
+	// rather than whether the last ones did.
 	LargestAlignableFreeCPUs map[int]int
 }
 
@@ -256,7 +259,7 @@ var (
 	defragAlignableFreeCPUsSpec = metricSpec{
 		name:   "dra_cpu_defrag_largest_alignable_free_cpus",
 		kind:   metricGauge,
-		help:   "Most CPUs still free within a single uncore cache of a NUMA node, which is the largest claim it can take unsplit.",
+		help:   "Largest claim a NUMA node can still take inside a single uncore cache, which is the best any one of its CPU partitions can offer.",
 		labels: []string{"numa_node"},
 	}
 	defragPassesSpec = metricSpec{
