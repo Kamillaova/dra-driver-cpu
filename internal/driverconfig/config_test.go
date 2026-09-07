@@ -841,3 +841,26 @@ defragEnabled: true
 	require.NoError(t, err)
 	assert.True(t, result.DefragEnabled)
 }
+
+// TestValidate_CachePlacementStrategy: only the two named policies exist, and
+// the policy governs which CPUs the driver picks, so it is rejected where the
+// driver does not pick.
+func TestValidate_CachePlacementStrategy(t *testing.T) {
+	cfg := driverconfig.Default()
+	assert.Equal(t, "pack", cfg.CachePlacementStrategy, "the default must be upstream's behaviour")
+	assert.NoError(t, cfg.Validate())
+
+	cfg.CachePlacementStrategy = "spread"
+	assert.NoError(t, cfg.Validate(), "spread must not demand whole-core allocation")
+
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires cpuDeviceMode")
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_GROUPED
+
+	cfg.CachePlacementStrategy = "sprinkle"
+	err = cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"sprinkle"`)
+}
