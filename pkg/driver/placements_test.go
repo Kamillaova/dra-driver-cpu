@@ -145,7 +145,7 @@ func TestServePlacementsDryRunSaysWhyNothingWouldMove(t *testing.T) {
 	plan := plans[0]
 	require.Empty(t, plan.Moves)
 	require.Positive(t, plan.Blocked)
-	require.Contains(t, plan.Reason, "blocked")
+	require.Contains(t, plan.Reason, "transient overlap is not permitted")
 }
 
 func TestServePlacementsReportsAMoveInFlight(t *testing.T) {
