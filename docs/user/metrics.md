@@ -44,7 +44,7 @@ uncore cache per NUMA node has no spread to recover, so its excess is permanentl
 `dra_cpu_defrag_largest_alignable_free_cpus` is the leading indicator: it says whether the *next*
 large claim will land aligned, where the excess count says whether the last ones did. A steady
 `dra_cpu_defrag_blocked_moves_total` with a non-zero excess means the node cannot reach a better
-placement on its own — the claims in the way are themselves pinned, or there is no slack to move
+placement on its own — the claims in the way never asked to be moved, or there is no slack to move
 them through.
 
 The custom metrics intentionally avoid labels for namespace, pod, claim, device, node, socket, group

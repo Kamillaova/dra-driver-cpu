@@ -1310,9 +1310,9 @@ func TestCreateContainerSharesAClaimHoldingNoExclusiveCPUs(t *testing.T) {
 	claimUID := types.UID("claim-pool")
 	poolCPUs := cpuset.New(2, 3)
 	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
-	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, []store.RequestAllocation{
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, store.ClaimRecord{Requests: []store.RequestAllocation{
 		{Request: "helpers", CPUs: poolCPUs, Role: store.Role("shared")},
-	}, false))
+	}}, false))
 	claimTracker := store.NewClaimTracker()
 	claimTracker.SetReservedFor(claimUID, []types.UID{"pod-a", "pod-b"})
 	driver := &CPUDriver{
@@ -1365,7 +1365,7 @@ func TestSynchronizeRecordsAReservationForAClaimHoldingNoExclusiveCPUs(t *testin
 	}
 	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
 		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "2-3"),
-		[]store.RequestAllocation{{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")}}))
+		store.ClaimRecord{Requests: []store.RequestAllocation{{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")}}}))
 
 	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
 	ctr := &api.Container{

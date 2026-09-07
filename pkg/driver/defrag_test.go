@@ -104,13 +104,28 @@ func (f *fakeContainerUpdater) setErr(err error) {
 	f.err = err
 }
 
-// placeClaim records a prepared claim on the given CPUs, as Prepare would.
+// placeClaim records a prepared claim on the given CPUs, as Prepare would. The
+// claim permits moves, since that is what these tests are about; placeFixedClaim
+// is the claim that does not.
 func (d *defragTestDriver) placeClaim(t *testing.T, claimUID types.UID, cpus cpuset.CPUSet) {
 	t.Helper()
+	d.place(t, claimUID, relocatableOn(cpus))
+}
+
+// placeFixedClaim records a claim whose configuration says nothing, so it never
+// permits its CPUs to change.
+func (d *defragTestDriver) placeFixedClaim(t *testing.T, claimUID types.UID, cpus cpuset.CPUSet) {
+	t.Helper()
+	d.place(t, claimUID, exclusiveOn(cpus))
+}
+
+func (d *defragTestDriver) place(t *testing.T, claimUID types.UID, record store.ClaimRecord) {
+	t.Helper()
 	logger := testr.New(t)
-	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(cpus), false))
+	cpus := store.UnionOf(record.Requests)
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, record, false))
 	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
-		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cpus.String()), exclusiveOn(cpus)))
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cpus.String()), record))
 }
 
 // runContainer binds claims to a running container, as CreateContainer would.
@@ -126,9 +141,9 @@ func (d *defragTestDriver) runContainer(t *testing.T, podUID types.UID, name str
 // recordedPlacement is the cpuset a claim's CDI spec names.
 func (d *defragTestDriver) recordedPlacement(t *testing.T, claimUID types.UID) cpuset.CPUSet {
 	t.Helper()
-	requests, err := d.cdiMgr.GetDeviceAllocations(getCDIDeviceName(claimUID))
+	record, err := d.cdiMgr.GetDeviceAllocations(getCDIDeviceName(claimUID))
 	require.NoError(t, err)
-	return store.UnionOf(requests)
+	return store.UnionOf(record.Requests)
 }
 
 func updateFor(t *testing.T, updates []*api.ContainerUpdate, containerID string) string {
@@ -396,8 +411,8 @@ func TestDefragPassKeepsTheDynamicEnvWhenItMovesAClaim(t *testing.T) {
 	logger := testr.New(t)
 	claimUID := types.UID("claim-1")
 	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue)
-	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(cpuset.New(0, 4)), false))
-	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), envVar, exclusiveOn(cpuset.New(0, 4))))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, relocatableOn(cpuset.New(0, 4)), false))
+	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), envVar, relocatableOn(cpuset.New(0, 4))))
 	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", claimUID)
 
 	d.defragPass(context.Background())
@@ -793,10 +808,10 @@ func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
 	d.cdiMgr = realCDI
 
 	claimUID := types.UID("claim-real-cdi")
-	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(cpuset.New(0, 4)), false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, relocatableOn(cpuset.New(0, 4)), false))
 	// Exactly as Prepare writes it, with no Refresh afterwards.
 	require.NoError(t, realCDI.AddDevice(logger, getCDIDeviceName(claimUID),
-		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue), exclusiveOn(cpuset.New(0, 4))))
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue), relocatableOn(cpuset.New(0, 4))))
 	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", claimUID)
 
 	d.defragPass(context.Background())
@@ -810,7 +825,7 @@ func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
 	require.NoError(t, realCDI.Refresh())
 	recorded, err := realCDI.GetDeviceAllocations(getCDIDeviceName(claimUID))
 	require.NoError(t, err)
-	require.Equal(t, exclusiveOn(cpuset.New(0, 1)), recorded)
+	require.Equal(t, relocatableOn(cpuset.New(0, 1)), recorded)
 }
 
 func TestDefragPassAsksForTheNextPassWhenItCommitsAnything(t *testing.T) {
@@ -825,4 +840,51 @@ func TestDefragPassAsksForTheNextPassWhenItCommitsAnything(t *testing.T) {
 
 	require.Len(t, d.updater.allCalls(), 1)
 	require.Len(t, d.reconcileTrigger, 1, "a committed round must ask for the next pass")
+}
+
+func TestDefragPassLeavesAClaimThatNeverAskedToBeMoved(t *testing.T) {
+	// A move changes the CPUs under a running workload, and only that workload
+	// knows whether it survives one, so a claim whose configuration says nothing
+	// is an obstacle rather than a candidate: the node keeps the spread it
+	// cannot repair, and reports it.
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeFixedClaim(t, "claim-1", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls(), "an immobile claim must not be moved")
+	cpus, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(0, 4), cpus)
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01)
+}
+
+func TestDefragPassStillMovesAClaimAfterARestart(t *testing.T) {
+	// Mobility is the claim's, and the driver does not watch ResourceClaims: a
+	// restart rebuilds what it knows from the specs on disk. Recorded nowhere,
+	// every claim would read as immobile afterwards and defragmentation would
+	// stop for the life of those pods -- silently, since refusing to move is
+	// also the correct answer for a claim that never asked.
+	logger := testr.New(t)
+	claimUID := types.UID("claim-across-restart")
+
+	before := newDefragTestDriver(t, 2, 4)
+	realCDI, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+	before.cdiMgr = realCDI
+	before.place(t, claimUID, relocatableOn(cpuset.New(0, 4)))
+
+	after := newDefragTestDriver(t, 2, 4)
+	after.cdiMgr = realCDI
+	after.seedAllocationStoreFromDisk(logger)
+
+	require.True(t, after.cpuAllocationStore.IsRelocatable(claimUID),
+		"the claim's own answer did not survive the restart")
+	after.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", claimUID)
+	after.defragPass(context.Background())
+
+	moved, ok := after.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(0, 1), moved, "the claim was not consolidated after the restart")
 }
