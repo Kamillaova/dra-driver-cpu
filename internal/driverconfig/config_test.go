@@ -788,10 +788,13 @@ reconcileSharedOnUnprepare: false
 	assert.False(t, result.ReconcileSharedOnUnprepare)
 }
 
-// TestResolve_DefragDefaults: defragmentation is off.
+// TestResolve_DefragDefaults: defragmentation is off, and the instant of
+// overlap an exchange needs is permitted, so enabling the one option gets the
+// repair a full node depends on.
 func TestResolve_DefragDefaults(t *testing.T) {
 	d := driverconfig.Default()
 	assert.False(t, d.DefragEnabled)
+	assert.True(t, d.DefragAllowTransientOverlap)
 	assert.NoError(t, d.Validate())
 }
 
@@ -870,13 +873,15 @@ func TestValidate_DefragRequirementsAreInertWhenDisabled(t *testing.T) {
 	assert.NoError(t, cfg.Validate())
 }
 
-// TestResolve_DefragOptionsFromFile: the option is settable from a config file.
+// TestResolve_DefragOptionsFromFile: both options are settable from a config
+// file, including forbidding the instant of overlap against its default.
 func TestResolve_DefragOptionsFromFile(t *testing.T) {
 	dir := t.TempDir()
 	cfgFile := writeFile(t, dir, "config.yaml", `
 apiVersion: v1alpha1
 assumeUnsolicitedUpdatesSafe: true
 defragEnabled: true
+defragAllowTransientOverlap: false
 `)
 
 	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
@@ -884,6 +889,17 @@ defragEnabled: true
 	})
 	require.NoError(t, err)
 	assert.True(t, result.DefragEnabled)
+	assert.False(t, result.DefragAllowTransientOverlap)
+}
+
+// TestValidate_DefragOverlapIsInertWhenDefragIsOff: forbidding the overlap on a
+// node that never defragments describes nothing, so it is not an error. The
+// option defaults on, so refusing the combination would refuse every default
+// configuration that leaves defragmentation off.
+func TestValidate_DefragOverlapIsInertWhenDefragIsOff(t *testing.T) {
+	cfg := driverconfig.Default()
+	cfg.DefragAllowTransientOverlap = false
+	assert.NoError(t, cfg.Validate())
 }
 
 // TestValidate_CachePlacementStrategy: only the two named policies exist, and
