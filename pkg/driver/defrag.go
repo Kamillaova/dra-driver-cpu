@@ -327,7 +327,13 @@ func selectMoveCPUs(logger logr.Logger, topo *cpuinfo.CPUTopology, available cpu
 
 // claimMovable reports whether a claim may be moved now. Called with applyMu held.
 func (cp *CPUDriver) claimMovable(claimUID types.UID) bool {
-	_, inFlight := cp.cpuAllocationStore.GetRebindOrigin(claimUID)
+	return claimMovableIn(cp.cpuAllocationStore, claimUID)
+}
+
+// claimMovableIn answers the same question against a given store, so a caller
+// that captured one under applyMu can ask after releasing it.
+func claimMovableIn(allocations *store.CPUAllocation, claimUID types.UID) bool {
+	_, inFlight := allocations.GetRebindOrigin(claimUID)
 	return !inFlight
 }
 
