@@ -105,10 +105,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `go.mod`: the `require` and `replace` of the nested `api` module, which upstream builds as part of
   the root module
 
-- `internal/driverconfig`: `DefragEnabled` and `validateDefrag`; `CachePlacementStrategy` and
-  `validateCachePlacementStrategy`; the `Profiles`
-  map, `Profile`, `ProfileLabel`, `DefaultProfileName`, `WithProfile`, `asProfile`,
-  `validateProfiles` and `WarnDeprecatedCPUFields`
+- `internal/driverconfig`: `DefragEnabled`, `DefragAllowTransientOverlap` and `validateDefrag`;
+  `CachePlacementStrategy` and `validateCachePlacementStrategy`; the `Profiles` map, `Profile`,
+  `ProfileLabel`, `DefaultProfileName`, `WithProfile`, `asProfile`, `validateProfiles` and
+  `WarnDeprecatedCPUFields`
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
   behind them

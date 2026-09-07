@@ -37,6 +37,10 @@ func Default() Config {
 		// enabling that one option gets the prompt reconcile without a second
 		// switch.
 		ReconcileSharedOnUnprepare: true,
-		CachePlacementStrategy:     string(coreselect.Pack),
+		// On by default, and inert until defragmentation is enabled: a node
+		// packed full has no free CPUs to move a claim through, so forbidding
+		// the instant of overlap forbids repairing it at all.
+		DefragAllowTransientOverlap: true,
+		CachePlacementStrategy:      string(coreselect.Pack),
 	}
 }
