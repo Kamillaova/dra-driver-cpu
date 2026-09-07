@@ -76,6 +76,16 @@ type Config struct {
 	// AssumeUnsolicitedUpdatesSafe, since a move is pushed to the runtime
 	// unprompted. Defaults to false.
 	DefragEnabled bool `json:"defragEnabled,omitempty"`
+	// DefragAllowTransientOverlap permits the instant during an exchange in
+	// which two claims hold the same CPUs. Exchanging the CPUs of two claims is
+	// the only repair a node with no free CPUs has, and the runtime applies the
+	// two cpuset writes of one batch in order, so between them both claims sit
+	// on the CPUs one of them is leaving.
+	//
+	// Defaults to true. Setting it to false forbids that instant, which also
+	// forbids every exchange: a move then needs free CPUs to move through, and a
+	// full node keeps the placement it has. Inert without DefragEnabled.
+	DefragAllowTransientOverlap bool `json:"defragAllowTransientOverlap,omitempty"`
 	// CachePlacementStrategy is how a claim that fits inside one uncore cache
 	// chooses among the caches that can hold it. "pack" (the default) fills
 	// the fullest cache that fits, keeping clean caches whole for larger
@@ -186,6 +196,7 @@ func (c Config) LogValues() []any {
 		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
 		"reconcileSharedOnUnprepare", c.ReconcileSharedOnUnprepare,
 		"defragEnabled", c.DefragEnabled,
+		"defragAllowTransientOverlap", c.DefragAllowTransientOverlap,
 		"cachePlacementStrategy", c.CachePlacementStrategy,
 		"cpuPartitions", c.CPUPartitions,
 		"profiles", c.Profiles,
@@ -209,6 +220,7 @@ type dumpConfig struct {
 	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe"`
 	ReconcileSharedOnUnprepare            bool               `json:"reconcileSharedOnUnprepare"`
 	DefragEnabled                         bool               `json:"defragEnabled"`
+	DefragAllowTransientOverlap           bool               `json:"defragAllowTransientOverlap"`
 	CachePlacementStrategy                string             `json:"cachePlacementStrategy"`
 	CPUPartitions                         []CPUPartition     `json:"cpuPartitions"`
 	Profiles                              map[string]Profile `json:"profiles"`
