@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -94,7 +95,7 @@ func newDefragTestDriverWith(t *testing.T, infos []cpuinfo.CPUInfo) *defragTestD
 		sysfs: fstest.MapFS{
 			"devices/system/cpu/online": &fstest.MapFile{Data: []byte(allCPUs.String() + "\n")},
 		},
-		defrag: defragOptions{enabled: true},
+		defrag: defragOptions{enabled: true, allowTransientOverlap: true, batchTimeout: defaultDefragBatchTimeout},
 	}
 	t.Cleanup(d.defragRetries.ShutDown)
 	return &defragTestDriver{CPUDriver: d, updater: updater, cdi: cdi, metrics: reg, allCPUs: allCPUs}
@@ -515,8 +516,10 @@ func TestDefragPassRecordsARefusedMoveAsAnError(t *testing.T) {
 
 func TestDefragPassRecordsBlockedMoves(t *testing.T) {
 	// Two claims each sitting exactly where the other belongs, with no free CPU
-	// to stage a swap through: a better placement exists and no move can reach it.
+	// to move either through and the exchange that would fix it forbidden: a
+	// better placement exists and nothing can reach it.
 	d := newDefragTestDriver(t, 2, 2)
+	d.defrag.allowTransientOverlap = false
 	d.placeClaim(t, "claim-1", cpuset.New(0, 3))
 	d.placeClaim(t, "claim-2", cpuset.New(1, 2))
 	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
@@ -1153,4 +1156,195 @@ func TestDefragPassMeasuresANodeWithNoPlannablePartition(t *testing.T) {
 		map[string]string{"numa_node": "0"}), 0.01,
 		"no partition can take a claim, and the series has to say so rather than disappear")
 	require.InDelta(t, 0, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01)
+}
+
+// exchangeDriver is the node an exchange exists for: two caches of two CPUs,
+// entirely held by two claims that each sit exactly where the other belongs.
+// There is no free CPU to move either through.
+func exchangeDriver(t *testing.T) *defragTestDriver {
+	t.Helper()
+	d := newDefragTestDriver(t, 2, 2)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 3))
+	d.placeClaim(t, "claim-2", cpuset.New(1, 2))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.runContainer(t, "pod-2", "ctr-2", "ctr-uid-2", "claim-2")
+	return d
+}
+
+func TestDefragPassExchangesTwoClaimsInOneBatch(t *testing.T) {
+	d := exchangeDriver(t)
+
+	d.defragPass(context.Background())
+
+	calls := d.updater.allCalls()
+	require.Len(t, calls, 1, "both containers are updated in one batch")
+	require.Equal(t, "0-1", updateFor(t, calls[0], "ctr-uid-1"))
+	require.Equal(t, "2-3", updateFor(t, calls[0], "ctr-uid-2"))
+
+	first, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	second, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-2")
+	require.Equal(t, cpuset.New(0, 1), first)
+	require.Equal(t, cpuset.New(2, 3), second)
+	require.Equal(t, cpuset.New(0, 1), d.recordedPlacement(t, "claim-1"))
+	require.Equal(t, cpuset.New(2, 3), d.recordedPlacement(t, "claim-2"))
+	for _, claimUID := range []types.UID{"claim-1", "claim-2"} {
+		_, inFlight := d.cpuAllocationStore.GetRebindOrigin(claimUID)
+		require.False(t, inFlight, "claim %s must be settled, not left half-swapped", claimUID)
+	}
+	require.True(t, d.cpuAllocationStore.GetSharedCPUs().IsEmpty(), "an exchange releases nothing")
+	require.Positive(t, metricValue(t, d.metrics, "dra_cpu_defrag_swap_overlap_seconds", nil))
+}
+
+func TestDefragPassRetriesTheRefusedHalfOfAnExchange(t *testing.T) {
+	// The runtime moves one container and refuses the other, which is the state
+	// that leaves two claims sharing CPUs. Completing the exchange is better than
+	// undoing it, so the refused half goes out again first.
+	d := exchangeDriver(t)
+	d.updater.reply = func(call int, updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
+		if call == 1 {
+			return refusing("ctr-uid-2")(call, updates)
+		}
+		return nil, nil
+	}
+
+	d.defragPass(context.Background())
+
+	calls := d.updater.allCalls()
+	require.Len(t, calls, 2, "the batch, then the half it refused")
+	require.Len(t, calls[1], 1)
+	require.Equal(t, "2-3", updateFor(t, calls[1], "ctr-uid-2"))
+
+	first, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 1), first, "the exchange completed")
+	_, inFlight := d.cpuAllocationStore.GetRebindOrigin("claim-2")
+	require.False(t, inFlight)
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_partial_batches_total", nil), 0.01)
+	require.Empty(t, d.pendingRounds)
+}
+
+func TestDefragPassRollsBackTheAppliedHalfOfAnExchange(t *testing.T) {
+	// The runtime keeps refusing one container, so the one it did move is put
+	// back: two claims sharing CPUs for good is the outcome to avoid.
+	d := exchangeDriver(t)
+	d.updater.reply = refusing("ctr-uid-2")
+
+	d.defragPass(context.Background())
+
+	calls := d.updater.allCalls()
+	require.Len(t, calls, 3, "the batch, the refused half again, then the rollback")
+	require.Equal(t, "0,3", updateFor(t, calls[2], "ctr-uid-1"), "the applied half goes back where it was")
+
+	first, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	second, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-2")
+	require.Equal(t, cpuset.New(0, 3), first)
+	require.Equal(t, cpuset.New(1, 2), second)
+	require.Equal(t, cpuset.New(0, 3), d.recordedPlacement(t, "claim-1"), "and so does the spec on disk")
+	for _, claimUID := range []types.UID{"claim-1", "claim-2"} {
+		_, inFlight := d.cpuAllocationStore.GetRebindOrigin(claimUID)
+		require.False(t, inFlight)
+	}
+	require.Empty(t, d.pendingRounds, "an undone exchange is settled; the next pass plans afresh")
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_rollbacks_total", map[string]string{"result": "success"}), 0.01)
+}
+
+func TestDefragPassKeepsAnUnsettleableExchangeInTransit(t *testing.T) {
+	// The runtime refuses one container and then refuses to put the other back.
+	// Nobody can say which CPUs the two containers are on, so both claims keep
+	// holding both cpusets and nothing else may be given them.
+	d := exchangeDriver(t)
+	d.updater.reply = func(call int, updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
+		if call < 3 {
+			return refusing("ctr-uid-2")(call, updates)
+		}
+		return refusing("ctr-uid-1")(call, updates)
+	}
+
+	d.defragPass(context.Background())
+
+	require.Len(t, d.updater.allCalls(), 3)
+	for _, claimUID := range []types.UID{"claim-1", "claim-2"} {
+		_, inFlight := d.cpuAllocationStore.GetRebindOrigin(claimUID)
+		require.True(t, inFlight, "claim %s must still hold both cpusets", claimUID)
+	}
+	require.True(t, d.cpuAllocationStore.GetSharedCPUs().IsEmpty())
+	require.Contains(t, d.pendingRounds, defaultScope(0), "the round is sent again rather than settled on a guess")
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_rollbacks_total", map[string]string{"result": "error"}), 0.01)
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_passes_total", map[string]string{"result": "error"}), 0.01)
+}
+
+func TestDefragPassUndoesAnExchangeTheRuntimeRefusedOutright(t *testing.T) {
+	// Neither container moved, so there is nothing to put back and no third
+	// batch: the claims go straight back to where they already are.
+	d := exchangeDriver(t)
+	d.updater.reply = refusing("ctr-uid-1", "ctr-uid-2")
+
+	d.defragPass(context.Background())
+
+	require.Len(t, d.updater.allCalls(), 1, "nothing was applied, so nothing is undone")
+	first, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 3), first)
+	require.Equal(t, cpuset.New(0, 3), d.recordedPlacement(t, "claim-1"))
+	require.Empty(t, d.pendingRounds)
+	require.Zero(t, metricValue(t, d.metrics, "dra_cpu_defrag_rollbacks_total", map[string]string{"result": "success"}))
+}
+
+func TestDefragPassTreatsAHangingBatchAsUnsettled(t *testing.T) {
+	// A runtime that never answers must not hold the one goroutine that runs
+	// passes: the batch has a deadline of its own, and running out of it is an
+	// unsettled round, since the call may still be applied.
+	d := exchangeDriver(t)
+	d.defrag.batchTimeout = 20 * time.Millisecond
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	d.updater.onUpdate = func([]*api.ContainerUpdate) { <-release }
+
+	done := make(chan struct{})
+	go func() {
+		d.defragPass(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pass waited on the runtime instead of its own deadline")
+	}
+
+	for _, claimUID := range []types.UID{"claim-1", "claim-2"} {
+		_, inFlight := d.cpuAllocationStore.GetRebindOrigin(claimUID)
+		require.True(t, inFlight, "claim %s must still hold both cpusets", claimUID)
+	}
+	require.Contains(t, d.pendingRounds, defaultScope(0))
+}
+
+func TestRetainUnsettledKeepsOnlyWhatIsWorthSendingAgain(t *testing.T) {
+	// A round can hold a move into free CPUs beside an exchange. Sending the
+	// whole round again would apply the move a second time, and for a move the
+	// runtime refused it would apply it against the ledger, so only the exchange
+	// nobody can place survives.
+	round := newDefragRound(defaultScope(0), nil)
+	round.moves = []defrag.Move{
+		{ClaimUID: "moved", From: cpuset.New(0), To: cpuset.New(1)},
+		{ClaimUID: "first", From: cpuset.New(2), To: cpuset.New(3), Exchange: 1},
+		{ClaimUID: "second", From: cpuset.New(3), To: cpuset.New(2), Exchange: 1},
+		{ClaimUID: "third", From: cpuset.New(4), To: cpuset.New(5), Exchange: 2},
+		{ClaimUID: "fourth", From: cpuset.New(5), To: cpuset.New(4), Exchange: 2},
+	}
+	round.outcomes[1] = exchangeApplied
+	for exchange, containers := range map[int][]types.UID{1: {"ctr-a"}, 2: {"ctr-b", "ctr-c"}} {
+		round.exchangeContainers[exchange] = containers
+		for _, containerUID := range containers {
+			round.updateByContainer[containerUID] = &api.ContainerUpdate{ContainerId: string(containerUID)}
+			round.claimsByContainer[containerUID] = []types.UID{"claim-of-" + containerUID}
+		}
+	}
+	round.updates = []*api.ContainerUpdate{{ContainerId: "moved-ctr"}, {ContainerId: "ctr-a"}, {ContainerId: "ctr-b"}, {ContainerId: "ctr-c"}}
+
+	next := round.retainUnsettled()
+
+	require.Equal(t, []types.UID{"third", "fourth"}, stepClaims(next.moves))
+	require.Len(t, next.updates, 2)
+	require.Equal(t, []types.UID{"ctr-b", "ctr-c"}, next.exchangeContainers[2])
+	require.NotContains(t, next.exchangeContainers, 1)
+	require.Contains(t, next.claimsByContainer, types.UID("ctr-b"))
+	require.NotContains(t, next.claimsByContainer, types.UID("ctr-a"))
 }

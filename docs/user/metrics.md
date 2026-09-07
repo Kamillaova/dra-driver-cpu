@@ -40,6 +40,14 @@ uncore cache per NUMA node has no spread to recover, so its excess is permanentl
 | `dra_cpu_defrag_moves_total`                 | Counter   | `result`    | Claim moves attempted. `error` is a move the runtime refused and the driver reverted.                                              |
 | `dra_cpu_defrag_blocked_moves_total`         | Counter   | none        | Moves a better placement called for that a pass could not make, usually because another claim is in the way.                       |
 | `dra_cpu_defrag_pass_duration_seconds`       | Histogram | none        | Defragmentation pass latency in seconds.                                                                                           |
+| `dra_cpu_defrag_swap_overlap_seconds`        | Histogram | none        | Duration of the batch carrying an exchange of two claims' CPUs, which bounds the window in which both of them hold the same CPUs.  |
+| `dra_cpu_defrag_partial_batches_total`       | Counter   | none        | Exchanges the runtime applied for some of their containers and refused for the rest.                                               |
+| `dra_cpu_defrag_rollbacks_total`             | Counter   | `result`    | Attempts to put the applied half of an exchange back. An `error` leaves two claims sharing CPUs.                                   |
+
+`dra_cpu_defrag_swap_overlap_seconds` measures the batch rather than the window itself: the instant
+the two claims share CPUs is inside the runtime, between the two writes it applies in order, so the
+batch is the tightest bound a plugin can observe. `dra_cpu_defrag_rollbacks_total{result="error"}` is
+the one to alert on — it means the driver could neither finish an exchange nor undo it.
 
 `dra_cpu_defrag_largest_alignable_free_cpus` is the leading indicator: it says whether the *next*
 large claim will land aligned, where the excess count says whether the last ones did. A steady

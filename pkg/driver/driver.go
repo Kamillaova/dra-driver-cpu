@@ -262,6 +262,11 @@ type Config struct {
 	// DefragEnabled moves running claims to recover uncore cache alignment.
 	// Requires AssumeUnsolicitedUpdatesSafe and grouped mode by NUMA node or socket.
 	DefragEnabled bool
+	// DefragAllowTransientOverlap permits exchanging the CPUs of two claims,
+	// which is the only repair a node with no free CPUs has and which costs the
+	// instant between the two container updates of one batch. Inert without
+	// DefragEnabled.
+	DefragAllowTransientOverlap bool
 	// CPUPartitions describes the node's cores, already parsed and validated as
 	// far as that is possible without the node's topology. Empty leaves the whole
 	// node in the implicit partition, which is what an undescribed node has.
@@ -393,7 +398,11 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		plugin.reconcileSharedOnUnprepare = config.ReconcileSharedOnUnprepare
 		// CCX-FORK: defragmentation, like the reconcile, presupposes unsolicited
 		// updates.
-		plugin.defrag = defragOptions{enabled: config.DefragEnabled}
+		plugin.defrag = defragOptions{
+			enabled:               config.DefragEnabled,
+			allowTransientOverlap: config.DefragAllowTransientOverlap,
+			batchTimeout:          defaultDefragBatchTimeout,
+		}
 		if plugin.defrag.enabled {
 			plugin.pendingRounds = make(map[defragScope]*defragRound)
 			plugin.defragRetries = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[defragScope]())

@@ -296,6 +296,7 @@ func (cp *CPUDriver) numaNodeReport(nodeTopo *defrag.Topology, free cpuset.CPUSe
 func (cp *CPUDriver) planPartitionReport(logger logr.Logger, input dryRunInput) {
 	plan, err := defrag.PlanNode(input.topology, input.placements, input.free, cp.defragSelector(logger, input.threadsPerCore), defrag.Options{
 		Eligible:             input.movable,
+		AllowSwaps:           cp.defrag.allowTransientOverlap,
 		KeepFreePoolNonEmpty: input.keepFreePoolNonEmpty,
 	})
 	if err != nil {

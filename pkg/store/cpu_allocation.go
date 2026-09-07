@@ -283,6 +283,32 @@ func (s *CPUAllocation) GetResourceClaimAllocationUnion(claimUIDs ...types.UID) 
 	return union, nil
 }
 
+// GetResourceClaimOriginUnion returns the union of the given claims' CPUs as
+// they were before the moves in flight, which for a claim that is not moving is
+// simply what it holds. It is what a container has to be pinned back to when a
+// move it took part in has to be undone, and it stays available for as long as
+// the move is in flight, since a mover never releases what it came from.
+//
+// CCX-FORK: upstream has no move, so a claim's CPUs have only one value.
+func (s *CPUAllocation) GetResourceClaimOriginUnion(claimUIDs ...types.UID) (cpuset.CPUSet, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	union := cpuset.New()
+	for _, claimUID := range claimUIDs {
+		allocation, ok := s.claims[claimUID]
+		if !ok {
+			return cpuset.New(), fmt.Errorf("claim %q is not prepared by this driver", claimUID)
+		}
+		if allocation.rebindOrigin == nil {
+			union = union.Union(allocation.cpus())
+			continue
+		}
+		union = union.Union(allocation.cpus().Difference(allocation.exclusiveCPUs())).Union(allocation.originCPUs())
+	}
+	return union, nil
+}
+
 // BeginRebind starts moving a prepared claim's exclusive CPUs onto target,
 // holding both its current and its target CPUs until the move is committed or
 // aborted. Neither half is offered to a shared container or to another claim in
