@@ -319,6 +319,123 @@ func (s *CPUAllocation) BeginRebind(logger logr.Logger, claimUID types.UID, targ
 	return nil
 }
 
+// BeginSwap starts an exchange between prepared claims: each is placed on the
+// CPUs targets names for it, and every one of them holds both its current and
+// its target CPUs until the exchange is committed or aborted. That transit set
+// is what keeps a Prepare arriving mid-batch from handing a newcomer CPUs a
+// half-swapped claim is still running on, and it is what an abort falls back
+// to, since no participant ever released anything.
+//
+// The targets divide up exactly the CPUs the claims already hold between them,
+// each keeping its own count, so the set the group occupies is the same before,
+// during and after. Nothing here touches the CPUs available to anything else,
+// whichever way the exchange ends. An exchange that also took free CPUs would
+// be a move and an exchange at once; the caller plans that as two steps.
+func (s *CPUAllocation) BeginSwap(logger logr.Logger, targets map[types.UID]cpuset.CPUSet) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(targets) < 2 {
+		return fmt.Errorf("an exchange needs at least two claims, got %d", len(targets))
+	}
+	claimUIDs := sortedUIDs(targets)
+	held, wanted := cpuset.New(), cpuset.New()
+	for _, claimUID := range claimUIDs {
+		allocation, ok := s.claims[claimUID]
+		if !ok {
+			return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
+		}
+		if allocation.rebindOrigin != nil {
+			return fmt.Errorf("claim %q is already rebinding from %q to %q", claimUID, allocation.originCPUs().String(), allocation.exclusiveCPUs().String())
+		}
+		current := allocation.exclusiveCPUs()
+		target := targets[claimUID]
+		if target.Size() != current.Size() {
+			return fmt.Errorf("exchange would change claim %q from %d CPUs to %d", claimUID, current.Size(), target.Size())
+		}
+		if overlap := wanted.Intersection(target); !overlap.IsEmpty() {
+			return fmt.Errorf("exchange gives CPUs %q to more than one claim", overlap.String())
+		}
+		held, wanted = held.Union(current), wanted.Union(target)
+	}
+	if !held.Equals(wanted) {
+		return fmt.Errorf("exchange of claims %v would move them from %q onto %q, which is not the same set of CPUs", claimUIDs, held.String(), wanted.String())
+	}
+
+	for _, claimUID := range claimUIDs {
+		allocation := s.claims[claimUID]
+		allocation.rebindOrigin = allocation.exclusiveByRequest()
+		allocation.placeExclusive(targets[claimUID])
+	}
+	logger.Info("began exchange of resource claims", "claims", claimUIDs, "cpus", held.String())
+	return nil
+}
+
+// CommitSwap ends an exchange with every participant on its target.
+func (s *CPUAllocation) CommitSwap(logger logr.Logger, claimUIDs ...types.UID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.checkSwapInFlight(claimUIDs); err != nil {
+		return err
+	}
+	for _, claimUID := range claimUIDs {
+		s.claims[claimUID].rebindOrigin = nil
+	}
+	logger.Info("committed exchange of resource claims", "claims", claimUIDs)
+	return nil
+}
+
+// AbortSwap ends an exchange with every participant back where it started.
+func (s *CPUAllocation) AbortSwap(logger logr.Logger, claimUIDs ...types.UID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.checkSwapInFlight(claimUIDs); err != nil {
+		return err
+	}
+	for _, claimUID := range claimUIDs {
+		allocation := s.claims[claimUID]
+		allocation.restoreExclusive(allocation.rebindOrigin)
+		allocation.rebindOrigin = nil
+	}
+	logger.Info("aborted exchange of resource claims", "claims", claimUIDs)
+	return nil
+}
+
+// checkSwapInFlight reports whether these claims are an exchange that can be
+// settled: every one of them is mid-rebind, and between them they are moving
+// onto the CPUs they came from. The second half is what lets both endings leave
+// the reserved set alone, so a caller that mixed an exchange with an unrelated
+// move is refused here rather than leaking that move's origin.
+func (s *CPUAllocation) checkSwapInFlight(claimUIDs []types.UID) error {
+	if len(claimUIDs) < 2 {
+		return fmt.Errorf("an exchange needs at least two claims, got %d", len(claimUIDs))
+	}
+	origins, targets := cpuset.New(), cpuset.New()
+	for _, claimUID := range claimUIDs {
+		allocation, ok := s.claims[claimUID]
+		if !ok || allocation.rebindOrigin == nil {
+			return fmt.Errorf("claim %q has no exchange in flight", claimUID)
+		}
+		origins = origins.Union(allocation.originCPUs())
+		targets = targets.Union(allocation.exclusiveCPUs())
+	}
+	if !origins.Equals(targets) {
+		return fmt.Errorf("claims %v are moving from %q onto %q, which is not an exchange between them", claimUIDs, origins.String(), targets.String())
+	}
+	return nil
+}
+
+func sortedUIDs(targets map[types.UID]cpuset.CPUSet) []types.UID {
+	claimUIDs := make([]types.UID, 0, len(targets))
+	for claimUID := range targets {
+		claimUIDs = append(claimUIDs, claimUID)
+	}
+	sort.Slice(claimUIDs, func(i, j int) bool { return claimUIDs[i] < claimUIDs[j] })
+	return claimUIDs
+}
+
 // CommitRebind releases the CPUs a claim moved away from, keeping the target.
 func (s *CPUAllocation) CommitRebind(logger logr.Logger, claimUID types.UID) error {
 	s.mu.Lock()
