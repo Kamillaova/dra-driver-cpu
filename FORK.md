@@ -73,7 +73,11 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries` and
   `defragRetryDue` and `placementPolicy` fields, and `Config.DefragEnabled`
 
-- `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `requestAllocations`, `addRequestCPUs`
+- `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
+  and the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields
+
+- `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
+  `requestAllocations`, `addRequestCPUs`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 

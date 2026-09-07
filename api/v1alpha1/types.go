@@ -38,4 +38,30 @@ type OpaqueConfig struct {
 type CPUConfig struct {
 	// CPUSet specifies the cpus to allocate in standard cpuset syntax (e.g., "0-3,5").
 	CPUSet string `json:"cpuset,omitempty"`
+	// Relocatable permits the driver to change which CPUs back this claim while
+	// its containers run. Only the workload knows whether it survives that: a
+	// launcher that re-reads its affinity when the cpuset changes loses nothing,
+	// one that pinned its threads once at start keeps running with that pinning
+	// silently gone. Defaults to false, so a claim that says nothing is never
+	// moved.
+	Relocatable bool `json:"relocatable,omitempty"`
+	// Alignment is what the claim asks about being placed across more caches
+	// than its size requires. It is meaningful only where the claim's requests
+	// offer the allocator alternatives of different shapes; a claim whose only
+	// alternative is the aligned one cannot be split whatever it says here.
+	// Defaults to AlignmentBestEffort.
+	Alignment Alignment `json:"alignment,omitempty"`
 }
+
+// Alignment is a claim's answer to landing split.
+type Alignment string
+
+const (
+	// AlignmentBestEffort runs the claim where the allocator placed it, split or
+	// not, and leaves it there. This is the plain exclusive request.
+	AlignmentBestEffort Alignment = "BestEffort"
+	// AlignmentRepairable runs the claim split and has the driver make it whole,
+	// which means moving other claims out of the way, so it requires
+	// Relocatable.
+	AlignmentRepairable Alignment = "Repairable"
+)
