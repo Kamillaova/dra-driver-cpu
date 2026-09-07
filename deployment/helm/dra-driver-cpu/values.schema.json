@@ -312,6 +312,58 @@
         "kubeconfig": {
           "type": "string"
         },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "cpuPartitions": {
+                "type": [
+                  "null",
+                  "array"
+                ],
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "role",
+                    "cpus"
+                  ],
+                  "properties": {
+                    "cpus": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string",
+                      "enum": [
+                        "reserved",
+                        "default",
+                        "shared",
+                        "exclusive"
+                      ]
+                    },
+                    "smt": {
+                      "oneOf": [
+                        {
+                          "type": "boolean"
+                        },
+                        {
+                          "type": "integer",
+                          "minimum": 1
+                        }
+                      ]
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
         "publishNodeAllocatableResourceMapping": {
           "type": "boolean"
         },
