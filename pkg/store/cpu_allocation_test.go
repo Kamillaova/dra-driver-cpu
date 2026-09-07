@@ -54,7 +54,9 @@ func TestCPUAllocationPreparedLifecycle(t *testing.T) {
 	require.True(t, store.GetSharedCPUs().Equals(cpuset.New(2, 3)))
 	require.Error(t, store.ReserveResourceClaimAllocation(logger, "claim-2", claimCPUs, false))
 
-	require.NoError(t, store.ValidateResourceClaimAllocations(map[types.UID]cpuset.CPUSet{claimUID: claimCPUs}))
+	union, err := store.GetResourceClaimAllocationUnion(claimUID)
+	require.NoError(t, err)
+	require.True(t, union.Equals(claimCPUs))
 	require.True(t, store.GetSharedCPUs().Equals(cpuset.New(2, 3)))
 
 	store.RemoveResourceClaimAllocation(logger, claimUID)
@@ -385,6 +387,60 @@ func BenchmarkGetSharedCPUs(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				_ = store.GetSharedCPUs()
 			}
+		})
+	}
+}
+
+func TestGetResourceClaimAllocationUnion(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(4))
+
+	testCases := []struct {
+		name          string
+		claimUIDs     []types.UID
+		expected      cpuset.CPUSet
+		expectedError string
+	}{
+		{
+			name:      "no claims",
+			claimUIDs: nil,
+			expected:  cpuset.New(),
+		},
+		{
+			name:      "single claim",
+			claimUIDs: []types.UID{"claim-1"},
+			expected:  cpuset.New(0, 1),
+		},
+		{
+			name:      "a container holding several claims gets all of their CPUs",
+			claimUIDs: []types.UID{"claim-1", "claim-2"},
+			expected:  cpuset.New(0, 1, 4),
+		},
+		{
+			name:          "unprepared claim",
+			claimUIDs:     []types.UID{"claim-absent"},
+			expectedError: `claim "claim-absent" is not prepared by this driver`,
+		},
+		{
+			// Partial results would pin a container to fewer CPUs than it holds.
+			name:          "one unprepared claim rejects the whole set",
+			claimUIDs:     []types.UID{"claim-1", "claim-absent"},
+			expectedError: `claim "claim-absent" is not prepared by this driver`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := store.GetResourceClaimAllocationUnion(tc.claimUIDs...)
+			if tc.expectedError != "" {
+				require.EqualError(t, err, tc.expectedError)
+				require.True(t, got.IsEmpty())
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, got)
 		})
 	}
 }
