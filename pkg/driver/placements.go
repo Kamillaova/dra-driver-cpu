@@ -178,7 +178,7 @@ func (cp *CPUDriver) placementsSnapshot(online cpuset.CPUSet, dryRun bool) (*pla
 	if cp.fullPhysicalCPUsOnly {
 		free = topo.CPUDetails.CompleteCores(free)
 	}
-	allocations := cp.cpuAllocationStore.ResourceClaimAllocations()
+	allocations := cp.cpuAllocationStore.ExclusiveClaimAllocations()
 	// Captured rather than read through cp: Synchronize replaces the store
 	// wholesale, and the plan below runs with the lock released.
 	snapshot := cp.cpuAllocationStore
