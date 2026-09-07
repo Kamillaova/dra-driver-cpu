@@ -115,6 +115,8 @@ type CPUDriver struct {
 	// reconcileSharedOnUnprepare widens shared containers as soon as a claim is
 	// released rather than at their next lifecycle event.
 	reconcileSharedOnUnprepare bool
+	// defrag configures the defragmentation pass, and is zero when it is off.
+	defrag defragOptions
 	// applyMu serializes the work that decides which CPUs back a claim: the DRA
 	// prepare and unprepare hooks, the NRI hooks that read a placement or record
 	// container state, and the background worker's local phases. It also covers
@@ -206,6 +208,9 @@ type Config struct {
 	// ReconcileSharedOnUnprepare widens shared containers onto released CPUs immediately.
 	// Requires AssumeUnsolicitedUpdatesSafe.
 	ReconcileSharedOnUnprepare bool
+	// DefragEnabled moves running claims to recover uncore cache alignment.
+	// Requires AssumeUnsolicitedUpdatesSafe and grouped mode by NUMA node or socket.
+	DefragEnabled bool
 }
 
 func (cfg Config) DevicesPerResourceSlice() int {
@@ -284,11 +289,19 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	// the driver cannot tell from the handshake, so the operator asserts it.
 	if config.AssumeUnsolicitedUpdatesSafe {
 		plugin.reconcileSharedOnUnprepare = config.ReconcileSharedOnUnprepare
+		// CCX-FORK: defragmentation, like the reconcile, presupposes unsolicited
+		// updates.
+		plugin.defrag = defragOptions{enabled: config.DefragEnabled}
 		if plugin.reconcileSharedOnUnprepare {
 			plugin.reconcileTrigger = make(chan struct{}, 1)
 		}
-	} else if config.ReconcileSharedOnUnprepare {
-		logger.V(2).Info("shared container reconcile is inert: set assumeUnsolicitedUpdatesSafe to enable it")
+	} else {
+		if config.ReconcileSharedOnUnprepare {
+			logger.V(2).Info("shared container reconcile is inert: set assumeUnsolicitedUpdatesSafe to enable it")
+		}
+		if config.DefragEnabled {
+			logger.Info("defragmentation is inert: set assumeUnsolicitedUpdatesSafe to enable it")
+		}
 	}
 
 	var devices []resourceapi.Device
