@@ -143,3 +143,16 @@ func (s *PodConfig) Len() int {
 func (cs *ContainerState) HasExclusiveCPUAllocation() bool {
 	return len(cs.resourceClaimUIDs) > 0
 }
+
+// ContainerUID returns the runtime's identifier for this container, which is what
+// addresses it in an NRI update.
+func (cs *ContainerState) ContainerUID() types.UID {
+	return cs.containerUID
+}
+
+// ClaimUIDs returns the claims this container holds. A container pinned from its
+// claims must be pinned to all of them at once, so a caller changing one still
+// needs the rest.
+func (cs *ContainerState) ClaimUIDs() []types.UID {
+	return append([]types.UID(nil), cs.resourceClaimUIDs...)
+}
