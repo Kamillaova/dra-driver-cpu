@@ -55,6 +55,20 @@ func UnionOf(requests []RequestAllocation) cpuset.CPUSet {
 	return union
 }
 
+// ClaimRecord is everything the driver records for one prepared claim: what each
+// of its requests holds, and whether the claim permits those CPUs to change
+// while its containers run.
+//
+// Mobility is recorded beside the placement because it outlives the claim object
+// as far as this driver is concerned: the driver does not watch ResourceClaims,
+// so after a restart the CDI specs on disk are all it has, and a claim whose
+// mobility it could not recover would stop being movable for the life of its
+// pod.
+type ClaimRecord struct {
+	Requests    []RequestAllocation
+	Relocatable bool
+}
+
 // CPUAllocation is the single source of truth for CPU allocations.
 type CPUAllocation struct {
 	mu            sync.RWMutex
@@ -70,14 +84,15 @@ type claimAllocation struct {
 	// rebindOrigin is the exclusive CPUs of each request before the move in
 	// flight, and is nil when none is.
 	rebindOrigin map[string]cpuset.CPUSet
+	relocatable  bool
 }
 
-func newClaimAllocation(requests []RequestAllocation) *claimAllocation {
-	byRequest := make(map[string]RequestAllocation, len(requests))
-	for _, request := range requests {
+func newClaimAllocation(record ClaimRecord) *claimAllocation {
+	byRequest := make(map[string]RequestAllocation, len(record.Requests))
+	for _, request := range record.Requests {
 		byRequest[request.Request] = request
 	}
-	return &claimAllocation{byRequest: byRequest}
+	return &claimAllocation{byRequest: byRequest, relocatable: record.Relocatable}
 }
 
 // requests returns the claim's allocations ordered by request name, so callers
@@ -213,24 +228,24 @@ func NewCPUAllocation(cpuTopology *cpuinfo.CPUTopology, reservedCPUs cpuset.CPUS
 }
 
 // ReserveResourceClaimAllocation records what each request of a prepared claim
-// was given. Its exclusive CPUs remain unavailable to shared containers and to
-// other claims until Unprepare; the CPUs of a request with any other role are
-// recorded for the container's cpuset alone. When shared containers are present,
-// the reservation must leave at least one CPU in the shared pool because NRI
-// cannot represent an empty CPUSet.
+// was given, and whether the claim allows its CPUs to change. Its exclusive CPUs
+// remain unavailable to shared containers and to other claims until Unprepare;
+// the CPUs of a request with any other role are recorded for the container's
+// cpuset alone. When shared containers are present, the reservation must leave at
+// least one CPU in the shared pool because NRI cannot represent an empty CPUSet.
 //
 // CCX-FORK: upstream records one cpuset per claim, since to it every request
-// grants CPUs the claim holds alone.
-func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, requests []RequestAllocation, hasSharedContainers bool) error {
+// grants CPUs the claim holds alone and no claim ever moves.
+func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, record ClaimRecord, hasSharedContainers bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if allocation, ok := s.claims[claimUID]; ok {
-		if allocation.equals(requests) {
+		if allocation.equals(record.Requests) {
 			return nil
 		}
-		return fmt.Errorf("claim %q is already prepared with CPUs %q (requested %q)", claimUID, allocation.cpus().String(), UnionOf(requests).String())
+		return fmt.Errorf("claim %q is already prepared with CPUs %q (requested %q)", claimUID, allocation.cpus().String(), UnionOf(record.Requests).String())
 	}
-	allocation := newClaimAllocation(requests)
+	allocation := newClaimAllocation(record)
 	if overlap := allocation.exclusiveOverlap(); !overlap.IsEmpty() {
 		return fmt.Errorf("claim %q was given CPUs %q for more than one of its exclusive requests", claimUID, overlap.String())
 	}
@@ -396,16 +411,25 @@ func (s *CPUAllocation) GetResourceClaimAllocation(claimUID types.UID) (cpuset.C
 	return allocation.cpus(), true
 }
 
-// GetResourceClaimRequests returns what each request of a claim was given,
-// ordered by request name.
-func (s *CPUAllocation) GetResourceClaimRequests(claimUID types.UID) ([]RequestAllocation, bool) {
+// GetClaimRecord returns everything recorded for a claim: what each of its
+// requests was given, ordered by request name, and whether its CPUs may change.
+func (s *CPUAllocation) GetClaimRecord(claimUID types.UID) (ClaimRecord, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	allocation, ok := s.claims[claimUID]
 	if !ok {
-		return nil, false
+		return ClaimRecord{}, false
 	}
-	return allocation.requests(), true
+	return ClaimRecord{Requests: allocation.requests(), Relocatable: allocation.relocatable}, true
+}
+
+// IsRelocatable reports whether a claim permits the driver to change its CPUs
+// while its containers run.
+func (s *CPUAllocation) IsRelocatable(claimUID types.UID) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocation, ok := s.claims[claimUID]
+	return ok && allocation.relocatable
 }
 
 // HoldsExclusiveCPUs reports whether a claim was given CPUs it holds alone.
