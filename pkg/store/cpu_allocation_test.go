@@ -699,3 +699,29 @@ func TestConcurrentRebindsAndReserves(t *testing.T) {
 	// Held either way: 0-1 by claim-1, and 2-3 by whichever racer won.
 	require.Equal(t, cpuset.New(4, 5, 6, 7), store.GetSharedCPUs())
 }
+
+func TestResourceClaimAllocations(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+	require.Empty(t, store.ResourceClaimAllocations())
+
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2))
+	require.Equal(t, map[types.UID]cpuset.CPUSet{
+		"claim-1": cpuset.New(0, 1),
+		"claim-2": cpuset.New(2),
+	}, store.ResourceClaimAllocations())
+
+	// The caller's copy must not be the store's own map.
+	got := store.ResourceClaimAllocations()
+	delete(got, "claim-1")
+	require.Len(t, store.ResourceClaimAllocations(), 2)
+
+	// A claim being moved reads as being on its target, matching the
+	// single-claim getter.
+	require.NoError(t, store.BeginRebind(logger, "claim-1", cpuset.New(4, 5)))
+	require.Equal(t, cpuset.New(4, 5), store.ResourceClaimAllocations()["claim-1"])
+
+	store.RemoveResourceClaimAllocation(logger, "claim-2")
+	require.Len(t, store.ResourceClaimAllocations(), 1)
+}
