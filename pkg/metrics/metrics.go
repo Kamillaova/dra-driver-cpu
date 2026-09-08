@@ -101,6 +101,7 @@ type Recorder interface {
 	RecordDefragNodePoisoned()
 	RecordDefragNodeReopened(duration time.Duration)
 	RecordDefragReadbackMismatch()
+	RecordDefragUnpublishedRound()
 	SetFlooredCapacityDevices(count int)
 	RecordSynchronizeSkippedClaim()
 	RecordMisplacedClaim()
@@ -131,6 +132,7 @@ type Metrics struct {
 	defragPoisonedNodes           prometheus.Counter
 	defragPoisonDurationSecsHist  prometheus.Histogram
 	defragReadbackMismatches      prometheus.Counter
+	defragUnpublishedRounds       prometheus.Counter
 	flooredCapacityDevices        prometheus.Gauge
 
 	synchronizeSkippedClaims prometheus.Counter
@@ -272,6 +274,11 @@ var (
 		kind: metricCounter,
 		help: "Total number of read-backs that left a fenced NUMA node fenced, because the CPUs its containers run on match neither what the driver recorded nor what they came from.",
 	}
+	defragUnpublishedRoundsSpec = metricSpec{
+		name: "dra_cpu_defrag_unpublished_rounds_total",
+		kind: metricCounter,
+		help: "Total number of defragmentation rounds abandoned because the capacity they shrink was not stored by the API server in time. While this rises no claim on the node is being moved.",
+	}
 	flooredCapacityDevicesSpec = metricSpec{
 		name: "dra_cpu_capacity_mirror_floored_devices",
 		kind: metricGauge,
@@ -317,6 +324,7 @@ var metricSpecs = []metricSpec{
 	defragPoisonedNodesSpec,
 	defragPoisonDurationSpec,
 	defragReadbackMismatchesSpec,
+	defragUnpublishedRoundsSpec,
 	flooredCapacityDevicesSpec,
 	synchronizeSkippedClaimsSpec,
 	misplacedClaimsSpec,
@@ -374,6 +382,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		defragPoisonedNodes:           newCounter(defragPoisonedNodesSpec),
 		defragPoisonDurationSecsHist:  newHistogram(defragPoisonDurationSpec),
 		defragReadbackMismatches:      newCounter(defragReadbackMismatchesSpec),
+		defragUnpublishedRounds:       newCounter(defragUnpublishedRoundsSpec),
 		flooredCapacityDevices:        newGauge(flooredCapacityDevicesSpec),
 
 		synchronizeSkippedClaims: newCounter(synchronizeSkippedClaimsSpec),
@@ -403,6 +412,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragPoisonedNodes,
 		m.defragPoisonDurationSecsHist,
 		m.defragReadbackMismatches,
+		m.defragUnpublishedRounds,
 		m.flooredCapacityDevices,
 		m.synchronizeSkippedClaims,
 		m.misplacedClaims,
@@ -543,6 +553,10 @@ func (m *Metrics) RecordDefragReadbackMismatch() {
 	m.defragReadbackMismatches.Inc()
 }
 
+func (m *Metrics) RecordDefragUnpublishedRound() {
+	m.defragUnpublishedRounds.Inc()
+}
+
 func (m *Metrics) SetFlooredCapacityDevices(count int) {
 	m.flooredCapacityDevices.Set(float64(count))
 }
@@ -591,6 +605,7 @@ func (noopRecorder) SetDefragNodePoisoned(int, bool)        {}
 func (noopRecorder) RecordDefragNodePoisoned()              {}
 func (noopRecorder) RecordDefragNodeReopened(time.Duration) {}
 func (noopRecorder) RecordDefragReadbackMismatch()          {}
+func (noopRecorder) RecordDefragUnpublishedRound()          {}
 func (noopRecorder) SetFlooredCapacityDevices(int)          {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()         {}
 func (noopRecorder) RecordMisplacedClaim()                  {}

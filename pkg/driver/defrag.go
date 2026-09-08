@@ -43,6 +43,27 @@ import (
 // life of the process.
 const defaultDefragBatchTimeout = 30 * time.Second
 
+// defaultDefragPublishTimeout is how long a round waits for the capacity it
+// shrank to reach the API server before giving up on itself.
+//
+// The publishing controller retries a rejected or failed write under its own
+// rate limiter and resyncs on its informer's events, so a write that has not
+// landed in a window this size is not about to. Waiting longer would hold a
+// scope's reservations against a control plane that is not answering, which the
+// retry queue does better: the round is abandoned and the scope is tried again
+// with the backoff its own failures have earned.
+const defaultDefragPublishTimeout = 30 * time.Second
+
+// storedSlicePollInterval is how often a round asks whether the capacity it
+// published has been stored. The informer answers from its cache, so this is
+// the cost of a comparison rather than of a request.
+const storedSlicePollInterval = 100 * time.Millisecond
+
+// storedSliceSyncTimeout bounds the wait for the driver's own slice informer to
+// fill at startup, the same order as the wait for the kubelet to register the
+// plugin.
+const storedSliceSyncTimeout = 30 * time.Second
+
 // defragOptions is the pass configuration, fixed at startup.
 type defragOptions struct {
 	enabled bool
@@ -51,6 +72,7 @@ type defragOptions struct {
 	// on the CPUs one is leaving.
 	allowTransientOverlap bool
 	batchTimeout          time.Duration
+	publishTimeout        time.Duration
 }
 
 // defragScope is the region one round covers: one NUMA node of one CPU
@@ -101,6 +123,10 @@ type defragRound struct {
 	// outcomes is what became of each exchange. An exchange missing from it, or
 	// recorded as unsettled, is one the round cannot close.
 	outcomes map[int]exchangeOutcome
+	// replayed marks a round an earlier attempt left unsettled, whose holds are
+	// therefore not this attempt's to release: its claims may be on either of the
+	// two cpusets they hold and only a read-back may say which.
+	replayed bool
 	// store is the allocation store the reservations live in. Synchronize
 	// replaces it wholesale, which discards them.
 	store *store.CPUAllocation
@@ -229,6 +255,12 @@ func (cp *CPUDriver) runDefragRound(ctx context.Context, scope defragScope, onli
 		cp.republishStaleSlicesLocking(ctx)
 		return cpumetrics.ResultSuccess
 	}
+	// The reservation already shrank the capacity of every device this round
+	// moves a claim onto. Nothing may be told to take those CPUs until a
+	// scheduler can see that they are gone.
+	if err := cp.awaitStoredShrink(ctx, round); err != nil {
+		return cp.abandonDefragRound(ctx, logger, round, err)
+	}
 
 	logger.V(2).Info("applying defragmentation moves", "numMoves", len(round.moves), "numUpdates", len(round.updates))
 	// An empty round means nothing is running on the CPUs involved, so the store
@@ -252,6 +284,33 @@ func (cp *CPUDriver) runDefragRound(ctx context.Context, scope defragScope, onli
 	// have fenced one or reopened one.
 	cp.republishStaleSlicesLocking(ctx)
 	return result
+}
+
+// abandonDefragRound gives a round up because the capacity it depends on was
+// not stored, and reports it as a failure so the scope is tried again.
+//
+// A round this attempt planned releases its holds: nothing has been asked of the
+// runtime, so its claims are where they were and the reservations are the only
+// thing to undo. A round replayed from an earlier attempt keeps them, because
+// its outcome is unknown -- its claims hold both cpusets and only a read-back
+// may settle them.
+//
+// Either way the controller is handed the current truth again: the capacity
+// before the round for one that was released, and the same shrink for one still
+// held, which the next attempt waits for again.
+func (cp *CPUDriver) abandonDefragRound(ctx context.Context, logger logr.Logger, round *defragRound, cause error) cpumetrics.Result {
+	logger.Error(cause, "not moving any claim: the capacity this round shrinks was not stored", "numMoves", len(round.moves))
+	cp.metricsRecorder().RecordDefragUnpublishedRound()
+
+	cp.applyMu.Lock()
+	if !round.replayed && round.store == cp.cpuAllocationStore {
+		cp.abortMoves(logger, round.moves)
+	}
+	cp.applyMu.Unlock()
+
+	cp.retryDefragScope(round.scope)
+	cp.republishStaleSlicesLocking(ctx)
+	return cpumetrics.ResultError
 }
 
 // republishStaleSlicesLocking is republishStaleSlices for a caller that holds no
@@ -599,6 +658,7 @@ func (cp *CPUDriver) takePendingRound(logger logr.Logger, scope defragScope) *de
 		return nil
 	}
 	logger.V(2).Info("retrying an unconfirmed defragmentation round", "numMoves", len(round.moves))
+	round.replayed = true
 	return round
 }
 
