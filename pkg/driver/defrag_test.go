@@ -27,6 +27,7 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
@@ -47,6 +48,9 @@ type defragTestDriver struct {
 	cdi     *mockCdiMgr
 	metrics *prometheus.Registry
 	allCPUs cpuset.CPUSet
+	// cgroups is the kernel's answer about where each container really runs,
+	// which only a test that fences a node has to write to.
+	cgroups fstest.MapFS
 }
 
 func newDefragTestDriver(t *testing.T, caches, cpusPerCache int) *defragTestDriver {
@@ -80,6 +84,7 @@ func newDefragTestDriverWith(t *testing.T, infos []cpuinfo.CPUInfo) *defragTestD
 	updater := &fakeContainerUpdater{}
 	cdi := newMockCdiMgr()
 	reg := prometheus.NewRegistry()
+	cgroups := fstest.MapFS{}
 	d := &CPUDriver{
 		metrics:            cpumetrics.New(reg),
 		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New(), onlineCPUs: allCPUs},
@@ -89,6 +94,8 @@ func newDefragTestDriverWith(t *testing.T, infos []cpuinfo.CPUInfo) *defragTestD
 		cdiMgr:             cdi,
 		containerUpdater:   updater,
 		reconcileTrigger:   make(chan struct{}, 1),
+		cgroupfs:           cgroups,
+		poisonedNodes:      make(map[int]*poisonedNode),
 		pendingRounds:      make(map[defragScope]*defragRound),
 		defragRetries:      workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[defragScope]()),
 		defragRetryDue:     make(chan defragScope),
@@ -98,7 +105,7 @@ func newDefragTestDriverWith(t *testing.T, infos []cpuinfo.CPUInfo) *defragTestD
 		defrag: defragOptions{enabled: true, allowTransientOverlap: true, batchTimeout: defaultDefragBatchTimeout},
 	}
 	t.Cleanup(d.defragRetries.ShutDown)
-	return &defragTestDriver{CPUDriver: d, updater: updater, cdi: cdi, metrics: reg, allCPUs: allCPUs}
+	return &defragTestDriver{CPUDriver: d, updater: updater, cdi: cdi, metrics: reg, allCPUs: allCPUs, cgroups: cgroups}
 }
 
 // describe resolves the driver's cores into the given partitions plus the
@@ -183,7 +190,23 @@ func (d *defragTestDriver) runContainer(t *testing.T, podUID types.UID, name str
 		_, err := d.claimTracker.SetOwner(testr.New(t), podUID, name, claimUIDs...)
 		require.NoError(t, err)
 	}
-	d.podConfigStore.SetContainerState(podUID, store.NewContainerState(name, containerUID, claimUIDs...))
+	d.podConfigStore.SetContainerState(podUID, store.NewContainerState(name, containerUID, claimUIDs...).WithCgroup(cgroupOf(containerUID)))
+}
+
+// cgroupOf is where the fake runtime puts a container, in the form the cgroupfs
+// driver reports.
+func cgroupOf(containerUID types.UID) string {
+	return "/kubepods/" + string(containerUID)
+}
+
+// liveCPUs is what the kernel says a container is really confined to, which is
+// what lifts a fence.
+func (d *defragTestDriver) liveCPUs(containerUID types.UID, cpus cpuset.CPUSet) {
+	dir, err := cgroupfs.Dir(cgroupOf(containerUID))
+	if err != nil {
+		panic(err)
+	}
+	d.cgroups[dir+"/cpuset.cpus.effective"] = &fstest.MapFile{Data: []byte(cpus.String() + "\n")}
 }
 
 // recordedPlacement is the cpuset a claim's CDI spec names.
@@ -1385,6 +1408,7 @@ func TestDefragPassLeavesAnUnansweredRetryUnsettled(t *testing.T) {
 		require.True(t, inFlight, "claim %s must still hold both cpusets", claimUID)
 	}
 	require.Contains(t, d.pendingRounds, defaultScope(0))
+	require.True(t, d.nodeIsPoisoned(0), "an exchange in neither state fences its NUMA node")
 }
 
 func TestDefragPassTreatsAReplacedContainerAsMoved(t *testing.T) {
@@ -1410,6 +1434,7 @@ func TestDefragPassTreatsAReplacedContainerAsMoved(t *testing.T) {
 	second, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-2")
 	require.Equal(t, cpuset.New(0, 1), first, "the exchange is recorded as applied")
 	require.Equal(t, cpuset.New(2, 3), second)
+	require.False(t, d.nodeIsPoisoned(0))
 	require.Empty(t, d.pendingRounds)
 	require.Zero(t, metricValue(t, d.metrics, "dra_cpu_defrag_partial_batches_total", nil))
 }

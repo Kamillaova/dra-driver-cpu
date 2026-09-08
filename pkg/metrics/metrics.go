@@ -97,6 +97,10 @@ type Recorder interface {
 	RecordDefragSwapOverlap(duration time.Duration)
 	RecordDefragPartialBatch()
 	RecordDefragRollback(result Result)
+	SetDefragNodePoisoned(numaNodeID int, poisoned bool)
+	RecordDefragNodePoisoned()
+	RecordDefragNodeReopened(duration time.Duration)
+	RecordDefragReadbackMismatch()
 	RecordSynchronizeSkippedClaim()
 	RecordMisplacedClaim()
 	SetPartitionState(map[string]bool)
@@ -122,6 +126,10 @@ type Metrics struct {
 	defragSwapOverlapSecondsHist  prometheus.Histogram
 	defragPartialBatches          prometheus.Counter
 	defragRollbacks               *prometheus.CounterVec
+	defragNodePoisoned            *prometheus.GaugeVec
+	defragPoisonedNodes           prometheus.Counter
+	defragPoisonDurationSecsHist  prometheus.Histogram
+	defragReadbackMismatches      prometheus.Counter
 
 	synchronizeSkippedClaims prometheus.Counter
 	misplacedClaims          prometheus.Counter
@@ -240,6 +248,28 @@ var (
 		help:   "Total number of attempts to put the applied half of an exchange back, by result; an error leaves two claims sharing CPUs.",
 		labels: []string{"result"},
 	}
+	defragNodePoisonedSpec = metricSpec{
+		name:   "dra_cpu_defrag_numa_node_poisoned",
+		kind:   metricGauge,
+		help:   "Whether the driver has stopped vouching for a NUMA node (1) because an exchange of CPUs there could not be settled either way.",
+		labels: []string{"numa_node"},
+	}
+	defragPoisonedNodesSpec = metricSpec{
+		name: "dra_cpu_defrag_poisoned_nodes_total",
+		kind: metricCounter,
+		help: "Total number of times a NUMA node was fenced after an exchange that could be neither finished nor undone.",
+	}
+	defragPoisonDurationSpec = metricSpec{
+		name:    "dra_cpu_defrag_poisoned_duration_seconds",
+		kind:    metricHistogram,
+		help:    "How long each fenced NUMA node stayed fenced, from the unsettled exchange to the read-back that agreed with the driver's records.",
+		buckets: prometheus.ExponentialBuckets(1, 4, 8),
+	}
+	defragReadbackMismatchesSpec = metricSpec{
+		name: "dra_cpu_defrag_readback_mismatches_total",
+		kind: metricCounter,
+		help: "Total number of read-backs that left a fenced NUMA node fenced, because the CPUs its containers run on match neither what the driver recorded nor what they came from.",
+	}
 	synchronizeSkippedClaimsSpec = metricSpec{
 		name: "dra_cpu_synchronize_skipped_claims_total",
 		kind: metricCounter,
@@ -276,6 +306,10 @@ var metricSpecs = []metricSpec{
 	defragSwapOverlapSpec,
 	defragPartialBatchesSpec,
 	defragRollbacksSpec,
+	defragNodePoisonedSpec,
+	defragPoisonedNodesSpec,
+	defragPoisonDurationSpec,
+	defragReadbackMismatchesSpec,
 	synchronizeSkippedClaimsSpec,
 	misplacedClaimsSpec,
 	partitionVerifiedSpec,
@@ -328,6 +362,10 @@ func New(reg prometheus.Registerer) *Metrics {
 		defragSwapOverlapSecondsHist:  newHistogram(defragSwapOverlapSpec),
 		defragPartialBatches:          newCounter(defragPartialBatchesSpec),
 		defragRollbacks:               newCounterVec(defragRollbacksSpec),
+		defragNodePoisoned:            newGaugeVec(defragNodePoisonedSpec),
+		defragPoisonedNodes:           newCounter(defragPoisonedNodesSpec),
+		defragPoisonDurationSecsHist:  newHistogram(defragPoisonDurationSpec),
+		defragReadbackMismatches:      newCounter(defragReadbackMismatchesSpec),
 
 		synchronizeSkippedClaims: newCounter(synchronizeSkippedClaimsSpec),
 		misplacedClaims:          newCounter(misplacedClaimsSpec),
@@ -352,6 +390,10 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragSwapOverlapSecondsHist,
 		m.defragPartialBatches,
 		m.defragRollbacks,
+		m.defragNodePoisoned,
+		m.defragPoisonedNodes,
+		m.defragPoisonDurationSecsHist,
+		m.defragReadbackMismatches,
 		m.synchronizeSkippedClaims,
 		m.misplacedClaims,
 		m.partitionVerified,
@@ -467,6 +509,30 @@ func (m *Metrics) RecordDefragRollback(result Result) {
 	m.defragRollbacks.WithLabelValues(result.String()).Inc()
 }
 
+// SetDefragNodePoisoned reports one NUMA node rather than replacing the series
+// wholesale, because a fence is raised and lifted between passes: a gauge that
+// only a pass could write would say a node is healthy for as long as nothing
+// else happened on it.
+func (m *Metrics) SetDefragNodePoisoned(numaNodeID int, poisoned bool) {
+	value := 0.0
+	if poisoned {
+		value = 1.0
+	}
+	m.defragNodePoisoned.WithLabelValues(strconv.Itoa(numaNodeID)).Set(value)
+}
+
+func (m *Metrics) RecordDefragNodePoisoned() {
+	m.defragPoisonedNodes.Inc()
+}
+
+func (m *Metrics) RecordDefragNodeReopened(duration time.Duration) {
+	m.defragPoisonDurationSecsHist.Observe(duration.Seconds())
+}
+
+func (m *Metrics) RecordDefragReadbackMismatch() {
+	m.defragReadbackMismatches.Inc()
+}
+
 func (m *Metrics) RecordSynchronizeSkippedClaim() {
 	m.synchronizeSkippedClaims.Inc()
 }
@@ -507,6 +573,10 @@ func (noopRecorder) RecordDefragBlockedMoves(int)           {}
 func (noopRecorder) RecordDefragSwapOverlap(time.Duration)  {}
 func (noopRecorder) RecordDefragPartialBatch()              {}
 func (noopRecorder) RecordDefragRollback(Result)            {}
+func (noopRecorder) SetDefragNodePoisoned(int, bool)        {}
+func (noopRecorder) RecordDefragNodePoisoned()              {}
+func (noopRecorder) RecordDefragNodeReopened(time.Duration) {}
+func (noopRecorder) RecordDefragReadbackMismatch()          {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()         {}
 func (noopRecorder) RecordMisplacedClaim()                  {}
 func (noopRecorder) SetPartitionState(map[string]bool)      {}
