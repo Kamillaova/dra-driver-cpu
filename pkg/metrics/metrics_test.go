@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 17)
+	require.Len(t, descriptors, 20)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -55,6 +55,9 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_moves_total",
 		"dra_cpu_defrag_blocked_moves_total",
 		"dra_cpu_defrag_pass_duration_seconds",
+		"dra_cpu_defrag_swap_overlap_seconds",
+		"dra_cpu_defrag_partial_batches_total",
+		"dra_cpu_defrag_rollbacks_total",
 		"dra_cpu_synchronize_skipped_claims_total",
 		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_partition_verified",
@@ -66,7 +69,10 @@ func TestDescriptors(t *testing.T) {
 	require.Equal(t, []string{"result"}, descriptors[11].Labels)
 	require.Empty(t, descriptors[14].Labels)
 	require.Empty(t, descriptors[15].Labels)
-	require.Equal(t, []string{"partition"}, descriptors[16].Labels)
+	require.Equal(t, []string{"result"}, descriptors[16].Labels)
+	require.Empty(t, descriptors[17].Labels)
+	require.Empty(t, descriptors[18].Labels)
+	require.Equal(t, []string{"partition"}, descriptors[19].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -102,8 +108,11 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_defrag_blocked_moves_total",
 		"dra_cpu_defrag_excess_uncore_caches",
 		"dra_cpu_defrag_moves_total",
+		"dra_cpu_defrag_partial_batches_total",
 		"dra_cpu_defrag_pass_duration_seconds",
 		"dra_cpu_defrag_passes_total",
+		"dra_cpu_defrag_rollbacks_total",
+		"dra_cpu_defrag_swap_overlap_seconds",
 		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_prepare_claim_duration_seconds",
 		"dra_cpu_prepare_claims_total",

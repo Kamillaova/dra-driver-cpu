@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -33,9 +34,23 @@ import (
 	"k8s.io/utils/cpuset"
 )
 
+// defaultDefragBatchTimeout is how long a round waits for the runtime to answer
+// one batch of container updates.
+//
+// The NRI stub calls the runtime with a background context and no timeout of its
+// own (UpdateContainers in github.com/containerd/nri/pkg/stub), so a runtime that
+// never answers would otherwise hold the one goroutine that runs passes for the
+// life of the process.
+const defaultDefragBatchTimeout = 30 * time.Second
+
 // defragOptions is the pass configuration, fixed at startup.
 type defragOptions struct {
 	enabled bool
+	// allowTransientOverlap permits exchanging the CPUs of two claims, and with
+	// it the instant between the two container updates in which both of them sit
+	// on the CPUs one is leaving.
+	allowTransientOverlap bool
+	batchTimeout          time.Duration
 }
 
 // defragScope is the region one round covers: one NUMA node of one CPU
@@ -55,15 +70,92 @@ func (s defragScope) logValues() []any {
 	return []any{"numaNode", s.numaNodeID, "partition", s.partition}
 }
 
+// exchangeOutcome is what became of one exchange once the runtime answered.
+type exchangeOutcome int
+
+const (
+	// exchangeUnsettled is the state a round starts in and the one it stays in
+	// when the driver cannot say where the exchange's containers are running.
+	exchangeUnsettled exchangeOutcome = iota
+	// exchangeApplied means every container of the exchange took its new cpuset.
+	exchangeApplied
+	// exchangeUndone means the half the runtime accepted was put back.
+	exchangeUndone
+)
+
 // defragRound is one scope's set of moves that has been reserved and written
 // to disk and is waiting for the runtime to confirm it.
 type defragRound struct {
 	scope   defragScope
 	moves   []defrag.Move
 	updates []*api.ContainerUpdate
+	// exchangeContainers is the containers each exchange's claims run in, so a
+	// reply naming some of them can be attributed to the exchange it belongs to.
+	exchangeContainers map[int][]types.UID
+	// updateByContainer is this round's own update for each container it touches,
+	// so a retry sends what the driver sent rather than what the runtime echoed.
+	updateByContainer map[types.UID]*api.ContainerUpdate
+	// claimsByContainer is every claim each of those containers holds, which is
+	// what a rollback has to pin it back to.
+	claimsByContainer map[types.UID][]types.UID
+	// outcomes is what became of each exchange. An exchange missing from it, or
+	// recorded as unsettled, is one the round cannot close.
+	outcomes map[int]exchangeOutcome
 	// store is the allocation store the reservations live in. Synchronize
 	// replaces it wholesale, which discards them.
 	store *store.CPUAllocation
+}
+
+func newDefragRound(scope defragScope, allocations *store.CPUAllocation) *defragRound {
+	return &defragRound{
+		scope:              scope,
+		exchangeContainers: map[int][]types.UID{},
+		updateByContainer:  map[types.UID]*api.ContainerUpdate{},
+		claimsByContainer:  map[types.UID][]types.UID{},
+		outcomes:           map[int]exchangeOutcome{},
+		store:              allocations,
+	}
+}
+
+// hasExchanges reports whether any of the round's moves is part of an exchange,
+// which is what makes a partial reply something to act on rather than something
+// to leave to the next pass.
+func (r *defragRound) hasExchanges() bool {
+	for _, move := range r.moves {
+		if move.Exchange != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// defragSteps groups moves into the units that are applied and settled together:
+// one move into free CPUs, or all the moves of one exchange.
+func defragSteps(moves []defrag.Move) [][]defrag.Move {
+	var steps [][]defrag.Move
+	at := map[int]int{}
+	for _, move := range moves {
+		if move.Exchange == 0 {
+			steps = append(steps, []defrag.Move{move})
+			continue
+		}
+		if index, ok := at[move.Exchange]; ok {
+			steps[index] = append(steps[index], move)
+			continue
+		}
+		at[move.Exchange] = len(steps)
+		steps = append(steps, []defrag.Move{move})
+	}
+	return steps
+}
+
+// stepClaims is the claims one step moves, in the order the step lists them.
+func stepClaims(step []defrag.Move) []types.UID {
+	claimUIDs := make([]types.UID, 0, len(step))
+	for _, move := range step {
+		claimUIDs = append(claimUIDs, move.ClaimUID)
+	}
+	return claimUIDs
 }
 
 // defragPass moves claims towards the best placement the node's topology allows,
@@ -134,14 +226,205 @@ func (cp *CPUDriver) runDefragRound(ctx context.Context, scope defragScope, onli
 	}
 
 	logger.V(2).Info("applying defragmentation moves", "numMoves", len(round.moves), "numUpdates", len(round.updates))
-	var failed []*api.ContainerUpdate
-	var updateErr error
-	if len(round.updates) > 0 {
-		failed, updateErr = cp.containerUpdater.UpdateContainers(round.updates)
-	}
 	// An empty round means nothing is running on the CPUs involved, so the store
 	// and the specs are the whole of the move.
+	start := time.Now()
+	failed, updateErr := cp.sendDefragBatch(logger, round.updates)
+	if updateErr == nil {
+		if round.hasExchanges() {
+			// The window in which the exchanged claims share CPUs is inside this
+			// call, between the two writes the runtime applies in order, so its
+			// duration is the tightest bound on the window a plugin can measure.
+			// Only a call that answered bounds anything: one that ran out of time
+			// would contribute the deadline, which is not a measurement of the
+			// window but of the giving up.
+			cp.metricsRecorder().RecordDefragSwapOverlap(time.Since(start))
+		}
+		cp.settleExchanges(logger, round, failed)
+	}
 	return cp.finishDefragRound(logger, round, failed, updateErr)
+}
+
+// sendDefragBatch pushes one batch of container updates and gives the runtime a
+// deadline of its own to answer it.
+//
+// A batch that runs out of time is reported as an error rather than as a refusal,
+// because a call that has not answered may still be applied: the round keeps both
+// cpusets of everything it touches and is sent again, which is the only thing
+// that can be concluded without guessing.
+//
+// Called with applyMu released.
+func (cp *CPUDriver) sendDefragBatch(logger logr.Logger, updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
+	if len(updates) == 0 {
+		return nil, nil
+	}
+	type reply struct {
+		failed []*api.ContainerUpdate
+		err    error
+	}
+	// Buffered, so the goroutine finishes and is collected however long the
+	// runtime takes to answer a call this one has already given up on.
+	answered := make(chan reply, 1)
+	go func() {
+		failed, err := cp.containerUpdater.UpdateContainers(updates)
+		answered <- reply{failed: failed, err: err}
+	}()
+
+	timer := time.NewTimer(cp.defrag.batchTimeout)
+	defer timer.Stop()
+	select {
+	case r := <-answered:
+		return r.failed, r.err
+	case <-timer.C:
+		logger.Error(nil, "the runtime did not answer a batch of container updates", "timeout", cp.defrag.batchTimeout, "numUpdates", len(updates))
+		return nil, fmt.Errorf("the runtime did not answer within %s", cp.defrag.batchTimeout)
+	}
+}
+
+// settleExchanges completes or undoes every exchange the runtime applied only in
+// part, and records what became of each.
+//
+// A refused half is sent again first: finishing the exchange is better than
+// undoing it, and the reservation still holds every CPU involved, so nothing has
+// to be planned again. Only when the runtime refuses it a second time is the half
+// it did apply put back. An exchange that ends neither way is left unsettled --
+// two claims are then sharing CPUs and the driver cannot say which -- and only a
+// read-back can close it.
+//
+// Called with applyMu released, because every attempt here is a call into the
+// runtime.
+func (cp *CPUDriver) settleExchanges(logger logr.Logger, round *defragRound, failed []*api.ContainerUpdate) {
+	refused := map[types.UID]struct{}{}
+	for _, update := range failed {
+		refused[types.UID(update.GetContainerId())] = struct{}{}
+	}
+
+	for _, step := range defragSteps(round.moves) {
+		exchange := step[0].Exchange
+		if exchange == 0 {
+			continue
+		}
+		eLogger := logger.WithValues("exchange", exchange, "claimUIDs", stepClaims(step))
+		containers := round.exchangeContainers[exchange]
+		notApplied := map[types.UID]struct{}{}
+		refusedHere := make([]*api.ContainerUpdate, 0, len(containers))
+		for _, containerUID := range containers {
+			if _, ok := refused[containerUID]; !ok {
+				continue
+			}
+			if !cp.containerIsCurrent(round, containerUID) {
+				// Gone, or replaced by one with a new runtime ID. It is refusing
+				// nothing: a container created after the reservation is pinned
+				// from the store, which already holds the target.
+				eLogger.V(2).Info("a refused container is no longer the one its pod runs", "containerID", containerUID)
+				continue
+			}
+			notApplied[containerUID] = struct{}{}
+			refusedHere = append(refusedHere, round.updateByContainer[containerUID])
+		}
+		switch len(refusedHere) {
+		case 0:
+			round.outcomes[exchange] = exchangeApplied
+			continue
+		case len(containers):
+			// Not one of the exchange's containers moved, so there is nothing to
+			// put back and the claims can go straight back to where they are.
+			eLogger.Info("runtime refused an exchange outright, leaving both claims where they are")
+			round.outcomes[exchange] = exchangeUndone
+			continue
+		}
+
+		cp.metricsRecorder().RecordDefragPartialBatch()
+		eLogger.Info("runtime applied an exchange in part, sending the rest again", "numRefused", len(refusedHere))
+		stillRefused, err := cp.sendDefragBatch(eLogger, refusedHere)
+		switch {
+		case err != nil:
+			// The retry may have been applied before it stopped answering, so the
+			// exchange is in neither state as far as this driver knows and undoing
+			// the other half could be undoing a completed exchange. Only a
+			// read-back can say.
+			eLogger.Error(err, "the retry of a half-applied exchange was not answered")
+			round.outcomes[exchange] = exchangeUnsettled
+		case len(stillRefused) == 0:
+			round.outcomes[exchange] = exchangeApplied
+		default:
+			round.outcomes[exchange] = cp.rollBackExchange(eLogger, round, exchange, notApplied)
+		}
+	}
+}
+
+// containerIsCurrent reports whether a container this round addressed is still
+// the one its pod runs, which is what tells a refusal from a container that has
+// simply been replaced since the batch went out.
+//
+// Called with applyMu released: the two stores it reads take their own locks, and
+// the answer is a snapshot either way.
+func (cp *CPUDriver) containerIsCurrent(round *defragRound, containerUID types.UID) bool {
+	claimUIDs := round.claimsByContainer[containerUID]
+	if len(claimUIDs) == 0 {
+		return false
+	}
+	owner, ok := cp.claimTracker.Owner(claimUIDs[0])
+	if !ok {
+		return false
+	}
+	state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
+	return state != nil && state.ContainerUID() == containerUID
+}
+
+// rollBackExchange puts the containers the runtime did move back on the CPUs
+// they were running on before the exchange, and reports whether that leaves the
+// exchange undone or unsettled. notApplied is the containers that refused it, so
+// everything else in the exchange is what has to go back.
+func (cp *CPUDriver) rollBackExchange(logger logr.Logger, round *defragRound, exchange int, notApplied map[types.UID]struct{}) exchangeOutcome {
+	updates, err := cp.rollbackUpdates(round, exchange, notApplied)
+	if err != nil {
+		logger.Error(err, "cannot build the batch that would undo a half-applied exchange")
+		cp.metricsRecorder().RecordDefragRollback(cpumetrics.ResultError)
+		return exchangeUnsettled
+	}
+	stillRefused, err := cp.sendDefragBatch(logger, updates)
+	if err != nil || len(stillRefused) > 0 {
+		if err == nil {
+			err = fmt.Errorf("the runtime refused %d of %d updates", len(stillRefused), len(updates))
+		}
+		logger.Error(err, "cannot undo a half-applied exchange: two claims now share CPUs")
+		cp.metricsRecorder().RecordDefragRollback(cpumetrics.ResultError)
+		return exchangeUnsettled
+	}
+	logger.Info("undid a half-applied exchange", "numContainers", len(updates))
+	cp.metricsRecorder().RecordDefragRollback(cpumetrics.ResultSuccess)
+	return exchangeUndone
+}
+
+// rollbackUpdates is the batch that puts one exchange's containers back where
+// they were running before it. Only the ones the runtime accepted need it; the
+// rest never moved.
+//
+// Built under applyMu because it reads the store, and sent with the lock
+// released like every other batch. The CPUs it names are still reserved for those
+// claims, since a mover never releases what it came from.
+func (cp *CPUDriver) rollbackUpdates(round *defragRound, exchange int, notApplied map[types.UID]struct{}) ([]*api.ContainerUpdate, error) {
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
+	if round.store != cp.cpuAllocationStore {
+		return nil, fmt.Errorf("the allocation store was rebuilt while the exchange was out")
+	}
+	var updates []*api.ContainerUpdate
+	for _, containerUID := range round.exchangeContainers[exchange] {
+		if _, refused := notApplied[containerUID]; refused {
+			continue
+		}
+		cpus, err := round.store.GetResourceClaimOriginUnion(round.claimsByContainer[containerUID]...)
+		if err != nil {
+			return nil, fmt.Errorf("cannot determine the CPUs container %q came from: %w", containerUID, err)
+		}
+		update := &api.ContainerUpdate{ContainerId: string(containerUID)}
+		update.SetLinuxCPUSetCPUs(cpus.String())
+		updates = append(updates, update)
+	}
+	return updates, nil
 }
 
 // observeNodeShape republishes how well placed the node's claims are and how
@@ -207,31 +490,18 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, onl
 		return nil
 	}
 
-	round := &defragRound{scope: scope, store: cp.cpuAllocationStore}
-	for _, move := range moves {
-		mLogger := logger.WithValues("claimUID", move.ClaimUID)
-		if err := cp.cpuAllocationStore.BeginRebind(mLogger, move.ClaimUID, move.To); err != nil {
-			mLogger.Error(err, "cannot start moving claim")
+	round := newDefragRound(scope, cp.cpuAllocationStore)
+	for _, step := range defragSteps(moves) {
+		if !cp.beginDefragStep(logger, step) {
 			continue
 		}
-		// The spec on disk is the desired placement, and it is what a driver
-		// restart rebuilds the store from, so it has to name the target before
-		// the container is told about it.
-		if err := cp.writeClaimPlacement(mLogger, move.ClaimUID); err != nil {
-			mLogger.Error(err, "cannot record new placement, leaving claim where it is", "to", move.To.String())
-			if abortErr := cp.cpuAllocationStore.AbortRebind(mLogger, move.ClaimUID); abortErr != nil {
-				mLogger.Error(abortErr, "cannot undo the reservation either")
-			}
-			continue
-		}
-		round.moves = append(round.moves, move)
+		round.moves = append(round.moves, step...)
 	}
 	if len(round.moves) == 0 {
 		return nil
 	}
 
-	updates, err := cp.roundUpdates(logger, round.moves)
-	if err != nil {
+	if err := cp.roundUpdates(logger, round); err != nil {
 		// Most likely the shared pool cannot be narrowed any further. Undo
 		// everything rather than move a claim onto CPUs a shared container still
 		// holds.
@@ -239,8 +509,47 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, onl
 		cp.abortMoves(logger, round.moves)
 		return nil
 	}
-	round.updates = updates
 	return round
+}
+
+// beginDefragStep reserves one step and records the new placement of every claim
+// in it, and reports whether the step can be attempted at all.
+//
+// An exchange is reserved as a unit and abandoned as a unit: each of its moves
+// takes CPUs another is still running on, so keeping one of them would put two
+// claims on the same CPUs with nothing left to undo it.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) beginDefragStep(logger logr.Logger, step []defrag.Move) bool {
+	logger = logger.WithValues("claimUIDs", stepClaims(step))
+	if step[0].Exchange == 0 {
+		move := step[0]
+		if err := cp.cpuAllocationStore.BeginRebind(logger, move.ClaimUID, move.To); err != nil {
+			logger.Error(err, "cannot start moving claim")
+			return false
+		}
+	} else {
+		targets := make(map[types.UID]cpuset.CPUSet, len(step))
+		for _, move := range step {
+			targets[move.ClaimUID] = move.To
+		}
+		if err := cp.cpuAllocationStore.BeginSwap(logger, targets); err != nil {
+			logger.Error(err, "cannot start exchanging claims")
+			return false
+		}
+	}
+
+	// The spec on disk is the desired placement, and it is what a driver restart
+	// rebuilds the store from, so it has to name the target before the container
+	// is told about it.
+	for _, move := range step {
+		if err := cp.writeClaimPlacement(logger.WithValues("claimUID", move.ClaimUID), move.ClaimUID); err != nil {
+			logger.Error(err, "cannot record new placement, leaving the claims where they are", "claimUID", move.ClaimUID, "to", move.To.String())
+			cp.abortMoves(logger, step)
+			return false
+		}
+	}
+	return true
 }
 
 // takePendingRound returns the round a previous attempt could not confirm, so it
@@ -489,7 +798,8 @@ func (cp *CPUDriver) planScopeMoves(logger logr.Logger, scope defragScope, onlin
 	}
 
 	plan, err := defrag.PlanNode(view.topology, view.placements, view.free, cp.defragSelector(logger, view.threadsPerCore), defrag.Options{
-		Eligible: cp.claimMovable,
+		Eligible:   cp.claimMovable,
+		AllowSwaps: cp.defrag.allowTransientOverlap,
 		// While a move is in flight its claim holds both its old and its new
 		// CPUs, so a round that took every free CPU would leave the shared pool
 		// momentarily empty, which NRI cannot express.
@@ -568,11 +878,8 @@ func (cp *CPUDriver) writeClaimPlacement(logger logr.Logger, claimUID types.UID)
 //
 // A moved claim with no running container needs no update at all; the store and
 // its spec are the whole of its state until a container is created from them.
-func (cp *CPUDriver) roundUpdates(logger logr.Logger, moves []defrag.Move) ([]*api.ContainerUpdate, error) {
-	var updates []*api.ContainerUpdate
-	covered := map[types.UID]struct{}{}
-
-	for _, move := range moves {
+func (cp *CPUDriver) roundUpdates(logger logr.Logger, round *defragRound) error {
+	for _, move := range round.moves {
 		mLogger := logger.WithValues("claimUID", move.ClaimUID)
 		owner, ok := cp.claimTracker.Owner(move.ClaimUID)
 		if !ok {
@@ -585,20 +892,25 @@ func (cp *CPUDriver) roundUpdates(logger logr.Logger, moves []defrag.Move) ([]*a
 			continue
 		}
 		containerUID := state.ContainerUID()
-		if _, done := covered[containerUID]; done {
+		if move.Exchange != 0 && !slices.Contains(round.exchangeContainers[move.Exchange], containerUID) {
+			round.exchangeContainers[move.Exchange] = append(round.exchangeContainers[move.Exchange], containerUID)
+		}
+		if _, done := round.updateByContainer[containerUID]; done {
 			continue
 		}
-		covered[containerUID] = struct{}{}
 
 		// A container holding several claims must be pinned to all of them at
 		// once, moved or not.
-		cpus, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(state.ClaimUIDs()...)
+		claimUIDs := state.ClaimUIDs()
+		cpus, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
 		if err != nil {
-			return nil, fmt.Errorf("cannot determine CPUs for container %q: %w", containerUID, err)
+			return fmt.Errorf("cannot determine CPUs for container %q: %w", containerUID, err)
 		}
 		update := &api.ContainerUpdate{ContainerId: string(containerUID)}
 		update.SetLinuxCPUSetCPUs(cpus.String())
-		updates = append(updates, update)
+		round.updates = append(round.updates, update)
+		round.updateByContainer[containerUID] = update
+		round.claimsByContainer[containerUID] = claimUIDs
 	}
 
 	// The pool is already narrowed by the reservations, so this moves shared
@@ -606,9 +918,10 @@ func (cp *CPUDriver) roundUpdates(logger logr.Logger, moves []defrag.Move) ([]*a
 	// the moves commit and the origins return to the pool.
 	shared, err := cp.getSharedContainerUpdates(logger, types.UID(""))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return append(updates, shared...), nil
+	round.updates = append(round.updates, shared...)
+	return nil
 }
 
 // finishDefragRound settles every move in a round according to what the runtime
@@ -635,38 +948,68 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		cp.retryDefragScope(round.scope)
 		return cpumetrics.ResultError
 	}
-	delete(cp.pendingRounds, round.scope)
-
 	refused := map[types.UID]struct{}{}
 	for _, update := range failed {
 		refused[types.UID(update.GetContainerId())] = struct{}{}
 	}
 
-	committed, reverted := 0, 0
-	for _, move := range round.moves {
-		mLogger := logger.WithValues("claimUID", move.ClaimUID)
-		if cp.moveWasRefused(move, refused) {
-			mLogger.Info("runtime refused a move, leaving the claim where it is",
-				"from", move.From.String(), "to", move.To.String())
-			reverted++
-			if err := cp.cpuAllocationStore.AbortRebind(mLogger, move.ClaimUID); err != nil {
-				mLogger.Error(err, "cannot undo the reservation")
+	committed, reverted, unsettled := 0, 0, 0
+	for _, step := range defragSteps(round.moves) {
+		sLogger := logger.WithValues("claimUIDs", stepClaims(step))
+		if step[0].Exchange == 0 {
+			move := step[0]
+			if cp.moveWasRefused(move, refused) {
+				sLogger.Info("runtime refused a move, leaving the claim where it is",
+					"from", move.From.String(), "to", move.To.String())
+				reverted++
+				cp.abortStep(sLogger, step)
 				continue
 			}
-			if err := cp.writeClaimPlacement(mLogger, move.ClaimUID); err != nil {
-				mLogger.Error(err, "cannot restore the recorded placement")
+			if err := cp.cpuAllocationStore.CommitRebind(sLogger, move.ClaimUID); err != nil {
+				sLogger.Error(err, "cannot complete the move")
+				reverted++
+				continue
 			}
+			committed++
 			continue
 		}
-		if err := cp.cpuAllocationStore.CommitRebind(mLogger, move.ClaimUID); err != nil {
-			mLogger.Error(err, "cannot complete the move")
-			reverted++
-			continue
+
+		exchange := step[0].Exchange
+		switch round.outcomes[exchange] {
+		case exchangeApplied:
+			if err := cp.cpuAllocationStore.CommitSwap(sLogger, stepClaims(step)...); err != nil {
+				sLogger.Error(err, "cannot complete the exchange")
+				round.outcomes[exchange] = exchangeUnsettled
+				unsettled += len(step)
+				continue
+			}
+			committed += len(step)
+		case exchangeUndone:
+			if !cp.abortStep(sLogger, step) {
+				round.outcomes[exchange] = exchangeUnsettled
+				unsettled += len(step)
+				continue
+			}
+			reverted += len(step)
+		default:
+			// Neither applied nor undone: the claims still hold both cpusets and
+			// the round is sent again rather than settled on a guess.
+			sLogger.Info("an exchange is unsettled, keeping both cpusets reserved")
+			unsettled += len(step)
 		}
-		committed++
 	}
 	cp.metricsRecorder().RecordDefragMoves(cpumetrics.ResultSuccess, committed)
 	cp.metricsRecorder().RecordDefragMoves(cpumetrics.ResultError, reverted)
+
+	if unsettled > 0 {
+		// Only the exchanges nobody can place are sent again: re-sending a move
+		// this round has already settled would apply it a second time, and for a
+		// move that was put back it would apply it against the ledger.
+		cp.pendingRounds[round.scope] = round.retainUnsettled()
+		cp.retryDefragScope(round.scope)
+		return cpumetrics.ResultError
+	}
+	delete(cp.pendingRounds, round.scope)
 
 	if committed > 0 {
 		// Two jobs at once. The CPUs the moved claims left are back in the pool
@@ -721,14 +1064,52 @@ func (cp *CPUDriver) moveWasRefused(move defrag.Move, refused map[types.UID]stru
 // abortMoves undoes reservations and recorded placements for moves that will not
 // be attempted.
 func (cp *CPUDriver) abortMoves(logger logr.Logger, moves []defrag.Move) {
-	for _, move := range moves {
-		mLogger := logger.WithValues("claimUID", move.ClaimUID)
-		if err := cp.cpuAllocationStore.AbortRebind(mLogger, move.ClaimUID); err != nil {
-			mLogger.Error(err, "cannot undo the reservation")
-			continue
+	for _, step := range defragSteps(moves) {
+		cp.abortStep(logger.WithValues("claimUIDs", stepClaims(step)), step)
+	}
+}
+
+// abortStep puts one step's claims back where they came from, in the store and
+// in the specs on disk, and reports whether the store took it. An exchange is
+// undone as a unit for the reason it is reserved as one.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) abortStep(logger logr.Logger, step []defrag.Move) bool {
+	if step[0].Exchange == 0 {
+		if err := cp.cpuAllocationStore.AbortRebind(logger, step[0].ClaimUID); err != nil {
+			logger.Error(err, "cannot undo the reservation")
+			return false
 		}
-		if err := cp.writeClaimPlacement(mLogger, move.ClaimUID); err != nil {
-			mLogger.Error(err, "cannot restore the recorded placement")
+	} else if err := cp.cpuAllocationStore.AbortSwap(logger, stepClaims(step)...); err != nil {
+		logger.Error(err, "cannot undo the exchange's reservation")
+		return false
+	}
+	for _, move := range step {
+		if err := cp.writeClaimPlacement(logger, move.ClaimUID); err != nil {
+			logger.Error(err, "cannot restore the recorded placement", "claimUID", move.ClaimUID)
 		}
 	}
+	return true
+}
+
+// retainUnsettled narrows a round to the exchanges the runtime left in a state
+// nobody can name, which are the only part of it worth sending again: a move
+// this round has already settled would be applied a second time, and one that
+// was put back would be applied against the ledger.
+func (r *defragRound) retainUnsettled() *defragRound {
+	next := newDefragRound(r.scope, r.store)
+	for _, step := range defragSteps(r.moves) {
+		exchange := step[0].Exchange
+		if exchange == 0 || r.outcomes[exchange] != exchangeUnsettled {
+			continue
+		}
+		next.moves = append(next.moves, step...)
+		next.exchangeContainers[exchange] = r.exchangeContainers[exchange]
+		for _, containerUID := range r.exchangeContainers[exchange] {
+			next.updates = append(next.updates, r.updateByContainer[containerUID])
+			next.updateByContainer[containerUID] = r.updateByContainer[containerUID]
+			next.claimsByContainer[containerUID] = r.claimsByContainer[containerUID]
+		}
+	}
+	return next
 }

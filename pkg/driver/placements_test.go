@@ -133,8 +133,10 @@ func TestPlacementsPlansWithApplyMuReleased(t *testing.T) {
 
 func TestServePlacementsDryRunSaysWhyNothingWouldMove(t *testing.T) {
 	// The question this endpoint exists to answer: a claim is split and stays
-	// split, and nothing in the metrics says why.
+	// split, and nothing in the metrics says why. Here the answer is the switch
+	// the operator turned off, which "blocked" alone would not have said.
 	d := newDefragTestDriver(t, 2, 2)
+	d.defrag.allowTransientOverlap = false
 	d.placeClaim(t, "claim-1", cpuset.New(0, 3))
 	d.placeClaim(t, "claim-2", cpuset.New(1, 2))
 	d.runContainer(t, "pod-uid-1", "ctr-1", "ctr-uid-1", "claim-1")
@@ -146,6 +148,25 @@ func TestServePlacementsDryRunSaysWhyNothingWouldMove(t *testing.T) {
 	require.Empty(t, plan.Moves)
 	require.Positive(t, plan.Blocked)
 	require.Contains(t, plan.Reason, "transient overlap is not permitted")
+}
+
+func TestServePlacementsDryRunShowsAnExchange(t *testing.T) {
+	// The same node with the switch on: the dry run names both halves of the
+	// exchange, which is what an operator asking whether a full node can be
+	// repaired at all is looking at.
+	d := newDefragTestDriver(t, 2, 2)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 3))
+	d.placeClaim(t, "claim-2", cpuset.New(1, 2))
+	d.runContainer(t, "pod-uid-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.runContainer(t, "pod-uid-2", "ctr-2", "ctr-uid-2", "claim-2")
+
+	plans := getPlacements(t, d, "?dryrun=1").NUMANodes[0].Plans
+	require.Len(t, plans, 1)
+	require.Equal(t, []moveReport{
+		{ClaimUID: "claim-1", From: "0,3", To: "0-1"},
+		{ClaimUID: "claim-2", From: "1-2", To: "2-3"},
+	}, plans[0].Moves)
+	require.Empty(t, d.updater.allCalls(), "a dry run sends nothing")
 }
 
 func TestServePlacementsReportsAMoveInFlight(t *testing.T) {
