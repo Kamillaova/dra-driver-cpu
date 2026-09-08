@@ -32,6 +32,7 @@ import (
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
@@ -139,6 +140,14 @@ type CPUDriver struct {
 	// sysfs is kept so a defragmentation pass can re-read which CPUs are online;
 	// the set read in New is only true of startup.
 	sysfs sysfs.FS
+	// cgroupfs is the host's cgroup2 tree, read only to find out which CPUs a
+	// container is really running on. Nil when defragmentation is off, which is
+	// when nothing can leave a placement in doubt.
+	cgroupfs cgroupfs.FS
+	// poisonedNodes are the NUMA nodes the driver cannot vouch for: an exchange
+	// there ended in a state nobody can name, so two claims may be sharing CPUs.
+	// Guarded by applyMu.
+	poisonedNodes map[int]*poisonedNode
 	// pendingRounds is, per scope, a set of moves the runtime never confirmed,
 	// held so the next attempt at that scope can send it again. Guarded by
 	// applyMu.
@@ -164,9 +173,13 @@ type CPUDriver struct {
 	// never after.
 	publishMu sync.Mutex
 	// publishedOccupancy is, per device, whether it held a claim when the device
-	// order was last published, which is the only input that order has. Guarded
-	// by applyMu.
+	// order was last published, which is one of the two inputs the published
+	// slices have. Guarded by applyMu.
 	publishedOccupancy map[string]bool
+	// publishedPoison is the other: the NUMA nodes that were fenced when the
+	// slices were last published, whose devices carry the poison taint. Guarded
+	// by applyMu.
+	publishedPoison map[int]bool
 
 	kubeletRootDir string
 }
@@ -213,6 +226,7 @@ type deviceTopology struct {
 type Providers struct {
 	CPUInfo   CPUInfoProvider
 	SysFS     sysfs.FS
+	CgroupFS  cgroupfs.FS
 	K8SClient kubernetes.Interface
 }
 
@@ -228,6 +242,13 @@ func (pr Providers) EnsureSysFS() sysfs.FS {
 		return sysfs.Host()
 	}
 	return pr.SysFS
+}
+
+func (pr Providers) EnsureCgroupFS() cgroupfs.FS {
+	if pr.CgroupFS == nil {
+		return cgroupfs.Host()
+	}
+	return pr.CgroupFS
 }
 
 // Config is the configuration for the CPUDriver.
@@ -404,6 +425,8 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 			batchTimeout:          defaultDefragBatchTimeout,
 		}
 		if plugin.defrag.enabled {
+			plugin.cgroupfs = providers.EnsureCgroupFS()
+			plugin.poisonedNodes = make(map[int]*poisonedNode)
 			plugin.pendingRounds = make(map[defragScope]*defragRound)
 			plugin.defragRetries = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[defragScope]())
 			plugin.defragRetryDue = make(chan defragScope)
@@ -451,8 +474,12 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 
 	// A slice holding a tainted device may carry half as many devices as one
 	// without, so the limit follows what was actually built rather than the
-	// options alone.
-	if slices.ContainsFunc(devices, func(d resourceapi.Device) bool { return len(d.Taints) > 0 }) {
+	// options alone -- and, where a fence may taint any device at any moment,
+	// what may yet be built. Deciding the chunk size at publication time instead
+	// would change how many slices the pool has while it is fenced, which is a
+	// worse thing to do to a pool's generation than losing half a slice's
+	// capacity on a node that has a handful of grouped devices.
+	if plugin.defrag.enabled || slices.ContainsFunc(devices, func(d resourceapi.Device) bool { return len(d.Taints) > 0 }) {
 		plugin.devicesPerResourceSlice = min(plugin.devicesPerResourceSlice, resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures)
 	}
 
