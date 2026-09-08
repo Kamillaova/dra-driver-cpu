@@ -51,6 +51,14 @@ const (
 	// placement per request carry this one instead.
 	cdiCPUSetAnnotation = "dra.cpu/cpuset"
 
+	// cdiRecordedAnnotation records how many CPUs the claim's allocation charged
+	// each device it names, which is what the scheduler has subtracted from those
+	// devices' capacities. The driver does not watch ResourceClaims, so after a
+	// restart this is where that answer comes from until a replayed Prepare hands
+	// the claim over again; absent means unknown, and an unknown answer leaves the
+	// published capacity uncorrected rather than guessing.
+	cdiRecordedAnnotation = "dra.cpu/recorded"
+
 	// cdiRelocatableAnnotation records whether the claim's own configuration
 	// permits its CPUs to change. The driver does not watch ResourceClaims, so
 	// after a restart this is where that answer comes from; absent means false,
@@ -123,17 +131,28 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 	if err != nil {
 		return fmt.Errorf("failed to record the placement of CDI device %q: %w", deviceName, err)
 	}
+	annotations := map[string]string{
+		cdiPlacementsAnnotation:  placements,
+		cdiRelocatableAnnotation: strconv.FormatBool(record.Relocatable),
+	}
+	// A claim that charged nothing writes no annotation, so a spec is not made to
+	// carry the word for an empty answer. It reads back the same as one written
+	// before the driver kept them, which is the same answer.
+	if len(record.Recorded) > 0 {
+		recorded, err := json.Marshal(record.Recorded)
+		if err != nil {
+			return fmt.Errorf("failed to record the charged devices of CDI device %q: %w", deviceName, err)
+		}
+		annotations[cdiRecordedAnnotation] = string(recorded)
+	}
 
 	spec := &cdiSpec.Spec{
 		Version: cdiSpecVersion,
 		Kind:    c.cdiKind,
 		Devices: []cdiSpec.Device{
 			{
-				Name: deviceName,
-				Annotations: map[string]string{
-					cdiPlacementsAnnotation:  placements,
-					cdiRelocatableAnnotation: strconv.FormatBool(record.Relocatable),
-				},
+				Name:        deviceName,
+				Annotations: annotations,
 				ContainerEdits: cdiSpec.ContainerEdits{
 					Env: []string{envVar},
 				},
@@ -146,7 +165,7 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 	}
 
 	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVar,
-		"placements", placements, "relocatable", record.Relocatable)
+		"placements", placements, "recorded", annotations[cdiRecordedAnnotation], "relocatable", record.Relocatable)
 	return nil
 }
 
@@ -201,20 +220,28 @@ func decodePlacements(recorded string) ([]store.RequestAllocation, error) {
 // describe a single exclusive request without a name. The spec file is
 // driver-owned, so unlike a container's environment its env value is current.
 // A missing or unparsable mobility annotation reads as immobile, which is the
-// field's default and cannot cost a claim anything but a move.
+// field's default and cannot cost a claim anything but a move. A missing set of
+// charged devices reads as unknown, which leaves the published capacity
+// uncorrected for that claim; an unparsable one is an error, because a spec this
+// driver wrote is the one place that answer was kept.
 func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord, error) {
 	device := c.cache.GetDevice(cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName))
 	if device == nil {
 		return store.ClaimRecord{}, fmt.Errorf("failed to find CDI device %q", deviceName)
 	}
 	relocatable, _ := strconv.ParseBool(device.Annotations[cdiRelocatableAnnotation])
+	charged, err := decodeRecordedDevices(device.Annotations[cdiRecordedAnnotation])
+	if err != nil {
+		return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
+			cdiRecordedAnnotation, device.Annotations[cdiRecordedAnnotation], deviceName, err)
+	}
 
 	if recorded, ok := device.Annotations[cdiPlacementsAnnotation]; ok {
 		requests, err := decodePlacements(recorded)
 		if err != nil {
 			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiPlacementsAnnotation, recorded, deviceName, err)
 		}
-		return store.ClaimRecord{Requests: requests, Relocatable: relocatable}, nil
+		return store.ClaimRecord{Requests: requests, Relocatable: relocatable, Recorded: charged}, nil
 	}
 
 	if recorded, ok := device.Annotations[cdiCPUSetAnnotation]; ok {
@@ -225,6 +252,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		return store.ClaimRecord{
 			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
 			Relocatable: relocatable,
+			Recorded:    charged,
 		}, nil
 	}
 
@@ -236,9 +264,23 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		return store.ClaimRecord{
 			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
 			Relocatable: relocatable,
+			Recorded:    charged,
 		}, nil
 	}
 	return store.ClaimRecord{}, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
+}
+
+// decodeRecordedDevices reads the charged amounts back. An absent annotation is
+// not an error: it is a spec written before the driver kept them.
+func decodeRecordedDevices(recorded string) (map[string]int, error) {
+	if recorded == "" {
+		return nil, nil
+	}
+	var charged map[string]int
+	if err := json.Unmarshal([]byte(recorded), &charged); err != nil {
+		return nil, err
+	}
+	return charged, nil
 }
 
 // PreparedClaimAllocations returns what was recorded on disk for every claim

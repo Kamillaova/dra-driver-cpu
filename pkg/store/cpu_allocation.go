@@ -18,6 +18,7 @@ package store
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"sync"
@@ -68,6 +69,11 @@ func UnionOf(requests []RequestAllocation) cpuset.CPUSet {
 type ClaimRecord struct {
 	Requests    []RequestAllocation
 	Relocatable bool
+	// Recorded is how many CPUs the claim's allocation charged to each device it
+	// names, which is what a scheduler subtracts from that device's capacity. It
+	// is empty for a claim that was given no CPUs of its own, and for one whose
+	// record on disk was written before the driver kept this.
+	Recorded map[string]int
 }
 
 // CPUAllocation is the single source of truth for CPU allocations.
@@ -94,6 +100,8 @@ type claimAllocation struct {
 	// its members being unprepared while the batch is out.
 	swapGroup   int
 	relocatable bool
+	// recorded is what the claim's allocation charged each device it names.
+	recorded map[string]int
 }
 
 func newClaimAllocation(record ClaimRecord) *claimAllocation {
@@ -101,7 +109,11 @@ func newClaimAllocation(record ClaimRecord) *claimAllocation {
 	for _, request := range record.Requests {
 		byRequest[request.Request] = request
 	}
-	return &claimAllocation{byRequest: byRequest, relocatable: record.Relocatable}
+	return &claimAllocation{
+		byRequest:   byRequest,
+		relocatable: record.Relocatable,
+		recorded:    maps.Clone(record.Recorded),
+	}
 }
 
 // requests returns the claim's allocations ordered by request name, so callers
@@ -614,7 +626,34 @@ func (s *CPUAllocation) GetClaimRecord(claimUID types.UID) (ClaimRecord, bool) {
 	if !ok {
 		return ClaimRecord{}, false
 	}
-	return ClaimRecord{Requests: allocation.requests(), Relocatable: allocation.relocatable}, true
+	return ClaimRecord{
+		Requests:    allocation.requests(),
+		Relocatable: allocation.relocatable,
+		Recorded:    maps.Clone(allocation.recorded),
+	}, true
+}
+
+// SetRecordedDevices records what a claim's allocation charged each device,
+// which a caller supplies when the claim's own record could not carry it: a
+// spec written before the driver kept this names no device, and the claim
+// object a replayed Prepare hands over is where the answer comes back from.
+//
+// It refuses to overwrite an answer the store already has, since the
+// allocation is immutable and two answers about it cannot both be right.
+func (s *CPUAllocation) SetRecordedDevices(logger logr.Logger, claimUID types.UID, recorded map[string]int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	allocation, ok := s.claims[claimUID]
+	if !ok {
+		return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
+	}
+	if len(allocation.recorded) > 0 {
+		return fmt.Errorf("claim %q already records the devices its allocation charged", claimUID)
+	}
+	allocation.recorded = maps.Clone(recorded)
+	logger.V(2).Info("recovered the devices a claim's allocation charged", "recorded", recorded)
+	return nil
 }
 
 // IsRelocatable reports whether a claim permits the driver to change its CPUs
