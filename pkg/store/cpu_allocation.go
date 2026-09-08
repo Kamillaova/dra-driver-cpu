@@ -675,6 +675,39 @@ func (s *CPUAllocation) HoldsExclusiveCPUs(claimUID types.UID) bool {
 	return ok && !allocation.exclusiveCPUs().IsEmpty()
 }
 
+// ClaimHolding is one prepared claim as the capacity published for a device is
+// computed from.
+//
+// Held is the claim's exclusive CPUs together with the ones it is moving away
+// from, because a claim with a move in flight occupies both: its container is on
+// one of the two and the driver does not know which until the runtime answers.
+// A device the claim is moving onto is therefore shrunk from the moment the move
+// is reserved, and the one it is leaving grows only once the move is committed.
+type ClaimHolding struct {
+	Held     cpuset.CPUSet
+	Recorded map[string]int
+}
+
+// ClaimHoldings returns every prepared claim that holds CPUs of its own, in one
+// snapshot.
+//
+// One snapshot rather than a reader per quantity: a caller that took the CPUs
+// and the charged amounts in two calls could catch a move between them and
+// publish a device as both emptied and never filled.
+func (s *CPUAllocation) ClaimHoldings() map[types.UID]ClaimHolding {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	holdings := make(map[types.UID]ClaimHolding, len(s.claims))
+	for claimUID, allocation := range s.claims {
+		held := allocation.exclusiveCPUs().Union(allocation.originCPUs())
+		if held.IsEmpty() {
+			continue
+		}
+		holdings[claimUID] = ClaimHolding{Held: held, Recorded: maps.Clone(allocation.recorded)}
+	}
+	return holdings
+}
+
 // ExclusiveClaimAllocations returns every prepared claim that holds exclusive
 // CPUs, and which CPUs those are. A claim with a rebind in flight reads as being
 // on its target, as it does through GetResourceClaimAllocation.
