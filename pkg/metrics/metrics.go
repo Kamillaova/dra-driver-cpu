@@ -94,6 +94,9 @@ type Recorder interface {
 	RecordDefragPass(result Result, duration time.Duration)
 	RecordDefragMoves(result Result, count int)
 	RecordDefragBlockedMoves(count int)
+	RecordDefragSwapOverlap(duration time.Duration)
+	RecordDefragPartialBatch()
+	RecordDefragRollback(result Result)
 	RecordSynchronizeSkippedClaim()
 	RecordMisplacedClaim()
 	SetPartitionState(map[string]bool)
@@ -116,6 +119,9 @@ type Metrics struct {
 	defragMoves                   *prometheus.CounterVec
 	defragBlockedMoves            prometheus.Counter
 	defragPassDurationSecondsHist prometheus.Histogram
+	defragSwapOverlapSecondsHist  prometheus.Histogram
+	defragPartialBatches          prometheus.Counter
+	defragRollbacks               *prometheus.CounterVec
 
 	synchronizeSkippedClaims prometheus.Counter
 	misplacedClaims          prometheus.Counter
@@ -217,6 +223,23 @@ var (
 		help:    "Duration of defragmentation passes in seconds.",
 		buckets: prometheus.DefBuckets,
 	}
+	defragSwapOverlapSpec = metricSpec{
+		name:    "dra_cpu_defrag_swap_overlap_seconds",
+		kind:    metricHistogram,
+		help:    "Duration of the container update batch carrying an exchange of two claims' CPUs, which bounds the window in which both of them hold the same CPUs.",
+		buckets: prometheus.DefBuckets,
+	}
+	defragPartialBatchesSpec = metricSpec{
+		name: "dra_cpu_defrag_partial_batches_total",
+		kind: metricCounter,
+		help: "Total number of exchanges the runtime applied for some of their containers and refused for the rest.",
+	}
+	defragRollbacksSpec = metricSpec{
+		name:   "dra_cpu_defrag_rollbacks_total",
+		kind:   metricCounter,
+		help:   "Total number of attempts to put the applied half of an exchange back, by result; an error leaves two claims sharing CPUs.",
+		labels: []string{"result"},
+	}
 	synchronizeSkippedClaimsSpec = metricSpec{
 		name: "dra_cpu_synchronize_skipped_claims_total",
 		kind: metricCounter,
@@ -250,6 +273,9 @@ var metricSpecs = []metricSpec{
 	defragMovesSpec,
 	defragBlockedMovesSpec,
 	defragPassDurationSpec,
+	defragSwapOverlapSpec,
+	defragPartialBatchesSpec,
+	defragRollbacksSpec,
 	synchronizeSkippedClaimsSpec,
 	misplacedClaimsSpec,
 	partitionVerifiedSpec,
@@ -299,6 +325,9 @@ func New(reg prometheus.Registerer) *Metrics {
 		defragMoves:                   newCounterVec(defragMovesSpec),
 		defragBlockedMoves:            newCounter(defragBlockedMovesSpec),
 		defragPassDurationSecondsHist: newHistogram(defragPassDurationSpec),
+		defragSwapOverlapSecondsHist:  newHistogram(defragSwapOverlapSpec),
+		defragPartialBatches:          newCounter(defragPartialBatchesSpec),
+		defragRollbacks:               newCounterVec(defragRollbacksSpec),
 
 		synchronizeSkippedClaims: newCounter(synchronizeSkippedClaimsSpec),
 		misplacedClaims:          newCounter(misplacedClaimsSpec),
@@ -320,6 +349,9 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragMoves,
 		m.defragBlockedMoves,
 		m.defragPassDurationSecondsHist,
+		m.defragSwapOverlapSecondsHist,
+		m.defragPartialBatches,
+		m.defragRollbacks,
 		m.synchronizeSkippedClaims,
 		m.misplacedClaims,
 		m.partitionVerified,
@@ -329,6 +361,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.unprepareClaims.WithLabelValues(result.String())
 		m.defragPasses.WithLabelValues(result.String())
 		m.defragMoves.WithLabelValues(result.String())
+		m.defragRollbacks.WithLabelValues(result.String())
 	}
 	return m
 }
@@ -418,6 +451,22 @@ func (m *Metrics) RecordDefragBlockedMoves(count int) {
 	m.defragBlockedMoves.Add(float64(count))
 }
 
+// RecordDefragSwapOverlap observes the batch that carried an exchange. The
+// instant the two claims share CPUs is inside the runtime, between the two
+// writes it applies in order, so the batch is the tightest bound on it a plugin
+// can measure.
+func (m *Metrics) RecordDefragSwapOverlap(duration time.Duration) {
+	m.defragSwapOverlapSecondsHist.Observe(duration.Seconds())
+}
+
+func (m *Metrics) RecordDefragPartialBatch() {
+	m.defragPartialBatches.Inc()
+}
+
+func (m *Metrics) RecordDefragRollback(result Result) {
+	m.defragRollbacks.WithLabelValues(result.String()).Inc()
+}
+
 func (m *Metrics) RecordSynchronizeSkippedClaim() {
 	m.synchronizeSkippedClaims.Inc()
 }
@@ -455,6 +504,9 @@ func (noopRecorder) SetDefragState(DefragState)             {}
 func (noopRecorder) RecordDefragPass(Result, time.Duration) {}
 func (noopRecorder) RecordDefragMoves(Result, int)          {}
 func (noopRecorder) RecordDefragBlockedMoves(int)           {}
+func (noopRecorder) RecordDefragSwapOverlap(time.Duration)  {}
+func (noopRecorder) RecordDefragPartialBatch()              {}
+func (noopRecorder) RecordDefragRollback(Result)            {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()         {}
 func (noopRecorder) RecordMisplacedClaim()                  {}
 func (noopRecorder) SetPartitionState(map[string]bool)      {}

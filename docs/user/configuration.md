@@ -168,6 +168,21 @@ on - is configured through other Helm values, not through this file.
   `sched_getaffinity(2)` or the container's own `cpuset.cpus.effective` instead. See
   [How it Works](how-it-works.md).
 
+`defragAllowTransientOverlap` (bool, default: `true`)
+
+- Permit the instant during an exchange in which two claims hold the same CPUs. Exchanging the CPUs
+  of two claims is the only repair a node with no free CPUs has, and the runtime applies the two
+  cpuset writes of one batch in order, so between them both claims sit on the CPUs one of them is
+  leaving. cgroup v2 allows that: only `cpuset.cpus.partition` makes a set exclusive, and neither
+  the kubelet nor containerd uses partitions for pods.
+- Set it to `false` to forbid that instant, which also forbids every exchange: a claim then moves
+  only into CPUs nothing holds, and a node packing has filled keeps the placement it has. The
+  refusal is visible — those moves are counted in `dra_cpu_defrag_blocked_moves_total`, and
+  `/placements?dryrun=1` says an exchange would have helped.
+- Inert without `defragEnabled`. The window is two sequential cgroup writes inside one batch, during
+  which the two claims share CPUs at roughly half speed; a workload that cannot afford even that
+  opts out of moves entirely with `cpuConfig.relocatable: false`, which is the default.
+
 `cachePlacementStrategy` (string, `pack` | `spread`, default: `pack`)
 
 - How a claim that fits inside one uncore cache chooses among the caches that can hold it. `pack`,
