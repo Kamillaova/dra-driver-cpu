@@ -865,3 +865,299 @@ func TestIsRelocatable(t *testing.T) {
 	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "replacement", exclusiveRequest(cpuset.New(0, 1)), false))
 	require.False(t, store.IsRelocatable("replacement"))
 }
+
+// TestSwapHoldsBothCpusetsForBothClaims: the transit set is the whole point of
+// the exchange. Between BeginSwap and its ending, each participant reads as
+// being on its target while still holding what it came from, and neither set is
+// offered to a shared container or to another claim.
+func TestSwapHoldsBothCpusetsForBothClaims(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2, 3))
+
+	require.NoError(t, store.BeginSwap(logger, map[types.UID]cpuset.CPUSet{
+		"claim-1": cpuset.New(2, 3),
+		"claim-2": cpuset.New(0, 1),
+	}))
+
+	first, ok := store.GetResourceClaimAllocation("claim-1")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(2, 3), first)
+	second, ok := store.GetResourceClaimAllocation("claim-2")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(0, 1), second)
+
+	origin, ok := store.GetRebindOrigin("claim-1")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(0, 1), origin)
+	origin, ok = store.GetRebindOrigin("claim-2")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(2, 3), origin)
+
+	require.Equal(t, cpuset.New(4, 5), store.GetSharedCPUs(), "an exchange offers nothing to anyone else")
+	require.Error(t, store.ReserveResourceClaimAllocation(logger, "claim-3", exclusiveRequest(cpuset.New(1)), false),
+		"a newcomer must not be given CPUs a half-swapped claim still occupies")
+}
+
+// TestSwapEndingsLeaveTheReservedSetAlone: the group holds the same CPUs before,
+// during and after, so committing and aborting both leave the accounting where
+// they found it. Only where each claim sits changes.
+func TestSwapEndingsLeaveTheReservedSetAlone(t *testing.T) {
+	logger := testr.New(t)
+	for _, tc := range []struct {
+		name          string
+		commit        bool
+		expectedFirst cpuset.CPUSet
+	}{
+		{name: "commit puts each claim on its target", commit: true, expectedFirst: cpuset.New(2, 3)},
+		{name: "abort puts each claim back", commit: false, expectedFirst: cpuset.New(0, 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+			requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+			requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2, 3))
+			require.NoError(t, store.BeginSwap(logger, map[types.UID]cpuset.CPUSet{
+				"claim-1": cpuset.New(2, 3),
+				"claim-2": cpuset.New(0, 1),
+			}))
+
+			if tc.commit {
+				require.NoError(t, store.CommitSwap(logger, "claim-1", "claim-2"))
+			} else {
+				require.NoError(t, store.AbortSwap(logger, "claim-1", "claim-2"))
+			}
+
+			first, ok := store.GetResourceClaimAllocation("claim-1")
+			require.True(t, ok)
+			require.Equal(t, tc.expectedFirst, first)
+			second, ok := store.GetResourceClaimAllocation("claim-2")
+			require.True(t, ok)
+			require.Equal(t, cpuset.New(0, 1, 2, 3).Difference(tc.expectedFirst), second)
+
+			require.Equal(t, cpuset.New(0, 1, 2, 3), store.GetPreparedCPUs())
+			require.Equal(t, cpuset.New(4, 5), store.GetSharedCPUs())
+			_, inFlight := store.GetRebindOrigin("claim-1")
+			require.False(t, inFlight)
+			_, inFlight = store.GetRebindOrigin("claim-2")
+			require.False(t, inFlight)
+		})
+	}
+}
+
+// TestSwapRotatesThreeClaims: the operation is defined over the group rather
+// than over a pair, so a rotation is one exchange and needs no intermediate.
+func TestSwapRotatesThreeClaims(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2, 3))
+	requirePreparedAllocation(t, logger, store, "claim-3", cpuset.New(4, 5))
+
+	require.NoError(t, store.BeginSwap(logger, map[types.UID]cpuset.CPUSet{
+		"claim-1": cpuset.New(2, 3),
+		"claim-2": cpuset.New(4, 5),
+		"claim-3": cpuset.New(0, 1),
+	}))
+	require.NoError(t, store.CommitSwap(logger, "claim-1", "claim-2", "claim-3"))
+
+	for claimUID, expected := range map[types.UID]cpuset.CPUSet{
+		"claim-1": cpuset.New(2, 3),
+		"claim-2": cpuset.New(4, 5),
+		"claim-3": cpuset.New(0, 1),
+	} {
+		got, ok := store.GetResourceClaimAllocation(claimUID)
+		require.True(t, ok)
+		require.Equal(t, expected, got, "claim %s", claimUID)
+	}
+	require.True(t, store.GetSharedCPUs().IsEmpty())
+}
+
+func TestBeginSwapRejections(t *testing.T) {
+	logger := testr.New(t)
+
+	testCases := []struct {
+		name          string
+		targets       map[types.UID]cpuset.CPUSet
+		beginFirst    map[types.UID]cpuset.CPUSet
+		expectedError string
+	}{
+		{
+			name:          "a single claim is not an exchange",
+			targets:       map[types.UID]cpuset.CPUSet{"claim-1": cpuset.New(2, 3)},
+			expectedError: "an exchange needs at least two claims, got 1",
+		},
+		{
+			name: "an unprepared participant",
+			targets: map[types.UID]cpuset.CPUSet{
+				"claim-1":      cpuset.New(2, 3),
+				"claim-absent": cpuset.New(0, 1),
+			},
+			expectedError: `claim "claim-absent" is not prepared by this driver`,
+		},
+		{
+			// Each claim keeps its own count, so a target of another size is
+			// not something a rebind could apply.
+			name: "a participant that would change size",
+			targets: map[types.UID]cpuset.CPUSet{
+				"claim-1": cpuset.New(2, 3, 4),
+				"claim-2": cpuset.New(0),
+			},
+			expectedError: `exchange would change claim "claim-1" from 2 CPUs to 3`,
+		},
+		{
+			name: "two participants given the same CPU",
+			targets: map[types.UID]cpuset.CPUSet{
+				"claim-1": cpuset.New(2, 3),
+				"claim-2": cpuset.New(3, 0),
+			},
+			expectedError: `exchange gives CPUs "3" to more than one claim`,
+		},
+		{
+			// Free CPUs are a move's business. An exchange that took one would
+			// grow the set the group holds, which is what makes both of its
+			// endings free of accounting.
+			name: "onto a free CPU",
+			targets: map[types.UID]cpuset.CPUSet{
+				"claim-1": cpuset.New(4, 5),
+				"claim-2": cpuset.New(0, 1),
+			},
+			expectedError: `which is not the same set of CPUs`,
+		},
+		{
+			name: "while one participant is already rebinding",
+			beginFirst: map[types.UID]cpuset.CPUSet{
+				"claim-1": cpuset.New(4, 5),
+			},
+			targets: map[types.UID]cpuset.CPUSet{
+				"claim-1": cpuset.New(2, 3),
+				"claim-2": cpuset.New(0, 1),
+			},
+			expectedError: `claim "claim-1" is already rebinding`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+			requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+			requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2, 3))
+			for claimUID, target := range tc.beginFirst {
+				require.NoError(t, store.BeginRebind(logger, claimUID, target))
+			}
+			sharedBefore := store.GetSharedCPUs()
+			firstBefore, _ := store.GetResourceClaimAllocation("claim-1")
+
+			err := store.BeginSwap(logger, tc.targets)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.expectedError)
+			require.Equal(t, sharedBefore, store.GetSharedCPUs(), "a rejected exchange must not change accounting")
+			current, _ := store.GetResourceClaimAllocation("claim-1")
+			require.Equal(t, firstBefore, current, "a rejected exchange must not move anybody")
+		})
+	}
+}
+
+// TestSettleSwapRejectsAnythingElse: an ending is safe to leave the reserved set
+// alone only because the group is moving onto the CPUs it came from. A caller
+// that names a claim outside the exchange is refused rather than trusted.
+func TestSettleSwapRejectsAnythingElse(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2, 3))
+	requirePreparedAllocation(t, logger, store, "claim-3", cpuset.New(4, 5))
+
+	require.EqualError(t, store.CommitSwap(logger, "claim-1", "claim-2"), `claim "claim-1" has no exchange in flight`)
+	require.EqualError(t, store.AbortSwap(logger, "claim-1"), "an exchange needs at least two claims, got 1")
+
+	require.NoError(t, store.BeginSwap(logger, map[types.UID]cpuset.CPUSet{
+		"claim-1": cpuset.New(2, 3),
+		"claim-2": cpuset.New(0, 1),
+	}))
+	require.NoError(t, store.BeginRebind(logger, "claim-3", cpuset.New(6, 7)))
+
+	// A claim moving on its own is not part of an exchange, and naming half of
+	// one leaves the other half holding two cpusets nothing would settle.
+	require.EqualError(t, store.CommitSwap(logger, "claim-1", "claim-3"), `claim "claim-3" has no exchange in flight`)
+	require.EqualError(t, store.CommitSwap(logger, "claim-1", "claim-3", "absent"), `claim "claim-3" has no exchange in flight`)
+
+	require.NoError(t, store.CommitSwap(logger, "claim-1", "claim-2"))
+	require.EqualError(t, store.CommitSwap(logger, "claim-1", "claim-2"), `claim "claim-1" has no exchange in flight`)
+}
+
+// TestSettleSwapRefusesToLeaveHalfOfOneBehind: an exchange is settled as a unit,
+// so naming only some of its still-prepared members is refused. Settling one
+// half would leave the other holding both cpusets with nothing able to close it.
+func TestSettleSwapRefusesToLeaveHalfOfOneBehind(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2, 3))
+	requirePreparedAllocation(t, logger, store, "claim-3", cpuset.New(4, 5))
+	require.NoError(t, store.BeginSwap(logger, map[types.UID]cpuset.CPUSet{
+		"claim-1": cpuset.New(2, 3),
+		"claim-2": cpuset.New(4, 5),
+		"claim-3": cpuset.New(0, 1),
+	}))
+
+	require.EqualError(t, store.CommitSwap(logger, "claim-1", "claim-2"),
+		`claim "claim-3" belongs to the same exchange and was not named`)
+	require.NoError(t, store.CommitSwap(logger, "claim-1", "claim-2", "claim-3"))
+}
+
+// TestRemoveDuringSwapKeepsThePartnersCPUs: the halves of an exchange belong to
+// two claims, so releasing a departing participant's own two cpusets would
+// release the CPUs its partner is still running on and offer them to the next
+// claim that asks. Unprepare arriving mid-batch is exactly the interleaving the
+// transit set exists to survive.
+func TestRemoveDuringSwapKeepsThePartnersCPUs(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2, 3))
+	require.NoError(t, store.BeginSwap(logger, map[types.UID]cpuset.CPUSet{
+		"claim-1": cpuset.New(2, 3),
+		"claim-2": cpuset.New(0, 1),
+	}))
+
+	store.RemoveResourceClaimAllocation(logger, "claim-1")
+
+	// claim-2 is still mid-exchange and holds both halves, so neither may be
+	// offered to anyone else.
+	require.Equal(t, cpuset.New(0, 1, 2, 3), store.GetPreparedCPUs())
+	require.Equal(t, cpuset.New(4, 5), store.GetSharedCPUs())
+	for _, cpu := range []int{0, 1, 2, 3} {
+		require.Error(t, store.ReserveResourceClaimAllocation(logger, "newcomer", exclusiveRequest(cpuset.New(cpu)), false),
+			"CPU %d is still held by the surviving half of the exchange", cpu)
+	}
+
+	// And the survivor can still be settled, or the exchange would keep its CPUs
+	// for as long as the driver runs.
+	require.NoError(t, store.CommitSwap(logger, "claim-1", "claim-2"))
+	second, ok := store.GetResourceClaimAllocation("claim-2")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(0, 1), second)
+	require.Equal(t, cpuset.New(0, 1), store.GetPreparedCPUs(), "the departed claim's CPUs are free once the exchange closes")
+}
+
+// TestRemoveDuringSwapUndoesTheSurvivor: the other ending, for the same reason.
+func TestRemoveDuringSwapUndoesTheSurvivor(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
+	requirePreparedAllocation(t, logger, store, "claim-2", cpuset.New(2, 3))
+	require.NoError(t, store.BeginSwap(logger, map[types.UID]cpuset.CPUSet{
+		"claim-1": cpuset.New(2, 3),
+		"claim-2": cpuset.New(0, 1),
+	}))
+
+	store.RemoveResourceClaimAllocation(logger, "claim-2")
+	require.Equal(t, cpuset.New(0, 1, 2, 3), store.GetPreparedCPUs())
+
+	require.NoError(t, store.AbortSwap(logger, "claim-1", "claim-2"))
+	first, ok := store.GetResourceClaimAllocation("claim-1")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(0, 1), first)
+	require.Equal(t, cpuset.New(0, 1), store.GetPreparedCPUs())
+}
