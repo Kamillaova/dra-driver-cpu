@@ -339,11 +339,14 @@ type driverConfigValues struct {
 	// ReconcileSharedOnUnprepare defaults to true in the driver, so a config
 	// file that does not mention it leaves it on: absent must read as true,
 	// which a plain bool cannot express.
-	ReconcileSharedOnUnprepare *bool                    `json:"reconcileSharedOnUnprepare,omitempty"`
-	DefragEnabled              bool                     `json:"defragEnabled,omitempty"`
-	CPUPartitions              []driverConfigPartition  `json:"cpuPartitions,omitempty"`
-	CachePlacementStrategy     string                   `json:"cachePlacementStrategy,omitempty"`
-	Profiles                   map[string]profileValues `json:"profiles,omitempty"`
+	ReconcileSharedOnUnprepare *bool `json:"reconcileSharedOnUnprepare,omitempty"`
+	DefragEnabled              bool  `json:"defragEnabled,omitempty"`
+	// DefragAllowTransientOverlap defaults to true in the driver, so absent
+	// reads as true here for the same reason ReconcileSharedOnUnprepare does.
+	DefragAllowTransientOverlap *bool                    `json:"defragAllowTransientOverlap,omitempty"`
+	CPUPartitions               []driverConfigPartition  `json:"cpuPartitions,omitempty"`
+	CachePlacementStrategy      string                   `json:"cachePlacementStrategy,omitempty"`
+	Profiles                    map[string]profileValues `json:"profiles,omitempty"`
 }
 
 type profileValues struct {
@@ -421,6 +424,13 @@ func discoverNodeCPUInfo(ctx context.Context, fxt *fixture.Fixture, nodeName, im
 func (v driverConfigValues) reconcilesSharedOnUnprepare() bool {
 	return v.AssumeUnsolicitedUpdatesSafe &&
 		(v.ReconcileSharedOnUnprepare == nil || *v.ReconcileSharedOnUnprepare)
+}
+
+// allowsTransientOverlap reports whether the driver may exchange the CPUs of two
+// claims, which is the only repair a node with no free CPUs has.
+func (v driverConfigValues) allowsTransientOverlap() bool {
+	return v.DefragEnabled &&
+		(v.DefragAllowTransientOverlap == nil || *v.DefragAllowTransientOverlap)
 }
 
 // getDriverConfigValues reads the ConfigMap if the daemonset uses --config=, else falls back to
