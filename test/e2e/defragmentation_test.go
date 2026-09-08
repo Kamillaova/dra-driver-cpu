@@ -25,10 +25,12 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
 
+	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/discovery"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
 	cpusetmatchers "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/matchers/cpuset"
 	e2enode "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/node"
@@ -990,6 +992,126 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		after := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread)
 		gomega.Expect(after.CPUAssigned).To(cpusetmatchers.HaveSize(before.CPUAssigned.Size()))
 	})
+
+	ginkgo.It("should repair a node with no free CPUs by exchanging two claims", func(ctx context.Context) {
+		fxt := rootFxt.WithPrefix("defrag-swap")
+		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(fxt.Teardown)
+
+		if !cfgValues.allowsTransientOverlap() {
+			ginkgo.Skip("exchanges are forbidden in the driver configuration; set defragAllowTransientOverlap to exercise them")
+		}
+
+		// The arrangement the exchange exists for. Every cache of one NUMA node
+		// is filled down to a single allocation step, and the victim asks for
+		// two: it cannot fit in one cache, so it lands split, and afterwards the
+		// node has no free CPU at all. Nothing can move anywhere; only exchanging
+		// the victim with a filler that is in its way repairs it.
+		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
+		fxt.Log.Info("cache geometry", "numaNode", fragNUMA, "freePerCache", free, "allocationStep", step)
+		if len(free) < 2 || free[0] < 3*step {
+			ginkgo.Skip(fmt.Sprintf("an exchange needs at least two caches with %d or more free CPUs each, got %v", 3*step, free))
+		}
+
+		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to one allocation step free", fragNUMA))
+		fillers := fillCachesDownTo(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, fragNUMA, step, "cpu-claim-swap-filler")
+		if len(fillers) < 2 {
+			ginkgo.Skip(fmt.Sprintf("could only place %d of %d fillers", len(fillers), len(free)))
+		}
+
+		ginkgo.By("placing a claim that no single cache can hold, which fills the node")
+		victim, victimUID, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+			movableClaimSpecWithSelector(2*step, numaCEL(cfgValues, fragNUMA)), "cpu-claim-swap-victim")
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, victim)
+		fxt.Log.Info("victim placement", "cpus", before.CPUAssigned.String())
+
+		fragmented, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		if fragmented.totalExcess() == 0 {
+			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
+		}
+		if len(fragmented.freePerCacheOn(fragNUMA)) > 0 {
+			for _, cacheFree := range fragmented.freePerCacheOn(fragNUMA) {
+				if cacheFree > 0 {
+					ginkgo.Skip(fmt.Sprintf("the node is not full, so a plain move could repair it: %v", fragmented.freePerCacheOn(fragNUMA)))
+				}
+			}
+		}
+
+		ginkgo.By("waiting for the node to settle")
+		var settled placementsReport
+		gomega.Eventually(func(g gomega.Gomega) {
+			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, true)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(report.plannedMoves()).To(gomega.BeZero(), "a pass still wants to move claims: %+v", report.NUMANodes)
+			settled = report
+		}, 3*time.Minute, 5*time.Second).Should(gomega.Succeed())
+
+		ginkgo.By("verifying the victim was made whole without a single CPU being freed")
+		gomega.Expect(settled.totalExcess()).To(gomega.BeZero(),
+			"claims still span more caches than their sizes require: %+v", settled.NUMANodes)
+		after, ok := settled.claimCPUs(victimUID)
+		gomega.Expect(ok).To(gomega.BeTrue(), "the victim claim vanished: %+v", settled.Claims)
+		gomega.Expect(after).ToNot(cpusetmatchers.Equal(before.CPUAssigned), "the claim was never moved")
+		gomega.Expect(after).To(cpusetmatchers.HaveSize(before.CPUAssigned.Size()))
+		gomega.Expect(spreadOf(settled, after)).To(gomega.Equal(1), "the victim is still split across caches")
+
+		ginkgo.By("verifying no two claims ended up sharing a CPU")
+		held := cpuset.New()
+		for _, claim := range settled.Claims {
+			cpus, err := cpuset.Parse(claim.CPUs)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(held.Intersection(cpus).IsEmpty()).To(gomega.BeTrue(),
+				"claim %s on %s overlaps another claim", claim.ClaimUID, cpus.String())
+			held = held.Union(cpus)
+		}
+
+		ginkgo.By("measuring how long the two containers held the same CPUs")
+		// The exchange's other half is whichever filler moved. Both containers
+		// sampled their own cpuset far faster than any report interval, so the
+		// window between the runtime's two writes is measurable from here.
+		victimHistory := cpuSetHistoryOf(ctx, fxt.K8SClientset, victim)
+		gomega.Expect(victimHistory).To(gomega.HaveLen(2), "the victim's container did not see its cpuset change exactly once")
+
+		var partnerOverlap time.Duration
+		var partner *v1.Pod
+		for _, filler := range fillers {
+			history := cpuSetHistoryOf(ctx, fxt.K8SClientset, filler)
+			if len(history) < 2 {
+				continue
+			}
+			partner, partnerOverlap = filler, measuredOverlap(victimHistory, history)
+			break
+		}
+		gomega.Expect(partner).ToNot(gomega.BeNil(), "no filler moved, so nothing was exchanged")
+		fxt.Log.Info("measured overlap during the exchange",
+			"victim", e2epod.Identify(victim), "partner", e2epod.Identify(partner), "overlap", partnerOverlap.String())
+		gomega.Expect(partnerOverlap).To(gomega.BeNumerically("<", 5*time.Second),
+			"the two claims shared CPUs for %s, which is not the instant between two writes of one batch", partnerOverlap)
+
+		ginkgo.By("verifying neither container was restarted and both are pinned where the driver says")
+		for _, pod := range []*v1.Pod{victim, partner} {
+			reread, err := fxt.K8SClientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(reread.Status.ContainerStatuses).ToNot(gomega.BeEmpty())
+			gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero(),
+				"an exchange must not restart a container")
+			live := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread)
+			gomega.Expect(live.CPUAffinity.Equals(live.CPUAssigned)).To(gomega.BeTrue(),
+				"the kernel affinity %s does not match the cgroup cpuset %s", live.CPUAffinity.String(), live.CPUAssigned.String())
+		}
+
+		ginkgo.By("verifying the exchange settled, so no NUMA node was fenced")
+		gomega.Expect(defragCounter(ctx, fxt.K8SClientset, targetNode.Name, `dra_cpu_defrag_rollbacks_total\{result="error"\}`)).To(gomega.BeZero(),
+			"the driver could neither finish an exchange nor undo it")
+		gomega.Expect(defragCounter(ctx, fxt.K8SClientset, targetNode.Name, `dra_cpu_defrag_poisoned_nodes_total`)).To(gomega.BeZero(),
+			"a NUMA node was fenced, so the driver cannot say which claim holds which CPUs")
+		gomega.Expect(defragCounter(ctx, fxt.K8SClientset, targetNode.Name,
+			fmt.Sprintf(`dra_cpu_defrag_numa_node_poisoned\{numa_node="%d"\}`, fragNUMA))).To(gomega.BeZero())
+	})
 })
 
 // restartDriverOnNode deletes the driver pod on a node and waits for the
@@ -1149,4 +1271,87 @@ func claimUIDsBySize(ctx context.Context, fxt *fixture.Fixture, pod *v1.Pod, sma
 		g.Expect(bigUID).ToNot(gomega.BeEmpty(), "no claim of %d CPUs owned by the pod", bigSize)
 	}, time.Minute, 2*time.Second).Should(gomega.Succeed())
 	return smallUID, bigUID
+}
+
+// cpuSetHistoryOf is every cpuset a tester container has been seen on, oldest
+// first, as the container itself sampled it.
+func cpuSetHistoryOf(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) []cpuSetSample {
+	ginkgo.GinkgoHelper()
+	data, err := e2epod.GetLogs(ctx, cs, pod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get logs for %s", e2epod.Identify(pod))
+
+	testerInfo := discovery.DRACPUTester{}
+	gomega.Expect(unmarshalLatestReport(data, &testerInfo)).To(gomega.Succeed(), "cannot unmarshal tester report from logs")
+
+	samples := make([]cpuSetSample, 0, len(testerInfo.CPUSetHistory))
+	for _, change := range testerInfo.CPUSetHistory {
+		at, err := time.Parse(time.RFC3339Nano, change.At)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse sample time %q", change.At)
+		cpus, err := cpuset.Parse(change.CPUs)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse sampled cpuset %q", change.CPUs)
+		samples = append(samples, cpuSetSample{at: at, cpus: cpus})
+	}
+	return samples
+}
+
+// cpuSetSample is one container's cpuset from one moment on.
+type cpuSetSample struct {
+	at   time.Time
+	cpus cpuset.CPUSet
+}
+
+// measuredOverlap is how long two containers held a CPU in common, from the two
+// histories they sampled themselves. Both run on the same node, so their
+// timestamps come from one clock.
+//
+// It is a lower bound on the real window, since a change is seen at the first
+// sample after it happened, and it is zero when the two writes landed inside one
+// sampling interval.
+func measuredOverlap(first, second []cpuSetSample) time.Duration {
+	var moments []time.Time
+	for _, sample := range append(append([]cpuSetSample{}, first...), second...) {
+		moments = append(moments, sample.at)
+	}
+	slices.SortFunc(moments, func(a, b time.Time) int { return a.Compare(b) })
+
+	var overlap time.Duration
+	for i := 0; i+1 < len(moments); i++ {
+		if cpusAt(first, moments[i]).Intersection(cpusAt(second, moments[i])).IsEmpty() {
+			continue
+		}
+		overlap += moments[i+1].Sub(moments[i])
+	}
+	return overlap
+}
+
+// cpusAt is the cpuset a container was on at one moment, which is the newest
+// sample not after it.
+func cpusAt(samples []cpuSetSample, at time.Time) cpuset.CPUSet {
+	cpus := cpuset.New()
+	for _, sample := range samples {
+		if sample.at.After(at) {
+			break
+		}
+		cpus = sample.cpus
+	}
+	return cpus
+}
+
+// defragCounter reads one of the driver's defragmentation counters, and zero
+// when it has never been incremented and so has no series yet.
+func defragCounter(ctx context.Context, cs kubernetes.Interface, nodeName, expr string) int {
+	ginkgo.GinkgoHelper()
+	driverPod, err := e2epod.GetDRACPUPod(ctx, cs, nodeName)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	podIP, err := waitForPodIP(ctx, cs, driverPod.Name)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	raw, err := getMetricsFromPodIP(podIP)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	m := regexp.MustCompile(expr + ` ([0-9.e+]+)`).FindStringSubmatch(raw)
+	if m == nil {
+		return 0
+	}
+	value, err := strconv.ParseFloat(m[1], 64)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	return int(value)
 }
