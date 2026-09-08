@@ -75,6 +75,12 @@ honor these settings, where applicable.
   `systemctl restart containerd` inside the node. The tests skip themselves anyway on a node whose CPUs the driver sees as one
   uncore cache, since there is no spread to recover there.
 
+  The spec that repairs a node with no free CPUs at all rides on the same switch, and skips in
+  addition when the deployed `driverConfig.defragAllowTransientOverlap` is `false`: exchanging the
+  CPUs of two claims is the only repair such a node has, and that option is what permits it. It
+  measures how long the two containers held the same CPUs, which they sample themselves — a report
+  interval is orders of magnitude coarser than the window between the runtime's two writes.
+
 - `DRACPU_E2E_FULL_PCPUS_ONLY`: (optional, default `false`): when `true`, *the Makefile*
   `ci-kind-setup` target deploys the driver with `driverConfig.fullPhysicalCPUsOnly: true`, and the
   whole-core tests run instead of skipping. They skip themselves on a node with SMT disabled, where
