@@ -33,6 +33,10 @@ type Recorder interface {
 	RecordNRIRemoveContainer(err error, claimCount int, elapsed time.Duration)
 	RecordSynchronizeSkippedClaim()
 	RecordMisplacedClaim()
+	// CCX-FORK: RecordPrepareNoRoom is the fork's, and belongs with the prepare
+	// counters above rather than with the defragmentation block below: it counts
+	// an admission the node refused, whether or not anything ever moved.
+	RecordPrepareNoRoom(shape string)
 	// CCX-FORK: upstream's Recorder ends above; the defragmentation methods are
 	// the fork's.
 	SetDefragState(cpumetrics.DefragState)
