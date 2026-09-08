@@ -2600,20 +2600,18 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 	})
 }
 
-// TestPrepareGroupedClaimOnACacheDevice: under uncore-cache grouping a device
-// is one cache, and Prepare treats it as it treats any other group -- the claim
-// takes CPUs from that device's own set, so a claim allocated on a cache cannot
-// come out spanning two.
-func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
+// newCacheGroupedPrepareDriver is a driver publishing one device per uncore
+// cache, with whole-core allocation on, ready to be handed a claim.
+func newCacheGroupedPrepareDriver(t *testing.T) (*CPUDriver, devattr.GroupedDevices) {
+	t.Helper()
 	logger := testr.New(t)
-	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_2Caches_HT()}
-	topo, err := mockProvider.GetCPUTopology(logger)
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_2Caches_HT()}).GetCPUTopology(logger)
 	require.NoError(t, err)
 	online := topo.CPUDetails.CPUs()
 
 	built := devattr.BuildGrouped(logger, devattr.GROUP_BY_UNCORE_CACHE, topo, online, cpuset.New(),
 		store.NewPCIeRootMapper(), false, true, devattr.WithImplicitDefault(nil, online))
-	d := &CPUDriver{
+	return &CPUDriver{
 		driverName:       testDriverName,
 		cpuDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
 		cpuDeviceGroupBy: devattr.GROUP_BY_UNCORE_CACHE,
@@ -2630,7 +2628,17 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 		podConfigStore:     store.NewPodConfig(),
 		claimTracker:       store.NewClaimTracker(),
 		cdiMgr:             newMockCdiMgr(),
-	}
+	}, built
+}
+
+// TestPrepareGroupedClaimOnACacheDevice: under uncore-cache grouping a device
+// is one cache, and Prepare treats it as it treats any other group -- the claim
+// takes CPUs from that device's own set, so a claim allocated on a cache cannot
+// come out spanning two.
+func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
+	logger := testr.New(t)
+	d, built := newCacheGroupedPrepareDriver(t)
+	topo := d.topology.cpuTopology
 
 	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
 	require.Contains(t, built.CPUs, cache1)
@@ -2644,6 +2652,44 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 	require.True(t, got.IsSubsetOf(built.CPUs[cache1]),
 		"claim took %s, which is not inside cache 1's %s", got.String(), built.CPUs[cache1].String())
 	require.Equal(t, got, topo.CPUDetails.CompleteCores(got), "whole cores, as the device's request policy promises")
+}
+
+// TestPrepareRecordsTheDeviceItsAllocationCharged: the published capacity of a
+// cache is corrected by the difference between what the allocations naming it
+// charged and what the claims there occupy, so the first half has to be kept.
+func TestPrepareRecordsTheDeviceItsAllocationCharged(t *testing.T) {
+	d, _ := newCacheGroupedPrepareDriver(t)
+	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
+
+	result := d.prepareGroupedResourceClaim(testr.New(t),
+		testClaim("claim-cache1", testDriverName, testNodeName, map[string]int64{cache1: 4}), defaultPlacement)
+	require.NoError(t, result.Err)
+
+	record, ok := d.cpuAllocationStore.GetClaimRecord("claim-cache1")
+	require.True(t, ok)
+	require.Equal(t, map[string]int{cache1: 4}, record.Recorded)
+}
+
+// TestReplayedPrepareRecoversTheChargedDevice: a store rebuilt from a spec
+// written before the driver kept them has no answer, and the claim object the
+// kubelet replays Prepare with is where it comes back from. The allocation is
+// immutable, so it is the same answer, and the CPUs the container is already
+// running on are left alone.
+func TestReplayedPrepareRecoversTheChargedDevice(t *testing.T) {
+	logger := testr.New(t)
+	d, built := newCacheGroupedPrepareDriver(t)
+	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
+	running := cpuset.New(built.CPUs[cache1].List()[:4]...)
+
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-cache1", exclusiveOn(running), false))
+	result := d.prepareGroupedResourceClaim(logger,
+		testClaim("claim-cache1", testDriverName, testNodeName, map[string]int64{cache1: 4}), defaultPlacement)
+	require.NoError(t, result.Err)
+
+	record, ok := d.cpuAllocationStore.GetClaimRecord("claim-cache1")
+	require.True(t, ok)
+	require.Equal(t, map[string]int{cache1: 4}, record.Recorded)
+	require.Equal(t, running, store.UnionOf(record.Requests))
 }
 
 func TestPreparedEnvSaysDynamicOnlyWhenPlacementCanChange(t *testing.T) {
