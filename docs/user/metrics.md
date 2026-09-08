@@ -48,6 +48,7 @@ uncore cache per NUMA node has no spread to recover, so its excess is permanentl
 | `dra_cpu_defrag_poisoned_nodes_total`        | Counter   | none        | Times a NUMA node was fenced after such an exchange.                                                                               |
 | `dra_cpu_defrag_poisoned_duration_seconds`   | Histogram | none        | How long each fenced NUMA node stayed fenced, from the unsettled exchange to the read-back that agreed with the driver's records.  |
 | `dra_cpu_defrag_readback_mismatches_total`   | Counter   | none        | Read-backs that left a fenced node fenced, because its containers' CPUs match neither the driver's record nor what they came from. |
+| `dra_cpu_defrag_unpublished_rounds_total`    | Counter   | none        | Rounds abandoned because the capacity they shrink was not stored by the API server in time. While this rises, no claim on the node is being moved. |
 
 `dra_cpu_defrag_swap_overlap_seconds` measures the batch rather than the window itself: the instant
 the two claims share CPUs is inside the runtime, between the two writes it applies in order, so the
