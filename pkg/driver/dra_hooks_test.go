@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
@@ -32,7 +33,9 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
@@ -40,6 +43,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
@@ -2543,7 +2547,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
 		d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
 
-		result := d.prepareGroupedResourceClaim(logger, newClaim("claim-4", 4), defaultPlacement)
+		result := d.prepareGroupedResourceClaim(context.Background(), logger, newClaim("claim-4", 4), defaultPlacement)
 		require.NoError(t, result.Err)
 
 		got, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-4")
@@ -2556,7 +2560,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
 		d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
 
-		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-8", 8), defaultPlacement).Err)
+		require.NoError(t, d.prepareGroupedResourceClaim(context.Background(), logger, newClaim("claim-8", 8), defaultPlacement).Err)
 		got, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-8")
 
 		caches := map[int]struct{}{}
@@ -2572,7 +2576,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(0), newMockCdiMgr())
 		d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
 
-		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-14", 14), defaultPlacement).Err)
+		require.NoError(t, d.prepareGroupedResourceClaim(context.Background(), logger, newClaim("claim-14", 14), defaultPlacement).Err)
 		got, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-14")
 
 		require.Equal(t, 14, got.Size())
@@ -2584,7 +2588,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
 		d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
 
-		result := d.prepareGroupedResourceClaim(logger, newClaim("claim-odd", 3), defaultPlacement)
+		result := d.prepareGroupedResourceClaim(context.Background(), logger, newClaim("claim-odd", 3), defaultPlacement)
 		require.Error(t, result.Err)
 		require.Contains(t, result.Err.Error(), "not a multiple of the 2-CPU core size")
 		require.Contains(t, result.Err.Error(), "DRAConsumableCapacity")
@@ -2594,7 +2598,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
 
 		// An odd count is allowed and satisfied exactly, as upstream does.
-		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-3", 3), defaultPlacement).Err)
+		require.NoError(t, d.prepareGroupedResourceClaim(context.Background(), logger, newClaim("claim-3", 3), defaultPlacement).Err)
 		got, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-3")
 		require.Equal(t, 3, got.Size())
 	})
@@ -2642,7 +2646,7 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 
 	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
 	require.Contains(t, built.CPUs, cache1)
-	result := d.prepareGroupedResourceClaim(logger,
+	result := d.prepareGroupedResourceClaim(context.Background(), logger,
 		testClaim("claim-cache1", testDriverName, testNodeName, map[string]int64{cache1: 4}), defaultPlacement)
 	require.NoError(t, result.Err)
 
@@ -2654,6 +2658,70 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 	require.Equal(t, got, topo.CPUDetails.CompleteCores(got), "whole cores, as the device's request policy promises")
 }
 
+// TestPrepareRefusesAClaimWhoseRecordedDeviceIsFull: a scheduler subtracted
+// this claim's CPUs from that device's published capacity, so it saw room. The
+// pod waits bound and the kubelet retries, which is the safe end of it -- and
+// the counter and the event are how anyone finds out it happened.
+func TestPrepareRefusesAClaimWhoseRecordedDeviceIsFull(t *testing.T) {
+	logger := testr.New(t)
+	d, built := newCacheGroupedPrepareDriver(t)
+	reg := prometheus.NewRegistry()
+	d.metrics = cpumetrics.New(reg)
+	client := k8sfake.NewSimpleClientset()
+	d.kubeClient = client
+	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
+
+	// Another claim already holds every CPU of cache 1.
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-sitting-there",
+		exclusiveOn(built.CPUs[cache1]), false))
+
+	claim := testClaim("claim-late", testDriverName, testNodeName, map[string]int64{cache1: 4})
+	result := d.prepareGroupedResourceClaim(context.Background(), logger, claim, defaultPlacement)
+	require.ErrorContains(t, result.Err, "cannot hold the 4 CPUs")
+
+	require.InDelta(t, 1, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
+		map[string]string{"shape": opaqueapi.ShapeNeverSplit}), 0.01)
+	require.InDelta(t, 0, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
+		map[string]string{"shape": opaqueapi.ShapeFlexible}), 0.01)
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		events, err := client.CoreV1().Events(claim.Namespace).List(context.Background(), metav1.ListOptions{})
+		assert.NoError(c, err)
+		if !assert.Len(c, events.Items, 1) {
+			return
+		}
+		assert.Equal(c, "RecordedDeviceFull", events.Items[0].Reason)
+		assert.Equal(c, "ResourceClaim", events.Items[0].InvolvedObject.Kind)
+		assert.Equal(c, claim.Name, events.Items[0].InvolvedObject.Name)
+	}, time.Second, 10*time.Millisecond, "the event is written off the hook's own goroutine")
+}
+
+// TestPrepareRefusesAClaimWhoseRecordedDeviceHasNoWholeCoreLeft: a device can
+// have as many CPUs free as the claim was charged for and still be unable to
+// hand them out, when whole-core allocation is on and every free CPU is the lone
+// survivor of a half-held core. That is the same fact as being full, and is
+// counted the same way.
+func TestPrepareRefusesAClaimWhoseRecordedDeviceHasNoWholeCoreLeft(t *testing.T) {
+	logger := testr.New(t)
+	d, built := newCacheGroupedPrepareDriver(t)
+	reg := prometheus.NewRegistry()
+	d.metrics = cpumetrics.New(reg)
+	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
+
+	// One thread of each of cache 1's four cores, which leaves four of its CPUs
+	// free and not one of its cores.
+	halfHeld := cpuset.New(4, 5, 6, 7)
+	require.True(t, halfHeld.IsSubsetOf(built.CPUs[cache1]))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-half-cores",
+		exclusiveOn(halfHeld), false))
+
+	result := d.prepareGroupedResourceClaim(context.Background(), logger,
+		testClaim("claim-wants-cores", testDriverName, testNodeName, map[string]int64{cache1: 4}), defaultPlacement)
+	require.ErrorContains(t, result.Err, "with 4 of its own free")
+	require.InDelta(t, 1, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
+		map[string]string{"shape": opaqueapi.ShapeNeverSplit}), 0.01)
+}
+
 // TestPrepareRecordsTheDeviceItsAllocationCharged: the published capacity of a
 // cache is corrected by the difference between what the allocations naming it
 // charged and what the claims there occupy, so the first half has to be kept.
@@ -2661,7 +2729,7 @@ func TestPrepareRecordsTheDeviceItsAllocationCharged(t *testing.T) {
 	d, _ := newCacheGroupedPrepareDriver(t)
 	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
 
-	result := d.prepareGroupedResourceClaim(testr.New(t),
+	result := d.prepareGroupedResourceClaim(context.Background(), testr.New(t),
 		testClaim("claim-cache1", testDriverName, testNodeName, map[string]int64{cache1: 4}), defaultPlacement)
 	require.NoError(t, result.Err)
 
@@ -2682,7 +2750,7 @@ func TestReplayedPrepareRecoversTheChargedDevice(t *testing.T) {
 	running := cpuset.New(built.CPUs[cache1].List()[:4]...)
 
 	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-cache1", exclusiveOn(running), false))
-	result := d.prepareGroupedResourceClaim(logger,
+	result := d.prepareGroupedResourceClaim(context.Background(), logger,
 		testClaim("claim-cache1", testDriverName, testNodeName, map[string]int64{cache1: 4}), defaultPlacement)
 	require.NoError(t, result.Err)
 

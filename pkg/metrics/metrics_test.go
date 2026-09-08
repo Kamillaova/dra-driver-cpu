@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 26)
+	require.Len(t, descriptors, 27)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -49,6 +49,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_unprepare_claims_total",
 		"dra_cpu_prepare_claim_duration_seconds",
 		"dra_cpu_claim_allocated_cpus",
+		"dra_cpu_prepare_no_room_total",
 		"dra_cpu_defrag_excess_uncore_caches",
 		"dra_cpu_defrag_largest_alignable_free_cpus",
 		"dra_cpu_defrag_passes_total",
@@ -68,23 +69,27 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_partition_verified",
 	}, names)
-	require.Equal(t, []string{"result"}, descriptors[4].Labels)
-	require.Equal(t, []string{"result"}, descriptors[5].Labels)
-	require.Equal(t, []string{"numa_node"}, descriptors[9].Labels)
-	require.Equal(t, []string{"result"}, descriptors[10].Labels)
-	require.Equal(t, []string{"result"}, descriptors[11].Labels)
-	require.Empty(t, descriptors[14].Labels)
-	require.Empty(t, descriptors[15].Labels)
-	require.Equal(t, []string{"result"}, descriptors[16].Labels)
-	require.Equal(t, []string{"numa_node"}, descriptors[17].Labels)
-	require.Empty(t, descriptors[18].Labels)
-	require.Empty(t, descriptors[19].Labels)
-	require.Empty(t, descriptors[20].Labels)
-	require.Empty(t, descriptors[21].Labels)
-	require.Empty(t, descriptors[22].Labels)
-	require.Empty(t, descriptors[23].Labels)
-	require.Empty(t, descriptors[24].Labels)
-	require.Equal(t, []string{"partition"}, descriptors[25].Labels)
+	// By name rather than by position in the list above: a metric added in the
+	// middle renumbers every assertion after it, and the name is what a query
+	// against these series is written with anyway.
+	labelled := map[string][]string{
+		"dra_cpu_prepare_claims_total":               {"result"},
+		"dra_cpu_unprepare_claims_total":             {"result"},
+		"dra_cpu_prepare_no_room_total":              {"shape"},
+		"dra_cpu_defrag_largest_alignable_free_cpus": {"numa_node"},
+		"dra_cpu_defrag_passes_total":                {"result"},
+		"dra_cpu_defrag_moves_total":                 {"result"},
+		"dra_cpu_defrag_rollbacks_total":             {"result"},
+		"dra_cpu_defrag_numa_node_poisoned":          {"numa_node"},
+		"dra_cpu_partition_verified":                 {"partition"},
+	}
+	for _, desc := range descriptors {
+		want := labelled[desc.Name]
+		if want == nil {
+			want = []string{}
+		}
+		require.Equal(t, want, desc.Labels, desc.Name)
+	}
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -133,6 +138,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_prepare_claim_duration_seconds",
 		"dra_cpu_prepare_claims_total",
+		"dra_cpu_prepare_no_room_total",
 		"dra_cpu_reserved_cpus",
 		"dra_cpu_resource_claims_active",
 		"dra_cpu_synchronize_skipped_claims_total",
