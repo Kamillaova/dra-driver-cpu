@@ -68,6 +68,35 @@ those CPUs meanwhile; a refused half is sent again; and if the runtime refuses i
 half it did move is put back. Each attempt has a deadline of its own, so a runtime that never answers
 is an unsettled round rather than a wait without end.
 
+### When an exchange cannot be settled either way
+
+If the runtime will neither finish an exchange nor undo it, the driver has lost track of which of the
+two claims is on which CPUs, and it says so rather than guessing. The NUMA node is **fenced**:
+
+- `PrepareResourceClaims` fails for every device reaching into it, so a bound pod waits rather than
+  starting on CPUs another workload may be running on;
+- nothing further is planned there;
+- its devices carry a `NoSchedule` taint under `dra.cpu/poisoned`, so the scheduler stops sending
+  claims to a node that would refuse them. It is its own taint key, distinct from the one a named
+  [CPU partition](cpu-partitions.md) carries, and nothing is meant to tolerate it;
+- both claims keep holding both cpusets, so nothing else is offered what they might be using.
+
+The fence lifts on evidence, not on time. The driver reads the two containers' `cpuset.cpus.effective`
+back from the host's cgroup tree and rebuilds its records from what it finds: if both containers took
+their new CPUs the exchange is recorded as done, if neither did it is recorded as never having
+happened, and anything else leaves the fence up and is counted in
+`dra_cpu_defrag_readback_mismatches_total`. Neither the forward state nor the rolled-back one may be
+assumed — a call that failed may have applied work before its reply was lost.
+
+The read-back needs the host's cgroup2 tree mounted read-only at `/sys/fs/cgroup`, which the chart
+does. A container's own `/sys/fs/cgroup` is its cgroup namespace's view and says nothing about anyone
+else, so without that mount a fenced node cannot reopen.
+
+`dra_cpu_defrag_numa_node_poisoned` is the gauge to alert on, and
+`dra_cpu_defrag_poisoned_duration_seconds` says how long the fences have lasted. A node that stays
+fenced is a runtime that is refusing container updates it should be accepting; the driver has already
+stopped making things worse there, and the containers involved keep running.
+
 ## What it does not do
 
 - **It does not change a claim's size.** A claim allocated 4 CPUs always has 4.
@@ -83,9 +112,10 @@ is an unsettled round rather than a wait without end.
   call a move uses, and applies against the container's current state: a claim's cpuset survives a
   resize, including a resize issued after the claim has been moved. Verified on containerd
   v2.4.0-beta.0, and pinned by an e2e spec.
-- **It is invisible to the scheduler.** A move changes neither a device's `capacity` nor any claim's
+- **A move is invisible to the scheduler.** It changes neither a device's `capacity` nor any claim's
   `consumedCapacity`, so no `ResourceSlice` is republished, no scheduler cache is invalidated, and no
-  write reaches the API server.
+  write reaches the API server. Fencing a NUMA node is the one thing here that does reach the API
+  server: the taint has to, or the scheduler would keep sending claims to a node that refuses them.
 - **It cannot fix a bad node choice.** The scheduler sees only how many CPUs are free on a node, never
   their shape, so it can bind a large claim to a node that genuinely cannot free a cache while a
   neighbour could. A bound claim cannot move to another node.

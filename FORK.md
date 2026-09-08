@@ -81,14 +81,15 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `decodePlacements`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries` and
-  `defragRetryDue` and `placementPolicy` fields, and `Config.DefragEnabled` and
+  `defragRetryDue`, `cgroupfs`, `poisonedNodes` and `placementPolicy` fields,
+  `Providers.CgroupFS` and `EnsureCgroupFS`, and `Config.DefragEnabled` and
   `Config.DefragAllowTransientOverlap`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
   and the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields
 
 - `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
-  `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`
+  `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `republishStaleSlices`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 
@@ -102,7 +103,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/store/claim_tracker.go`: `Owner`
 
-- `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
+- `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`,
+  `ContainerState.WithCgroup`, `ContainerState.CgroupPath`
 
 - `go.mod`: the `require` and `replace` of the nested `api` module, which upstream builds as part of
   the root module
@@ -121,9 +123,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
 
-Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/driver/defrag.go`, `reconcile.go`,
-`placements.go`, `deviceorder.go`, `pkg/cpuinfo/coretopology.go`, `api/attributes.go`,
-`api/v1alpha1/projection.go`) are visible to `git diff --stat` on their own and are not repeated here.
+Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/cgroupfs`, `pkg/driver/defrag.go`,
+`reconcile.go`, `placements.go`, `deviceorder.go`, `poison.go`, `pkg/cpuinfo/coretopology.go`,
+`api/attributes.go`, `api/v1alpha1/projection.go`) are visible to `git diff --stat` on their own and
+are not repeated here.
 
 `api/` is a nested module here (`api/go.mod`), because the scheduler plugin that reads the driver's
 device attributes pins it independently and importing it must not drag in the whole driver. Upstream
