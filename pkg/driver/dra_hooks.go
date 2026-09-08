@@ -275,6 +275,30 @@ func requestAllocations(byRequest map[string]store.RequestAllocation) []store.Re
 	return requests
 }
 
+// recordedDevices is how many CPUs a claim's allocation charged each device it
+// takes CPUs of its own from, which is what a scheduler subtracts from those
+// devices' capacities. A pool is left out, for the reason deviceIsPool gives.
+func (cp *CPUDriver) recordedDevices(claim *resourceapi.ResourceClaim) map[string]int {
+	if claim.Status.Allocation == nil {
+		return nil
+	}
+	charged := map[string]int{}
+	for _, alloc := range claim.Status.Allocation.Devices.Results {
+		if alloc.Driver != cp.driverName || cp.topology.deviceIsPool(alloc.Device) {
+			continue
+		}
+		quantity, ok := alloc.ConsumedCapacity[device.CPUResourceQualifiedName]
+		if !ok {
+			continue
+		}
+		charged[alloc.Device] += int(quantity.Value())
+	}
+	if len(charged) == 0 {
+		return nil
+	}
+	return charged
+}
+
 // addRequestCPUs merges one allocation result into the request it belongs to. A
 // request satisfied by several devices holds their union, and every device of
 // one request has the same role, since a device class selects one partition.
@@ -313,6 +337,23 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		// If the CDI file is already created on disk, the CDI manager will safely overwrite it with the same configuration.
 		// This ensures that the CDI specification file is written/recreated on disk (for example, if the driver
 		// pod restarted and synchronized its memory store from the runtime but did not recreate the CDI files on disk).
+		//
+		// CCX-FORK: a record recovered from a spec written before the driver kept
+		// the charged devices names none, and this claim object is where that
+		// answer comes back from -- the allocation is immutable, so what it charges
+		// now is what it charged when the claim was first prepared. The kubelet
+		// replays Prepare for every claim after a driver restart, which is what
+		// makes the published capacity right again one restart after an upgrade
+		// rather than once the node's pods have turned over.
+		if len(existing.Recorded) == 0 {
+			if charged := cp.recordedDevices(claim); len(charged) > 0 {
+				if err := cp.cpuAllocationStore.SetRecordedDevices(logger, claim.UID, charged); err != nil {
+					logger.Error(err, "cannot record which devices this claim's allocation charged, leaving their capacities uncorrected")
+				} else {
+					existing.Recorded = charged
+				}
+			}
+		}
 		return cp.prepareDevices(logger, claim, existing, placement)
 	}
 
@@ -329,7 +370,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		// device is claimed, not carved up: the claim is given its whole CPU
 		// set, and the amount the allocator charged bounds how much work lands
 		// there rather than naming a number of CPUs to take.
-		if cp.topology.deviceNameToRole[alloc.Device] == device.PARTITION_ROLE_SHARED {
+		if cp.topology.deviceIsPool(alloc.Device) {
 			poolCPUs, published := cp.topology.deviceNameToCPUs[alloc.Device]
 			if !published {
 				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
@@ -429,7 +470,11 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		return kubeletplugin.PrepareResult{}
 	}
 
-	record := store.ClaimRecord{Requests: requestAllocations(byRequest), Relocatable: placement.Relocatable}
+	record := store.ClaimRecord{
+		Requests:    requestAllocations(byRequest),
+		Relocatable: placement.Relocatable,
+		Recorded:    cp.recordedDevices(claim),
+	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
