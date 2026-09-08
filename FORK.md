@@ -97,7 +97,7 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
   `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `recordedDevices`,
-  `publishResources`, `republishStaleSlices`
+  `recordedDeviceFull`, `recordClaimEvent`, `publishResources`, `republishStaleSlices`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 
@@ -124,7 +124,7 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `WarnDeprecatedCPUFields`
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods,
-  `SetFlooredCapacityDevices`, and the collectors behind them
+  `SetFlooredCapacityDevices` and `RecordPrepareNoRoom`, and the collectors behind them
 
 - `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
   `e2e_suite_test.go`, and the `defragEnabled`/`defragAllowTransientOverlap`/`fullPhysicalCPUsOnly`
@@ -191,8 +191,8 @@ behaviour) rather than silently adapting.
 - **The defragmentation option is a flat `defrag*` field, not a nested block.** `Config` is flat
   throughout, its dump mirror is a field-for-field type conversion, and two reflection tests walk its
   fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
-- **One metric carries a `numa_node` label**, against the rule stated in `docs/user/metrics.md`. The
-  rule is amended there rather than quietly broken.
+- **Two metrics carry a label the rule stated in `docs/user/metrics.md` would forbid**, `numa_node`
+  and `shape`. The rule is amended there rather than quietly broken.
 - **Allocation-time cache placement is a policy, not a constant.** The design held that upstream's
   packed order "needs no improvement" because it preserves whole caches for future large claims. The
   platform wants the opposite for its small tenants -- one VM per cache while there is slack, L3

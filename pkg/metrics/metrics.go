@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/kubernetes-sigs/dra-driver-cpu/api"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -88,6 +89,10 @@ type Recorder interface {
 	RecordPrepare(result Result, duration time.Duration)
 	RecordUnprepare(result Result)
 	RecordClaimAllocatedCPUs(cpus int)
+	// CCX-FORK: RecordPrepareNoRoom is the fork's, and belongs with the prepare
+	// counters above rather than with the defragmentation block below: it counts
+	// an admission the node refused, whether or not anything ever moved.
+	RecordPrepareNoRoom(shape string)
 	// CCX-FORK: upstream's Recorder ends above; the defragmentation methods and
 	// everything serving them in this file are the fork's.
 	SetDefragState(DefragState)
@@ -118,6 +123,7 @@ type Metrics struct {
 	unprepareClaims      *prometheus.CounterVec
 	prepareClaimDuration prometheus.Histogram
 	claimAllocatedCPUs   prometheus.Histogram
+	prepareNoRoom        *prometheus.CounterVec
 
 	defragExcessUncoreCaches      prometheus.Gauge
 	defragAlignableFreeCPUs       *prometheus.GaugeVec
@@ -200,6 +206,12 @@ var (
 		kind:    metricHistogram,
 		help:    "Number of CPUs allocated for each newly successful claim allocation.",
 		buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024},
+	}
+	prepareNoRoomSpec = metricSpec{
+		name:   "dra_cpu_prepare_no_room_total",
+		kind:   metricCounter,
+		help:   "Total number of claims refused at Prepare because the device their allocation names cannot hold what it was charged for there. `shape` is never-split for a claim the allocator could not have split, flexible for one it could.",
+		labels: []string{"shape"},
 	}
 	defragExcessUncoreCachesSpec = metricSpec{
 		name: "dra_cpu_defrag_excess_uncore_caches",
@@ -311,6 +323,7 @@ var metricSpecs = []metricSpec{
 	unprepareClaimsSpec,
 	prepareClaimDurationSpec,
 	claimAllocatedCPUsSpec,
+	prepareNoRoomSpec,
 	defragExcessUncoreCachesSpec,
 	defragAlignableFreeCPUsSpec,
 	defragPassesSpec,
@@ -368,6 +381,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		unprepareClaims:      newCounterVec(unprepareClaimsSpec),
 		prepareClaimDuration: newHistogram(prepareClaimDurationSpec),
 		claimAllocatedCPUs:   newHistogram(claimAllocatedCPUsSpec),
+		prepareNoRoom:        newCounterVec(prepareNoRoomSpec),
 
 		defragExcessUncoreCaches:      newGauge(defragExcessUncoreCachesSpec),
 		defragAlignableFreeCPUs:       newGaugeVec(defragAlignableFreeCPUsSpec),
@@ -399,6 +413,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.unprepareClaims,
 		m.prepareClaimDuration,
 		m.claimAllocatedCPUs,
+		m.prepareNoRoom,
 		m.defragExcessUncoreCaches,
 		m.defragAlignableFreeCPUs,
 		m.defragPasses,
@@ -418,6 +433,9 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.misplacedClaims,
 		m.partitionVerified,
 	)
+	for _, shape := range []string{api.ShapeNeverSplit, api.ShapeFlexible} {
+		m.prepareNoRoom.WithLabelValues(shape)
+	}
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
 		m.unprepareClaims.WithLabelValues(result.String())
@@ -482,6 +500,10 @@ func (m *Metrics) RecordUnprepare(result Result) {
 
 func (m *Metrics) RecordClaimAllocatedCPUs(cpus int) {
 	m.claimAllocatedCPUs.Observe(float64(cpus))
+}
+
+func (m *Metrics) RecordPrepareNoRoom(shape string) {
+	m.prepareNoRoom.WithLabelValues(shape).Inc()
 }
 
 // SetDefragState replaces the per-NUMA-node series wholesale, so a node a pass
@@ -594,6 +616,7 @@ func (noopRecorder) SetAllocationState(AllocationState)     {}
 func (noopRecorder) RecordPrepare(Result, time.Duration)    {}
 func (noopRecorder) RecordUnprepare(Result)                 {}
 func (noopRecorder) RecordClaimAllocatedCPUs(int)           {}
+func (noopRecorder) RecordPrepareNoRoom(string)             {}
 func (noopRecorder) SetDefragState(DefragState)             {}
 func (noopRecorder) RecordDefragPass(Result, time.Duration) {}
 func (noopRecorder) RecordDefragMoves(Result, int)          {}
