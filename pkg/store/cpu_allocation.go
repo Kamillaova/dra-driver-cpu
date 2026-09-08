@@ -18,6 +18,7 @@ package store
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 
@@ -77,6 +78,9 @@ type CPUAllocation struct {
 	// CCX-FORK: upstream holds one cpuset per claim, keyed by claim UID alone.
 	claims       map[types.UID]*claimAllocation
 	preparedCPUs cpuset.CPUSet
+	// lastSwapGroup numbers the exchanges this store has begun, so that the
+	// participants of one can be told from the participants of another.
+	lastSwapGroup int
 }
 
 type claimAllocation struct {
@@ -84,7 +88,12 @@ type claimAllocation struct {
 	// rebindOrigin is the exclusive CPUs of each request before the move in
 	// flight, and is nil when none is.
 	rebindOrigin map[string]cpuset.CPUSet
-	relocatable  bool
+	// swapGroup identifies the exchange this claim is part of, and is zero for a
+	// claim moving into free CPUs on its own. The group is recorded rather than
+	// inferred from which CPUs the movers hold, because it has to survive one of
+	// its members being unprepared while the batch is out.
+	swapGroup   int
+	relocatable bool
 }
 
 func newClaimAllocation(record ClaimRecord) *claimAllocation {
@@ -319,6 +328,151 @@ func (s *CPUAllocation) BeginRebind(logger logr.Logger, claimUID types.UID, targ
 	return nil
 }
 
+// BeginSwap starts an exchange between prepared claims: each is placed on the
+// CPUs targets names for it, and every one of them holds both its current and
+// its target CPUs until the exchange is committed or aborted. That transit set
+// is what keeps a Prepare arriving mid-batch from handing a newcomer CPUs a
+// half-swapped claim is still running on, and it is what an abort falls back
+// to, since no participant ever released anything.
+//
+// The targets divide up exactly the CPUs the claims already hold between them,
+// each keeping its own count, so the set the group occupies is the same before,
+// during and after. Nothing here touches the CPUs available to anything else,
+// whichever way the exchange ends. An exchange that also took free CPUs would
+// be a move and an exchange at once; the caller plans that as two steps.
+func (s *CPUAllocation) BeginSwap(logger logr.Logger, targets map[types.UID]cpuset.CPUSet) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(targets) < 2 {
+		return fmt.Errorf("an exchange needs at least two claims, got %d", len(targets))
+	}
+	claimUIDs := sortedUIDs(targets)
+	held, wanted := cpuset.New(), cpuset.New()
+	for _, claimUID := range claimUIDs {
+		allocation, ok := s.claims[claimUID]
+		if !ok {
+			return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
+		}
+		if allocation.rebindOrigin != nil {
+			return fmt.Errorf("claim %q is already rebinding from %q to %q", claimUID, allocation.originCPUs().String(), allocation.exclusiveCPUs().String())
+		}
+		current := allocation.exclusiveCPUs()
+		target := targets[claimUID]
+		if target.Size() != current.Size() {
+			return fmt.Errorf("exchange would change claim %q from %d CPUs to %d", claimUID, current.Size(), target.Size())
+		}
+		if overlap := wanted.Intersection(target); !overlap.IsEmpty() {
+			return fmt.Errorf("exchange gives CPUs %q to more than one claim", overlap.String())
+		}
+		held, wanted = held.Union(current), wanted.Union(target)
+	}
+	if !held.Equals(wanted) {
+		return fmt.Errorf("exchange of claims %v would move them from %q onto %q, which is not the same set of CPUs", claimUIDs, held.String(), wanted.String())
+	}
+
+	s.lastSwapGroup++
+	for _, claimUID := range claimUIDs {
+		allocation := s.claims[claimUID]
+		allocation.rebindOrigin = allocation.exclusiveByRequest()
+		allocation.swapGroup = s.lastSwapGroup
+		allocation.placeExclusive(targets[claimUID])
+	}
+	logger.Info("began exchange of resource claims", "claims", claimUIDs, "cpus", held.String())
+	return nil
+}
+
+// CommitSwap ends an exchange with every participant still prepared on its
+// target.
+func (s *CPUAllocation) CommitSwap(logger logr.Logger, claimUIDs ...types.UID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	present, err := s.swapInFlight(claimUIDs)
+	if err != nil {
+		return err
+	}
+	for _, claimUID := range present {
+		allocation := s.claims[claimUID]
+		allocation.rebindOrigin, allocation.swapGroup = nil, 0
+	}
+	s.preparedCPUs = s.heldByClaimsLocked()
+	logger.Info("committed exchange of resource claims", "claims", present)
+	return nil
+}
+
+// AbortSwap ends an exchange with every participant still prepared back where it
+// started.
+func (s *CPUAllocation) AbortSwap(logger logr.Logger, claimUIDs ...types.UID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	present, err := s.swapInFlight(claimUIDs)
+	if err != nil {
+		return err
+	}
+	for _, claimUID := range present {
+		allocation := s.claims[claimUID]
+		allocation.restoreExclusive(allocation.rebindOrigin)
+		allocation.rebindOrigin, allocation.swapGroup = nil, 0
+	}
+	s.preparedCPUs = s.heldByClaimsLocked()
+	logger.Info("aborted exchange of resource claims", "claims", present)
+	return nil
+}
+
+// swapInFlight returns the participants of one exchange that are still prepared.
+//
+// A participant unprepared while the batch was out is skipped rather than
+// refused. It released nothing its partner is taking -- removing it recomputed
+// what the survivors hold -- and refusing the whole group over it would leave the
+// rest holding two cpusets with nothing able to settle them, which on a fenced
+// NUMA node means fenced for as long as the driver runs.
+//
+// Everything else is refused, and the group id is what makes that exact: a claim
+// moving on its own, a claim not moving at all, two exchanges named together, and
+// an exchange named without one of its still-prepared members are each a caller
+// settling something it did not begin.
+func (s *CPUAllocation) swapInFlight(claimUIDs []types.UID) ([]types.UID, error) {
+	if len(claimUIDs) < 2 {
+		return nil, fmt.Errorf("an exchange needs at least two claims, got %d", len(claimUIDs))
+	}
+	group := 0
+	present := make([]types.UID, 0, len(claimUIDs))
+	for _, claimUID := range claimUIDs {
+		allocation, ok := s.claims[claimUID]
+		if !ok {
+			continue
+		}
+		if allocation.swapGroup == 0 {
+			return nil, fmt.Errorf("claim %q has no exchange in flight", claimUID)
+		}
+		if group != 0 && allocation.swapGroup != group {
+			return nil, fmt.Errorf("claims %v are not one exchange", claimUIDs)
+		}
+		group = allocation.swapGroup
+		present = append(present, claimUID)
+	}
+	if len(present) == 0 {
+		return nil, fmt.Errorf("no claim of the exchange %v is prepared any more", claimUIDs)
+	}
+	for claimUID, allocation := range s.claims {
+		if allocation.swapGroup == group && !slices.Contains(present, claimUID) {
+			return nil, fmt.Errorf("claim %q belongs to the same exchange and was not named", claimUID)
+		}
+	}
+	return present, nil
+}
+
+func sortedUIDs(targets map[types.UID]cpuset.CPUSet) []types.UID {
+	claimUIDs := make([]types.UID, 0, len(targets))
+	for claimUID := range targets {
+		claimUIDs = append(claimUIDs, claimUID)
+	}
+	sort.Slice(claimUIDs, func(i, j int) bool { return claimUIDs[i] < claimUIDs[j] })
+	return claimUIDs
+}
+
 // CommitRebind releases the CPUs a claim moved away from, keeping the target.
 func (s *CPUAllocation) CommitRebind(logger logr.Logger, claimUID types.UID) error {
 	s.mu.Lock()
@@ -377,15 +531,29 @@ func (s *CPUAllocation) RemoveResourceClaimAllocation(logger logr.Logger, claimU
 	}
 }
 
-// CCX-FORK: upstream releases only the claim's own cpuset; a claim removed
-// mid-rebind also holds the CPUs it was moving away from.
+// CCX-FORK: upstream releases only the claim's own cpuset; here a claim may hold
+// two, the CPUs it runs on and the ones it is moving onto.
 func (s *CPUAllocation) removeLocked(claimUID types.UID) {
-	allocation, ok := s.claims[claimUID]
-	if !ok {
+	if _, ok := s.claims[claimUID]; !ok {
 		return
 	}
 	delete(s.claims, claimUID)
-	s.preparedCPUs = s.preparedCPUs.Difference(allocation.exclusiveCPUs().Union(allocation.originCPUs()))
+	s.preparedCPUs = s.heldByClaimsLocked()
+}
+
+// heldByClaimsLocked is every CPU the prepared claims hold between them, both
+// halves of a move in flight included.
+//
+// Recomputed rather than adjusted claim by claim, because a CPU one claim is
+// leaving is a CPU another may be taking: the two sides of an exchange hold each
+// other's, so subtracting a departing claim's own would release a CPU its partner
+// is still running on.
+func (s *CPUAllocation) heldByClaimsLocked() cpuset.CPUSet {
+	held := cpuset.New()
+	for _, allocation := range s.claims {
+		held = held.Union(allocation.exclusiveCPUs()).Union(allocation.originCPUs())
+	}
+	return held
 }
 
 // GetSharedCPUs returns CPUs available to shared containers.
