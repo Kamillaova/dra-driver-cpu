@@ -192,10 +192,12 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 // taking them away would stop a workload to enforce a description that changed
 // after it started. A pass moves it home once one may.
 //
-// It checks that the claim sits inside some one partition, not that it sits
-// inside its own: the driver's record of a restored claim is per request and
-// carries no device name, so which partition granted it is not recoverable
-// here. A claim that drifted wholly into another partition therefore passes.
+// It checks that the claim sits inside some one partition, not inside the
+// partition of the device its allocation charged, so a claim that drifted wholly
+// into another partition passes. The narrower reading would report nothing on
+// exactly the nodes it matters on: this runs while the store is being rebuilt
+// from the specs on disk, and a spec written by an older driver names no charged
+// device to compare against.
 func (cp *CPUDriver) checkClaimPartition(logger logr.Logger, cpus cpuset.CPUSet) {
 	if cpus.IsEmpty() {
 		return

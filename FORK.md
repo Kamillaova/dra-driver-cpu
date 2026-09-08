@@ -38,6 +38,13 @@ carries no `dra.cpu/placements` annotation, so the fork falls back to parsing th
 which for an upstream spec is the real placement. Each claim gains an annotation the next time its spec
 is written.
 
+**A claim's charged devices are recovered at its next Prepare.** A spec written before
+`dra.cpu/recorded` existed does not say how many CPUs the claim's allocation charged each device, and
+an absent answer is read as unknown rather than as zero: read as zero, every running claim would look
+like a tenant of a device its allocation never named. The kubelet replays `NodePrepareResources` for
+every claim when the driver restarts, and the claim object it hands over carries the allocation, which
+is immutable — so the answer comes back one restart after an upgrade, and the spec is rewritten with it.
+
 **Within the fork, a claim's mobility does not survive the driver version that introduced it.** A spec
 written before `dra.cpu/relocatable` existed carries no such annotation, and an absent one reads as
 immobile — the field's default, and the safe reading. So upgrading a node past that version leaves its
@@ -76,20 +83,21 @@ DaemonSet.
 Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
-- `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiRelocatableAnnotation`,
-  `cdiEnvDynamicValue`, `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`,
-  `decodePlacements`
+- `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiRecordedAnnotation`,
+  `cdiRelocatableAnnotation`, `cdiEnvDynamicValue`, `GetDeviceAllocations`, `cdiRequestPlacement`,
+  `encodePlacements`, `decodePlacements`, `decodeRecordedDevices`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries` and
   `defragRetryDue`, `cgroupfs`, `poisonedNodes` and `placementPolicy` fields,
-  `Providers.CgroupFS` and `EnsureCgroupFS`, and `Config.DefragEnabled` and
-  `Config.DefragAllowTransientOverlap`
+  `deviceTopology.deviceIsPool`, `Providers.CgroupFS` and `EnsureCgroupFS`, and
+  `Config.DefragEnabled` and `Config.DefragAllowTransientOverlap`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
   and the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields
 
 - `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
-  `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `republishStaleSlices`
+  `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `recordedDevices`,
+  `republishStaleSlices`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 
@@ -99,7 +107,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
   `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
-  `GetClaimRecord`, `IsRelocatable`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
+  `GetClaimRecord`, `SetRecordedDevices`, `IsRelocatable`, `HoldsExclusiveCPUs`,
+  `ExclusiveClaimAllocations`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 

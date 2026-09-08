@@ -1161,3 +1161,46 @@ func TestRemoveDuringSwapUndoesTheSurvivor(t *testing.T) {
 	require.Equal(t, cpuset.New(0, 1), first)
 	require.Equal(t, cpuset.New(0, 1), store.GetPreparedCPUs())
 }
+
+func TestRecordedDevicesRoundTrip(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3), cpuset.New())
+
+	record := exclusiveRequest(cpuset.New(0, 1))
+	record.Recorded = map[string]int{"cpudevcache000": 2}
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-a", record, false))
+
+	got, ok := store.GetClaimRecord("claim-a")
+	require.True(t, ok)
+	require.Equal(t, map[string]int{"cpudevcache000": 2}, got.Recorded)
+
+	// The store hands out a copy: a caller that keeps the map it was given, and
+	// one that mutates the record it passed in, must not be able to rewrite what
+	// the scheduler is believed to have subtracted.
+	got.Recorded["cpudevcache000"] = 16
+	record.Recorded["cpudevcache001"] = 4
+	again, ok := store.GetClaimRecord("claim-a")
+	require.True(t, ok)
+	require.Equal(t, map[string]int{"cpudevcache000": 2}, again.Recorded)
+}
+
+func TestSetRecordedDevices(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3), cpuset.New())
+	requirePreparedAllocation(t, logger, store, "claim-legacy", cpuset.New(0, 1))
+
+	require.Error(t, store.SetRecordedDevices(logger, "claim-absent", map[string]int{"cpudevcache000": 2}),
+		"a claim this driver has not prepared has no record to complete")
+
+	require.NoError(t, store.SetRecordedDevices(logger, "claim-legacy", map[string]int{"cpudevcache000": 2}))
+	got, ok := store.GetClaimRecord("claim-legacy")
+	require.True(t, ok)
+	require.Equal(t, map[string]int{"cpudevcache000": 2}, got.Recorded)
+
+	// The allocation is immutable, so a second answer about it contradicts the
+	// first rather than updating it.
+	require.Error(t, store.SetRecordedDevices(logger, "claim-legacy", map[string]int{"cpudevcache001": 2}))
+	got, ok = store.GetClaimRecord("claim-legacy")
+	require.True(t, ok)
+	require.Equal(t, map[string]int{"cpudevcache000": 2}, got.Recorded)
+}

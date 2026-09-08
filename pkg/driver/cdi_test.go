@@ -519,3 +519,67 @@ func TestGetDeviceAllocationsReadsAnAbsentMobilityAnnotationAsImmobile(t *testin
 		require.Equal(t, cpuset.New(0, 1), store.UnionOf(got.Requests), name)
 	}
 }
+
+func TestGetDeviceAllocationsRecoversChargedDevices(t *testing.T) {
+	// The published capacity of a device is corrected by the difference between
+	// what a claim's allocation charged it and what the claim occupies there, so
+	// a restart that loses the first half loses the correction.
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	record := relocatableOn(cpuset.New(2, 3))
+	record.Recorded = map[string]int{"cpudevcache000": 2}
+	require.NoError(t, mgr.AddDevice(logger, "claim-charged", "DRA_CPUSET_claim-charged=dynamic", record))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations("claim-charged")
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{"cpudevcache000": 2}, got.Recorded)
+}
+
+func TestGetDeviceAllocationsReadsAnAbsentChargedAnnotationAsUnknown(t *testing.T) {
+	// A spec written before the driver recorded them. Read as "charged nothing",
+	// every running claim would look like a tenant of a device its allocation
+	// never named and the node's caches would each shrink by their occupancy;
+	// read as unknown, the capacity is published uncorrected, which is what it
+	// was before the mirror existed.
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	require.NoError(t, mgr.AddDevice(logger, "claim-legacy", "DRA_CPUSET_claim-legacy=0-1", exclusiveOn(cpuset.New(0, 1))))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations("claim-legacy")
+	require.NoError(t, err)
+	require.Empty(t, got.Recorded)
+}
+
+func TestGetDeviceAllocationsMalformedChargedAnnotation(t *testing.T) {
+	// Unlike mobility, an unparsable value here has no safe default: reading it
+	// as unknown would silently drop a correction the driver had recorded.
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-charged-corrupt"
+	spec := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name: deviceName,
+			Annotations: map[string]string{
+				cdiCPUSetAnnotation:   "0-1",
+				cdiRecordedAnnotation: "{not json",
+			},
+			ContainerEdits: cdiSpec.ContainerEdits{Env: []string{fmt.Sprintf("%s_%s=0-1", cdiEnvVarPrefix, deviceName)}},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(spec, mgr.getSpecName(deviceName)))
+	require.NoError(t, mgr.Refresh())
+
+	_, err = mgr.GetDeviceAllocations(deviceName)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), cdiRecordedAnnotation)
+}

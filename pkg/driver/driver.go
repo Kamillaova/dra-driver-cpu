@@ -256,6 +256,18 @@ type deviceTopology struct {
 	deviceThreadsPerCore map[string]int
 }
 
+// deviceIsPool reports whether a device grants a share of a pool rather than
+// CPUs its claim holds alone.
+//
+// The question is asked wherever a caller must not treat a pool's capacity as a
+// count of CPUs one claim occupies: it bounds how much work lands on CPUs every
+// claim asking for it holds at the same time. One predicate, because two of
+// those callers have to agree exactly or the published capacity stops
+// describing the node.
+func (t deviceTopology) deviceIsPool(deviceName string) bool {
+	return t.deviceNameToRole[deviceName] == device.PARTITION_ROLE_SHARED
+}
+
 // Providers group the interfaces the CPUDriver depends on
 type Providers struct {
 	CPUInfo   CPUInfoProvider
