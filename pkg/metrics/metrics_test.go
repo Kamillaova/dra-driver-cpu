@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 20)
+	require.Len(t, descriptors, 24)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -58,6 +58,10 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_swap_overlap_seconds",
 		"dra_cpu_defrag_partial_batches_total",
 		"dra_cpu_defrag_rollbacks_total",
+		"dra_cpu_defrag_numa_node_poisoned",
+		"dra_cpu_defrag_poisoned_nodes_total",
+		"dra_cpu_defrag_poisoned_duration_seconds",
+		"dra_cpu_defrag_readback_mismatches_total",
 		"dra_cpu_synchronize_skipped_claims_total",
 		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_partition_verified",
@@ -70,9 +74,13 @@ func TestDescriptors(t *testing.T) {
 	require.Empty(t, descriptors[14].Labels)
 	require.Empty(t, descriptors[15].Labels)
 	require.Equal(t, []string{"result"}, descriptors[16].Labels)
-	require.Empty(t, descriptors[17].Labels)
+	require.Equal(t, []string{"numa_node"}, descriptors[17].Labels)
 	require.Empty(t, descriptors[18].Labels)
-	require.Equal(t, []string{"partition"}, descriptors[19].Labels)
+	require.Empty(t, descriptors[19].Labels)
+	require.Empty(t, descriptors[20].Labels)
+	require.Empty(t, descriptors[21].Labels)
+	require.Empty(t, descriptors[22].Labels)
+	require.Equal(t, []string{"partition"}, descriptors[23].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -111,6 +119,9 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_defrag_partial_batches_total",
 		"dra_cpu_defrag_pass_duration_seconds",
 		"dra_cpu_defrag_passes_total",
+		"dra_cpu_defrag_poisoned_duration_seconds",
+		"dra_cpu_defrag_poisoned_nodes_total",
+		"dra_cpu_defrag_readback_mismatches_total",
 		"dra_cpu_defrag_rollbacks_total",
 		"dra_cpu_defrag_swap_overlap_seconds",
 		"dra_cpu_misplaced_claims_total",
@@ -163,9 +174,16 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordUnprepare(ResultError)
 	m.RecordClaimAllocatedCPUs(1)
 	m.SetDefragState(DefragState{LargestAlignableFreeCPUs: map[int]int{0: 4}})
+	m.SetDefragNodePoisoned(0, false)
 	m.RecordDefragPass(ResultSuccess, time.Second)
 	m.RecordDefragMoves(ResultSuccess, 1)
 	m.RecordDefragBlockedMoves(1)
+	m.RecordDefragSwapOverlap(time.Second)
+	m.RecordDefragPartialBatch()
+	m.RecordDefragRollback(ResultSuccess)
+	m.RecordDefragNodePoisoned()
+	m.RecordDefragNodeReopened(time.Second)
+	m.RecordDefragReadbackMismatch()
 	m.RecordSynchronizeSkippedClaim()
 	m.RecordMisplacedClaim()
 	m.SetPartitionState(map[string]bool{"dataplane": true})

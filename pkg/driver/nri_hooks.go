@@ -137,14 +137,14 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 
 			var state *store.ContainerState
 			if len(claimUIDs) == 0 {
-				state = store.NewContainerState(container.GetName(), containerUID)
+				state = store.NewContainerState(container.GetName(), containerUID).WithCgroup(container.GetLinux().GetCgroupsPath())
 			} else {
 				allGuaranteedCPUs, err := cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
 				if err != nil {
 					return nil, err
 				}
 				cLogger.V(2).Info("found guaranteed CPUs", "cpus", allGuaranteedCPUs.String())
-				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...)
+				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...).WithCgroup(container.GetLinux().GetCgroupsPath())
 
 				// Reconcile guaranteed container CPU mask.
 				guaranteedUpdate := &api.ContainerUpdate{
@@ -172,7 +172,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	containerUpdates = append(containerUpdates, sharedContainerUpdates...)
 	// CCX-FORK: the store was just rebuilt from what is actually running, which
 	// is the other way a cache stops being empty.
-	cp.republishOnCacheOrderChange(ctx)
+	cp.republishStaleSlices(ctx)
 	// CCX-FORK: a driver that has just learnt the node's real placements is
 	// looking at a node nothing has defragmented since it went down, which is
 	// exactly when the spread is worst.
@@ -393,7 +393,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 			// closed instead of allowing the runtime to keep its default affinity.
 			return nil, nil, fmt.Errorf("cannot create shared container: no shared CPUs available")
 		}
-		state := store.NewContainerState(ctr.GetName(), containerId)
+		state := store.NewContainerState(ctr.GetName(), containerId).WithCgroup(ctr.GetLinux().GetCgroupsPath())
 		cp.podConfigStore.SetContainerState(podUID, state)
 
 		logger.V(2).Info("no guaranteed CPUs found, using shared CPUs", "sharedCPUs", sharedCPUs.String())
@@ -437,7 +437,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 			return nil, nil, err
 		}
 		logger.V(2).Info("guaranteed CPUs found", "cpus", guaranteedCPUs.String())
-		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...)
+		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...).WithCgroup(ctr.GetLinux().GetCgroupsPath())
 		adjust.SetLinuxCPUSetCPUs(guaranteedCPUs.String())
 		// A new owner means this is the first CreateContainer after Prepare, so
 		// existing shared containers must be moved off the newly claimed CPUs.
