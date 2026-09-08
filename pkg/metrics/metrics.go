@@ -101,6 +101,7 @@ type Recorder interface {
 	RecordDefragNodePoisoned()
 	RecordDefragNodeReopened(duration time.Duration)
 	RecordDefragReadbackMismatch()
+	SetFlooredCapacityDevices(count int)
 	RecordSynchronizeSkippedClaim()
 	RecordMisplacedClaim()
 	SetPartitionState(map[string]bool)
@@ -130,6 +131,7 @@ type Metrics struct {
 	defragPoisonedNodes           prometheus.Counter
 	defragPoisonDurationSecsHist  prometheus.Histogram
 	defragReadbackMismatches      prometheus.Counter
+	flooredCapacityDevices        prometheus.Gauge
 
 	synchronizeSkippedClaims prometheus.Counter
 	misplacedClaims          prometheus.Counter
@@ -270,6 +272,11 @@ var (
 		kind: metricCounter,
 		help: "Total number of read-backs that left a fenced NUMA node fenced, because the CPUs its containers run on match neither what the driver recorded nor what they came from.",
 	}
+	flooredCapacityDevicesSpec = metricSpec{
+		name: "dra_cpu_capacity_mirror_floored_devices",
+		kind: metricGauge,
+		help: "Number of devices whose published CPU capacity is held above the amount the driver computed, because publishing that amount would put the device below its own request policy. Those devices are tainted, so the capacity they over-state is withdrawn rather than handed out.",
+	}
 	synchronizeSkippedClaimsSpec = metricSpec{
 		name: "dra_cpu_synchronize_skipped_claims_total",
 		kind: metricCounter,
@@ -310,6 +317,7 @@ var metricSpecs = []metricSpec{
 	defragPoisonedNodesSpec,
 	defragPoisonDurationSpec,
 	defragReadbackMismatchesSpec,
+	flooredCapacityDevicesSpec,
 	synchronizeSkippedClaimsSpec,
 	misplacedClaimsSpec,
 	partitionVerifiedSpec,
@@ -366,6 +374,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		defragPoisonedNodes:           newCounter(defragPoisonedNodesSpec),
 		defragPoisonDurationSecsHist:  newHistogram(defragPoisonDurationSpec),
 		defragReadbackMismatches:      newCounter(defragReadbackMismatchesSpec),
+		flooredCapacityDevices:        newGauge(flooredCapacityDevicesSpec),
 
 		synchronizeSkippedClaims: newCounter(synchronizeSkippedClaimsSpec),
 		misplacedClaims:          newCounter(misplacedClaimsSpec),
@@ -394,6 +403,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragPoisonedNodes,
 		m.defragPoisonDurationSecsHist,
 		m.defragReadbackMismatches,
+		m.flooredCapacityDevices,
 		m.synchronizeSkippedClaims,
 		m.misplacedClaims,
 		m.partitionVerified,
@@ -533,6 +543,10 @@ func (m *Metrics) RecordDefragReadbackMismatch() {
 	m.defragReadbackMismatches.Inc()
 }
 
+func (m *Metrics) SetFlooredCapacityDevices(count int) {
+	m.flooredCapacityDevices.Set(float64(count))
+}
+
 func (m *Metrics) RecordSynchronizeSkippedClaim() {
 	m.synchronizeSkippedClaims.Inc()
 }
@@ -577,6 +591,7 @@ func (noopRecorder) SetDefragNodePoisoned(int, bool)        {}
 func (noopRecorder) RecordDefragNodePoisoned()              {}
 func (noopRecorder) RecordDefragNodeReopened(time.Duration) {}
 func (noopRecorder) RecordDefragReadbackMismatch()          {}
+func (noopRecorder) SetFlooredCapacityDevices(int)          {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()         {}
 func (noopRecorder) RecordMisplacedClaim()                  {}
 func (noopRecorder) SetPartitionState(map[string]bool)      {}

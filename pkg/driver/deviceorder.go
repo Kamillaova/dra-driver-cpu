@@ -28,20 +28,24 @@ import (
 )
 
 // chunkDevices cuts each partition's devices into ResourceSlice-sized chunks,
-// in the order they are published. A partition's devices are never mixed with
-// another's, so a named partition's taints stay in its own slices.
+// in the order they are published, and reports how many of them are published at
+// their capacity floor. A partition's devices are never mixed with another's, so
+// a named partition's taints stay in its own slices.
 //
 // Called with applyMu held.
-func (cp *CPUDriver) chunkDevices(occupied map[string]bool, poisoned map[int]bool) [][]resourceapi.Device {
+func (cp *CPUDriver) chunkDevices(occupied map[string]bool, poisoned map[int]bool, mirror capacityMirror) ([][]resourceapi.Device, int) {
 	var chunks [][]resourceapi.Device
+	floored := 0
 	for _, partitionDevices := range cp.topology.devicesByPartition {
 		if len(partitionDevices) == 0 {
 			continue
 		}
-		ordered := cp.fenceDevices(cp.orderCacheDevices(partitionDevices, occupied), poisoned)
+		mirrored, atFloor := applyCapacityMirror(cp.orderCacheDevices(partitionDevices, occupied), mirror)
+		floored += atFloor
+		ordered := cp.fenceDevices(mirrored, poisoned)
 		chunks = append(chunks, slices.Collect(slices.Chunk(ordered, cp.devicesPerResourceSlice))...)
 	}
-	return chunks
+	return chunks, floored
 }
 
 // fenceDevices taints every device reaching into a NUMA node the driver has
@@ -97,7 +101,7 @@ func (cp *CPUDriver) orderCacheDevices(devices []resourceapi.Device, occupied ma
 	// A pool's devices are not caches: every claim that asks for one holds all of
 	// it, so there is no emptiness to order them by and no cache for a claim to
 	// meet first. They are published as they were built.
-	if cp.topology.deviceNameToRole[devices[0].Name] == device.PARTITION_ROLE_SHARED {
+	if cp.topology.deviceIsPool(devices[0].Name) {
 		return devices
 	}
 	ordered := slices.Clone(devices)
@@ -123,26 +127,29 @@ func (cp *CPUDriver) occupiedDevices() map[string]bool {
 	return occupied
 }
 
-// refreshDeviceOrder returns the chunks to publish. The order and the two inputs
-// it was computed from are recorded together, because a later hook decides
-// whether to publish again by comparing them; recording one without the others
-// is what would make that comparison lie.
+// refreshDeviceOrder returns the chunks to publish. The order and the three
+// inputs it was computed from are recorded together, because a later hook
+// decides whether to publish again by comparing them; recording one without the
+// others is what would make that comparison lie.
 //
 // Called with applyMu held.
 func (cp *CPUDriver) refreshDeviceOrder() [][]resourceapi.Device {
 	if cp.topology.devicesByPartition == nil {
 		return nil
 	}
-	occupied, poisoned := cp.occupiedDevices(), cp.poisonedNUMANodes()
-	cp.publishedOccupancy, cp.publishedPoison = occupied, poisoned
-	cp.topology.deviceSlices = cp.chunkDevices(occupied, poisoned)
+	occupied, poisoned, mirror := cp.occupiedDevices(), cp.poisonedNUMANodes(), cp.capacityMirror()
+	cp.publishedOccupancy, cp.publishedPoison, cp.publishedCorrection = occupied, poisoned, mirror.corrections()
+	chunks, floored := cp.chunkDevices(occupied, poisoned, mirror)
+	cp.topology.deviceSlices = chunks
+	cp.metricsRecorder().SetFlooredCapacityDevices(floored)
 	return cp.topology.deviceSlices
 }
 
 // publishedSlicesAreStale reports whether what the slices carry has stopped
-// describing the node: a NUMA node fenced or reopened since they went out, or a
-// cache that has changed between holding a claim and holding none, which is what
-// the published device order is a function of.
+// describing the node: a NUMA node fenced or reopened since they went out, a
+// capacity whose correction has changed, or a cache that has changed between
+// holding a claim and holding none, which is what the published device order is
+// a function of.
 //
 // Called with applyMu held.
 func (cp *CPUDriver) publishedSlicesAreStale() bool {
@@ -150,6 +157,12 @@ func (cp *CPUDriver) publishedSlicesAreStale() bool {
 		return false
 	}
 	if !maps.Equal(cp.poisonedNUMANodes(), cp.publishedPoison) {
+		return true
+	}
+	// Before the grouping check: a claim leaves the device its allocation charged
+	// under every grouping the driver may move a claim under, and only the device
+	// order is particular to caches.
+	if !maps.Equal(cp.capacityMirror().corrections(), cp.publishedCorrection) {
 		return true
 	}
 	if cp.cpuDeviceGroupBy != device.GROUP_BY_UNCORE_CACHE {

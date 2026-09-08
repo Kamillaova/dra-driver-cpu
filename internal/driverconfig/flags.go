@@ -173,17 +173,9 @@ func (c Config) validateDefrag() error {
 		return fmt.Errorf("invalid defragEnabled: requires cpuDeviceMode %q, got %q",
 			device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
 	}
-	// Grouping by uncore cache is the case where the driver does choose the CPUs
-	// and still may not move them: a device is one cache there, so a claim moved
-	// to another cache no longer sits on the device its allocation names, and the
-	// scheduler's per-device accounting stops describing the node.
-	if c.GroupBy == device.GROUP_BY_UNCORE_CACHE {
-		return fmt.Errorf("invalid defragEnabled: with groupBy %q a device is one uncore cache, so a move between caches would leave the device the claim was allocated on",
-			device.GROUP_BY_UNCORE_CACHE)
-	}
-	if c.GroupBy != device.GROUP_BY_NUMA_NODE && c.GroupBy != device.GROUP_BY_SOCKET {
-		return fmt.Errorf("invalid defragEnabled: requires groupBy %q or %q, got %q",
-			device.GROUP_BY_NUMA_NODE, device.GROUP_BY_SOCKET, c.GroupBy)
+	if c.GroupBy != device.GROUP_BY_NUMA_NODE && c.GroupBy != device.GROUP_BY_SOCKET && c.GroupBy != device.GROUP_BY_UNCORE_CACHE {
+		return fmt.Errorf("invalid defragEnabled: requires groupBy %q, %q or %q, got %q",
+			device.GROUP_BY_NUMA_NODE, device.GROUP_BY_SOCKET, device.GROUP_BY_UNCORE_CACHE, c.GroupBy)
 	}
 	// A move is a container update the runtime did not ask for, which is exactly
 	// what that option asserts is safe here.

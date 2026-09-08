@@ -26,6 +26,7 @@ The command prints JSON metadata for custom `dra_cpu_*` metrics only. It does no
 | `dra_cpu_synchronize_skipped_claims_total` | Counter   | none     | Claims or containers `Synchronize` could not adopt from the runtime's reported state, skipped rather than aborting the whole call. |
 | `dra_cpu_misplaced_claims_total`           | Counter   | none     | Restored claims whose CPUs no single CPU partition holds, which is what a partition list edited under a running node looks like. |
 | `dra_cpu_partition_verified`               | Gauge     | `partition` | Whether a CPU partition's declaration matches this machine (1) or contradicts it, in which case the partition publishes no devices (0). |
+| `dra_cpu_capacity_mirror_floored_devices`  | Gauge     | none     | Devices whose published CPU capacity is held above the amount the driver computed, because publishing that amount would put the device below its own request policy. Each of them is tainted, so the capacity the number over-states is withdrawn rather than handed out. |
 
 ## Defragmentation
 

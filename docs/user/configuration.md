@@ -150,13 +150,18 @@ on - is configured through other Helm values, not through this file.
 - Let the driver move a running claim onto different CPUs to recover uncore cache (CCX/L3)
   alignment lost to claim churn, without restarting its container. A claim keeps its CPU
   count and its NUMA footprint; only which CPUs back it change.
-- Requires `cpuDeviceMode: grouped` with `groupBy: numanode` or `socket`, because those
-  are the modes where the driver chooses a claim's CPUs in the first place: `individual`
-  mode has the scheduler pick exact per-CPU devices, and `groupBy: machine` takes the
-  cpuset from the claim's own opaque config. `groupBy: uncorecache` is refused for a
-  different reason: the driver does choose the CPUs there, but a device is one cache, so
-  moving a claim to another cache would take it off the device it was allocated on and
-  the scheduler's per-device accounting would stop describing the node.
+- Requires `cpuDeviceMode: grouped` with `groupBy: numanode`, `socket` or `uncorecache`,
+  because those are the modes where the driver chooses a claim's CPUs in the first place:
+  `individual` mode has the scheduler pick exact per-CPU devices, and `groupBy: machine`
+  takes the cpuset from the claim's own opaque config.
+- Under `groupBy: uncorecache` a device is one cache, so a move takes the claim off the
+  device its allocation named. A claim's allocation cannot be rewritten, so the capacity
+  published for each cache carries the difference instead: its own size, plus the CPUs
+  charged to it by claims that have left, minus the CPUs occupied on it by claims charged
+  elsewhere. A scheduler subtracting what its own records charged then arrives at the CPUs
+  really free there. The consequence to know about is that a cache device's `capacity` is
+  no longer its size while any claim sits off the cache it was allocated from;
+  `dra.cpu/numCPUs` still carries the size.
 - Requires `assumeUnsolicitedUpdatesSafe`, since a move is pushed to the runtime
   unprompted.
 - A structural no-op on nodes with one cache per NUMA node, where there is no spread to
