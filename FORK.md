@@ -118,7 +118,11 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   behind them
 
 - `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
-  `e2e_suite_test.go`, and the `defragEnabled`/`fullPhysicalCPUsOnly` config read-back
+  `e2e_suite_test.go`, and the `defragEnabled`/`defragAllowTransientOverlap`/`fullPhysicalCPUsOnly`
+  config read-back
+
+- `test/image/dracputester`: the cpuset watcher, and `discovery.DRACPUCPUSetChange` with the history
+  it reports; upstream's tester reports the cpuset it is on, not the ones it has been on
 
 - the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
   they pin, rather than kept apart
