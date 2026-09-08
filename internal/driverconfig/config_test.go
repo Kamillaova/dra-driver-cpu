@@ -828,11 +828,10 @@ func TestValidate_DefragRequirements(t *testing.T) {
 			expectedError: "requires groupBy",
 		},
 		{
-			// Here the driver does choose the CPUs, but a device is one cache, so
-			// a move would take the claim off the device it was allocated on.
-			name:          "grouped by uncore cache",
-			mutate:        func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_UNCORE_CACHE },
-			expectedError: "a device is one uncore cache",
+			// A move does take the claim off the device it was allocated on here,
+			// and the capacity published for both devices carries the difference.
+			name:   "grouped by uncore cache",
+			mutate: func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_UNCORE_CACHE },
 		},
 		{
 			name:          "without the unsolicited update assertion",

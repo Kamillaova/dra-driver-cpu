@@ -176,10 +176,14 @@ type CPUDriver struct {
 	// order was last published, which is one of the two inputs the published
 	// slices have. Guarded by applyMu.
 	publishedOccupancy map[string]bool
-	// publishedPoison is the other: the NUMA nodes that were fenced when the
+	// publishedPoison is the second: the NUMA nodes that were fenced when the
 	// slices were last published, whose devices carry the poison taint. Guarded
 	// by applyMu.
 	publishedPoison map[int]bool
+	// publishedCorrection is the third: how far each device's published capacity
+	// stood from its physical size, for the devices where the two differ.
+	// Guarded by applyMu.
+	publishedCorrection map[string]int
 
 	kubeletRootDir string
 }
@@ -486,11 +490,16 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 
 	// A slice holding a tainted device may carry half as many devices as one
 	// without, so the limit follows what was actually built rather than the
-	// options alone -- and, where a fence may taint any device at any moment,
-	// what may yet be built. Deciding the chunk size at publication time instead
-	// would change how many slices the pool has while it is fenced, which is a
-	// worse thing to do to a pool's generation than losing half a slice's
-	// capacity on a node that has a handful of grouped devices.
+	// options alone -- and, where a device may be tainted at any moment, what may
+	// yet be built. Two things taint one: a fence, and a capacity the mirror
+	// cannot publish the truth for. The second needs a claim sitting on a device
+	// its allocation did not name, which takes either a move or a partition list
+	// edited under a running node -- and a node with a partition list has a named
+	// partition, whose devices are tainted already. Deciding the chunk size at
+	// publication time instead would change how many slices the pool has while a
+	// device is tainted, which is a worse thing to do to a pool's generation than
+	// losing half a slice's capacity on a node that has a handful of grouped
+	// devices.
 	if plugin.defrag.enabled || slices.ContainsFunc(devices, func(d resourceapi.Device) bool { return len(d.Taints) > 0 }) {
 		plugin.devicesPerResourceSlice = min(plugin.devicesPerResourceSlice, resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures)
 	}
