@@ -39,6 +39,9 @@ type Recorder interface {
 	RecordDefragPass(result cpumetrics.Result, duration time.Duration)
 	RecordDefragMoves(result cpumetrics.Result, count int)
 	RecordDefragBlockedMoves(count int)
+	RecordDefragSwapOverlap(duration time.Duration)
+	RecordDefragPartialBatch()
+	RecordDefragRollback(result cpumetrics.Result)
 	SetPartitionState(verified map[string]bool)
 }
 
