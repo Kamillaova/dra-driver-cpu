@@ -79,4 +79,18 @@ type ClaimPlacementStatus struct {
 	CPUSet string `json:"cpuset"`
 	// CPUCount is the number of CPUs allocated on this device.
 	CPUCount int `json:"cpuCount"`
+	// NUMANode is the NUMA node ID chosen for this claim.
+	NUMANode *int `json:"numaNode,omitempty"`
+	// Partition is the CPU partition name chosen for this claim.
+	Partition string `json:"partition,omitempty"`
+	// FrontierSnapshot is the repair frontier advertised when this claim was prepared.
+	FrontierSnapshot string `json:"frontierSnapshot,omitempty"`
+	// WitnessRounds is the repair rounds proven by the repair witness plan.
+	WitnessRounds *int `json:"witnessRounds,omitempty"`
+	// WitnessPlan is a summary of the repair witness moves.
+	WitnessPlan string `json:"witnessPlan,omitempty"`
+	// InitialCPUSet is the initial cpuset granted at Prepare.
+	InitialCPUSet string `json:"initialCPUSet,omitempty"`
+	// RuntimeOutcome is the latest runtime container update status.
+	RuntimeOutcome string `json:"runtimeOutcome,omitempty"`
 }

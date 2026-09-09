@@ -1307,6 +1307,7 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 				reverted++
 				continue
 			}
+			cp.checkClaimAlignmentOutcome(sLogger, round.scope, move)
 			if err := cp.writeClaimPlacement(sLogger, move.ClaimUID); err != nil {
 				sLogger.Error(err, "cannot clear round provenance from recorded placement", "claimUID", move.ClaimUID)
 			}
@@ -1419,6 +1420,7 @@ func (cp *CPUDriver) settleExchangeStep(logger logr.Logger, round *defragRound, 
 			return false
 		}
 		for _, move := range step {
+			cp.checkClaimAlignmentOutcome(logger, round.scope, move)
 			if err := cp.writeClaimPlacement(logger, move.ClaimUID); err != nil {
 				logger.Error(err, "cannot clear round provenance from recorded placement", "claimUID", move.ClaimUID)
 			}
@@ -1479,4 +1481,28 @@ func (r *defragRound) retainUnsettled() *defragRound {
 		}
 	}
 	return next
+}
+
+func (cp *CPUDriver) checkClaimAlignmentOutcome(logger logr.Logger, scope defragScope, move defrag.Move) {
+	if cp.topology.cpuTopology == nil {
+		return
+	}
+	online := cp.topology.onlineCPUs
+	allocatable := cp.defragAllocatable(online)
+	part, ok := cp.defragPartition(scope.partition, allocatable)
+	if !ok {
+		return
+	}
+	nodeTopo, err := defrag.NewTopology(cp.topology.cpuTopology, scope.numaNodeID, part.CPUs.Intersection(allocatable))
+	if err != nil {
+		return
+	}
+	if nodeTopo.ExcessSpread(move.To) == 0 {
+		cp.cpuAllocationStore.UpdateClaimRuntimeOutcome(move.ClaimUID, "aligned")
+		logger.Info("claim aligned", "claimUID", move.ClaimUID, "finalCPUSet", move.To.String())
+		ns, name := cp.claimNameAndNamespace(move.ClaimUID)
+		if ns != "" && name != "" {
+			cp.recordClaimEventRef(context.Background(), ns, name, move.ClaimUID, "ClaimAligned", fmt.Sprintf("claim aligned to cpuset %s", move.To.String()))
+		}
+	}
 }
