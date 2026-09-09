@@ -229,7 +229,8 @@ func deviceDiffers(want, got resourceapi.Device) string {
 // intendedDevices is every device the driver would publish now, by name. Called
 // with applyMu held.
 func (cp *CPUDriver) intendedDevices() map[string]resourceapi.Device {
-	chunks, _ := cp.chunkDevices(cp.occupiedDevices(), cp.poisonedNUMANodes(), cp.capacityMirror(), cp.frontier())
+	frontier, frontierInput := cp.frontier()
+	chunks, _ := cp.chunkDevices(cp.occupiedDevices(), cp.poisonedNUMANodes(), cp.capacityMirror(), frontier, frontierInput)
 	devices := map[string]resourceapi.Device{}
 	for _, chunk := range chunks {
 		for _, dev := range chunk {

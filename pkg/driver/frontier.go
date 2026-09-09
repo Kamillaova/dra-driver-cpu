@@ -37,9 +37,9 @@ func scopeFrontierKey(partition string, numaNodeID int) string {
 	return fmt.Sprintf("%s/%d", partition, numaNodeID)
 }
 
-func (cp *CPUDriver) frontier() map[string]string {
+func (cp *CPUDriver) frontier() (map[string]string, map[string]string) {
 	if cp.topology.cpuTopology == nil || cp.topology.devicesByPartition == nil || cp.cpuDeviceGroupBy != device.GROUP_BY_UNCORE_CACHE {
-		return nil
+		return nil, nil
 	}
 	online := cp.topology.onlineCPUs
 	if online.IsEmpty() && cp.topology.cpuTopology != nil {
@@ -48,12 +48,13 @@ func (cp *CPUDriver) frontier() map[string]string {
 	allocatable := cp.defragAllocatable(online)
 	partitions := cp.defragPartitions(allocatable)
 	if len(partitions) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	occupied := cp.occupiedDevices()
 	partDevices := cp.partitionDevicesMap()
-	result := make(map[string]string)
+	rounds := make(map[string]string)
+	input := make(map[string]string)
 
 	for _, partition := range partitions {
 		partitionDevices := partDevices[partition.Name]
@@ -64,13 +65,15 @@ func (cp *CPUDriver) frontier() map[string]string {
 		for _, numaNodeID := range numaNodes {
 			key := scopeFrontierKey(partition.Name, numaNodeID)
 			if cp.nodeIsPoisoned(numaNodeID) {
-				result[key] = unreachableFrontier()
+				rounds[key] = unreachableFrontier()
+				input[key] = ""
 				continue
 			}
 			scope := defragScope{numaNodeID: numaNodeID, partition: partition.Name}
 			view, ok := cp.defragView(logr.Discard(), scope, online)
 			if !ok {
-				result[key] = unreachableFrontier()
+				rounds[key] = unreachableFrontier()
+				input[key] = ""
 				continue
 			}
 			numaDevices := cp.filterDevicesByNUMANode(partitionDevices, numaNodeID)
@@ -80,10 +83,16 @@ func (cp *CPUDriver) frontier() map[string]string {
 			for k := 1; k <= api.RepairRoundsFields; k++ {
 				fields[k-1] = cp.simulateSplitLandingAndSearch(view, k, ordered)
 			}
-			result[key] = strings.Join(fields, ",")
+			rounds[key] = strings.Join(fields, ",")
+
+			uids := make([]types.UID, 0, len(view.placements))
+			for _, p := range view.placements {
+				uids = append(uids, p.ClaimUID)
+			}
+			input[key] = api.FrontierInputDigest(uids)
 		}
 	}
-	return result
+	return rounds, input
 }
 
 func unreachableFrontier() string {
@@ -249,7 +258,7 @@ func planRounds(moves []defrag.Move) int {
 	return rounds
 }
 
-func (cp *CPUDriver) attachFrontierAttributes(devices []resourceapi.Device, frontierByScope map[string]string) []resourceapi.Device {
+func (cp *CPUDriver) attachFrontierAttributes(devices []resourceapi.Device, frontierByScope map[string]string, inputByScope map[string]string) []resourceapi.Device {
 	if cp.cpuDeviceGroupBy != device.GROUP_BY_UNCORE_CACHE || len(devices) == 0 {
 		return devices
 	}
@@ -279,6 +288,11 @@ func (cp *CPUDriver) attachFrontierAttributes(devices []resourceapi.Device, fron
 		}
 		attrs[device.AttributeRepairRounds] = resourceapi.DeviceAttribute{
 			StringValue: new(repairRounds),
+		}
+		if digest, ok := inputByScope[key]; ok && digest != "" {
+			attrs[device.AttributeFrontierInput] = resourceapi.DeviceAttribute{
+				StringValue: new(digest),
+			}
 		}
 		dev.Attributes = attrs
 		attached[i] = dev
