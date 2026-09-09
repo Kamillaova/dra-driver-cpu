@@ -93,6 +93,7 @@ type CPUInfoProvider interface {
 type CPUDriver struct {
 	driverName         string
 	nodeName           string
+	namespace          string
 	kubeClient         kubernetes.Interface
 	draPlugin          KubeletPlugin
 	nriPlugin          stub.Stub
@@ -288,6 +289,7 @@ func (pr Providers) EnsureCgroupFS() cgroupfs.FS {
 type Config struct {
 	DriverName       string
 	NodeName         string
+	Namespace        string
 	ReservedCPUs     cpuset.CPUSet
 	CPUDeviceMode    string
 	CPUDeviceGroupBy string
@@ -345,9 +347,14 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	if metricsRecorder == nil {
 		metricsRecorder = cpumetrics.Noop()
 	}
+	ns := config.Namespace
+	if ns == "" {
+		ns = metav1.NamespaceDefault
+	}
 	plugin := &CPUDriver{
 		driverName: config.DriverName,
 		nodeName:   config.NodeName,
+		namespace:  ns,
 		kubeClient: providers.K8SClient,
 		topology: deviceTopology{
 			deviceNameToCPUID:      make(map[string]int),
@@ -786,7 +793,7 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 
 		claimReader, err := watchAllocatedClaims(ctx, cp)
 		if err != nil {
-			return asyncErr, fmt.Errorf("failed to watch ResourceClaims: %w", err)
+			return asyncErr, fmt.Errorf("failed to watch projected claim ConfigMap: %w", err)
 		}
 		cp.claimReader = claimReader
 	}
