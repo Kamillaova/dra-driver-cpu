@@ -629,6 +629,67 @@ func movableClaimSpecWithSelector(cpus int, cel string) resourcev1.ResourceClaim
 	return spec
 }
 
+func repairableClaimSpecWithSelector(cpus int, cel string) resourcev1.ResourceClaimSpec {
+	ginkgo.GinkgoHelper()
+	var selectors []resourcev1.DeviceSelector
+	if cel != "" {
+		selectors = []resourcev1.DeviceSelector{
+			{CEL: &resourcev1.CELDeviceSelector{Expression: cel}},
+		}
+	}
+	rawConfig, err := json.Marshal(v1alpha1.OpaqueConfig{
+		APIVersion: v1alpha1.APIVersion,
+		CPUConfig: v1alpha1.CPUConfig{
+			Relocatable: true,
+			Alignment:   v1alpha1.AlignmentRepairable,
+		},
+	})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	reqName := "request-cpus"
+	return resourcev1.ResourceClaimSpec{
+		Devices: resourcev1.DeviceClaim{
+			Requests: []resourcev1.DeviceRequest{
+				{
+					Name: reqName,
+					FirstAvailable: []resourcev1.DeviceSubRequest{
+						{
+							Name:            "aligned",
+							DeviceClassName: driverName,
+							Selectors:       selectors,
+							Capacity: &resourcev1.CapacityRequirements{
+								Requests: map[resourcev1.QualifiedName]resource.Quantity{
+									"dra.cpu/cpu": *resource.NewQuantity(int64(cpus), resource.DecimalSI),
+								},
+							},
+						},
+						{
+							Name:            "split",
+							DeviceClassName: driverName,
+							Selectors:       selectors,
+							Capacity: &resourcev1.CapacityRequirements{
+								Requests: map[resourcev1.QualifiedName]resource.Quantity{
+									"dra.cpu/cpu": *resource.NewQuantity(int64(cpus), resource.DecimalSI),
+								},
+							},
+						},
+					},
+				},
+			},
+			Config: []resourcev1.DeviceClaimConfiguration{
+				{
+					Requests: []string{reqName},
+					DeviceConfiguration: resourcev1.DeviceConfiguration{
+						Opaque: &resourcev1.OpaqueDeviceConfiguration{
+							Driver:     driverName,
+							Parameters: runtime.RawExtension{Raw: rawConfig},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 // numaCEL pins a claim to one NUMA node's device. Only numanode grouping
 // publishes the attribute per device, so other modes get no selector and the
 // scenario spans the machine as it always did.
