@@ -498,10 +498,14 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 		return kubeletplugin.PrepareResult{Err: err}
 	}
 
-	if err := cp.secureRepairWitness(ctx, logger, claim, cpuAssignment, placement); err != nil {
+	plan, err := cp.secureRepairWitness(ctx, logger, claim, cpuAssignment, placement)
+	if err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 		return kubeletplugin.PrepareResult{Err: err}
 	}
+	corr := cp.buildClaimCorrelation(claim, cpuAssignment, plan)
+	record.Correlation = corr
+	cp.cpuAllocationStore.SetClaimCorrelation(claim.UID, corr)
 
 	result := cp.prepareDevices(logger, claim, record, placement)
 	if result.Err != nil {
@@ -509,6 +513,18 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 		cp.releaseActiveExactPlanAndClosure(cpuAssignment)
 		return result
 	}
+	logger.Info("claim admitted",
+		"claimUID", claim.UID,
+		"numaNode", corr.NUMANode,
+		"partition", corr.Partition,
+		"frontierSnapshot", corr.FrontierSnapshot,
+		"witnessRounds", corr.WitnessRounds,
+		"witnessPlan", corr.WitnessPlan,
+		"initialCPUSet", corr.InitialCPUSet,
+		"runtimeOutcome", corr.RuntimeOutcome,
+	)
+	cp.recordClaimEvent(ctx, claim, "ClaimAdmitted", fmt.Sprintf("admitted on NUMA %v partition %s with cpuset %s frontier %s witness %s",
+		corr.NUMANode, corr.Partition, corr.InitialCPUSet, corr.FrontierSnapshot, corr.WitnessPlan))
 	if cp.makeRoomTargets != nil {
 		if target, ok := cp.makeRoomTargets[claim.UID]; ok {
 			for numaNodeID, plan := range cp.activeExactPlans {
@@ -779,32 +795,49 @@ func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logge
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	if err := cp.secureRepairWitness(ctx, logger, claim, claimCPUSet, placement); err != nil {
+	plan, err := cp.secureRepairWitness(ctx, logger, claim, claimCPUSet, placement)
+	if err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 		return kubeletplugin.PrepareResult{Err: err}
 	}
+	corr := cp.buildClaimCorrelation(claim, claimCPUSet, plan)
+	record.Correlation = corr
+	cp.cpuAllocationStore.SetClaimCorrelation(claim.UID, corr)
+
 	result := cp.prepareDevices(logger, claim, record, placement)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 		cp.releaseActiveExactPlanAndClosure(claimCPUSet)
 		return result
 	}
+	logger.Info("claim admitted",
+		"claimUID", claim.UID,
+		"numaNode", corr.NUMANode,
+		"partition", corr.Partition,
+		"frontierSnapshot", corr.FrontierSnapshot,
+		"witnessRounds", corr.WitnessRounds,
+		"witnessPlan", corr.WitnessPlan,
+		"initialCPUSet", corr.InitialCPUSet,
+		"runtimeOutcome", corr.RuntimeOutcome,
+	)
+	cp.recordClaimEvent(ctx, claim, "ClaimAdmitted", fmt.Sprintf("admitted on NUMA %v partition %s with cpuset %s frontier %s witness %s",
+		corr.NUMANode, corr.Partition, corr.InitialCPUSet, corr.FrontierSnapshot, corr.WitnessPlan))
 	cp.metricsRecorder().RecordClaimAllocatedCPUs(claimCPUSet.Size())
 	cp.refreshAllocationMetrics()
 	return result
 }
 
-func (cp *CPUDriver) secureRepairWitness(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, cpuAssignment cpuset.CPUSet, placement opaqueapi.ClaimPlacement) error {
+func (cp *CPUDriver) secureRepairWitness(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, cpuAssignment cpuset.CPUSet, placement opaqueapi.ClaimPlacement) (*defrag.ExactPlan, error) {
 	if placement.Alignment != v1alpha1.AlignmentRepairable {
-		return nil
+		return nil, nil
 	}
 	topo := cp.topology.cpuTopology
 	if topo == nil {
-		return nil
+		return nil, nil
 	}
 	nodeIDs := topo.CPUDetails.KeepOnly(cpuAssignment).NUMANodes().List()
 	if len(nodeIDs) != 1 {
-		return nil
+		return nil, nil
 	}
 	numaNodeID := nodeIDs[0]
 	online := cp.topology.onlineCPUs
@@ -822,11 +855,11 @@ func (cp *CPUDriver) secureRepairWitness(ctx context.Context, logger logr.Logger
 		}
 	}
 	if matchingScope == nil {
-		return nil
+		return nil, nil
 	}
 	view, ok := cp.defragView(logger, *matchingScope, online)
 	if !ok || view.topology.ExcessSpread(cpuAssignment) <= 0 {
-		return nil
+		return nil, nil
 	}
 	goal := defrag.GoalMakeClaimWhole{ClaimUID: claim.UID}
 	sel := cp.defragSelector(logger, view.threadsPerCore)
@@ -839,12 +872,12 @@ func (cp *CPUDriver) secureRepairWitness(ctx context.Context, logger logr.Logger
 	if err != nil || !plan.Status.Feasible() || len(plan.Moves) == 0 {
 		cp.recordClaimEvent(ctx, claim, "NoRepairWitness", "no repair witness within budget for split repairable claim")
 		cp.metricsRecorder().RecordPrepareNoWitness()
-		return fmt.Errorf("no repair witness within budget for repairable claim %s/%s on NUMA node %d", claim.Namespace, claim.Name, numaNodeID)
+		return nil, fmt.Errorf("no repair witness within budget for repairable claim %s/%s on NUMA node %d", claim.Namespace, claim.Name, numaNodeID)
 	}
 	closure := plan.ComputeClosure()
 	cp.cpuAllocationStore.ReserveClosure(numaNodeID, closure)
 	cp.setActiveExactPlan(numaNodeID, &plan)
-	return nil
+	return &plan, nil
 }
 
 func (cp *CPUDriver) releaseActiveExactPlanAndClosure(cpuAssignment cpuset.CPUSet) {
@@ -856,6 +889,92 @@ func (cp *CPUDriver) releaseActiveExactPlanAndClosure(cpuAssignment cpuset.CPUSe
 		cp.clearActiveExactPlan(nodeID)
 		cp.cpuAllocationStore.ReleaseClosure(nodeID)
 	}
+}
+
+func (cp *CPUDriver) buildClaimCorrelation(claim *resourceapi.ResourceClaim, cpus cpuset.CPUSet, plan *defrag.ExactPlan) store.ClaimCorrelation {
+	var numaNode *int
+	if cp.topology.cpuTopology != nil {
+		nodeIDs := cp.topology.cpuTopology.CPUDetails.KeepOnly(cpus).NUMANodes().List()
+		if len(nodeIDs) == 1 {
+			n := nodeIDs[0]
+			numaNode = &n
+		}
+	}
+	var partition string
+	if claim.Status.Allocation != nil {
+		for _, alloc := range claim.Status.Allocation.Devices.Results {
+			if alloc.Driver == cp.driverName {
+				p := cp.devicePartition(alloc.Device)
+				if p != "" {
+					partition = p
+					break
+				}
+			}
+		}
+	}
+	if partition == "" {
+		partition = device.DefaultPartitionName
+	}
+	var frontierSnapshot string
+	if numaNode != nil && partition != "" {
+		key := scopeFrontierKey(partition, *numaNode)
+		if cp.publishedFrontier != nil {
+			frontierSnapshot = cp.publishedFrontier[key]
+		}
+		if frontierSnapshot == "" {
+			f, _ := cp.frontier()
+			if f != nil {
+				frontierSnapshot = f[key]
+			}
+		}
+	}
+	var witnessRounds *int
+	var witnessPlan string
+	if plan != nil {
+		r := len(plan.Moves)
+		witnessRounds = &r
+		var descs []string
+		for _, m := range plan.Moves {
+			descs = append(descs, fmt.Sprintf("%s:%s->%s", m.ClaimUID, m.From.String(), m.To.String()))
+		}
+		witnessPlan = strings.Join(descs, "; ")
+	}
+
+	runtimeOutcome := "aligned"
+	if cp.topology.cpuTopology != nil && cp.cpuDeviceGroupBy == device.GROUP_BY_UNCORE_CACHE && numaNode != nil {
+		online := cp.topology.onlineCPUs
+		allocatable := cp.defragAllocatable(online)
+		if part, ok := cp.defragPartition(partition, allocatable); ok {
+			if nodeTopo, err := defrag.NewTopology(cp.topology.cpuTopology, *numaNode, part.CPUs.Intersection(allocatable)); err == nil {
+				if nodeTopo.ExcessSpread(cpus) > 0 {
+					runtimeOutcome = "started_split"
+				}
+			}
+		}
+	}
+
+	return store.ClaimCorrelation{
+		NUMANode:         numaNode,
+		Partition:        partition,
+		FrontierSnapshot: frontierSnapshot,
+		WitnessRounds:    witnessRounds,
+		WitnessPlan:      witnessPlan,
+		InitialCPUSet:    cpus.String(),
+		RuntimeOutcome:   runtimeOutcome,
+	}
+}
+
+func (cp *CPUDriver) claimNameAndNamespace(uid types.UID) (string, string) {
+	if cp.claimReader != nil {
+		if claims, err := cp.claimReader.AllocatedClaims(); err == nil {
+			for _, c := range claims {
+				if c.UID == uid {
+					return c.Namespace, c.Name
+				}
+			}
+		}
+	}
+	return "", ""
 }
 
 // cdiEnvValue is what the injected variable says about a claim's placement: the
@@ -1011,6 +1130,16 @@ func (cp *CPUDriver) refreshAllocationMetrics() {
 }
 
 func (cp *CPUDriver) unprepareResourceClaim(logger logr.Logger, claim kubeletplugin.NamespacedObject) error {
+	if existing, ok := cp.cpuAllocationStore.GetClaimRecord(claim.UID); ok {
+		if existing.Correlation.RuntimeOutcome != "aligned" && existing.Correlation.RuntimeOutcome != "" {
+			logger.Info("claim unrepaired",
+				"claimUID", claim.UID,
+				"initialCPUSet", existing.Correlation.InitialCPUSet,
+				"finalCPUSet", store.UnionOf(existing.Requests).String(),
+			)
+			cp.recordClaimEventRef(context.Background(), claim.Namespace, claim.Name, claim.UID, "ClaimUnrepaired", "claim deallocated while still split")
+		}
+	}
 	// Remove the CDI spec first. If that fails, keep the allocation recorded so
 	// the driver does not make those CPUs available while stale CDI state remains.
 	if err := cp.cdiMgr.RemoveDevice(logger, getCDIDeviceName(claim.UID)); err != nil {
