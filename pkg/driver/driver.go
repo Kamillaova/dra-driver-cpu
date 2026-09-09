@@ -204,7 +204,16 @@ type CPUDriver struct {
 	// Guarded by applyMu.
 	publishedFrontierInput map[string]string
 
+	promiseObligations map[types.UID]*promiseObligation
+
 	kubeletRootDir string
+}
+
+type promiseObligation struct {
+	claimUID         types.UID
+	prepareTime      time.Time
+	advertisedRounds string
+	actualRounds     int
 }
 
 // deviceHealthEntry is the last known health of a single device.
@@ -466,6 +475,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	plugin.cpuAllocationStore = store.NewCPUAllocation(plugin.topology.cpuTopology, plugin.topology.reservedCPUs)
 	plugin.refreshAllocationMetrics()
 	plugin.podConfigStore = store.NewPodConfig()
+	plugin.promiseObligations = make(map[types.UID]*promiseObligation)
 
 	plugin.fullPhysicalCPUsOnly = config.FullPhysicalCPUsOnly
 	if plugin.fullPhysicalCPUsOnly {
