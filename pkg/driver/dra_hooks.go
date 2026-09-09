@@ -509,6 +509,19 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 		cp.releaseActiveExactPlanAndClosure(cpuAssignment)
 		return result
 	}
+	if cp.makeRoomTargets != nil {
+		if target, ok := cp.makeRoomTargets[claim.UID]; ok {
+			for numaNodeID, plan := range cp.activeExactPlans {
+				if plan != nil {
+					if targetCache, ok := plan.Goal.TargetCache(); ok && targetCache == target.cacheID {
+						cp.clearActiveExactPlan(numaNodeID)
+						cp.cpuAllocationStore.ReleaseClosure(numaNodeID)
+					}
+				}
+			}
+			delete(cp.makeRoomTargets, claim.UID)
+		}
+	}
 	cp.metricsRecorder().RecordClaimAllocatedCPUs(cpuAssignment.Size())
 	cp.refreshAllocationMetrics()
 	return result
@@ -532,6 +545,10 @@ func (cp *CPUDriver) recordedDeviceFull(ctx context.Context, logger logr.Logger,
 	shape := opaqueapi.ShapeFlexible
 	if !claimOffersSplitAlternatives(claim) {
 		shape = opaqueapi.ShapeNeverSplit
+		if cp.cpuDeviceGroupBy == device.GROUP_BY_UNCORE_CACHE {
+			cp.ensureMakeRoomTarget(claim, deviceName)
+			cp.requestReconcile()
+		}
 	}
 	err := fmt.Errorf("device %q cannot hold the %d CPUs claim %s/%s was charged for there, with %d of its own free: %w",
 		deviceName, charged, claim.Namespace, claim.Name, room, cause)
@@ -541,27 +558,51 @@ func (cp *CPUDriver) recordedDeviceFull(ctx context.Context, logger logr.Logger,
 	return err
 }
 
+func (cp *CPUDriver) ensureMakeRoomTarget(claim *resourceapi.ResourceClaim, deviceName string) {
+	if cp.makeRoomTargets == nil {
+		cp.makeRoomTargets = make(map[types.UID]*makeRoomTarget)
+	}
+	if _, ok := cp.makeRoomTargets[claim.UID]; ok {
+		return
+	}
+	cacheID := cp.topology.deviceNameToUncoreCacheID[deviceName]
+	numaNodeID := cp.topology.deviceNameToNUMANodeID[deviceName]
+	partition := cp.devicePartition(deviceName)
+	if partition == "" {
+		partition = device.DefaultPartitionName
+	}
+	cp.makeRoomTargets[claim.UID] = &makeRoomTarget{
+		claimUID:   claim.UID,
+		namespace:  claim.Namespace,
+		name:       claim.Name,
+		cacheID:    cacheID,
+		numaNodeID: numaNodeID,
+		partition:  partition,
+		device:     deviceName,
+	}
+}
+
 // recordClaimEvent puts a message about one claim on that claim's own event
 // stream, where whoever is looking at a pod stuck starting will find it.
 //
 // Written on its own goroutine, and on a context the caller's cannot cancel:
 // the kubelet must not wait on an API call for it, and the hook asking for it
 // holds applyMu, which may not be held across a call that blocks.
-func (cp *CPUDriver) recordClaimEvent(ctx context.Context, claim *resourceapi.ResourceClaim, reason, message string) {
+func (cp *CPUDriver) recordClaimEventRef(ctx context.Context, ns, name string, uid types.UID, reason, message string) {
 	if cp.kubeClient == nil {
 		return
 	}
 	event := &v1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: claim.Name + ".",
-			Namespace:    claim.Namespace,
+			GenerateName: name + ".",
+			Namespace:    ns,
 		},
 		InvolvedObject: v1.ObjectReference{
 			APIVersion: resourceapi.SchemeGroupVersion.String(),
 			Kind:       "ResourceClaim",
-			Namespace:  claim.Namespace,
-			Name:       claim.Name,
-			UID:        claim.UID,
+			Namespace:  ns,
+			Name:       name,
+			UID:        uid,
 		},
 		Reason:         reason,
 		Message:        message,
@@ -573,10 +614,14 @@ func (cp *CPUDriver) recordClaimEvent(ctx context.Context, claim *resourceapi.Re
 	}
 	ctx = context.WithoutCancel(ctx)
 	go func() {
-		if _, err := cp.kubeClient.CoreV1().Events(claim.Namespace).Create(ctx, event, metav1.CreateOptions{}); err != nil {
-			ctxlog.FromContext(ctx).Error(err, "cannot report a claim event", "reason", reason, "claim", ctxlog.KObj(claim))
+		if _, err := cp.kubeClient.CoreV1().Events(ns).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+			ctxlog.FromContext(ctx).Error(err, "cannot report a claim event", "reason", reason, "claimUID", uid)
 		}
 	}()
+}
+
+func (cp *CPUDriver) recordClaimEvent(ctx context.Context, claim *resourceapi.ResourceClaim, reason, message string) {
+	cp.recordClaimEventRef(ctx, claim.Namespace, claim.Name, claim.UID, reason, message)
 }
 
 // takeCPUsForDevice picks the CPUs backing one device's share of a claim.
@@ -979,6 +1024,19 @@ func (cp *CPUDriver) unprepareResourceClaim(logger logr.Logger, claim kubeletplu
 				cp.clearActiveExactPlan(numaNodeID)
 				cp.cpuAllocationStore.ReleaseClosure(numaNodeID)
 			}
+		}
+	}
+	if cp.makeRoomTargets != nil {
+		if target, ok := cp.makeRoomTargets[claim.UID]; ok {
+			for numaNodeID, plan := range cp.activeExactPlans {
+				if plan != nil {
+					if targetCache, ok := plan.Goal.TargetCache(); ok && targetCache == target.cacheID {
+						cp.clearActiveExactPlan(numaNodeID)
+						cp.cpuAllocationStore.ReleaseClosure(numaNodeID)
+					}
+				}
+			}
+			delete(cp.makeRoomTargets, claim.UID)
 		}
 	}
 	// The released CPUs are back in the shared pool now, but the containers

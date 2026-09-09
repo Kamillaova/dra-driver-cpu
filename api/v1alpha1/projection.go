@@ -49,6 +49,21 @@ type ProjectedClaim struct {
 	CPUConfig CPUConfig `json:"cpuConfig"`
 	// State says whether the claim still holds its allocation.
 	State ClaimState `json:"state"`
+	OffersSplitAlternatives bool   `json:"offersSplitAlternatives,omitempty"`
+	Shape                   string `json:"shape,omitempty"`
+}
+
+func (pc ProjectedClaim) IsNeverSplit() bool {
+	if pc.Shape == "never-split" {
+		return true
+	}
+	if pc.Shape == "flexible" {
+		return false
+	}
+	if pc.OffersSplitAlternatives || pc.CPUConfig.Alignment == AlignmentRepairable {
+		return false
+	}
+	return true
 }
 
 // ProjectedDevice is one device one request of a claim was given.
