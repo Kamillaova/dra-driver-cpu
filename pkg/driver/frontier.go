@@ -41,10 +41,7 @@ func (cp *CPUDriver) frontier() (map[string]string, map[string]string) {
 	if cp.topology.cpuTopology == nil || cp.topology.devicesByPartition == nil || cp.cpuDeviceGroupBy != device.GROUP_BY_UNCORE_CACHE {
 		return nil, nil
 	}
-	online := cp.topology.onlineCPUs
-	if online.IsEmpty() && cp.topology.cpuTopology != nil {
-		online = cp.topology.cpuTopology.CPUDetails.CPUs()
-	}
+	online := cp.topology.cpuTopology.CPUDetails.CPUs()
 	allocatable := cp.defragAllocatable(online)
 	partitions := cp.defragPartitions(allocatable)
 	if len(partitions) == 0 {

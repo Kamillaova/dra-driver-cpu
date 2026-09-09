@@ -177,4 +177,3 @@ func (cp *CPUDriver) publishedSlicesAreStale() bool {
 	rounds, input := cp.frontier()
 	return !maps.Equal(rounds, cp.publishedFrontier) || !maps.Equal(input, cp.publishedFrontierInput)
 }
-
