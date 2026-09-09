@@ -26,6 +26,7 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,13 +45,14 @@ func newRestartTestDriver(t *testing.T, cdi *mockCdiMgr, cgroups fstest.MapFS) *
 	require.NoError(t, err)
 
 	return &CPUDriver{
-		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New(), onlineCPUs: allCPUs},
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
 		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 		podConfigStore:     store.NewPodConfig(),
 		claimTracker:       store.NewClaimTracker(),
 		cdiMgr:             cdi,
 		cgroupfs:           cgroups,
 		poisonedNodes:      make(map[int]*poisonedNode),
+		metrics:            cpumetrics.Noop(),
 	}
 }
 

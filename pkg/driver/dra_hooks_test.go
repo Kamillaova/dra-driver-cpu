@@ -3334,3 +3334,126 @@ func TestMetadataCarriesWhatTheClaimSaidAboutItsPlacement(t *testing.T) {
 		}
 	})
 }
+
+func mockCPUInfos_SingleSocket_3Caches_HT() []cpuinfo.CPUInfo {
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 12 {
+		core := cpu % 6
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        core,
+			SocketID:      0,
+			NUMANodeID:    0,
+			UncoreCacheID: core / 2,
+			SiblingCPUID:  (cpu + 6) % 12,
+			CoreType:      cpuinfo.CoreTypePerformance,
+		})
+	}
+	return withSiblingCPUSets(infos)
+}
+
+func TestPrepareRepairableClaimSecuresRepairWitness(t *testing.T) {
+	logger := testr.New(t)
+	infos := mockCPUInfos_SingleSocket_3Caches_HT()
+	d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
+	d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
+	d.fullPhysicalCPUsOnly = true
+
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-a",
+		relocatableOn(cpuset.New(0, 6)), false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-b",
+		exclusiveOn(cpuset.New(2, 8)), false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-d",
+		exclusiveOn(cpuset.New(4, 10)), false))
+
+	repairableClaim := testClaim("claim-repairable", testDriverName, testNodeName,
+		map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "0": 4})
+	repairableClaim.Namespace = "default"
+	repairableClaim = withSplitAlternatives(repairableClaim)
+	repairableClaim = claimWithRawConfigs(repairableClaim, testDriverName,
+		`{"apiVersion":"v1alpha1","cpuConfig":{"alignment":"Repairable","relocatable":true}}`)
+
+	placement, err := d.claimConfig(repairableClaim)
+	require.NoError(t, err)
+
+	result := d.prepareGroupedResourceClaim(context.Background(), logger, repairableClaim, placement)
+	require.NoError(t, result.Err)
+
+	require.True(t, d.hasActiveExactPlan(0))
+	plan := d.getActiveExactPlan(0)
+	require.NotNil(t, plan)
+	target, ok := plan.Goal.TargetClaim()
+	require.True(t, ok)
+	require.Equal(t, types.UID("claim-repairable"), target)
+
+	closure := d.cpuAllocationStore.ReservedClosures()
+	require.False(t, closure.IsEmpty())
+	require.True(t, closure.Contains(5), "transit set is reserved in closure")
+
+	laterClaim := testClaim("claim-later", testDriverName, testNodeName,
+		map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2})
+	laterClaim.Namespace = "default"
+	laterPlacement, err := d.claimConfig(laterClaim)
+	require.NoError(t, err)
+	laterResult := d.prepareGroupedResourceClaim(context.Background(), logger, laterClaim, laterPlacement)
+	require.Error(t, laterResult.Err)
+
+	unprepared, err := d.UnprepareResourceClaims(context.Background(), []kubeletplugin.NamespacedObject{
+		{UID: "claim-repairable"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, unprepared["claim-repairable"])
+	require.False(t, d.hasActiveExactPlan(0))
+	require.True(t, d.cpuAllocationStore.ReservedClosures().IsEmpty())
+}
+
+func TestPrepareRepairableClaimFailsWithoutRepairWitness(t *testing.T) {
+	logger := testr.New(t)
+	infos := mockCPUInfos_SingleSocket_3Caches_HT()
+	d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
+	d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
+	d.fullPhysicalCPUsOnly = true
+
+	reg := prometheus.NewRegistry()
+	d.metrics = cpumetrics.New(reg)
+	client := k8sfake.NewSimpleClientset()
+	d.kubeClient = client
+
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-a",
+		exclusiveOn(cpuset.New(0, 6)), false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-b",
+		exclusiveOn(cpuset.New(2, 8)), false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-d",
+		exclusiveOn(cpuset.New(4, 10)), false))
+
+	repairableClaim := testClaim("claim-repairable", testDriverName, testNodeName,
+		map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "0": 4})
+	repairableClaim.Namespace = "default"
+	repairableClaim = withSplitAlternatives(repairableClaim)
+	repairableClaim = claimWithRawConfigs(repairableClaim, testDriverName,
+		`{"apiVersion":"v1alpha1","cpuConfig":{"alignment":"Repairable","relocatable":true}}`)
+
+	placement, err := d.claimConfig(repairableClaim)
+	require.NoError(t, err)
+
+	result := d.prepareGroupedResourceClaim(context.Background(), logger, repairableClaim, placement)
+	require.ErrorContains(t, result.Err, "no repair witness within budget")
+
+	require.InDelta(t, 1, metricValue(t, reg, "dra_cpu_prepare_no_witness_total", nil), 0.01)
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		events, err := client.CoreV1().Events(repairableClaim.Namespace).List(context.Background(), metav1.ListOptions{})
+		assert.NoError(c, err)
+		if !assert.Len(c, events.Items, 1) {
+			return
+		}
+		assert.Equal(c, "NoRepairWitness", events.Items[0].Reason)
+		assert.Equal(c, "ResourceClaim", events.Items[0].InvolvedObject.Kind)
+		assert.Equal(c, repairableClaim.Name, events.Items[0].InvolvedObject.Name)
+	}, time.Second, 10*time.Millisecond)
+
+	_, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-repairable")
+	require.False(t, ok)
+	require.False(t, d.hasActiveExactPlan(0))
+	require.True(t, d.cpuAllocationStore.ReservedClosures().IsEmpty())
+}

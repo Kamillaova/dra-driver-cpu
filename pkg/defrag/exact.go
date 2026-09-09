@@ -82,7 +82,7 @@ func (g GoalMakeClaimWhole) IsSatisfied(topo *Topology, placements map[types.UID
 }
 
 func (g GoalMakeClaimWhole) TargetClaim() (types.UID, bool) { return g.ClaimUID, true }
-func (g GoalMakeClaimWhole) TargetCache() (int, bool)        { return 0, false }
+func (g GoalMakeClaimWhole) TargetCache() (int, bool)       { return 0, false }
 func (g GoalMakeClaimWhole) Description() string {
 	return fmt.Sprintf("make claim %q whole", g.ClaimUID)
 }
@@ -101,7 +101,7 @@ func (g GoalFreeCache) IsSatisfied(topo *Topology, placements map[types.UID]cpus
 }
 
 func (g GoalFreeCache) TargetClaim() (types.UID, bool) { return "", false }
-func (g GoalFreeCache) TargetCache() (int, bool)        { return g.CacheID, true }
+func (g GoalFreeCache) TargetCache() (int, bool)       { return g.CacheID, true }
 func (g GoalFreeCache) Description() string {
 	return fmt.Sprintf("free cache %d", g.CacheID)
 }
@@ -128,7 +128,7 @@ func (g GoalKCacheHome) IsSatisfied(topo *Topology, placements map[types.UID]cpu
 }
 
 func (g GoalKCacheHome) TargetClaim() (types.UID, bool) { return "", false }
-func (g GoalKCacheHome) TargetCache() (int, bool)        { return 0, false }
+func (g GoalKCacheHome) TargetCache() (int, bool)       { return 0, false }
 func (g GoalKCacheHome) Description() string {
 	return fmt.Sprintf("produce a %d-cache home", g.K)
 }

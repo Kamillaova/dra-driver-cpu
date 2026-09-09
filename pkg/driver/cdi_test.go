@@ -607,4 +607,3 @@ func TestGetDeviceAllocationsRecoversAlignment(t *testing.T) {
 	require.Equal(t, v1alpha1.AlignmentRepairable, got.Alignment)
 	require.True(t, got.Relocatable)
 }
-

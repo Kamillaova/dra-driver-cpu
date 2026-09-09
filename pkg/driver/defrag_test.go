@@ -1587,5 +1587,3 @@ func TestAllocatedUnpreparedCPUsTreatedAsConsumed(t *testing.T) {
 	require.False(t, view.free.Contains(1))
 	d.applyMu.Unlock()
 }
-
-
