@@ -24,6 +24,7 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr"
+	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
@@ -194,6 +195,7 @@ func stepClaims(step []defrag.Move) []types.UID {
 // has not settled holds up nothing but itself.
 func (cp *CPUDriver) defragPass(ctx context.Context) {
 	logger := ctxlog.FromContext(ctx)
+	cp.reconcileMakeRoomTargets(ctx)
 	online, ok := cp.defragOnlineCPUs(logger)
 	if !ok {
 		return
@@ -252,7 +254,7 @@ func (cp *CPUDriver) runDefragRound(ctx context.Context, scope defragScope, onli
 	// what settles the exchange that fenced it, and until it does there is
 	// nothing to plan there.
 	cp.liftPoison(logger, scope.numaNodeID)
-	round := cp.beginDefragRound(logger, scope, online)
+	round := cp.beginDefragRound(ctx, logger, scope, online)
 	if round == nil {
 		cp.republishStaleSlicesLocking(ctx)
 		return cpumetrics.ResultSuccess
@@ -560,10 +562,7 @@ func (cp *CPUDriver) currentOnlineCPUs(logger logr.Logger) (cpuset.CPUSet, error
 	return cpuinfo.OnlineCPUs(logger, cp.sysfs)
 }
 
-// beginDefragRound plans one scope's moves, reserves them, and records each
-// claim's new placement in its CDI spec. It returns nil when there is nothing to
-// do.
-func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, online cpuset.CPUSet) *defragRound {
+func (cp *CPUDriver) beginDefragRound(ctx context.Context, logger logr.Logger, scope defragScope, online cpuset.CPUSet) *defragRound {
 	cp.applyMu.Lock()
 	defer cp.applyMu.Unlock()
 
@@ -586,6 +585,52 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, onl
 			logger.Info("active exact plan no longer matches ledger; aborting and clearing exact plan", "numaNode", scope.numaNodeID)
 			cp.clearActiveExactPlan(scope.numaNodeID)
 			cp.cpuAllocationStore.ReleaseClosure(scope.numaNodeID)
+		}
+	}
+
+	if len(moves) == 0 && len(cp.makeRoomTargets) > 0 {
+		var targetUIDs []string
+		for uid, target := range cp.makeRoomTargets {
+			tPart := target.partition
+			if tPart == "" {
+				tPart = device.DefaultPartitionName
+			}
+			sPart := scope.partition
+			if sPart == "" {
+				sPart = device.DefaultPartitionName
+			}
+			if target.numaNodeID == scope.numaNodeID && tPart == sPart {
+				targetUIDs = append(targetUIDs, string(uid))
+			}
+		}
+		slices.Sort(targetUIDs)
+		view, ok := cp.defragView(logger, scope, online)
+		if ok {
+			for _, uidStr := range targetUIDs {
+				target := cp.makeRoomTargets[types.UID(uidStr)]
+				if view.topology.CPUsInCache(target.cacheID).IsSubsetOf(view.free) {
+					continue
+				}
+				goal := defrag.GoalFreeCache{CacheID: target.cacheID}
+				sel := cp.defragSelector(logger, view.threadsPerCore)
+				opts := defrag.ExactOptions{
+					Eligible:   cp.claimMovableForExact,
+					AllowSwaps: cp.defrag.allowTransientOverlap,
+				}
+				inFlight := cp.allocatedUnpreparedCPUs(scope.numaNodeID)
+				plan, err := defrag.ExactSearch(view.topology, view.placements, view.free, inFlight, goal, sel, opts)
+				if err == nil && plan.Status.Feasible() && len(plan.Moves) > 0 {
+					closure := plan.ComputeClosure()
+					cp.cpuAllocationStore.ReserveClosure(scope.numaNodeID, closure)
+					cp.setActiveExactPlan(scope.numaNodeID, &plan)
+					moves = plan.Moves
+					break
+				}
+				if plan.Status == defrag.SearchUnreachable {
+					delete(cp.makeRoomTargets, target.claimUID)
+					cp.recordClaimEventRef(ctx, target.namespace, target.name, target.claimUID, "MakeRoomUnreachable", "make-room target cache is unreachable within exact search bounds")
+				}
+			}
 		}
 	}
 
@@ -1005,6 +1050,92 @@ func (cp *CPUDriver) getActiveExactPlan(numaNodeID int) *defrag.ExactPlan {
 		return nil
 	}
 	return cp.activeExactPlans[numaNodeID]
+}
+
+func (cp *CPUDriver) reconcileMakeRoomTargets(ctx context.Context) {
+	if cp.cpuDeviceGroupBy != device.GROUP_BY_UNCORE_CACHE || cp.claimReader == nil {
+		return
+	}
+	projected, err := cp.claimReader.GetProjectedClaims()
+	if err != nil || projected == nil {
+		return
+	}
+
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
+	if cp.makeRoomTargets == nil {
+		cp.makeRoomTargets = make(map[types.UID]*makeRoomTarget)
+	}
+
+	projectedMap := make(map[types.UID]v1alpha1.ProjectedClaim, len(projected.Claims))
+	for _, pc := range projected.Claims {
+		projectedMap[types.UID(pc.UID)] = pc
+	}
+
+	for uid, target := range cp.makeRoomTargets {
+		pc, exists := projectedMap[uid]
+		if !exists {
+			delete(cp.makeRoomTargets, uid)
+			cp.recordClaimEventRef(ctx, target.namespace, target.name, uid, "MakeRoomDropped", "claim deleted from projected claims")
+			continue
+		}
+		if pc.State == v1alpha1.ClaimStateDeallocated {
+			delete(cp.makeRoomTargets, uid)
+			cp.recordClaimEventRef(ctx, target.namespace, target.name, uid, "MakeRoomDropped", "claim deallocated")
+			continue
+		}
+	}
+
+	if cp.cpuAllocationStore == nil {
+		return
+	}
+	preparedCPUs := cp.cpuAllocationStore.GetPreparedCPUs()
+	hasNewTarget := false
+	for _, pc := range projected.Claims {
+		if pc.State != v1alpha1.ClaimStateAllocated {
+			continue
+		}
+		uid := types.UID(pc.UID)
+		if _, ok := cp.makeRoomTargets[uid]; ok {
+			continue
+		}
+		if _, ok := cp.cpuAllocationStore.GetClaimRecord(uid); ok {
+			continue
+		}
+		if !pc.IsNeverSplit() {
+			continue
+		}
+		for _, dev := range pc.Devices {
+			devCPUs, ok := cp.topology.deviceNameToCPUs[dev.Device]
+			if !ok {
+				continue
+			}
+			if !devCPUs.Intersection(preparedCPUs).IsEmpty() {
+				cacheID := cp.topology.deviceNameToUncoreCacheID[dev.Device]
+				numaNodeID := cp.topology.deviceNameToNUMANodeID[dev.Device]
+				partition := cp.devicePartition(dev.Device)
+				if partition == "" {
+					partition = device.DefaultPartitionName
+				}
+				cp.makeRoomTargets[uid] = &makeRoomTarget{
+					claimUID:   uid,
+					namespace:  pc.Namespace,
+					name:       pc.Name,
+					cacheID:    cacheID,
+					numaNodeID: numaNodeID,
+					partition:  partition,
+					device:     dev.Device,
+				}
+				hasNewTarget = true
+				break
+			}
+		}
+	}
+
+	if hasNewTarget {
+		cp.requestReconcile()
+	}
 }
 
 // largestAlignableFreeCPUs is the most CPUs still free inside a single uncore

@@ -2700,6 +2700,12 @@ func TestPrepareRefusesAClaimWhoseRecordedDeviceIsFull(t *testing.T) {
 	require.InDelta(t, 0, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
 		map[string]string{"shape": opaqueapi.ShapeFlexible}), 0.01)
 
+	d.applyMu.Lock()
+	target, hasTarget := d.makeRoomTargets[claim.UID]
+	require.True(t, hasTarget)
+	require.Equal(t, d.topology.deviceNameToUncoreCacheID[cache1], target.cacheID)
+	d.applyMu.Unlock()
+
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		events, err := client.CoreV1().Events(claim.Namespace).List(context.Background(), metav1.ListOptions{})
 		assert.NoError(c, err)
