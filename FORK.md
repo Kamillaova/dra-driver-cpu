@@ -89,9 +89,9 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `cdiRelocatableAnnotation`, `cdiEnvDynamicValue`, `GetDeviceAllocations`, `cdiRequestPlacement`,
   `encodePlacements`, `decodePlacements`, `decodeRecordedDevices`
 
-- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries` and
-  `defragRetryDue`, `cgroupfs`, `poisonedNodes`, `publishedCorrection`, `storedSlices` and
-  `placementPolicy` fields, `deviceTopology.deviceIsPool`, `Providers.CgroupFS` and
+- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `activeExactPlans`,
+  `defragRetries` and `defragRetryDue`, `cgroupfs`, `poisonedNodes`, `publishedCorrection`,
+  `storedSlices` and `placementPolicy` fields, `deviceTopology.deviceIsPool`, `Providers.CgroupFS` and
   `EnsureCgroupFS`, and `Config.DefragEnabled` and `Config.DefragAllowTransientOverlap`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
