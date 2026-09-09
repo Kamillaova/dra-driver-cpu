@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -65,6 +66,20 @@ const (
 	// which is both the field's default and the right reading of a spec written
 	// before the driver recorded it.
 	cdiRelocatableAnnotation = "dra.cpu/relocatable"
+
+	// cdiRoundIDAnnotation records the defragmentation round currently in flight
+	// for this claim.
+	cdiRoundIDAnnotation = "dra.cpu/round.id"
+
+	// cdiRoundOriginAnnotation records the CPUs this claim held before the round.
+	cdiRoundOriginAnnotation = "dra.cpu/round.origin"
+
+	// cdiRoundTargetAnnotation records the CPUs this round is moving the claim to.
+	cdiRoundTargetAnnotation = "dra.cpu/round.target"
+
+	// cdiRoundPartnersAnnotation records the other claims participating in the
+	// same swap exchange.
+	cdiRoundPartnersAnnotation = "dra.cpu/round.partners"
 
 	// cdiEnvDynamicValue stands in for a cpuset in the injected variable when a
 	// claim's placement may change while its container runs.
@@ -144,6 +159,16 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 			return fmt.Errorf("failed to record the charged devices of CDI device %q: %w", deviceName, err)
 		}
 		annotations[cdiRecordedAnnotation] = string(recorded)
+	}
+	if record.Round != nil && record.Round.RoundID != "" {
+		annotations[cdiRoundIDAnnotation] = record.Round.RoundID
+		annotations[cdiRoundOriginAnnotation] = record.Round.Origin.String()
+		annotations[cdiRoundTargetAnnotation] = record.Round.Target.String()
+		partners, err := json.Marshal(record.Round.Partners)
+		if err != nil {
+			return fmt.Errorf("failed to record round partners of CDI device %q: %w", deviceName, err)
+		}
+		annotations[cdiRoundPartnersAnnotation] = string(partners)
 	}
 
 	spec := &cdiSpec.Spec{
@@ -236,12 +261,37 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			cdiRecordedAnnotation, device.Annotations[cdiRecordedAnnotation], deviceName, err)
 	}
 
+	var roundProv *store.RoundProvenance
+	if roundID, ok := device.Annotations[cdiRoundIDAnnotation]; ok && roundID != "" {
+		origin, err := cpuset.Parse(device.Annotations[cdiRoundOriginAnnotation])
+		if err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
+				cdiRoundOriginAnnotation, device.Annotations[cdiRoundOriginAnnotation], deviceName, err)
+		}
+		target, err := cpuset.Parse(device.Annotations[cdiRoundTargetAnnotation])
+		if err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
+				cdiRoundTargetAnnotation, device.Annotations[cdiRoundTargetAnnotation], deviceName, err)
+		}
+		partners, err := decodeRoundPartners(device.Annotations[cdiRoundPartnersAnnotation])
+		if err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
+				cdiRoundPartnersAnnotation, device.Annotations[cdiRoundPartnersAnnotation], deviceName, err)
+		}
+		roundProv = &store.RoundProvenance{
+			RoundID:  roundID,
+			Origin:   origin,
+			Target:   target,
+			Partners: partners,
+		}
+	}
+
 	if recorded, ok := device.Annotations[cdiPlacementsAnnotation]; ok {
 		requests, err := decodePlacements(recorded)
 		if err != nil {
 			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiPlacementsAnnotation, recorded, deviceName, err)
 		}
-		return store.ClaimRecord{Requests: requests, Relocatable: relocatable, Recorded: charged}, nil
+		return store.ClaimRecord{Requests: requests, Relocatable: relocatable, Recorded: charged, Round: roundProv}, nil
 	}
 
 	if recorded, ok := device.Annotations[cdiCPUSetAnnotation]; ok {
@@ -253,6 +303,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
 			Relocatable: relocatable,
 			Recorded:    charged,
+			Round:       roundProv,
 		}, nil
 	}
 
@@ -265,9 +316,26 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
 			Relocatable: relocatable,
 			Recorded:    charged,
+			Round:       roundProv,
 		}, nil
 	}
 	return store.ClaimRecord{}, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
+}
+
+func decodeRoundPartners(recorded string) ([]types.UID, error) {
+	if recorded == "" {
+		return nil, nil
+	}
+	var partners []types.UID
+	if err := json.Unmarshal([]byte(recorded), &partners); err == nil {
+		return partners, nil
+	}
+	for _, p := range strings.Split(recorded, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			partners = append(partners, types.UID(p))
+		}
+	}
+	return partners, nil
 }
 
 // decodeRecordedDevices reads the charged amounts back. An absent annotation is

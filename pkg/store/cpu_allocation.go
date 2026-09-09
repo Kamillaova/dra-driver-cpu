@@ -57,6 +57,15 @@ func UnionOf(requests []RequestAllocation) cpuset.CPUSet {
 	return union
 }
 
+// RoundProvenance records a defragmentation round in flight when the claim's
+// placement was written.
+type RoundProvenance struct {
+	RoundID  string
+	Origin   cpuset.CPUSet
+	Target   cpuset.CPUSet
+	Partners []types.UID
+}
+
 // ClaimRecord is everything the driver records for one prepared claim: what each
 // of its requests holds, and whether the claim permits those CPUs to change
 // while its containers run.
@@ -74,6 +83,9 @@ type ClaimRecord struct {
 	// is empty for a claim that was given no CPUs of its own, and for one whose
 	// record on disk was written before the driver kept this.
 	Recorded map[string]int
+	// Round is the defragmentation round in flight when this record was written
+	// to disk, or nil when no round is active for the claim.
+	Round *RoundProvenance
 }
 
 // CPUAllocation is the single source of truth for CPU allocations.

@@ -19,12 +19,14 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
@@ -49,6 +51,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	podConfigStore := store.NewPodConfig()
 	claimTracker := store.NewClaimTracker()
 	var containerUpdates []*api.ContainerUpdate
+	var claimsToClearRound []types.UID
 	cdiCacheRefreshAttempted := false
 
 	for _, pod := range pods {
@@ -75,12 +78,14 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					caLogger.Info("ignoring claim the runtime injected no CDI device for during synchronize")
 					continue
 				}
+
 				if !cdiCacheRefreshAttempted {
 					err = cp.cdiMgr.Refresh()
 					cdiCacheRefreshAttempted = true
 					if err != nil {
 						logger.Error(err, "failed to refresh CDI cache, continuing with available CDI devices")
 					}
+					cp.reconcileActiveRounds(logger)
 				}
 
 				deviceName := getCDIDeviceName(uid)
@@ -146,14 +151,78 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					return nil, err
 				}
 				cLogger.V(2).Info("found guaranteed CPUs", "cpus", allGuaranteedCPUs.String())
-				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...).WithCgroup(container.GetLinux().GetCgroupsPath())
-
-				// Reconcile guaranteed container CPU mask.
-				guaranteedUpdate := &api.ContainerUpdate{
-					ContainerId: container.GetId(),
+				cgroupsPath := ""
+				if linux := container.GetLinux(); linux != nil {
+					cgroupsPath = linux.GetCgroupsPath()
 				}
-				guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
-				containerUpdates = append(containerUpdates, guaranteedUpdate)
+				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...).WithCgroup(cgroupsPath)
+
+				originUnion := cpuset.New()
+				targetUnion := cpuset.New()
+				hadRound := false
+				for _, uid := range claimUIDs {
+					rec, err := cp.cdiMgr.GetDeviceAllocations(getCDIDeviceName(uid))
+					if err == nil && rec.Round != nil && rec.Round.RoundID != "" {
+						hadRound = true
+						originUnion = originUnion.Union(rec.Round.Origin)
+						targetUnion = targetUnion.Union(rec.Round.Target)
+					} else if claimCPUs, ok := cpuAllocationStore.GetResourceClaimAllocation(uid); ok {
+						originUnion = originUnion.Union(claimCPUs)
+						targetUnion = targetUnion.Union(claimCPUs)
+					}
+				}
+				if !hadRound {
+					originUnion = allGuaranteedCPUs
+					targetUnion = allGuaranteedCPUs
+				}
+
+				var committedCPUs cpuset.CPUSet
+				if linux := container.GetLinux(); linux != nil {
+					if res := linux.GetResources(); res != nil && res.GetCpu() != nil {
+						committedCPUs, _ = cpuset.Parse(res.GetCpu().GetCpus())
+					}
+				}
+
+				var kernelCPUs cpuset.CPUSet
+				var kernelErr error
+				if cp.cgroupfs != nil && cgroupsPath != "" {
+					kernelCPUs, kernelErr = cgroupfs.CPUSet(cp.cgroupfs, cgroupsPath)
+				} else if cp.cgroupfs != nil || cgroupsPath != "" {
+					kernelErr = fmt.Errorf("cgroupfs is not mounted or cgroupsPath is empty")
+				}
+
+				classification := cp.classifyContainer(allGuaranteedCPUs, committedCPUs, kernelCPUs, originUnion, targetUnion, kernelErr)
+				switch classification {
+				case containerSettled:
+					cLogger.V(2).Info("owned container is settled", "cpus", allGuaranteedCPUs.String())
+					if hadRound {
+						claimsToClearRound = append(claimsToClearRound, claimUIDs...)
+					}
+				case containerForwardApplicable:
+					cLogger.Info("owned container is forward-applicable, converging", "cpus", allGuaranteedCPUs.String())
+					guaranteedUpdate := &api.ContainerUpdate{
+						ContainerId: container.GetId(),
+					}
+					guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
+					containerUpdates = append(containerUpdates, guaranteedUpdate)
+					if hadRound {
+						claimsToClearRound = append(claimsToClearRound, claimUIDs...)
+					}
+				case containerRollbackApplicable:
+					cLogger.Info("owned container is rollback-applicable, reverting", "cpus", allGuaranteedCPUs.String())
+					guaranteedUpdate := &api.ContainerUpdate{
+						ContainerId: container.GetId(),
+					}
+					guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
+					containerUpdates = append(containerUpdates, guaranteedUpdate)
+					if hadRound {
+						claimsToClearRound = append(claimsToClearRound, claimUIDs...)
+					}
+				case containerUnknown:
+					cLogger.Error(kernelErr, "owned container is in unknown state from three-way check, poisoning NUMA node",
+						"desired", allGuaranteedCPUs.String(), "committed", committedCPUs.String(), "kernel", kernelCPUs.String())
+					cp.poisonNUMANodeForCPUs(cLogger, allGuaranteedCPUs.Union(originUnion).Union(kernelCPUs))
+				}
 			}
 			podConfigStore.SetContainerState(types.UID(pod.GetUid()), state)
 			cLogger.V(6).Info("set container state", "claims", len(claimUIDs))
@@ -164,6 +233,10 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	cp.cpuAllocationStore = cpuAllocationStore
 	cp.claimTracker = claimTracker
 	cp.refreshAllocationMetrics()
+
+	for _, uid := range claimsToClearRound {
+		_ = cp.writeClaimPlacement(logger, uid)
+	}
 
 	// Reconcile container CPU masks to handle cases where the NRI plugin might have crashed
 	// or restarted and missed updating the cgroup settings.
@@ -529,4 +602,120 @@ func (cp *CPUDriver) RemoveContainer(ctx context.Context, pod *api.PodSandbox, c
 	// we leaked state and StopContainer didn't clean up properly.
 	cp.metrics.RecordNRIRemoveContainer(nil, len(claimUIDs), time.Since(startTime))
 	return nil
+}
+
+type containerClassification int
+
+const (
+	containerSettled containerClassification = iota
+	containerForwardApplicable
+	containerRollbackApplicable
+	containerUnknown
+)
+
+func (cp *CPUDriver) classifyContainer(desired, committed, kernel, origin, target cpuset.CPUSet, kernelErr error) containerClassification {
+	if kernelErr != nil {
+		return containerUnknown
+	}
+
+	if kernel.IsEmpty() {
+		if committed.IsEmpty() {
+			if desired.Equals(target) {
+				return containerForwardApplicable
+			}
+			return containerRollbackApplicable
+		}
+		if committed.Equals(desired) {
+			return containerSettled
+		}
+		if desired.Equals(target) && committed.Equals(origin) {
+			return containerForwardApplicable
+		}
+		if desired.Equals(origin) && committed.Equals(target) {
+			return containerRollbackApplicable
+		}
+		return containerUnknown
+	}
+
+	if kernel.Equals(desired) && (committed.IsEmpty() || committed.Equals(desired)) {
+		return containerSettled
+	}
+
+	if desired.Equals(target) {
+		if (kernel.Equals(origin) || kernel.Equals(target)) && (committed.IsEmpty() || committed.Equals(origin) || committed.Equals(target)) {
+			return containerForwardApplicable
+		}
+		return containerUnknown
+	}
+
+	if desired.Equals(origin) {
+		if (kernel.Equals(target) || committed.Equals(target)) && (kernel.Equals(origin) || kernel.Equals(target)) && (committed.IsEmpty() || committed.Equals(origin) || committed.Equals(target)) {
+			return containerRollbackApplicable
+		}
+		if kernel.Equals(origin) && (committed.IsEmpty() || committed.Equals(origin)) {
+			return containerSettled
+		}
+		return containerUnknown
+	}
+
+	return containerUnknown
+}
+
+func (cp *CPUDriver) reconcileActiveRounds(logger logr.Logger) {
+	allocations := cp.cdiMgr.PreparedClaimAllocations(logger)
+	if len(allocations) == 0 {
+		return
+	}
+
+	rounds := make(map[string]map[types.UID]store.ClaimRecord)
+	for uid, record := range allocations {
+		if record.Round != nil && record.Round.RoundID != "" {
+			if rounds[record.Round.RoundID] == nil {
+				rounds[record.Round.RoundID] = make(map[types.UID]store.ClaimRecord)
+			}
+			rounds[record.Round.RoundID][uid] = record
+		}
+	}
+
+	if len(rounds) == 0 {
+		return
+	}
+
+	for roundID, participants := range rounds {
+		isComplete := true
+		for uid, rec := range participants {
+			for _, partnerUID := range rec.Round.Partners {
+				partnerRec, exists := participants[partnerUID]
+				if !exists {
+					isComplete = false
+					break
+				}
+				if !slices.Contains(partnerRec.Round.Partners, uid) {
+					isComplete = false
+					break
+				}
+			}
+			if !isComplete {
+				break
+			}
+		}
+
+		if isComplete {
+			logger.Info("active defrag round is complete, converging forward", "roundID", roundID, "participants", len(participants))
+			continue
+		}
+
+		logger.Info("active defrag round is incomplete, reverting to origin", "roundID", roundID, "participants", len(participants))
+		for uid, rec := range participants {
+			origin := rec.Round.Origin
+			if len(rec.Requests) > 0 && !origin.IsEmpty() {
+				rec.Requests[0].CPUs = origin
+			}
+			envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, uid, cp.cdiEnvValue(rec))
+			if err := cp.cdiMgr.AddDevice(logger, getCDIDeviceName(uid), envVar, rec); err != nil {
+				logger.Error(err, "failed to revert incomplete round CDI spec", "roundID", roundID, "claimUID", uid)
+			}
+		}
+		_ = cp.cdiMgr.Refresh()
+	}
 }
