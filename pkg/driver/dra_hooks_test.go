@@ -1939,6 +1939,20 @@ func testClaim(claimUID types.UID, driverName, poolName string, consumedCapacity
 	}
 }
 
+func testFlexibleClaim(claimUID types.UID, driverName, poolName string, consumedCapacity map[string]int64) *resourceapi.ResourceClaim {
+	claim := testClaim(claimUID, driverName, poolName, consumedCapacity)
+	claim.Spec.Devices.Requests = []resourceapi.DeviceRequest{
+		{
+			Name: string(claimUID),
+			FirstAvailable: []resourceapi.DeviceSubRequest{
+				{Name: "sub0"},
+				{Name: "sub1"},
+			},
+		},
+	}
+	return claim
+}
+
 func testClaimWithOpaqueConfig(claimUID types.UID, driverName, poolName string, consumedCapacity map[string]int64, cpusetVal string) *resourceapi.ResourceClaim {
 	claim := testClaim(claimUID, driverName, poolName, consumedCapacity)
 	claim.Status.Allocation.Devices.Config = []resourceapi.DeviceAllocationConfiguration{
@@ -2625,8 +2639,10 @@ func newCacheGroupedPrepareDriver(t *testing.T) (*CPUDriver, devattr.GroupedDevi
 			deviceNameToSocketID:   map[string]int{},
 			deviceNameToNUMANodeID: built.NameToID,
 			deviceNameToCPUs:       built.CPUs,
-			deviceNameToRole:       built.Roles,
-			deviceThreadsPerCore:   built.ThreadsPerCore,
+			deviceNameToRole:          built.Roles,
+			deviceNameToPartition:     built.Partitions,
+			deviceNameToUncoreCacheID: built.UncoreCacheID,
+			deviceThreadsPerCore:      built.ThreadsPerCore,
 		},
 		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 		podConfigStore:     store.NewPodConfig(),
@@ -2736,6 +2752,261 @@ func TestPrepareRecordsTheDeviceItsAllocationCharged(t *testing.T) {
 	record, ok := d.cpuAllocationStore.GetClaimRecord("claim-cache1")
 	require.True(t, ok)
 	require.Equal(t, map[string]int{cache1: 4}, record.Recorded)
+}
+
+func TestPrepareRehomesFlexibleClaimWhenRecordedDeviceFull(t *testing.T) {
+	logger := testr.New(t)
+	d, built := newCacheGroupedPrepareDriver(t)
+	cache0 := devattr.CPUDeviceCacheGroupedPrefix + "000"
+	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
+
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-sitting-there",
+		exclusiveOn(built.CPUs[cache1]), false))
+
+	claim := testFlexibleClaim("claim-flexible", testDriverName, testNodeName, map[string]int64{cache1: 4})
+	result := d.prepareGroupedResourceClaim(context.Background(), logger, claim, defaultPlacement)
+	require.NoError(t, result.Err)
+
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-flexible")
+	require.True(t, ok)
+	require.Equal(t, 4, got.Size())
+	require.True(t, got.IsSubsetOf(built.CPUs[cache0]))
+
+	record, ok := d.cpuAllocationStore.GetClaimRecord("claim-flexible")
+	require.True(t, ok)
+	require.Equal(t, map[string]int{cache1: 4}, record.Recorded)
+
+	mirror := d.capacityMirror()
+	require.Equal(t, 4, mirror[cache1].departed)
+	require.Equal(t, 0, mirror[cache1].squatters)
+	require.Equal(t, 0, mirror[cache0].departed)
+	require.Equal(t, 4, mirror[cache0].squatters)
+}
+
+func new4CacheGroupedPrepareDriver(t *testing.T, policy coreselect.Policy) (*CPUDriver, devattr.GroupedDevices) {
+	t.Helper()
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 32 {
+		core := cpu % 16
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        core,
+			SocketID:      0,
+			NUMANodeID:    0,
+			UncoreCacheID: core / 4,
+			SiblingCPUID:  (cpu + 16) % 32,
+			CoreType:      cpuinfo.CoreTypePerformance,
+		})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+	online := topo.CPUDetails.CPUs()
+	built := devattr.BuildGrouped(logger, devattr.GROUP_BY_UNCORE_CACHE, topo, online, cpuset.New(),
+		store.NewPCIeRootMapper(), false, true, devattr.WithImplicitDefault(nil, online))
+	return &CPUDriver{
+		driverName:       testDriverName,
+		cpuDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		cpuDeviceGroupBy: devattr.GROUP_BY_UNCORE_CACHE,
+		placementPolicy:  policy,
+		topology: deviceTopology{
+			cpuTopology:               topo,
+			onlineCPUs:                online,
+			deviceNameToSocketID:      map[string]int{},
+			deviceNameToNUMANodeID:    built.NameToID,
+			deviceNameToCPUs:          built.CPUs,
+			deviceNameToRole:          built.Roles,
+			deviceNameToPartition:     built.Partitions,
+			deviceNameToUncoreCacheID: built.UncoreCacheID,
+			deviceThreadsPerCore:      built.ThreadsPerCore,
+		},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		podConfigStore:     store.NewPodConfig(),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgr(),
+	}, built
+}
+
+func TestPrepareRehomesFlexibleClaimSpreadSelectsCleanestCache(t *testing.T) {
+	logger := testr.New(t)
+	d, built := new4CacheGroupedPrepareDriver(t, coreselect.Spread)
+	c0 := devattr.CPUDeviceCacheGroupedPrefix + "000"
+	c1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
+	c2 := devattr.CPUDeviceCacheGroupedPrefix + "002"
+
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-c0",
+		exclusiveOn(built.CPUs[c0]), false))
+
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-c1",
+		exclusiveOn(cpuset.New(4, 5, 20, 21)), false))
+
+	claim := testFlexibleClaim("claim-spread", testDriverName, testNodeName, map[string]int64{c0: 4})
+	result := d.prepareGroupedResourceClaim(context.Background(), logger, claim, defaultPlacement)
+	require.NoError(t, result.Err)
+
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-spread")
+	require.True(t, ok)
+	require.True(t, got.IsSubsetOf(built.CPUs[c2]))
+	require.False(t, got.IsSubsetOf(built.CPUs[c1]))
+}
+
+func TestPrepareRehomesFlexibleClaimPackSelectsFullestCache(t *testing.T) {
+	logger := testr.New(t)
+	d, built := new4CacheGroupedPrepareDriver(t, coreselect.Pack)
+	c0 := devattr.CPUDeviceCacheGroupedPrefix + "000"
+	c1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
+
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-c0",
+		exclusiveOn(built.CPUs[c0]), false))
+
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-c1",
+		exclusiveOn(cpuset.New(4, 5, 20, 21)), false))
+
+	claim := testFlexibleClaim("claim-pack", testDriverName, testNodeName, map[string]int64{c0: 4})
+	result := d.prepareGroupedResourceClaim(context.Background(), logger, claim, defaultPlacement)
+	require.NoError(t, result.Err)
+
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-pack")
+	require.True(t, ok)
+	require.True(t, got.IsSubsetOf(built.CPUs[c1]))
+}
+
+func TestPrepareRehomesFlexibleClaimNeverAcrossNUMA(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 16 {
+		numa := cpu / 8
+		core := cpu % 8
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        core,
+			SocketID:      numa,
+			NUMANodeID:    numa,
+			UncoreCacheID: numa,
+			SiblingCPUID:  cpu ^ 4,
+			CoreType:      cpuinfo.CoreTypePerformance,
+		})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+	online := topo.CPUDetails.CPUs()
+	built := devattr.BuildGrouped(logger, devattr.GROUP_BY_UNCORE_CACHE, topo, online, cpuset.New(),
+		store.NewPCIeRootMapper(), false, true, devattr.WithImplicitDefault(nil, online))
+	reg := prometheus.NewRegistry()
+	d := &CPUDriver{
+		driverName:       testDriverName,
+		cpuDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		cpuDeviceGroupBy: devattr.GROUP_BY_UNCORE_CACHE,
+		placementPolicy:  coreselect.Pack,
+		metrics:          cpumetrics.New(reg),
+		topology: deviceTopology{
+			cpuTopology:               topo,
+			onlineCPUs:                online,
+			deviceNameToSocketID:      map[string]int{},
+			deviceNameToNUMANodeID:    built.NameToID,
+			deviceNameToCPUs:          built.CPUs,
+			deviceNameToRole:          built.Roles,
+			deviceNameToPartition:     built.Partitions,
+			deviceNameToUncoreCacheID: built.UncoreCacheID,
+			deviceThreadsPerCore:      built.ThreadsPerCore,
+		},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		podConfigStore:     store.NewPodConfig(),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgr(),
+	}
+
+	c0 := devattr.CPUDeviceCacheGroupedPrefix + "000"
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-c0",
+		exclusiveOn(built.CPUs[c0]), false))
+
+	claim := testFlexibleClaim("claim-flexible-cross", testDriverName, testNodeName, map[string]int64{c0: 4})
+	result := d.prepareGroupedResourceClaim(context.Background(), logger, claim, defaultPlacement)
+	require.ErrorContains(t, result.Err, "cannot hold the 4 CPUs")
+	require.InDelta(t, 1, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
+		map[string]string{"shape": opaqueapi.ShapeFlexible}), 0.01)
+	require.InDelta(t, 0, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
+		map[string]string{"shape": opaqueapi.ShapeNeverSplit}), 0.01)
+}
+
+func TestPrepareRehomesFlexibleClaimNeverOutsidePartition(t *testing.T) {
+	logger := testr.New(t)
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_2Caches_HT()}).GetCPUTopology(logger)
+	require.NoError(t, err)
+	online := topo.CPUDetails.CPUs()
+	partitions := []devattr.Partition{
+		{
+			Name: "partA",
+			Role: devattr.PARTITION_ROLE_EXCLUSIVE,
+			CPUs: cpuset.New(0, 1, 2, 3, 8, 9, 10, 11),
+		},
+		{
+			Name: "partB",
+			Role: devattr.PARTITION_ROLE_EXCLUSIVE,
+			CPUs: cpuset.New(4, 5, 6, 7, 12, 13, 14, 15),
+		},
+	}
+	built := devattr.BuildGrouped(logger, devattr.GROUP_BY_UNCORE_CACHE, topo, online, cpuset.New(),
+		store.NewPCIeRootMapper(), false, true, devattr.WithImplicitDefault(partitions, online))
+	reg := prometheus.NewRegistry()
+	d := &CPUDriver{
+		driverName:       testDriverName,
+		cpuDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		cpuDeviceGroupBy: devattr.GROUP_BY_UNCORE_CACHE,
+		placementPolicy:  coreselect.Pack,
+		metrics:          cpumetrics.New(reg),
+		topology: deviceTopology{
+			cpuTopology:               topo,
+			onlineCPUs:                online,
+			deviceNameToSocketID:      map[string]int{},
+			deviceNameToNUMANodeID:    built.NameToID,
+			deviceNameToCPUs:          built.CPUs,
+			deviceNameToRole:          built.Roles,
+			deviceNameToPartition:     built.Partitions,
+			deviceNameToUncoreCacheID: built.UncoreCacheID,
+			deviceThreadsPerCore:      built.ThreadsPerCore,
+		},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		podConfigStore:     store.NewPodConfig(),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgr(),
+	}
+
+	c0 := devattr.CPUDeviceCacheGroupedPrefix + "000-partA"
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-c0",
+		exclusiveOn(built.CPUs[c0]), false))
+
+	claim := testFlexibleClaim("claim-flexible-part", testDriverName, testNodeName, map[string]int64{c0: 4})
+	result := d.prepareGroupedResourceClaim(context.Background(), logger, claim, defaultPlacement)
+	require.ErrorContains(t, result.Err, "cannot hold the 4 CPUs")
+	require.InDelta(t, 1, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
+		map[string]string{"shape": opaqueapi.ShapeFlexible}), 0.01)
+}
+
+func TestPrepareNeverRehomesNeverSplitClaim(t *testing.T) {
+	logger := testr.New(t)
+	d, built := newCacheGroupedPrepareDriver(t)
+	reg := prometheus.NewRegistry()
+	d.metrics = cpumetrics.New(reg)
+	c0 := devattr.CPUDeviceCacheGroupedPrefix + "000"
+	c1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
+
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-c0",
+		exclusiveOn(built.CPUs[c0]), false))
+
+	claim := testClaim("claim-never-split", testDriverName, testNodeName, map[string]int64{c0: 4})
+	result := d.prepareGroupedResourceClaim(context.Background(), logger, claim, defaultPlacement)
+	require.ErrorContains(t, result.Err, "cannot hold the 4 CPUs")
+
+	_, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-never-split")
+	require.False(t, ok)
+
+	require.True(t, d.cpuAllocationStore.GetSharedCPUs().Intersection(built.CPUs[c1]).Equals(built.CPUs[c1]))
+
+	require.InDelta(t, 1, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
+		map[string]string{"shape": opaqueapi.ShapeNeverSplit}), 0.01)
+	require.InDelta(t, 0, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
+		map[string]string{"shape": opaqueapi.ShapeFlexible}), 0.01)
 }
 
 // TestReplayedPrepareRecoversTheChargedDevice: a store rebuilt from a spec
