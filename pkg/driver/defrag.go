@@ -108,6 +108,7 @@ const (
 // defragRound is one scope's set of moves that has been reserved and written
 // to disk and is waiting for the runtime to confirm it.
 type defragRound struct {
+	id      string
 	scope   defragScope
 	moves   []defrag.Move
 	updates []*api.ContainerUpdate
@@ -134,6 +135,7 @@ type defragRound struct {
 
 func newDefragRound(scope defragScope, allocations *store.CPUAllocation) *defragRound {
 	return &defragRound{
+		id:                 generateShortID(opIDLen),
 		scope:              scope,
 		exchangeContainers: map[int][]types.UID{},
 		updateByContainer:  map[types.UID]*api.ContainerUpdate{},
@@ -588,7 +590,7 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, onl
 
 	round := newDefragRound(scope, cp.cpuAllocationStore)
 	for _, step := range defragSteps(moves) {
-		if !cp.beginDefragStep(logger, step) {
+		if !cp.beginDefragStep(logger, round, step) {
 			continue
 		}
 		round.moves = append(round.moves, step...)
@@ -616,7 +618,7 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, onl
 // claims on the same CPUs with nothing left to undo it.
 //
 // Called with applyMu held.
-func (cp *CPUDriver) beginDefragStep(logger logr.Logger, step []defrag.Move) bool {
+func (cp *CPUDriver) beginDefragStep(logger logr.Logger, round *defragRound, step []defrag.Move) bool {
 	logger = logger.WithValues("claimUIDs", stepClaims(step))
 	if step[0].Exchange == 0 {
 		move := step[0]
@@ -639,7 +641,19 @@ func (cp *CPUDriver) beginDefragStep(logger logr.Logger, step []defrag.Move) boo
 	// rebuilds the store from, so it has to name the target before the container
 	// is told about it.
 	for _, move := range step {
-		if err := cp.writeClaimPlacement(logger.WithValues("claimUID", move.ClaimUID), move.ClaimUID); err != nil {
+		partners := make([]types.UID, 0, len(step)-1)
+		for _, other := range step {
+			if other.ClaimUID != move.ClaimUID {
+				partners = append(partners, other.ClaimUID)
+			}
+		}
+		roundProv := &store.RoundProvenance{
+			RoundID:  round.id,
+			Origin:   move.From,
+			Target:   move.To,
+			Partners: partners,
+		}
+		if err := cp.writeClaimPlacementWithRound(logger.WithValues("claimUID", move.ClaimUID), move.ClaimUID, roundProv); err != nil {
 			logger.Error(err, "cannot record new placement, leaving the claims where they are", "claimUID", move.ClaimUID, "to", move.To.String())
 			cp.abortMoves(logger, step)
 			return false
@@ -1001,10 +1015,15 @@ func claimMovableIn(allocations *store.CPUAllocation, claimUID types.UID) bool {
 // which only learns of a spec when it is refreshed and so cannot be relied on to
 // know about a claim this driver prepared itself.
 func (cp *CPUDriver) writeClaimPlacement(logger logr.Logger, claimUID types.UID) error {
+	return cp.writeClaimPlacementWithRound(logger, claimUID, nil)
+}
+
+func (cp *CPUDriver) writeClaimPlacementWithRound(logger logr.Logger, claimUID types.UID, round *store.RoundProvenance) error {
 	record, ok := cp.cpuAllocationStore.GetClaimRecord(claimUID)
 	if !ok {
 		return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
 	}
+	record.Round = round
 	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cp.cdiEnvValue(record))
 	return cp.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID), envVar, record)
 }
@@ -1106,6 +1125,9 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 				sLogger.Error(err, "cannot complete the move")
 				reverted++
 				continue
+			}
+			if err := cp.writeClaimPlacement(sLogger, move.ClaimUID); err != nil {
+				sLogger.Error(err, "cannot clear round provenance from recorded placement", "claimUID", move.ClaimUID)
 			}
 			committed++
 			continue
@@ -1211,6 +1233,11 @@ func (cp *CPUDriver) settleExchangeStep(logger logr.Logger, round *defragRound, 
 			logger.Error(err, "cannot complete the exchange")
 			round.outcomes[exchange] = exchangeUnsettled
 			return false
+		}
+		for _, move := range step {
+			if err := cp.writeClaimPlacement(logger, move.ClaimUID); err != nil {
+				logger.Error(err, "cannot clear round provenance from recorded placement", "claimUID", move.ClaimUID)
+			}
 		}
 		return true
 	case exchangeUndone:
