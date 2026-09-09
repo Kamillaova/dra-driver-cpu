@@ -54,8 +54,8 @@ func verifySharedPoolAfterRelease(ctx context.Context, fxt *fixture.Fixture, shr
 	} else {
 		ginkgo.By("checking existing shared containers keep their last cpuset until the next CreateContainer or Synchronize")
 	}
-	gomega.Eventually(observeAssignedCPUs(ctx, fxt, shrPod1)).WithTimeout(1 * time.Minute).WithPolling(5 * time.Second).Should(cpusetmatchers.Equal(afterRelease), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(shrPod1))
-	gomega.Eventually(observeAssignedCPUs(ctx, fxt, shrPod2)).WithTimeout(1 * time.Minute).WithPolling(5 * time.Second).Should(cpusetmatchers.Equal(afterRelease), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(shrPod2))
+	gomega.Eventually(observeAssignedCPUs(ctx, fxt, shrPod1)).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(cpusetmatchers.Equal(afterRelease), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(shrPod1))
+	gomega.Eventually(observeAssignedCPUs(ctx, fxt, shrPod2)).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(cpusetmatchers.Equal(afterRelease), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(shrPod2))
 }
 
 /*

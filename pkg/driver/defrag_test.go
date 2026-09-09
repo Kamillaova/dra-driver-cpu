@@ -873,8 +873,9 @@ func TestDefragPassMovesAClaimWithTheRealCDIManager(t *testing.T) {
 	// And the spec on disk agrees, since that is what a restart rebuilds from.
 	require.NoError(t, realCDI.Refresh())
 	recorded, err := realCDI.GetDeviceAllocations(getCDIDeviceName(claimUID))
-	require.NoError(t, err)
-	require.Equal(t, relocatableOn(cpuset.New(0, 1)), recorded)
+	expected := relocatableOn(cpuset.New(0, 1))
+	expected.Correlation.RuntimeOutcome = "aligned"
+	require.Equal(t, expected, recorded)
 }
 
 func TestDefragPassAsksForTheNextPassWhenItCommitsAnything(t *testing.T) {

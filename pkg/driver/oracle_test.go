@@ -41,6 +41,7 @@ import (
 
 	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuallocator"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
 	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
@@ -56,15 +57,15 @@ type oracleTopologyConfig struct {
 }
 
 type oracleClaim struct {
-	uid           types.UID
-	namespace     string
-	name          string
-	size          int
-	relocatable   bool
-	alignment     v1alpha1.Alignment
-	flexible      bool
-	podUID        types.UID
-	containerName string
+	uid                 types.UID
+	namespace           string
+	name                string
+	size                int
+	relocatable         bool
+	alignment           v1alpha1.Alignment
+	flexible            bool
+	podUID              types.UID
+	containerName       string
 	containerUID        types.UID
 	sharedContainerUIDs []types.UID
 	chargedCache        string
@@ -196,6 +197,7 @@ func newOracleHarness(t *testing.T, cfg oracleTopologyConfig) *oracleHarness {
 		cdiMgr:           mockCDI,
 		containerUpdater: updater,
 		claimReader:      reader,
+		cpuAllocator:     cpuallocator.NewCPUManager("dra.cpu", topo),
 		metrics:          cpumetrics.New(reg),
 		cgroupfs:         cgroups,
 		poisonedNodes:    make(map[int]*poisonedNode),
@@ -217,7 +219,6 @@ func newOracleHarness(t *testing.T, cfg oracleTopologyConfig) *oracleHarness {
 		topology: deviceTopology{
 			cpuTopology:               topo,
 			reservedCPUs:              cpuset.New(),
-			onlineCPUs:                allCPUs,
 			deviceNameToCPUs:          make(map[string]cpuset.CPUSet),
 			deviceNameToUncoreCacheID: make(map[string]int),
 			deviceNameToNUMANodeID:    make(map[string]int),
@@ -730,7 +731,7 @@ func (h *oracleHarness) CrashAndRestart() {
 	oldD.defragRetries.ShutDown()
 
 	topo := h.baseTopology.cpuTopology
-	allCPUs := h.baseTopology.onlineCPUs
+	allCPUs := h.baseTopology.cpuTopology.CPUDetails.CPUs()
 
 	newD := &CPUDriver{
 		nodeName:         oldD.nodeName,
@@ -738,6 +739,7 @@ func (h *oracleHarness) CrashAndRestart() {
 		cdiMgr:           h.mockCDI,
 		containerUpdater: h.fakeUpdater,
 		claimReader:      h.claimReader,
+		cpuAllocator:     cpuallocator.NewCPUManager(oldD.driverName, topo),
 		metrics:          oldD.metrics,
 		cgroupfs:         h.cgroups,
 		poisonedNodes:    make(map[int]*poisonedNode),
@@ -1241,7 +1243,7 @@ func TestInvariantOracle_UnequalCacheSizesAgainstUncanonicalisedOracle(t *testin
 	})
 
 	topo := h.driver.topology.cpuTopology
-	dTopo, err := defrag.NewTopology(topo, 0, h.driver.topology.onlineCPUs)
+	dTopo, err := defrag.NewTopology(topo, 0, h.driver.topology.cpuTopology.CPUDetails.CPUs())
 	require.NoError(t, err)
 
 	claimA := defrag.Placement{ClaimUID: "claim-A", CPUs: cpuset.New(0, 1, 4, 5)}
