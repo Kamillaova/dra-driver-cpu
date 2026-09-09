@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
+	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
@@ -66,6 +67,9 @@ const (
 	// which is both the field's default and the right reading of a spec written
 	// before the driver recorded it.
 	cdiRelocatableAnnotation = "dra.cpu/relocatable"
+
+	// cdiAlignmentAnnotation records what the claim asks about landing split.
+	cdiAlignmentAnnotation = "dra.cpu/alignment"
 
 	// cdiRoundIDAnnotation records the defragmentation round currently in flight
 	// for this claim.
@@ -146,9 +150,14 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 	if err != nil {
 		return fmt.Errorf("failed to record the placement of CDI device %q: %w", deviceName, err)
 	}
+	alignment := record.Alignment
+	if alignment == "" {
+		alignment = v1alpha1.AlignmentBestEffort
+	}
 	annotations := map[string]string{
 		cdiPlacementsAnnotation:  placements,
 		cdiRelocatableAnnotation: strconv.FormatBool(record.Relocatable),
+		cdiAlignmentAnnotation:   string(alignment),
 	}
 	// A claim that charged nothing writes no annotation, so a spec is not made to
 	// carry the word for an empty answer. It reads back the same as one written
@@ -255,6 +264,10 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		return store.ClaimRecord{}, fmt.Errorf("failed to find CDI device %q", deviceName)
 	}
 	relocatable, _ := strconv.ParseBool(device.Annotations[cdiRelocatableAnnotation])
+	alignment := v1alpha1.Alignment(device.Annotations[cdiAlignmentAnnotation])
+	if alignment == "" {
+		alignment = v1alpha1.AlignmentBestEffort
+	}
 	charged, err := decodeRecordedDevices(device.Annotations[cdiRecordedAnnotation])
 	if err != nil {
 		return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
@@ -291,7 +304,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		if err != nil {
 			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiPlacementsAnnotation, recorded, deviceName, err)
 		}
-		return store.ClaimRecord{Requests: requests, Relocatable: relocatable, Recorded: charged, Round: roundProv}, nil
+		return store.ClaimRecord{Requests: requests, Relocatable: relocatable, Alignment: alignment, Recorded: charged, Round: roundProv}, nil
 	}
 
 	if recorded, ok := device.Annotations[cdiCPUSetAnnotation]; ok {
@@ -302,6 +315,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		return store.ClaimRecord{
 			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
 			Relocatable: relocatable,
+			Alignment:   alignment,
 			Recorded:    charged,
 			Round:       roundProv,
 		}, nil
@@ -315,6 +329,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		return store.ClaimRecord{
 			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
 			Relocatable: relocatable,
+			Alignment:   alignment,
 			Recorded:    charged,
 			Round:       roundProv,
 		}, nil

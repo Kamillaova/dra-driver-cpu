@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	"github.com/go-logr/logr"
+	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
@@ -78,6 +79,7 @@ type RoundProvenance struct {
 type ClaimRecord struct {
 	Requests    []RequestAllocation
 	Relocatable bool
+	Alignment   v1alpha1.Alignment
 	// Recorded is how many CPUs the claim's allocation charged to each device it
 	// names, which is what a scheduler subtracts from that device's capacity. It
 	// is empty for a claim that was given no CPUs of its own, and for one whose
@@ -99,6 +101,9 @@ type CPUAllocation struct {
 	// lastSwapGroup numbers the exchanges this store has begun, so that the
 	// participants of one can be told from the participants of another.
 	lastSwapGroup int
+	// closureReservations holds, per NUMA node, the reserved CPU closure of an
+	// in-flight exact repair plan.
+	closureReservations map[int]cpuset.CPUSet
 }
 
 type claimAllocation struct {
@@ -112,6 +117,7 @@ type claimAllocation struct {
 	// its members being unprepared while the batch is out.
 	swapGroup   int
 	relocatable bool
+	alignment   v1alpha1.Alignment
 	// recorded is what the claim's allocation charged each device it names.
 	recorded map[string]int
 }
@@ -124,6 +130,7 @@ func newClaimAllocation(record ClaimRecord) *claimAllocation {
 	return &claimAllocation{
 		byRequest:   byRequest,
 		relocatable: record.Relocatable,
+		alignment:   record.Alignment,
 		recorded:    maps.Clone(record.Recorded),
 	}
 }
@@ -253,10 +260,11 @@ func NewCPUAllocation(cpuTopology *cpuinfo.CPUTopology, reservedCPUs cpuset.CPUS
 	availableCPUs := allCPUsSet.Difference(reservedCPUs)
 
 	return &CPUAllocation{
-		availableCPUs: availableCPUs,
-		reservedCPUs:  reservedCPUs,
-		claims:        make(map[types.UID]*claimAllocation),
-		preparedCPUs:  cpuset.New(),
+		availableCPUs:       availableCPUs,
+		reservedCPUs:        reservedCPUs,
+		claims:              make(map[types.UID]*claimAllocation),
+		preparedCPUs:        cpuset.New(),
+		closureReservations: make(map[int]cpuset.CPUSet),
 	}
 }
 
@@ -641,8 +649,65 @@ func (s *CPUAllocation) GetClaimRecord(claimUID types.UID) (ClaimRecord, bool) {
 	return ClaimRecord{
 		Requests:    allocation.requests(),
 		Relocatable: allocation.relocatable,
+		Alignment:   allocation.alignment,
 		Recorded:    maps.Clone(allocation.recorded),
 	}, true
+}
+
+// Alignment returns a claim's alignment policy. Defaults to AlignmentBestEffort.
+func (s *CPUAllocation) Alignment(claimUID types.UID) v1alpha1.Alignment {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocation, ok := s.claims[claimUID]
+	if !ok || allocation.alignment == "" {
+		return v1alpha1.AlignmentBestEffort
+	}
+	return allocation.alignment
+}
+
+// IsRepairable reports whether a claim asked to be made whole by the driver when landing split.
+func (s *CPUAllocation) IsRepairable(claimUID types.UID) bool {
+	return s.Alignment(claimUID) == v1alpha1.AlignmentRepairable
+}
+
+// ReserveClosure holds an exact repair plan's closure for a NUMA node.
+func (s *CPUAllocation) ReserveClosure(numaNodeID int, closure cpuset.CPUSet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closureReservations == nil {
+		s.closureReservations = make(map[int]cpuset.CPUSet)
+	}
+	s.closureReservations[numaNodeID] = closure
+}
+
+// ReleaseClosure clears the reserved closure for a NUMA node.
+func (s *CPUAllocation) ReleaseClosure(numaNodeID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closureReservations != nil {
+		delete(s.closureReservations, numaNodeID)
+	}
+}
+
+// ReservedClosures returns the union of all currently reserved plan closures across NUMA nodes.
+func (s *CPUAllocation) ReservedClosures() cpuset.CPUSet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	all := cpuset.New()
+	for _, c := range s.closureReservations {
+		all = all.Union(c)
+	}
+	return all
+}
+
+// ReservedClosure returns the reserved closure for a specific NUMA node.
+func (s *CPUAllocation) ReservedClosure(numaNodeID int) cpuset.CPUSet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closureReservations == nil {
+		return cpuset.New()
+	}
+	return s.closureReservations[numaNodeID]
 }
 
 // SetRecordedDevices records what a claim's allocation charged each device,

@@ -24,6 +24,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
+	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
@@ -1203,4 +1204,61 @@ func TestSetRecordedDevices(t *testing.T) {
 	got, ok = store.GetClaimRecord("claim-legacy")
 	require.True(t, ok)
 	require.Equal(t, map[string]int{"cpudevcache000": 2}, got.Recorded)
+}
+
+func TestClaimRecordAlignment(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3), cpuset.New())
+
+	record := ClaimRecord{
+		Requests:    []RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: RoleExclusive}},
+		Relocatable: true,
+		Alignment:   v1alpha1.AlignmentRepairable,
+	}
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-repairable", record, false))
+
+	got, ok := store.GetClaimRecord("claim-repairable")
+	require.True(t, ok)
+	require.Equal(t, v1alpha1.AlignmentRepairable, got.Alignment)
+	require.True(t, store.IsRepairable("claim-repairable"))
+	require.Equal(t, v1alpha1.AlignmentRepairable, store.Alignment("claim-repairable"))
+
+	defaultRecord := ClaimRecord{
+		Requests:    []RequestAllocation{{Request: "req", CPUs: cpuset.New(2, 3), Role: RoleExclusive}},
+		Relocatable: false,
+	}
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-default", defaultRecord, false))
+
+	gotDefault, ok := store.GetClaimRecord("claim-default")
+	require.True(t, ok)
+	require.Equal(t, v1alpha1.Alignment(""), gotDefault.Alignment)
+	require.False(t, store.IsRepairable("claim-default"))
+	require.Equal(t, v1alpha1.AlignmentBestEffort, store.Alignment("claim-default"))
+	require.False(t, store.IsRepairable("claim-nonexistent"))
+	require.Equal(t, v1alpha1.AlignmentBestEffort, store.Alignment("claim-nonexistent"))
+}
+
+func TestClosureReservations(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+
+	require.True(t, store.ReservedClosures().IsEmpty())
+	require.True(t, store.ReservedClosure(0).IsEmpty())
+
+	closure0 := cpuset.New(0, 1, 2, 3)
+	store.ReserveClosure(0, closure0)
+	require.True(t, store.ReservedClosure(0).Equals(closure0))
+	require.True(t, store.ReservedClosures().Equals(closure0))
+
+	closure1 := cpuset.New(4, 5)
+	store.ReserveClosure(1, closure1)
+	require.True(t, store.ReservedClosure(1).Equals(closure1))
+	require.True(t, store.ReservedClosures().Equals(cpuset.New(0, 1, 2, 3, 4, 5)))
+
+	store.ReleaseClosure(0)
+	require.True(t, store.ReservedClosure(0).IsEmpty())
+	require.True(t, store.ReservedClosures().Equals(closure1))
+
+	store.ReleaseClosure(1)
+	require.True(t, store.ReservedClosures().IsEmpty())
 }
