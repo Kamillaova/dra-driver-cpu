@@ -108,6 +108,10 @@ honor these settings, where applicable.
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.
   NOTE: setting this value will make the test output significantly larger.
 
+- `DRACPU_E2E_RELEASE_GATE`: (optional, default empty): when set (e.g. `1`), turns scenario skips
+  in defragmentation and scheduling into test failures, asserting that the expected fragmented topology
+  was created and exercised rather than silently skipped.
+
 ## how to run
 
 The simplest way is from your terminal:
