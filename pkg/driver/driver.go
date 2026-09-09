@@ -228,6 +228,9 @@ type CPUDriver struct {
 	// stood from its physical size, for the devices where the two differ.
 	// Guarded by applyMu.
 	publishedCorrection map[string]int
+	// publishedFrontier is the repair frontier published per (partition, NUMA node).
+	// Guarded by applyMu.
+	publishedFrontier map[string]string
 
 	kubeletRootDir string
 	cpuAllocator   CPUAllocator
