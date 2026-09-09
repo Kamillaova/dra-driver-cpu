@@ -32,6 +32,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpumanager"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -177,7 +178,7 @@ func (cp *CPUDriver) prepareClaim(ctx context.Context, logger logr.Logger, claim
 	if cp.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
 		return cp.prepareGroupedResourceClaim(ctx, logger, claim, placement)
 	}
-	return cp.prepareResourceClaim(logger, claim, placement)
+	return cp.prepareResourceClaim(ctx, logger, claim, placement)
 }
 
 // claimConfig is what a claim says about its own placement, folded from the
@@ -364,7 +365,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 
 	var cpuAssignment cpuset.CPUSet
 	byRequest := map[string]store.RequestAllocation{}
-	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs().Difference(cp.cpuAllocationStore.ReservedClosures())
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != cp.driverName {
 			continue
@@ -487,9 +488,16 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
+
+	if err := cp.secureRepairWitness(ctx, logger, claim, cpuAssignment, placement); err != nil {
+		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+
 	result := cp.prepareDevices(logger, claim, record, placement)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
+		cp.releaseActiveExactPlanAndClosure(cpuAssignment)
 		return result
 	}
 	cp.metricsRecorder().RecordClaimAllocatedCPUs(cpuAssignment.Size())
@@ -582,7 +590,7 @@ func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, topo *cpuinfo.CPUTopo
 }
 
 // CCX-FORK: upstream takes the logger and the claim alone, as above.
-func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
+func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
 	logger.V(4).Info("preparing individual resource claim")
 
 	if claim.Status.Allocation == nil {
@@ -626,7 +634,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	}
 
 	// All the CPUs allocated to a claim must not be prepared for another claim.
-	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs().Difference(cp.cpuAllocationStore.ReservedClosures())
 	if !claimCPUSet.IsSubsetOf(allocatableCPUs) {
 		return kubeletplugin.PrepareResult{
 			Err: fmt.Errorf("claim %s/%s has overlapping device assignment with other claims", claim.Namespace, claim.Name),
@@ -642,14 +650,83 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
+	if err := cp.secureRepairWitness(ctx, logger, claim, claimCPUSet, placement); err != nil {
+		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
+		return kubeletplugin.PrepareResult{Err: err}
+	}
 	result := cp.prepareDevices(logger, claim, record, placement)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
+		cp.releaseActiveExactPlanAndClosure(claimCPUSet)
 		return result
 	}
 	cp.metricsRecorder().RecordClaimAllocatedCPUs(claimCPUSet.Size())
 	cp.refreshAllocationMetrics()
 	return result
+}
+
+func (cp *CPUDriver) secureRepairWitness(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, cpuAssignment cpuset.CPUSet, placement opaqueapi.ClaimPlacement) error {
+	if placement.Alignment != v1alpha1.AlignmentRepairable {
+		return nil
+	}
+	topo := cp.topology.cpuTopology
+	if topo == nil {
+		return nil
+	}
+	nodeIDs := topo.CPUDetails.KeepOnly(cpuAssignment).NUMANodes().List()
+	if len(nodeIDs) != 1 {
+		return nil
+	}
+	numaNodeID := nodeIDs[0]
+	online := cp.topology.onlineCPUs
+	var matchingScope *defragScope
+	for _, s := range cp.defragScopes(online) {
+		if s.numaNodeID == numaNodeID {
+			allocatable := cp.defragAllocatable(online)
+			if part, ok := cp.defragPartition(s.partition, allocatable); ok {
+				if cpuAssignment.IsSubsetOf(part.CPUs) {
+					sCopy := s
+					matchingScope = &sCopy
+					break
+				}
+			}
+		}
+	}
+	if matchingScope == nil {
+		return nil
+	}
+	view, ok := cp.defragView(logger, *matchingScope, online)
+	if !ok || view.topology.ExcessSpread(cpuAssignment) <= 0 {
+		return nil
+	}
+	goal := defrag.GoalMakeClaimWhole{ClaimUID: claim.UID}
+	sel := cp.defragSelector(logger, view.threadsPerCore)
+	opts := defrag.ExactOptions{
+		Eligible:   cp.claimMovableForExact,
+		AllowSwaps: cp.defrag.allowTransientOverlap,
+	}
+	inFlight := cp.allocatedUnpreparedCPUs(numaNodeID)
+	plan, err := defrag.ExactSearch(view.topology, view.placements, view.free, inFlight, goal, sel, opts)
+	if err != nil || !plan.Status.Feasible() || len(plan.Moves) == 0 {
+		cp.recordClaimEvent(ctx, claim, "NoRepairWitness", "no repair witness within budget for split repairable claim")
+		cp.metricsRecorder().RecordPrepareNoWitness()
+		return fmt.Errorf("no repair witness within budget for repairable claim %s/%s on NUMA node %d", claim.Namespace, claim.Name, numaNodeID)
+	}
+	closure := plan.ComputeClosure()
+	cp.cpuAllocationStore.ReserveClosure(numaNodeID, closure)
+	cp.setActiveExactPlan(numaNodeID, &plan)
+	return nil
+}
+
+func (cp *CPUDriver) releaseActiveExactPlanAndClosure(cpuAssignment cpuset.CPUSet) {
+	topo := cp.topology.cpuTopology
+	if topo == nil {
+		return
+	}
+	for _, nodeID := range topo.CPUDetails.KeepOnly(cpuAssignment).NUMANodes().List() {
+		cp.clearActiveExactPlan(nodeID)
+		cp.cpuAllocationStore.ReleaseClosure(nodeID)
+	}
 }
 
 // cdiEnvValue is what the injected variable says about a claim's placement: the
@@ -812,6 +889,14 @@ func (cp *CPUDriver) unprepareResourceClaim(logger logr.Logger, claim kubeletplu
 	}
 	cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 	cp.claimTracker.Cleanup(claim.UID)
+	for numaNodeID, plan := range cp.activeExactPlans {
+		if plan != nil {
+			if targetClaim, ok := plan.Goal.TargetClaim(); ok && targetClaim == claim.UID {
+				cp.clearActiveExactPlan(numaNodeID)
+				cp.cpuAllocationStore.ReleaseClosure(numaNodeID)
+			}
+		}
+	}
 	// The released CPUs are back in the shared pool now, but the containers
 	// entitled to them still hold the narrower cpuset. Hand that off to the
 	// worker rather than doing it here: kubelet must not wait on an NRI round
