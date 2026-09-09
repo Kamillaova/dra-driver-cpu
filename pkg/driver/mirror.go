@@ -85,7 +85,7 @@ func (cp *CPUDriver) capacityMirror() capacityMirror {
 	}
 
 	mirror := capacityMirror{}
-	for _, holding := range cp.cpuAllocationStore.ClaimHoldings() {
+	for claimUID, holding := range cp.cpuAllocationStore.ClaimHoldings() {
 		if len(holding.Recorded) == 0 {
 			// A claim whose record was written before the driver kept the devices
 			// its allocation charged. Read as "charged nothing" it would count as a
@@ -101,7 +101,9 @@ func (cp *CPUDriver) capacityMirror() capacityMirror {
 			terms := mirror[name]
 			switch {
 			case charged > occupied:
-				terms.departed += charged - occupied
+				if cp.claimReader == nil || !cp.claimReader.IsProjectedDeallocated(claimUID) {
+					terms.departed += charged - occupied
+				}
 			case occupied > charged:
 				terms.squatters += occupied - charged
 			default:
