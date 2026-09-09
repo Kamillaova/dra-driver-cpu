@@ -1576,11 +1576,16 @@ func TestDefragPassRepairsRepairableClaimWithExactSearch(t *testing.T) {
 }
 
 type fakeClaimReader struct {
-	claims []*resourceapi.ResourceClaim
+	claims      []*resourceapi.ResourceClaim
+	deallocated map[types.UID]bool
 }
 
 func (f fakeClaimReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, error) {
 	return f.claims, nil
+}
+
+func (f fakeClaimReader) IsProjectedDeallocated(claimUID types.UID) bool {
+	return f.deallocated != nil && f.deallocated[claimUID]
 }
 
 func TestAllocatedUnpreparedCPUsTreatedAsConsumed(t *testing.T) {
