@@ -93,6 +93,7 @@ type Recorder interface {
 	// counters above rather than with the defragmentation block below: it counts
 	// an admission the node refused, whether or not anything ever moved.
 	RecordPrepareNoRoom(shape string)
+	RecordPrepareNoWitness()
 	// CCX-FORK: upstream's Recorder ends above; the defragmentation methods and
 	// everything serving them in this file are the fork's.
 	SetDefragState(DefragState)
@@ -124,6 +125,7 @@ type Metrics struct {
 	prepareClaimDuration prometheus.Histogram
 	claimAllocatedCPUs   prometheus.Histogram
 	prepareNoRoom        *prometheus.CounterVec
+	prepareNoWitness     prometheus.Counter
 
 	defragExcessUncoreCaches      prometheus.Gauge
 	defragAlignableFreeCPUs       *prometheus.GaugeVec
@@ -212,6 +214,11 @@ var (
 		kind:   metricCounter,
 		help:   "Total number of claims refused at Prepare because the device their allocation names cannot hold what it was charged for there. `shape` is never-split for a claim the allocator could not have split, flexible for one it could.",
 		labels: []string{"shape"},
+	}
+	prepareNoWitnessSpec = metricSpec{
+		name: "dra_cpu_prepare_no_witness_total",
+		kind: metricCounter,
+		help: "Total number of claims refused at Prepare because no repair plan within budget could be proven for a Repairable claim that landed split.",
 	}
 	defragExcessUncoreCachesSpec = metricSpec{
 		name: "dra_cpu_defrag_excess_uncore_caches",
@@ -324,6 +331,7 @@ var metricSpecs = []metricSpec{
 	prepareClaimDurationSpec,
 	claimAllocatedCPUsSpec,
 	prepareNoRoomSpec,
+	prepareNoWitnessSpec,
 	defragExcessUncoreCachesSpec,
 	defragAlignableFreeCPUsSpec,
 	defragPassesSpec,
@@ -382,6 +390,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		prepareClaimDuration: newHistogram(prepareClaimDurationSpec),
 		claimAllocatedCPUs:   newHistogram(claimAllocatedCPUsSpec),
 		prepareNoRoom:        newCounterVec(prepareNoRoomSpec),
+		prepareNoWitness:     newCounter(prepareNoWitnessSpec),
 
 		defragExcessUncoreCaches:      newGauge(defragExcessUncoreCachesSpec),
 		defragAlignableFreeCPUs:       newGaugeVec(defragAlignableFreeCPUsSpec),
@@ -414,6 +423,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.prepareClaimDuration,
 		m.claimAllocatedCPUs,
 		m.prepareNoRoom,
+		m.prepareNoWitness,
 		m.defragExcessUncoreCaches,
 		m.defragAlignableFreeCPUs,
 		m.defragPasses,
@@ -504,6 +514,13 @@ func (m *Metrics) RecordClaimAllocatedCPUs(cpus int) {
 
 func (m *Metrics) RecordPrepareNoRoom(shape string) {
 	m.prepareNoRoom.WithLabelValues(shape).Inc()
+}
+
+func (m *Metrics) RecordPrepareNoWitness() {
+	if m == nil || m.prepareNoWitness == nil {
+		return
+	}
+	m.prepareNoWitness.Inc()
 }
 
 // SetDefragState replaces the per-NUMA-node series wholesale, so a node a pass
@@ -617,6 +634,7 @@ func (noopRecorder) RecordPrepare(Result, time.Duration)    {}
 func (noopRecorder) RecordUnprepare(Result)                 {}
 func (noopRecorder) RecordClaimAllocatedCPUs(int)           {}
 func (noopRecorder) RecordPrepareNoRoom(string)             {}
+func (noopRecorder) RecordPrepareNoWitness()                 {}
 func (noopRecorder) SetDefragState(DefragState)             {}
 func (noopRecorder) RecordDefragPass(Result, time.Duration) {}
 func (noopRecorder) RecordDefragMoves(Result, int)          {}

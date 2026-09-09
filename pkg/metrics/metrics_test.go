@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 27)
+	require.Len(t, descriptors, 28)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -50,6 +50,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_prepare_claim_duration_seconds",
 		"dra_cpu_claim_allocated_cpus",
 		"dra_cpu_prepare_no_room_total",
+		"dra_cpu_prepare_no_witness_total",
 		"dra_cpu_defrag_excess_uncore_caches",
 		"dra_cpu_defrag_largest_alignable_free_cpus",
 		"dra_cpu_defrag_passes_total",
@@ -139,6 +140,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_prepare_claim_duration_seconds",
 		"dra_cpu_prepare_claims_total",
 		"dra_cpu_prepare_no_room_total",
+		"dra_cpu_prepare_no_witness_total",
 		"dra_cpu_reserved_cpus",
 		"dra_cpu_resource_claims_active",
 		"dra_cpu_synchronize_skipped_claims_total",
@@ -240,7 +242,18 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.RecordDefragMoves(ResultError, 2)
 		recorder.RecordDefragBlockedMoves(3)
 		recorder.RecordSynchronizeSkippedClaim()
+		recorder.RecordPrepareNoWitness()
 	})
+}
+
+func TestPrepareNoWitnessMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	require.InDelta(t, 0, testutil.ToFloat64(m.prepareNoWitness), 0.01)
+	m.RecordPrepareNoWitness()
+	m.RecordPrepareNoWitness()
+	require.InDelta(t, 2, testutil.ToFloat64(m.prepareNoWitness), 0.01)
 }
 
 func TestSynchronizeSkippedClaimsMetric(t *testing.T) {
