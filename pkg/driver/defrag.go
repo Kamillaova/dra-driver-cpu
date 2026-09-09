@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -110,10 +111,11 @@ const (
 // defragRound is one scope's set of moves that has been reserved and written
 // to disk and is waiting for the runtime to confirm it.
 type defragRound struct {
-	id      string
-	scope   defragScope
-	moves   []defrag.Move
-	updates []*api.ContainerUpdate
+	id          string
+	scope       defragScope
+	moves       []defrag.Move
+	updates     []*api.ContainerUpdate
+	sliceWrites int
 	// exchangeContainers is the containers each exchange's claims run in, so a
 	// reply naming some of them can be attributed to the exchange it belongs to.
 	exchangeContainers map[int][]types.UID
@@ -257,6 +259,7 @@ func (cp *CPUDriver) runDefragRound(ctx context.Context, scope defragScope, onli
 	cp.liftPoison(logger, scope.numaNodeID)
 	round := cp.beginDefragRound(ctx, logger, scope, online)
 	if round == nil {
+		cp.metrics.RecordSliceZeroCommitRefresh()
 		cp.republishStaleSlicesLocking(ctx)
 		return cpumetrics.ResultSuccess
 	}
@@ -264,6 +267,7 @@ func (cp *CPUDriver) runDefragRound(ctx context.Context, scope defragScope, onli
 	// moves a claim onto. Nothing may be told to take those CPUs until a
 	// scheduler can see that they are gone.
 	if err := cp.awaitStoredShrink(ctx, round); err != nil {
+		cp.metrics.RecordSliceWritesPerRound(round.sliceWrites)
 		return cp.abandonDefragRound(ctx, logger, round, err)
 	}
 
@@ -285,6 +289,7 @@ func (cp *CPUDriver) runDefragRound(ctx context.Context, scope defragScope, onli
 		cp.settleExchanges(logger, round, failed)
 	}
 	result := cp.finishDefragRound(logger, round, failed, updateErr)
+	cp.metrics.RecordSliceWritesPerRound(round.sliceWrites)
 	// The published devices carry which NUMA nodes are fenced, and this round may
 	// have fenced one or reopened one.
 	cp.republishStaleSlicesLocking(ctx)
@@ -1322,6 +1327,9 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 				reverted++
 				continue
 			}
+			if ob, ok := cp.promiseObligations[move.ClaimUID]; ok {
+				ob.actualRounds++
+			}
 			cp.checkClaimAlignmentOutcome(sLogger, round.scope, move)
 			if err := cp.writeClaimPlacement(sLogger, move.ClaimUID); err != nil {
 				sLogger.Error(err, "cannot clear round provenance from recorded placement", "claimUID", move.ClaimUID)
@@ -1349,6 +1357,9 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 	}
 	cp.metrics.RecordDefragMoves(cpumetrics.ResultSuccess, committed)
 	cp.metrics.RecordDefragMoves(cpumetrics.ResultError, reverted)
+	if committed == 0 {
+		cp.metrics.RecordSliceZeroCommitRefresh()
+	}
 
 	if unsettled > 0 {
 		// Only the exchanges nobody can place are sent again: re-sending a move
@@ -1435,6 +1446,9 @@ func (cp *CPUDriver) settleExchangeStep(logger logr.Logger, round *defragRound, 
 			return false
 		}
 		for _, move := range step {
+			if ob, ok := cp.promiseObligations[move.ClaimUID]; ok {
+				ob.actualRounds++
+			}
 			cp.checkClaimAlignmentOutcome(logger, round.scope, move)
 			if err := cp.writeClaimPlacement(logger, move.ClaimUID); err != nil {
 				logger.Error(err, "cannot clear round provenance from recorded placement", "claimUID", move.ClaimUID)
@@ -1518,6 +1532,14 @@ func (cp *CPUDriver) checkClaimAlignmentOutcome(logger logr.Logger, scope defrag
 		ns, name := cp.claimNameAndNamespace(move.ClaimUID)
 		if ns != "" && name != "" {
 			cp.recordClaimEventRef(context.Background(), ns, name, move.ClaimUID, "ClaimAligned", fmt.Sprintf("claim aligned to cpuset %s", move.To.String()))
+		}
+		if ob, ok := cp.promiseObligations[move.ClaimUID]; ok {
+			cp.metrics.RecordFrontierAdmissionOutcome("finished_aligned")
+			actualRoundsStr := strconv.Itoa(ob.actualRounds)
+			cp.metrics.RecordRepairRounds(ob.advertisedRounds, actualRoundsStr)
+			cp.metrics.RecordTimeToAlignment(time.Since(ob.prepareTime).Seconds())
+			delete(cp.promiseObligations, move.ClaimUID)
+			cp.refreshObligationMetrics()
 		}
 	}
 }

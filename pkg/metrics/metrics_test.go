@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 33)
+	require.Len(t, descriptors, 50)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -74,6 +74,23 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_readback_mismatches_total",
 		"dra_cpu_capacity_mirror_floored_devices",
 		"dra_cpu_defrag_unpublished_rounds_total",
+		"dra_cpu_frontier_admissions_total",
+		"dra_cpu_frontier_oldest_obligation_seconds",
+		"dra_cpu_repair_rounds_total",
+		"dra_cpu_time_to_alignment_seconds",
+		"dra_cpu_slice_writes_per_round",
+		"dra_cpu_slice_updates_total",
+		"dra_cpu_slice_update_bytes_total",
+		"dra_cpu_slice_update_conflicts_total",
+		"dra_cpu_slice_update_validation_errors_total",
+		"dra_cpu_slice_update_rate_limits_total",
+		"dra_cpu_slice_update_retry_depth",
+		"dra_cpu_store_to_driver_delay_seconds",
+		"dra_cpu_store_to_scheduler_delay_seconds",
+		"dra_cpu_frontier_unusable_duration_seconds",
+		"dra_cpu_slice_zero_commit_refreshes_total",
+		"dra_cpu_claims_off_recorded_cache",
+		"dra_cpu_capacity_mirror_max_abs_cache_error",
 	}, names)
 	// By name rather than by position in the list above: a metric added in the
 	// middle renumbers every assertion after it, and the name is what a query
@@ -92,6 +109,8 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_moves_total":                    {"result"},
 		"dra_cpu_defrag_rollbacks_total":                {"result"},
 		"dra_cpu_defrag_numa_node_poisoned":             {"numa_node"},
+		"dra_cpu_frontier_admissions_total":             {"outcome"},
+		"dra_cpu_repair_rounds_total":                   {"advertised_rounds", "actual_rounds"},
 	}
 	for _, desc := range descriptors {
 		want := labelled[desc.Name]
@@ -132,7 +151,9 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_allocated_cpus",
 		"dra_cpu_available_cpus",
 		"dra_cpu_capacity_mirror_floored_devices",
+		"dra_cpu_capacity_mirror_max_abs_cache_error",
 		"dra_cpu_claim_allocated_cpus",
+		"dra_cpu_claims_off_recorded_cache",
 		"dra_cpu_defrag_blocked_moves_total",
 		"dra_cpu_defrag_excess_uncore_caches",
 		"dra_cpu_defrag_moves_total",
@@ -145,6 +166,9 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_defrag_rollbacks_total",
 		"dra_cpu_defrag_swap_overlap_seconds",
 		"dra_cpu_defrag_unpublished_rounds_total",
+		"dra_cpu_frontier_admissions_total",
+		"dra_cpu_frontier_oldest_obligation_seconds",
+		"dra_cpu_frontier_unusable_duration_seconds",
 		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_nri_create_container_duration_seconds",
 		"dra_cpu_nri_remove_container_duration_seconds",
@@ -156,7 +180,18 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_prepare_no_witness_total",
 		"dra_cpu_reserved_cpus",
 		"dra_cpu_resource_claims_active",
+		"dra_cpu_slice_update_bytes_total",
+		"dra_cpu_slice_update_conflicts_total",
+		"dra_cpu_slice_update_rate_limits_total",
+		"dra_cpu_slice_update_retry_depth",
+		"dra_cpu_slice_update_validation_errors_total",
+		"dra_cpu_slice_updates_total",
+		"dra_cpu_slice_writes_per_round",
+		"dra_cpu_slice_zero_commit_refreshes_total",
+		"dra_cpu_store_to_driver_delay_seconds",
+		"dra_cpu_store_to_scheduler_delay_seconds",
 		"dra_cpu_synchronize_skipped_claims_total",
+		"dra_cpu_time_to_alignment_seconds",
 		"dra_cpu_unprepare_claim_duration_seconds",
 		"dra_cpu_unprepare_claims_total",
 	}, names)
@@ -218,6 +253,7 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordSynchronizeSkippedClaim()
 	m.RecordMisplacedClaim()
 	m.SetPartitionState(map[string]bool{"dataplane": true})
+	m.RecordRepairRounds("1", "1")
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -260,6 +296,22 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.RecordDefragBlockedMoves(3)
 		recorder.RecordSynchronizeSkippedClaim()
 		recorder.RecordPrepareNoWitness()
+		recorder.RecordFrontierAdmissionOutcome("started_split")
+		recorder.SetFrontierOldestObligationSeconds(10.0)
+		recorder.RecordRepairRounds("1", "1")
+		recorder.RecordTimeToAlignment(1.0)
+		recorder.RecordSliceWritesPerRound(1)
+		recorder.RecordSliceUpdate(100)
+		recorder.RecordSliceUpdateConflict()
+		recorder.RecordSliceUpdateValidationError()
+		recorder.RecordSliceUpdateRateLimit()
+		recorder.RecordSliceUpdateRetryDepth(1)
+		recorder.RecordStoreToDriverDelay(0.1)
+		recorder.RecordStoreToSchedulerDelay(0.1)
+		recorder.RecordFrontierUnusableDuration(1.0)
+		recorder.RecordSliceZeroCommitRefresh()
+		recorder.SetClaimsOffRecordedCache(1)
+		recorder.SetMaxAbsCacheError(1)
 	})
 }
 
@@ -334,4 +386,46 @@ func TestPrepareNoWitnessMetric(t *testing.T) {
 	m.RecordPrepareNoWitness()
 	m.RecordPrepareNoWitness()
 	require.InDelta(t, 2, testutil.ToFloat64(m.prepareNoWitness), 0.01)
+}
+func TestPromiseAndSliceMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	m.RecordFrontierAdmissionOutcome("started_split")
+	m.RecordFrontierAdmissionOutcome("waited_prepare")
+	m.SetFrontierOldestObligationSeconds(42.5)
+	m.RecordRepairRounds("1", "1")
+	m.RecordTimeToAlignment(3.2)
+	m.RecordSliceWritesPerRound(2)
+	m.RecordSliceUpdate(1024)
+	m.RecordSliceUpdateConflict()
+	m.RecordSliceUpdateValidationError()
+	m.RecordSliceUpdateRateLimit()
+	m.RecordSliceUpdateRetryDepth(3)
+	m.RecordStoreToDriverDelay(0.15)
+	m.RecordStoreToSchedulerDelay(0.25)
+	m.RecordFrontierUnusableDuration(12.0)
+	m.RecordSliceZeroCommitRefresh()
+	m.SetClaimsOffRecordedCache(5)
+	m.SetMaxAbsCacheError(2)
+
+	require.InDelta(t, 1, testutil.ToFloat64(m.frontierAdmissions.WithLabelValues("started_split")), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.frontierAdmissions.WithLabelValues("waited_prepare")), 0.01)
+	require.InDelta(t, 0, testutil.ToFloat64(m.frontierAdmissions.WithLabelValues("finished_aligned")), 0.01)
+	require.InDelta(t, 42.5, testutil.ToFloat64(m.frontierOldestObligationSeconds), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.repairRounds.WithLabelValues("1", "1")), 0.01)
+	require.Equal(t, 1, testutil.CollectAndCount(m.timeToAlignmentSeconds))
+	require.Equal(t, 1, testutil.CollectAndCount(m.sliceWritesPerRound))
+	require.InDelta(t, 1, testutil.ToFloat64(m.sliceUpdates), 0.01)
+	require.InDelta(t, 1024, testutil.ToFloat64(m.sliceUpdateBytes), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.sliceUpdateConflicts), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.sliceUpdateValidationErrors), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.sliceUpdateRateLimits), 0.01)
+	require.Equal(t, 1, testutil.CollectAndCount(m.sliceUpdateRetryDepth))
+	require.Equal(t, 1, testutil.CollectAndCount(m.storeToDriverDelaySeconds))
+	require.Equal(t, 1, testutil.CollectAndCount(m.storeToSchedulerDelaySeconds))
+	require.Equal(t, 1, testutil.CollectAndCount(m.frontierUnusableDurationSeconds))
+	require.InDelta(t, 1, testutil.ToFloat64(m.sliceZeroCommitRefreshes), 0.01)
+	require.InDelta(t, 5, testutil.ToFloat64(m.claimsOffRecordedCache), 0.01)
+	require.InDelta(t, 2, testutil.ToFloat64(m.capacityMirrorMaxAbsCacheError), 0.01)
 }
