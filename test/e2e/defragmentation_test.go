@@ -1112,6 +1112,96 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		gomega.Expect(defragCounter(ctx, fxt.K8SClientset, targetNode.Name,
 			fmt.Sprintf(`dra_cpu_defrag_numa_node_poisoned\{numa_node="%d"\}`, fragNUMA))).To(gomega.BeZero())
 	})
+
+	ginkgo.It("should record how long a repaired claim ran split", func(ctx context.Context) {
+		fxt := rootFxt.WithPrefix("defrag-repairable")
+		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(fxt.Teardown)
+
+		step := allocationStep(ctx, fxt.K8SClientset, targetNode.Name)
+		victimCPUs := 3 * step
+		leaveFreePerCache := 2 * step
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
+		fxt.Log.Info("cache geometry", "numaNode", fragNUMA, "freePerCache", free, "allocationStep", step)
+		if len(free) < 2 || free[0] < 3*step {
+			ginkgo.Skip(fmt.Sprintf("fragmenting needs at least two caches with %d or more free CPUs each, got %v",
+				3*step, free))
+		}
+
+		ginkgo.By(fmt.Sprintf("filling every cache of NUMA node %d down to two allocation steps free", fragNUMA))
+		fillers := fillCachesDownTo(ctx, fxt, dracpuTesterImage, targetNode.Name, cfgValues, fragNUMA, leaveFreePerCache, "cpu-claim-filler")
+		if len(fillers) < 2 {
+			ginkgo.Skip(fmt.Sprintf("could only place %d of %d fillers", len(fillers), len(free)))
+		}
+
+		ginkgo.By("placing a repairable claim that no single cache can hold")
+		victim, victimUID, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
+			repairableClaimSpecWithSelector(victimCPUs, numaCEL(cfgValues, fragNUMA)), "cpu-claim-repairable")
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, victim)
+		fxt.Log.Info("victim placement", "cpus", before.CPUAssigned.String())
+
+		ginkgo.By("verifying the repairable claim landed split")
+		fragmented, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		if fragmented.totalExcess() == 0 {
+			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
+		}
+		gomega.Expect(before.CPUAssigned.Size()).To(gomega.Equal(victimCPUs))
+		gomega.Expect(spreadOf(fragmented, before.CPUAssigned)).To(gomega.BeNumerically(">", 1),
+			"claim did not land split across caches")
+
+		ginkgo.By("releasing a filler to open room for the repair plan")
+		gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, fillers[0])).To(gomega.Succeed())
+
+		ginkgo.By("waiting for the node to settle and the repair plan to make the claim whole")
+		var settled placementsReport
+		gomega.Eventually(func(g gomega.Gomega) {
+			report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, true)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(report.plannedMoves()).To(gomega.BeZero(), "a pass still wants to move claims: %+v", report.NUMANodes)
+			settled = report
+		}, 3*time.Minute, 5*time.Second).Should(gomega.Succeed())
+
+		ginkgo.By("verifying the repairable claim was made whole")
+		gomega.Expect(settled.totalExcess()).To(gomega.BeZero(),
+			"claims still span more caches than their sizes require: %+v", settled.NUMANodes)
+		after, ok := settled.claimCPUs(victimUID)
+		gomega.Expect(ok).To(gomega.BeTrue(), "the victim claim vanished: %+v", settled.Claims)
+		gomega.Expect(after).ToNot(cpusetmatchers.Equal(before.CPUAssigned),
+			"the claim was never moved, so nothing was repaired")
+		gomega.Expect(after).To(cpusetmatchers.HaveSize(before.CPUAssigned.Size()))
+		gomega.Expect(spreadOf(settled, after)).To(gomega.Equal(1), "the victim is still split across caches")
+
+		ginkgo.By("recording how long the repaired claim ran split")
+		victimHistory := cpuSetHistoryOf(ctx, fxt.K8SClientset, victim)
+		gomega.Expect(len(victimHistory)).To(gomega.BeNumerically(">=", 2),
+			"the victim's container did not see its cpuset change")
+		initial := victimHistory[0]
+		repaired := victimHistory[len(victimHistory)-1]
+		splitDuration := repaired.at.Sub(initial.at)
+		gomega.Expect(splitDuration).To(gomega.BeNumerically(">", 0),
+			"split duration must be positive")
+		fxt.Log.Info("repaired claim split duration",
+			"duration", splitDuration.String(),
+			"initialCPUs", initial.cpus.String(),
+			"repairedCPUs", repaired.cpus.String(),
+			"splitDurationMs", splitDuration.Milliseconds())
+
+		ginkgo.By("verifying the container kept running throughout")
+		reread, err := fxt.K8SClientset.CoreV1().Pods(victim.Namespace).Get(ctx, victim.Name, metav1.GetOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		gomega.Expect(reread.Status.ContainerStatuses).ToNot(gomega.BeEmpty())
+		gomega.Expect(reread.Status.ContainerStatuses[0].RestartCount).To(gomega.BeZero(),
+			"a repair must not restart the container")
+
+		live := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread)
+		gomega.Expect(live.CPUAssigned).To(cpusetmatchers.Equal(after),
+			"the container is not on the CPUs the driver says its claim holds")
+		gomega.Expect(live.CPUAffinity.Equals(live.CPUAssigned)).To(gomega.BeTrue(),
+			"the kernel affinity %s does not match the cgroup cpuset %s", live.CPUAffinity.String(), live.CPUAssigned.String())
+	})
 })
 
 // restartDriverOnNode deletes the driver pod on a node and waits for the
