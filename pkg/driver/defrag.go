@@ -308,6 +308,8 @@ func (cp *CPUDriver) abandonDefragRound(ctx context.Context, logger logr.Logger,
 	if !round.replayed && round.store == cp.cpuAllocationStore {
 		cp.abortMoves(logger, round.moves)
 	}
+	cp.clearActiveExactPlan(round.scope.numaNodeID)
+	cp.cpuAllocationStore.ReleaseClosure(round.scope.numaNodeID)
 	cp.applyMu.Unlock()
 
 	cp.retryDefragScope(round.scope)
@@ -575,15 +577,46 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, onl
 		return nil
 	}
 
+	var moves []defrag.Move
 	if plan := cp.getActiveExactPlan(scope.numaNodeID); plan != nil {
 		view, ok := cp.defragView(logger, scope, online)
-		if ok && !plan.MatchesLedger(view.placements) {
+		if ok && plan.MatchesLedger(view.placements) {
+			moves = plan.Moves
+		} else {
 			logger.Info("active exact plan no longer matches ledger; aborting and clearing exact plan", "numaNode", scope.numaNodeID)
 			cp.clearActiveExactPlan(scope.numaNodeID)
+			cp.cpuAllocationStore.ReleaseClosure(scope.numaNodeID)
 		}
 	}
 
-	moves := cp.planScopeMoves(logger, scope, online)
+	if len(moves) == 0 {
+		view, ok := cp.defragView(logger, scope, online)
+		if ok {
+			for _, p := range view.placements {
+				if cp.cpuAllocationStore.IsRepairable(p.ClaimUID) && view.topology.ExcessSpread(p.CPUs) > 0 {
+					goal := defrag.GoalMakeClaimWhole{ClaimUID: p.ClaimUID}
+					sel := cp.defragSelector(logger, view.threadsPerCore)
+					opts := defrag.ExactOptions{
+						Eligible:   cp.claimMovableForExact,
+						AllowSwaps: cp.defrag.allowTransientOverlap,
+					}
+					inFlight := cp.allocatedUnpreparedCPUs(scope.numaNodeID)
+					plan, err := defrag.ExactSearch(view.topology, view.placements, view.free, inFlight, goal, sel, opts)
+					if err == nil && plan.Status.Feasible() && len(plan.Moves) > 0 {
+						closure := plan.ComputeClosure()
+						cp.cpuAllocationStore.ReserveClosure(scope.numaNodeID, closure)
+						cp.setActiveExactPlan(scope.numaNodeID, &plan)
+						moves = plan.Moves
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if len(moves) == 0 {
+		moves = cp.planScopeMoves(logger, scope, online)
+	}
 	if len(moves) == 0 {
 		return nil
 	}
@@ -595,16 +628,23 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, onl
 		}
 		round.moves = append(round.moves, step...)
 	}
+	if len(round.moves) < len(moves) && cp.hasActiveExactPlan(scope.numaNodeID) {
+		cp.abortMoves(logger, round.moves)
+		cp.clearActiveExactPlan(scope.numaNodeID)
+		cp.cpuAllocationStore.ReleaseClosure(scope.numaNodeID)
+		return nil
+	}
 	if len(round.moves) == 0 {
+		cp.clearActiveExactPlan(scope.numaNodeID)
+		cp.cpuAllocationStore.ReleaseClosure(scope.numaNodeID)
 		return nil
 	}
 
 	if err := cp.roundUpdates(logger, round); err != nil {
-		// Most likely the shared pool cannot be narrowed any further. Undo
-		// everything rather than move a claim onto CPUs a shared container still
-		// holds.
 		logger.Error(err, "abandoning defragmentation round", "numMoves", len(round.moves))
 		cp.abortMoves(logger, round.moves)
+		cp.clearActiveExactPlan(scope.numaNodeID)
+		cp.cpuAllocationStore.ReleaseClosure(scope.numaNodeID)
 		return nil
 	}
 	return round
@@ -796,6 +836,7 @@ func (cp *CPUDriver) defragView(logger logr.Logger, scope defragScope, online cp
 		// needs to know the option is requested, not any one device's step.
 		free = topo.CPUDetails.CompleteCores(free)
 	}
+	free = free.Difference(cp.allocatedUnpreparedCPUs(scope.numaNodeID))
 	placements := defrag.PlacementsByNUMANode(topo, cp.cpuAllocationStore.ExclusiveClaimAllocations())
 	return defragScopeView{
 		scope:          scope,
@@ -994,12 +1035,19 @@ func (cp *CPUDriver) claimMovable(claimUID types.UID) bool {
 	return claimMovableIn(cp.cpuAllocationStore, claimUID)
 }
 
-// claimMovableIn answers the same question against a given store, so a caller
-// that captured one under applyMu can ask after releasing it.
+func (cp *CPUDriver) claimMovableForExact(claimUID types.UID) bool {
+	if !cp.cpuAllocationStore.IsRelocatable(claimUID) {
+		return false
+	}
+	_, inFlight := cp.cpuAllocationStore.GetRebindOrigin(claimUID)
+	return !inFlight
+}
+
 func claimMovableIn(allocations *store.CPUAllocation, claimUID types.UID) bool {
-	// A move changes the CPUs under a running workload, and only the workload
-	// knows whether it survives that, so nothing is moved that has not said so.
 	if !allocations.IsRelocatable(claimUID) {
+		return false
+	}
+	if allocations.IsRepairable(claimUID) {
 		return false
 	}
 	_, inFlight := allocations.GetRebindOrigin(claimUID)
@@ -1093,6 +1141,8 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		logger.V(2).Info("defragmentation round outlived its stores", "numMoves", len(round.moves))
 		delete(cp.pendingRounds, round.scope)
 		cp.forgetDefragRetry(round.scope)
+		cp.clearActiveExactPlan(round.scope.numaNodeID)
+		cp.cpuAllocationStore.ReleaseClosure(round.scope.numaNodeID)
 		return cpumetrics.ResultSuccess
 	}
 	if updateErr != nil {
@@ -1161,6 +1211,8 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		return cpumetrics.ResultError
 	}
 	delete(cp.pendingRounds, round.scope)
+	cp.clearActiveExactPlan(round.scope.numaNodeID)
+	cp.cpuAllocationStore.ReleaseClosure(round.scope.numaNodeID)
 
 	if committed > 0 {
 		// Two jobs at once. The CPUs the moved claims left are back in the pool
