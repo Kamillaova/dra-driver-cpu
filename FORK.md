@@ -5,9 +5,10 @@ adding **mutable CPU placement** and **CCX-aware runtime defragmentation**: the 
 running claim's CPUs between uncore caches (AMD CCX / L3) without restarting the container, so that
 alignment lost to claim churn is recovered.
 
-See [docs/user/defragmentation.md](docs/user/defragmentation.md) for how to enable and operate it, and
+See [docs/user/defragmentation.md](docs/user/defragmentation.md) for how to enable and operate it,
 [docs/user/capacity-mirror.md](docs/user/capacity-mirror.md) for what a move does to the capacity the
-scheduler reads.
+scheduler reads, and [docs/user/ccx-aligned-scheduling.md](docs/user/ccx-aligned-scheduling.md) for the
+CCX cache-device model, the producer contract, rollout and rollback rules.
 
 ## Baseline
 
@@ -19,12 +20,24 @@ scheduler reads.
 | Container runtime | containerd >= v2.4.0-beta.0 (requires [containerd/nri#301](https://github.com/containerd/nri/pull/301), first vendored as nri v0.12.1)      |
 | CRI-O             | unsupported: v1.36 still vendors nri v0.12.0, which holds the `Adaptation` lock across `updateFn` and can deadlock on an unsolicited update |
 
-## Required cluster feature gates
+## Required cluster feature gates and gate register
 
-- `DRAConsumableCapacity` — already required by upstream `grouped` mode; also gates the
-  `requestPolicy` this fork publishes for `fullPhysicalCPUsOnly`.
-- `DRANodeAllocatableResources` — optional, but recommended. Without it the scheduler's node-level
-  `cpu` accounting is blind to DRA claims. See `docs/user/workload-requirements.md`.
+Cluster feature gates relevant to this fork and CCX-aligned scheduling, verified against Kubernetes v1.37.0 (`pkg/features/kube_features.go`):
+
+| Gate | Stage at v1.37.0 | Requirement / Role |
+|---|---|---|
+| `DRAConsumableCapacity` | Beta on (since 1.36) | **Required**. Enables consumable capacity accounting on cache devices and `requestPolicy` validation. |
+| `DRAPrioritizedList` | GA locked (1.36) | **Required**. Enables `firstAvailable` subrequest evaluation for split-capable claim shapes. |
+| `DRAResourceClaimDeviceStatus` | GA locked (1.37) | **Required**. Enables driver writing allocated device data into `status.devices`. |
+| `DRAResourceClaimGranularStatusAuthorization` | Beta on (since 1.36) | **Required**. Authorizes driver writing `status.devices` via `resourceclaims/driver` subresource with `associated-node:*`. |
+| `DRADeviceTaints`, `DRADeviceTaintRules` | GA (1.37) | **Required**. Enables `dra.cpu/partition`, `dra.cpu/floor`, and `dra.cpu/poisoned` device taints. |
+| `DRAExtendedResource` | GA locked (1.37) | GA in 1.37; not used by this fork's VM claims (extended resources count devices, not CPUs). |
+| `DRADeviceBindingConditions` | Beta on (since 1.36) | Driver binding condition evaluation. |
+| `DRAPartitionableDevices` | Beta on (since 1.36) | Counters infrastructure. |
+| `DRASchedulerFilterTimeout` | Beta on (since 1.34) | Per-node filter timeout in DynamicResources (default 10 s). |
+| `DRANodeAllocatableResources` | Alpha off (since 1.36) | Optional. When off, pods mirror claim CPUs into `requests.cpu`/`limits.cpu` for node-level accounting. When on, apiserver maps claim CPUs into node allocatable. |
+| `MutatingAdmissionPolicy` | GA (1.36) | GA cluster feature. |
+| `DRAWorkloadResourceClaims` | Beta off (1.37) | Not required for single-pod VMs. |
 
 ## Migration between upstream and this fork
 
@@ -67,7 +80,8 @@ Had the value been a stale-looking cpuset, upstream would instead reject the cla
 container holding none, classify it as shared and flatten a guaranteed container onto the shared pool.
 Draining avoids either. Runbook: drain the node, confirm no remaining pod holds a `dra.cpu` claim
 (`--ignore-daemonsets` skips DaemonSet pods, and static pods cannot be evicted at all), then roll the
-DaemonSet.
+DaemonSet. See [docs/user/ccx-aligned-scheduling.md](docs/user/ccx-aligned-scheduling.md#5-upgrade-and-downgrade-matrix)
+for the complete upgrade and downgrade matrix across components.
 
 ## Conventions
 
