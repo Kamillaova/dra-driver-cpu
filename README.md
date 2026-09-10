@@ -173,6 +173,7 @@ when filing an issue — it collects the CPU topology and driver configuration n
 - [CPU Partitions](docs/user/cpu-partitions.md) - describing a node's cores as named partitions with roles and a thread arity (this fork only).
 - [CPU Defragmentation](docs/user/defragmentation.md) - recovering uncore cache alignment of running claims (this fork only).
 - [The Capacity Mirror](docs/user/capacity-mirror.md) - why a cache device's published capacity is not its size once a claim has moved (this fork only).
+- [CCX-Aligned Scheduling](docs/user/ccx-aligned-scheduling.md) - the cache-device model, the producer contract, rollout and rollback rules (this fork only).
 - [Metrics](docs/user/metrics.md) - Prometheus metrics exposed by the driver.
 - [Device Attributes and Selectors](docs/user/device-attributes.md) - selectable device attributes, CEL selector examples, and sample `ResourceSlice` output in each mode.
 - [Device Metadata Files](docs/user/device-metadata.md) - the per-request JSON file a container reads to see what its claim was given.
