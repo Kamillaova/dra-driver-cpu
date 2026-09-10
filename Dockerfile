@@ -21,6 +21,7 @@ ARG LDFLAGS=-s -w
 # cache go modules
 WORKDIR /go/src/app
 COPY go.mod go.sum .
+COPY api/go.mod api/go.sum ./api/
 RUN go mod download
 
 # build
