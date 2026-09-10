@@ -17,6 +17,7 @@ limitations under the License.
 package device
 
 import (
+	"github.com/kubernetes-sigs/dra-driver-cpu/api"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/utils/cpuset"
@@ -40,42 +41,25 @@ const (
 	GROUP_BY_UNCORE_CACHE = "uncorecache"
 )
 
+// CCX-FORK: upstream spells the names out here. A scheduler plugin reading
+// these attributes cannot import this package without importing the whole
+// driver, so the names live in the nested api module both repositories pin and
+// this block is what the driver's own code keeps using.
 const (
-	AttributeSocketID   resourceapi.QualifiedName = "dra.cpu/socketID"
-	AttributeSMTEnabled resourceapi.QualifiedName = "dra.cpu/smtEnabled"
-	AttributeCacheL3ID  resourceapi.QualifiedName = "dra.cpu/cacheL3ID"
-	AttributeCoreType   resourceapi.QualifiedName = "dra.cpu/coreType"
-	AttributeCoreID     resourceapi.QualifiedName = "dra.cpu/coreID"
-	AttributeCPUID      resourceapi.QualifiedName = "dra.cpu/cpuID"
-	AttributeNumCPUs    resourceapi.QualifiedName = "dra.cpu/numCPUs"
-	// AttributeThreadsPerCore is a grouped device's own uniform thread-per-core
-	// count (0 when its cores do not all agree), independent of node-wide SMT:
-	// AttributeSMTEnabled is true exactly when this is greater than one.
-	AttributeThreadsPerCore resourceapi.QualifiedName = "dra.cpu/threadsPerCore"
-	// AttributeLargestUncoreCacheCPUs is the largest number of allocatable CPUs
-	// sharing one uncore cache within a grouped device, i.e. the biggest claim
-	// the group could satisfy from a single cache. It is not a per-cache size:
-	// caches within a group can differ, so a claim asking for cache-aligned CPUs
-	// must compare against the largest.
-	AttributeLargestUncoreCacheCPUs resourceapi.QualifiedName = "dra.cpu/largestUncoreCacheCPUs"
-	// AttributeUncoreCachesInGroup is how many uncore caches contribute
-	// allocatable CPUs to a grouped device. One means cache alignment within the
-	// group is trivially satisfied.
-	AttributeUncoreCachesInGroup resourceapi.QualifiedName = "dra.cpu/uncoreCachesInGroup"
-	// AttributePartition is the partition a device's CPUs belong to, which is
-	// "default" on a node whose cores nobody has described.
-	AttributePartition resourceapi.QualifiedName = "dra.cpu/partition"
-	// AttributeRole is that partition's role, so a claim can select on what the
-	// cores are for rather than on the name a fleet happened to give them.
-	AttributeRole resourceapi.QualifiedName = "dra.cpu/role"
-	// AttributeAllocatedNumCPUs is a metadata-only attribute (not published in
-	// ResourceSlice) that indicates how many CPUs were allocated to a specific
-	// claim from a grouped device's capacity.
-	AttributeAllocatedNumCPUs resourceapi.QualifiedName = "dra.cpu/allocatedNumCPUs"
-	// AttributeCPUSet is a metadata-only attribute naming the CPUs a request was
-	// given, published for a request whose CPUs cannot change while its
-	// container runs.
-	AttributeCPUSet resourceapi.QualifiedName = "dra.cpu/cpuset"
+	AttributeSocketID               resourceapi.QualifiedName = api.AttributeSocketID
+	AttributeSMTEnabled             resourceapi.QualifiedName = api.AttributeSMTEnabled
+	AttributeCacheL3ID              resourceapi.QualifiedName = api.AttributeCacheL3ID
+	AttributeCoreType               resourceapi.QualifiedName = api.AttributeCoreType
+	AttributeCoreID                 resourceapi.QualifiedName = api.AttributeCoreID
+	AttributeCPUID                  resourceapi.QualifiedName = api.AttributeCPUID
+	AttributeNumCPUs                resourceapi.QualifiedName = api.AttributeNumCPUs
+	AttributeThreadsPerCore         resourceapi.QualifiedName = api.AttributeThreadsPerCore
+	AttributeLargestUncoreCacheCPUs resourceapi.QualifiedName = api.AttributeLargestUncoreCacheCPUs
+	AttributeUncoreCachesInGroup    resourceapi.QualifiedName = api.AttributeUncoreCachesInGroup
+	AttributePartition              resourceapi.QualifiedName = api.AttributePartition
+	AttributeRole                   resourceapi.QualifiedName = api.AttributeRole
+	AttributeAllocatedNumCPUs       resourceapi.QualifiedName = api.AttributeAllocatedNumCPUs
+	AttributeCPUSet                 resourceapi.QualifiedName = api.AttributeCPUSet
 )
 
 // addPartitionAttributes names the partition a device's CPUs come from and what
