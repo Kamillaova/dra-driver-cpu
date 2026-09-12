@@ -839,7 +839,14 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 			return asyncErr, fmt.Errorf("failed to watch this node's ResourceSlices: %w", err)
 		}
 		cp.storedSlices = reader
-
+	}
+	// CCX-FORK: which CPUs back a claim is written to its status for every claim
+	// on the node, whether or not anything moves them: that is the only place a
+	// user can see where their claim actually landed. Tying it to
+	// defragmentation left the field empty on every node running without it,
+	// which reads as "this driver placed nothing" rather than as "this driver
+	// was not asked to say".
+	if cp.kubeClient != nil {
 		claimReader, err := watchAllocatedClaims(ctx, cp)
 		if err != nil {
 			return asyncErr, fmt.Errorf("failed to watch ResourceClaims: %w", err)
