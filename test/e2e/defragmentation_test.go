@@ -366,7 +366,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		fragmented, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		if fragmented.totalExcess() == 0 {
-			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
+			assertScenarioRan(false, fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
 		}
 		gomega.Expect(before.CPUAssigned.Size()).To(gomega.Equal(victimCPUs))
 
@@ -461,7 +461,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		report, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		if report.totalExcess() == 0 {
-			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", report.NUMANodes))
+			assertScenarioRan(false, fmt.Sprintf("the node did not fragment: %+v", report.NUMANodes))
 		}
 
 		ginkgo.By("releasing a filler and waiting for the claim to be moved")
@@ -1031,7 +1031,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		fragmented, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		if fragmented.totalExcess() == 0 {
-			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
+			assertScenarioRan(false, fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
 		}
 		if len(fragmented.freePerCacheOn(fragNUMA)) > 0 {
 			for _, cacheFree := range fragmented.freePerCacheOn(fragNUMA) {
@@ -1146,7 +1146,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		fragmented, err := getPlacements(ctx, fxt.K8SClientset, targetNode.Name, false)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		if fragmented.totalExcess() == 0 {
-			ginkgo.Skip(fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
+			assertScenarioRan(false, fmt.Sprintf("the node did not fragment: %+v", fragmented.NUMANodes))
 		}
 		gomega.Expect(before.CPUAssigned.Size()).To(gomega.Equal(victimCPUs))
 		gomega.Expect(spreadOf(fragmented, before.CPUAssigned)).To(gomega.BeNumerically(">", 1),
@@ -1183,11 +1183,15 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		splitDuration := repaired.at.Sub(initial.at)
 		gomega.Expect(splitDuration).To(gomega.BeNumerically(">", 0),
 			"split duration must be positive")
+		initialSpread := spreadOf(fragmented, initial.cpus)
 		fxt.Log.Info("repaired claim split duration",
 			"duration", splitDuration.String(),
 			"initialCPUs", initial.cpus.String(),
 			"repairedCPUs", repaired.cpus.String(),
-			"splitDurationMs", splitDuration.Milliseconds())
+			"splitDurationMs", splitDuration.Milliseconds(),
+			"splitDegree", initialSpread)
+		ginkgo.AddReportEntry("split-window-ms", splitDuration.Milliseconds())
+		ginkgo.AddReportEntry("split-degree", initialSpread)
 
 		ginkgo.By("verifying the container kept running throughout")
 		reread, err := fxt.K8SClientset.CoreV1().Pods(victim.Namespace).Get(ctx, victim.Name, metav1.GetOptions{})
