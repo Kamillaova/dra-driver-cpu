@@ -142,7 +142,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods,
   `SetFlooredCapacityDevices`, `RecordPrepareNoRoom`, `RecordPrepareNoWitness` and
-  `RecordSynchronizeForeignCPUs`, and the collectors behind them
+  `RecordSynchronizeForeignCPUs`, promise accounting, slice write amplification and downgrade gate
+  methods, and the collectors behind them
 
 - `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
   `e2e_suite_test.go`, and the `defragEnabled`/`defragAllowTransientOverlap`/`fullPhysicalCPUsOnly`
