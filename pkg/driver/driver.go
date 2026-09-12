@@ -286,7 +286,9 @@ type deviceTopology struct {
 	// allocation step (0 when the feature is off or that device has no single
 	// thread count), from BuildGrouped. Keyed by device name, which a caller
 	// preparing a claim already has (alloc.Device).
-	deviceThreadsPerCore map[string]int
+	deviceThreadsPerCore      map[string]int
+	deviceNameToPartition     map[string]string
+	deviceNameToUncoreCacheID map[string]int
 }
 
 // deviceIsPool reports whether a device grants a share of a pool rather than
@@ -299,6 +301,17 @@ type deviceTopology struct {
 // describing the node.
 func (t deviceTopology) deviceIsPool(deviceName string) bool {
 	return t.deviceNameToRole[deviceName] == device.PARTITION_ROLE_SHARED
+}
+
+func (t deviceTopology) devicePartition(deviceName string) string {
+	if t.deviceNameToPartition == nil {
+		return ""
+	}
+	return t.deviceNameToPartition[deviceName]
+}
+
+func (cp *CPUDriver) devicePartition(deviceName string) string {
+	return cp.topology.devicePartition(deviceName)
 }
 
 // Providers group the interfaces the CPUDriver depends on
@@ -568,6 +581,8 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		plugin.topology.deviceThreadsPerCore = built.ThreadsPerCore
 		plugin.topology.deviceNameToCPUs = built.CPUs
 		plugin.topology.deviceNameToRole = built.Roles
+		plugin.topology.deviceNameToPartition = built.Partitions
+		plugin.topology.deviceNameToUncoreCacheID = built.UncoreCacheID
 		switch plugin.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET:
 			plugin.topology.deviceNameToSocketID = built.NameToID
