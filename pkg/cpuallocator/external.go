@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-logr/logr"
 	opaqueapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
+	topology "github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/dynamic-resource-allocation/resourceclaim"
@@ -31,6 +32,30 @@ type External struct {
 	driverName   string
 	managedCPUs  cpuset.CPUSet
 	reservedCPUs cpuset.CPUSet
+	// CCX-FORK: upstream has no whole-core allocation mode. Non-nil once
+	// RequireWholeCores has been called, and then the topology an opaque
+	// cpuset's cores are completed against.
+	wholeCoreTopo *topology.CPUTopology
+}
+
+// RequireWholeCores refuses an opaque cpuset that splits a physical core. Under
+// fullPhysicalCPUsOnly the driver keeps a core's SMT siblings together on every
+// path where it chooses the CPUs itself; an operator-written cpuset is the one
+// path where it does not, so there the promise is checked rather than produced.
+func (alc *External) RequireWholeCores(topo *topology.CPUTopology) {
+	alc.wholeCoreTopo = topo
+}
+
+func (alc *External) validateWholeCores(opaqueCPUs cpuset.CPUSet) error {
+	if alc.wholeCoreTopo == nil {
+		return nil
+	}
+	complete := alc.wholeCoreTopo.CPUDetails.CompleteCores(opaqueCPUs)
+	if complete.Equals(opaqueCPUs) {
+		return nil
+	}
+	return fmt.Errorf("requested CPUs %s from opaque config split a physical core, which fullPhysicalCPUsOnly forbids: %s have no sibling in the set",
+		opaqueCPUs.String(), opaqueCPUs.Difference(complete).String())
 }
 
 func NewExternal(driverName string, managedCPUs, reservedCPUs cpuset.CPUSet) *External {
@@ -80,6 +105,9 @@ func (alc *External) GetPreferredCPUs(logger logr.Logger, allocation *resourceap
 		return cpuset.New(), err
 	}
 	if err := validateOpaqueCPUSet(preferred, alc.managedCPUs, alc.reservedCPUs, total); err != nil {
+		return cpuset.New(), err
+	}
+	if err := alc.validateWholeCores(preferred); err != nil {
 		return cpuset.New(), err
 	}
 	return preferred, nil
