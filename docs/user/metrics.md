@@ -24,6 +24,7 @@ The command prints JSON metadata for custom `dra_cpu_*` metrics only. It does no
 | `dra_cpu_prepare_claim_duration_seconds`        | Histogram | none                            | Per-claim prepare latency in seconds.                                                                                                                                                                                                                                     |
 | `dra_cpu_unprepare_claim_duration_seconds`      | Histogram | none                            | Per-claim unprepare latency in seconds.                                                                                                                                                                                                                                   |
 | `dra_cpu_claim_allocated_cpus`                  | Histogram | none                            | CPUs allocated for each newly successful claim allocation.                                                                                                                                                                                                                |
+| `dra_cpu_prepare_no_room_total`                 | Counter   | `shape`                         | Claims refused at Prepare because the device their allocation names cannot hold what it was charged for there. `shape` is `never-split` for a claim the allocator could not have split, `flexible` for one it could.                                                      |
 | `dra_cpu_nri_synchronize_duration_seconds`      | Histogram | `result`                        | Duration of the NRI `Synchronize` callback in seconds. `result` is `success` or `error`.                                                                                                                                                                                  |
 | `dra_cpu_nri_create_container_duration_seconds` | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `CreateContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`.                                                                                                                            |
 | `dra_cpu_nri_stop_container_duration_seconds`   | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `StopContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`.                                                                                                                              |
@@ -81,6 +82,9 @@ them through.
 The custom metrics intentionally avoid labels for namespace, pod, claim, device, node, socket, group
 mode, and error reason. Those labels would either be high-cardinality or need more API design before
 becoming part of the driver's metric surface. Node identity should come from scrape target labels.
-`numa_node` is the one exception, on the one metric where a node-wide total would hide what matters:
-claims are allocated per NUMA node, so free space in the wrong node is no help, and the label's
-cardinality is fixed by the hardware.
+Two labels are exceptions, each on the one metric where a total would hide what matters, and each
+with a domain something other than the workload fixes. `numa_node`: claims are allocated per NUMA
+node, so free space in the wrong node is no help, and the hardware fixes the cardinality. `shape`: a
+claim the allocator could not have placed anywhere else has nowhere to go when the device its
+allocation names is full, which is a different thing from one that could, and the domain is two
+values.

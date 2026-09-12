@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/kubernetes-sigs/dra-driver-cpu/api"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -114,6 +115,7 @@ type Metrics struct {
 	prepareClaimDuration       prometheus.Histogram
 	unprepareClaimDuration     prometheus.Histogram
 	claimAllocatedCPUs         prometheus.Histogram
+	prepareNoRoom              *prometheus.CounterVec
 	nriSynchronizeDuration     *prometheus.HistogramVec
 	nriCreateContainerDuration *prometheus.HistogramVec
 	nriStopContainerDuration   *prometheus.HistogramVec
@@ -215,6 +217,12 @@ var (
 		kind:    metricHistogram,
 		help:    "Number of CPUs allocated for each newly successful claim allocation.",
 		buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024},
+	}
+	prepareNoRoomSpec = metricSpec{
+		name:   "dra_cpu_prepare_no_room_total",
+		kind:   metricCounter,
+		help:   "Total number of claims refused at Prepare because the device their allocation names cannot hold what it was charged for there. `shape` is never-split for a claim the allocator could not have split, flexible for one it could.",
+		labels: []string{"shape"},
 	}
 	nriSynchronizeDurationSpec = metricSpec{
 		name:    "dra_cpu_nri_synchronize_duration_seconds",
@@ -355,6 +363,7 @@ var metricSpecs = []metricSpec{
 	prepareClaimDurationSpec,
 	unprepareClaimDurationSpec,
 	claimAllocatedCPUsSpec,
+	prepareNoRoomSpec,
 	nriSynchronizeDurationSpec,
 	nriCreateContainerDurationSpec,
 	nriStopContainerDurationSpec,
@@ -417,6 +426,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		prepareClaimDuration:       newHistogram(prepareClaimDurationSpec),
 		unprepareClaimDuration:     newHistogram(unprepareClaimDurationSpec),
 		claimAllocatedCPUs:         newHistogram(claimAllocatedCPUsSpec),
+		prepareNoRoom:              newCounterVec(prepareNoRoomSpec),
 		nriSynchronizeDuration:     newHistogramVec(nriSynchronizeDurationSpec),
 		nriCreateContainerDuration: newHistogramVec(nriCreateContainerDurationSpec),
 		nriStopContainerDuration:   newHistogramVec(nriStopContainerDurationSpec),
@@ -452,6 +462,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.prepareClaimDuration,
 		m.unprepareClaimDuration,
 		m.claimAllocatedCPUs,
+		m.prepareNoRoom,
 		m.nriSynchronizeDuration,
 		m.nriCreateContainerDuration,
 		m.nriStopContainerDuration,
@@ -475,6 +486,9 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.flooredCapacityDevices,
 		m.defragUnpublishedRounds,
 	)
+	for _, shape := range []string{api.ShapeNeverSplit, api.ShapeFlexible} {
+		m.prepareNoRoom.WithLabelValues(shape)
+	}
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
 		m.unprepareClaims.WithLabelValues(result.String())
@@ -598,6 +612,10 @@ func determineAllocation(claimCount int) CPUAllocation {
 	return CPUAllocationExclusive
 }
 
+func (m *Metrics) RecordPrepareNoRoom(shape string) {
+	m.prepareNoRoom.WithLabelValues(shape).Inc()
+}
+
 func (m *Metrics) RecordSynchronizeSkippedClaim() {
 	m.synchronizeSkippedClaims.Inc()
 }
@@ -713,6 +731,7 @@ func (noopRecorder) RecordNRICreateContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()                     {}
+func (noopRecorder) RecordPrepareNoRoom(string)                         {}
 func (noopRecorder) RecordMisplacedClaim()                              {}
 func (noopRecorder) SetPartitionState(map[string]bool)                  {}
 func (noopRecorder) SetDefragState(DefragState)                         {}
