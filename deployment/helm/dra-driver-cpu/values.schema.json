@@ -249,6 +249,9 @@
             "individual"
           ]
         },
+        "defragEnabled": {
+          "type": "boolean"
+        },
         "fullPhysicalCPUsOnly": {
           "type": "boolean"
         },
