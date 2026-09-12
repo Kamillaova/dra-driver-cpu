@@ -99,8 +99,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `activeExactPlans`,
   `defragRetries`, `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes`,
-  `publishedCorrection`, `storedSlices`, `claimReader` and `placementPolicy` fields,
-  `deviceTopology.deviceIsPool`, `Providers.CgroupFS` and
+  `publishedCorrection`, `publishedFrontier`, `publishedFrontierInput`, `storedSlices`,
+  `claimReader` and `placementPolicy` fields, `deviceTopology.deviceIsPool`, `Providers.CgroupFS` and
   `EnsureCgroupFS`, and `Config.DefragEnabled` and `Config.DefragAllowTransientOverlap`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
