@@ -748,32 +748,6 @@ func TestNewRejectsPartitionsTheNodeContradicts(t *testing.T) {
 	require.Contains(t, err.Error(), "splits physical cores")
 }
 
-// TestNUMANodeThreadsPerCoreFoldsPartitionDevices: a NUMA node or socket holding
-// several partitions holds several devices, and the step a caller planning by
-// NUMA node reads must be the one every device there agrees on.
-func TestNUMANodeThreadsPerCoreFoldsPartitionDevices(t *testing.T) {
-	infos := partitionTestInfos()
-	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(testr.New(t))
-	require.NoError(t, err)
-
-	nameToID := map[string]int{"vm": 0, "dataplane": 0}
-
-	agreeing := numaNodeThreadsPerCore(topo, devattr.GROUP_BY_NUMA_NODE, nameToID,
-		map[string]int{"vm": 2, "dataplane": 2})
-	require.Equal(t, map[int]int{0: 2}, agreeing)
-
-	disagreeing := numaNodeThreadsPerCore(topo, devattr.GROUP_BY_NUMA_NODE, nameToID,
-		map[string]int{"vm": 2, "dataplane": 1})
-	require.Equal(t, map[int]int{0: 0}, disagreeing,
-		"a node whose devices disagree promises no whole cores rather than whichever device came last")
-
-	// Under socket grouping the same fold runs on socket ids, and every NUMA
-	// node of a socket reads its answer.
-	bySocket := numaNodeThreadsPerCore(topo, devattr.GROUP_BY_SOCKET, nameToID,
-		map[string]int{"vm": 2, "dataplane": 1})
-	require.Equal(t, map[int]int{0: 0}, bySocket)
-}
-
 // partitionedDriver is a driver over partitionTestInfos with cores 1 and 5
 // declared as a dataplane partition, so CPUs 0,4,2,6,3,7 are the implicit one.
 func partitionedDriver(t *testing.T) *CPUDriver {

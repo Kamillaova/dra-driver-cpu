@@ -62,14 +62,27 @@ type numaNodeReport struct {
 	NUMANodeID int    `json:"numaNodeID"`
 	FreeCPUs   string `json:"freeCPUs"`
 	// ExcessUncoreCaches is how many caches this node's claims span beyond the
-	// fewest their sizes allow.
+	// fewest their sizes allow, summed over its partitions: the whole node's to
+	// repair, however its cores are divided.
 	ExcessUncoreCaches int `json:"excessUncoreCaches"`
 	// LargestAlignableFreeCPUs is the largest claim this node could still take
-	// inside a single cache.
+	// inside a single cache, which is the best of its partitions: a claim lands
+	// inside one of them.
 	LargestAlignableFreeCPUs int           `json:"largestAlignableFreeCPUs"`
 	Caches                   []cacheReport `json:"caches"`
-	// Plan is what a pass would do to this node, present only for a dry run.
-	Plan *planReport `json:"plan,omitempty"`
+	// Plans is what a pass would do to each of this node's partitions, one round
+	// each, and is present only for a dry run.
+	Plans []partitionPlan `json:"plans,omitempty"`
+}
+
+// partitionPlan is what a pass would do to one partition of one NUMA node,
+// which is the region one round covers and the whole of where its moves may
+// land.
+type partitionPlan struct {
+	Partition string `json:"partition"`
+	CPUs      string `json:"cpus"`
+	FreeCPUs  string `json:"freeCPUs"`
+	planReport
 }
 
 type cacheReport struct {
@@ -138,16 +151,13 @@ func (cp *CPUDriver) ServePlacements(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// dryRunInput is one NUMA node's planning input, captured under applyMu so the
-// plan itself can be computed without it.
+// dryRunInput is one scope's planning input, captured under applyMu so the plan
+// itself can be computed without it: the same view a pass plans from, plus where
+// to write the answer and a mobility test bound to the store that was current.
 type dryRunInput struct {
-	report         *numaNodeReport
-	topology       *defrag.Topology
-	placements     []defrag.Placement
-	free           cpuset.CPUSet
-	threadsPerCore int
-	movable        func(types.UID) bool
-	keepFreePool   bool
+	defragScopeView
+	report  *partitionPlan
+	movable func(types.UID) bool
 }
 
 // placements builds the report from one consistent snapshot.
@@ -162,21 +172,24 @@ func (cp *CPUDriver) placements(logger logr.Logger, dryRun bool) (*placementsRep
 		return nil, err
 	}
 
-	report, planning := cp.placementsSnapshot(online, dryRun)
+	report, planning := cp.placementsSnapshot(logger, online, dryRun)
 	for _, input := range planning {
-		cp.planNodeReport(logger, input)
+		cp.planPartitionReport(logger, input)
 	}
 	return report, nil
 }
 
 // placementsSnapshot reads everything the report and any plan need, under the
 // one lock, and returns the planning inputs for the caller to use without it.
-func (cp *CPUDriver) placementsSnapshot(online cpuset.CPUSet, dryRun bool) (*placementsReport, []dryRunInput) {
+//
+// Every per-partition number comes from the same defragView a pass plans from,
+// so the endpoint cannot describe a pass this driver would not run.
+func (cp *CPUDriver) placementsSnapshot(logger logr.Logger, online cpuset.CPUSet, dryRun bool) (*placementsReport, []dryRunInput) {
 	cp.applyMu.Lock()
 	defer cp.applyMu.Unlock()
 
 	topo := cp.topology.cpuTopology
-	allocatable := online.Intersection(topo.CPUDetails.CPUs()).Difference(cp.topology.reservedCPUs)
+	allocatable := cp.defragAllocatable(online)
 	free := cp.cpuAllocationStore.GetSharedCPUs().Intersection(allocatable)
 	if cp.fullPhysicalCPUsOnly {
 		free = topo.CPUDetails.CompleteCores(free)
@@ -185,7 +198,6 @@ func (cp *CPUDriver) placementsSnapshot(online cpuset.CPUSet, dryRun bool) (*pla
 	// Captured rather than read through cp: Synchronize replaces the store
 	// wholesale, and the plan below runs with the lock released.
 	snapshot := cp.cpuAllocationStore
-	keepFreePool := len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
 
 	report := &placementsReport{
 		NodeName:      cp.nodeName,
@@ -195,7 +207,6 @@ func (cp *CPUDriver) placementsSnapshot(online cpuset.CPUSet, dryRun bool) (*pla
 		Claims:        cp.claimReports(allocations),
 	}
 
-	placements := defrag.PlacementsByNUMANode(topo, allocations)
 	numaNodeIDs := topo.CPUDetails.NUMANodes().List()
 	report.NUMANodes = make([]numaNodeReport, 0, len(numaNodeIDs))
 	var planning []dryRunInput
@@ -208,19 +219,25 @@ func (cp *CPUDriver) placementsSnapshot(online cpuset.CPUSet, dryRun bool) (*pla
 			})
 			continue
 		}
-		report.NUMANodes = append(report.NUMANodes, cp.numaNodeReport(nodeTopo, placements[numaNodeID], free))
+		views, shape := cp.defragNodeViews(logger, nodeTopo, online)
+		report.NUMANodes = append(report.NUMANodes, cp.numaNodeReport(nodeTopo, free, shape))
 		if !dryRun {
 			continue
 		}
-		planning = append(planning, dryRunInput{
-			report:         &report.NUMANodes[len(report.NUMANodes)-1],
-			topology:       nodeTopo,
-			placements:     placements[numaNodeID],
-			free:           free.Intersection(nodeTopo.CPUs()),
-			threadsPerCore: cp.topology.numaNodeThreadsPerCore[numaNodeID],
-			movable:        func(claimUID types.UID) bool { return claimMovableIn(snapshot, claimUID) },
-			keepFreePool:   keepFreePool,
-		})
+		nodeReport := &report.NUMANodes[len(report.NUMANodes)-1]
+		nodeReport.Plans = make([]partitionPlan, 0, len(views))
+		for _, view := range views {
+			nodeReport.Plans = append(nodeReport.Plans, partitionPlan{
+				Partition: view.scope.partition,
+				CPUs:      view.topology.CPUs().String(),
+				FreeCPUs:  view.free.String(),
+			})
+			planning = append(planning, dryRunInput{
+				defragScopeView: view,
+				report:          &nodeReport.Plans[len(nodeReport.Plans)-1],
+				movable:         func(claimUID types.UID) bool { return claimMovableIn(snapshot, claimUID) },
+			})
+		}
 	}
 	return report, planning
 }
@@ -253,13 +270,15 @@ func (cp *CPUDriver) claimReports(allocations map[types.UID]cpuset.CPUSet) []cla
 	return reports
 }
 
-func (cp *CPUDriver) numaNodeReport(nodeTopo *defrag.Topology, placements []defrag.Placement, free cpuset.CPUSet) numaNodeReport {
+// numaNodeReport is the node's own shape: its caches and what is free in each,
+// whatever partition holds them, plus the two counts its partitions add up to.
+func (cp *CPUDriver) numaNodeReport(nodeTopo *defrag.Topology, free cpuset.CPUSet, shape defragNodeShape) numaNodeReport {
 	nodeFree := free.Intersection(nodeTopo.CPUs())
 	report := numaNodeReport{
 		NUMANodeID:               nodeTopo.NUMANodeID(),
 		FreeCPUs:                 nodeFree.String(),
-		ExcessUncoreCaches:       nodeTopo.Cost(placements),
-		LargestAlignableFreeCPUs: largestAlignableFreeCPUs(nodeTopo, nodeFree),
+		ExcessUncoreCaches:       shape.excessUncoreCaches,
+		LargestAlignableFreeCPUs: shape.largestAlignableFreeCPUs,
 	}
 	for _, cacheID := range nodeTopo.Caches() {
 		inCache := nodeTopo.CPUsInCache(cacheID)
@@ -272,17 +291,18 @@ func (cp *CPUDriver) numaNodeReport(nodeTopo *defrag.Topology, placements []defr
 	return report
 }
 
-// planNodeReport fills in one node's dry-run plan. Called with applyMu released.
-func (cp *CPUDriver) planNodeReport(logger logr.Logger, input dryRunInput) {
+// planPartitionReport fills in one partition's dry-run plan. Called with applyMu
+// released.
+func (cp *CPUDriver) planPartitionReport(logger logr.Logger, input dryRunInput) {
 	plan, err := defrag.PlanNode(input.topology, input.placements, input.free, cp.defragSelector(logger, input.threadsPerCore), defrag.Options{
 		Eligible:             input.movable,
-		KeepFreePoolNonEmpty: input.keepFreePool,
+		KeepFreePoolNonEmpty: input.keepFreePoolNonEmpty,
 	})
 	if err != nil {
-		input.report.Plan = &planReport{Reason: "cannot plan: " + err.Error()}
+		input.report.planReport = planReport{Reason: "cannot plan: " + err.Error()}
 		return
 	}
-	input.report.Plan = &planReport{
+	input.report.planReport = planReport{
 		Moves:       make([]moveReport, 0, len(plan.Moves)),
 		CurrentCost: plan.CurrentCost,
 		IdealCost:   plan.IdealCost,
@@ -290,7 +310,7 @@ func (cp *CPUDriver) planNodeReport(logger logr.Logger, input dryRunInput) {
 		Reason:      plan.Reason,
 	}
 	for _, move := range plan.Moves {
-		input.report.Plan.Moves = append(input.report.Plan.Moves, moveReport{
+		input.report.Moves = append(input.report.Moves, moveReport{
 			ClaimUID: string(move.ClaimUID),
 			From:     move.From.String(),
 			To:       move.To.String(),
