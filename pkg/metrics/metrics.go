@@ -116,6 +116,7 @@ type Metrics struct {
 	unprepareClaimDuration     prometheus.Histogram
 	claimAllocatedCPUs         prometheus.Histogram
 	prepareNoRoom              *prometheus.CounterVec
+	prepareNoWitness           prometheus.Counter
 	nriSynchronizeDuration     *prometheus.HistogramVec
 	nriCreateContainerDuration *prometheus.HistogramVec
 	nriStopContainerDuration   *prometheus.HistogramVec
@@ -224,6 +225,11 @@ var (
 		kind:   metricCounter,
 		help:   "Total number of claims refused at Prepare because the device their allocation names cannot hold what it was charged for there. `shape` is never-split for a claim the allocator could not have split, flexible for one it could.",
 		labels: []string{"shape"},
+	}
+	prepareNoWitnessSpec = metricSpec{
+		name: "dra_cpu_prepare_no_witness_total",
+		kind: metricCounter,
+		help: "Total number of claims refused at Prepare because no repair plan within budget could be proven for a Repairable claim that landed split.",
 	}
 	nriSynchronizeDurationSpec = metricSpec{
 		name:    "dra_cpu_nri_synchronize_duration_seconds",
@@ -370,6 +376,7 @@ var metricSpecs = []metricSpec{
 	unprepareClaimDurationSpec,
 	claimAllocatedCPUsSpec,
 	prepareNoRoomSpec,
+	prepareNoWitnessSpec,
 	nriSynchronizeDurationSpec,
 	nriCreateContainerDurationSpec,
 	nriStopContainerDurationSpec,
@@ -434,6 +441,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		unprepareClaimDuration:     newHistogram(unprepareClaimDurationSpec),
 		claimAllocatedCPUs:         newHistogram(claimAllocatedCPUsSpec),
 		prepareNoRoom:              newCounterVec(prepareNoRoomSpec),
+		prepareNoWitness:           newCounter(prepareNoWitnessSpec),
 		nriSynchronizeDuration:     newHistogramVec(nriSynchronizeDurationSpec),
 		nriCreateContainerDuration: newHistogramVec(nriCreateContainerDurationSpec),
 		nriStopContainerDuration:   newHistogramVec(nriStopContainerDurationSpec),
@@ -471,6 +479,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.unprepareClaimDuration,
 		m.claimAllocatedCPUs,
 		m.prepareNoRoom,
+		m.prepareNoWitness,
 		m.nriSynchronizeDuration,
 		m.nriCreateContainerDuration,
 		m.nriStopContainerDuration,
@@ -625,6 +634,13 @@ func (m *Metrics) RecordPrepareNoRoom(shape string) {
 	m.prepareNoRoom.WithLabelValues(shape).Inc()
 }
 
+func (m *Metrics) RecordPrepareNoWitness() {
+	if m == nil || m.prepareNoWitness == nil {
+		return
+	}
+	m.prepareNoWitness.Inc()
+}
+
 func (m *Metrics) RecordSynchronizeSkippedClaim() {
 	m.synchronizeSkippedClaims.Inc()
 }
@@ -746,6 +762,7 @@ func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()                     {}
 func (noopRecorder) RecordSynchronizeForeignCPUs()                      {}
 func (noopRecorder) RecordPrepareNoRoom(string)                         {}
+func (noopRecorder) RecordPrepareNoWitness()                            {}
 func (noopRecorder) RecordMisplacedClaim()                              {}
 func (noopRecorder) SetPartitionState(map[string]bool)                  {}
 func (noopRecorder) SetDefragState(DefragState)                         {}
