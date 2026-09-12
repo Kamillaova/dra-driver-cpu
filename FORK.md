@@ -5,7 +5,9 @@ adding **mutable CPU placement** and **CCX-aware runtime defragmentation**: the 
 running claim's CPUs between uncore caches (AMD CCX / L3) without restarting the container, so that
 alignment lost to claim churn is recovered.
 
-See [docs/user/defragmentation.md](docs/user/defragmentation.md) for how to enable and operate it.
+See [docs/user/defragmentation.md](docs/user/defragmentation.md) for how to enable and operate it, and
+[docs/user/capacity-mirror.md](docs/user/capacity-mirror.md) for what a move does to the capacity the
+scheduler reads.
 
 ## Baseline
 
