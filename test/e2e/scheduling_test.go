@@ -429,7 +429,7 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 		before, ok := fragmented.claimCPUs(victimUID)
 		gomega.Expect(ok).To(gomega.BeTrue(), "the victim claim is not reported: %+v", fragmented.Claims)
 		if spreadOf(fragmented, before) < 2 {
-			ginkgo.Skip(fmt.Sprintf("the victim landed unsplit on %s; nothing to repair", before.String()))
+			assertScenarioRan(false, fmt.Sprintf("the victim landed unsplit on %s; nothing to repair", before.String()))
 		}
 
 		ginkgo.By("releasing a filler and waiting for the repair the scheduler could not make")
@@ -460,5 +460,135 @@ var _ = ginkgo.Describe("Cross-node scheduling", ginkgo.Serial, ginkgo.Ordered, 
 			live := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, reread).CPUAssigned
 			g.Expect(live).To(cpusetmatchers.Equal(after), "the container is not on the CPUs the driver says its claim holds")
 		}, 30*time.Second, 5*time.Second).Should(gomega.Succeed())
+	})
+
+	ginkgo.It("should place aligned and split claims across the heterogeneous fleet", func(ctx context.Context) {
+		fxt := rootFxt.WithPrefix("sched-aligned-split")
+		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(fxt.Teardown)
+
+		nodeTypes := map[int]string{}
+		for _, dev := range fleet {
+			if _, ok := nodeTypes[dev.cachesInGroup]; !ok {
+				nodeTypes[dev.cachesInGroup] = dev.node
+			}
+		}
+		if len(nodeTypes) < 2 {
+			ginkgo.Skip("heterogeneous fleet verification requires at least two distinct node types")
+		}
+
+		for caches, target := range nodeTypes {
+			step := maxDeviceOf(target).step
+			baseline, err := getPlacements(ctx, fxt.K8SClientset, target, false)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			fragNUMA := baseline.numaWithMostCaches()
+			free := baseline.freePerCacheOn(fragNUMA)
+			if len(free) < 2 || free[0] < 2*step {
+				continue
+			}
+
+			alignedSize := step
+			alignedTmpl := fmt.Sprintf("cpu-claim-aligned-%d", caches)
+			createClaimTemplate(ctx, fxt, alignedTmpl, claimSpecWithSelector(alignedSize, numaCEL(cfgValues, fragNUMA)))
+			alignedPod := makeUnpinnedClaimPod(fxt.Namespace.Name, dracpuTesterImage, alignedTmpl)
+			alignedPod = e2epod.PinToNode(alignedPod, target)
+			alignedPod, err = e2epod.CreateSync(ctx, fxt.K8SClientset, alignedPod)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+			report, err := getPlacements(ctx, fxt.K8SClientset, target, false)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, alignedPod)
+			gomega.Expect(spreadOf(report, alloc.CPUAssigned)).To(gomega.Equal(1),
+				"aligned claim on node %s (caches=%d) unexpectedly split", target, caches)
+
+			fillers := fillCachesDownTo(ctx, fxt, dracpuTesterImage, target, cfgValues, fragNUMA, step, fmt.Sprintf("fill-%d", caches))
+			if len(fillers) >= 2 {
+				splitSize := 2 * step
+				splitTmpl := fmt.Sprintf("cpu-claim-split-%d", caches)
+				createClaimTemplate(ctx, fxt, splitTmpl, repairableClaimSpecWithSelector(splitSize, numaCEL(cfgValues, fragNUMA)))
+				splitPod := makeUnpinnedClaimPod(fxt.Namespace.Name, dracpuTesterImage, splitTmpl)
+				splitPod = e2epod.PinToNode(splitPod, target)
+				splitPod, err = e2epod.CreateSync(ctx, fxt.K8SClientset, splitPod)
+				if err == nil {
+					splitReport, err := getPlacements(ctx, fxt.K8SClientset, target, false)
+					gomega.Expect(err).ToNot(gomega.HaveOccurred())
+					splitAlloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, splitPod)
+					gomega.Expect(spreadOf(splitReport, splitAlloc.CPUAssigned)).To(gomega.BeNumerically(">", 1),
+						"split claim on node %s did not split across caches", target)
+					gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, splitPod)).To(gomega.Succeed())
+				}
+				for _, f := range fillers {
+					_ = e2epod.DeleteSync(ctx, fxt.K8SClientset, f)
+				}
+			}
+			gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, alignedPod)).To(gomega.Succeed())
+		}
+	})
+
+	ginkgo.It("should keep a never-split claim Pending while no whole cache is free, and start once one is", func(ctx context.Context) {
+		fxt := rootFxt.WithPrefix("sched-never-split")
+		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+		ginkgo.DeferCleanup(fxt.Teardown)
+
+		target := ""
+		for _, dev := range fleet {
+			if dev.cachesInGroup >= 2 {
+				target = dev.node
+				break
+			}
+		}
+		if target == "" {
+			ginkgo.Skip("never-split verification requires a node with at least two uncore caches")
+		}
+
+		step := maxDeviceOf(target).step
+		baseline, err := getPlacements(ctx, fxt.K8SClientset, target, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		fragNUMA := baseline.numaWithMostCaches()
+		free := baseline.freePerCacheOn(fragNUMA)
+		if len(free) < 2 || free[0] < 2*step {
+			ginkgo.Skip(fmt.Sprintf("need at least two caches with >= %d free CPUs on node %s", 2*step, target))
+		}
+
+		claimSize := 2 * step
+		ginkgo.By(fmt.Sprintf("filling caches down to %d free CPUs each so no single cache fits %d CPUs", step, claimSize))
+		fillers := fillCachesDownTo(ctx, fxt, dracpuTesterImage, target, cfgValues, fragNUMA, step, "cpu-claim-ns-fill")
+		if len(fillers) < 2 {
+			ginkgo.Skip("could not place fillers to fragment node")
+		}
+
+		ginkgo.By("creating a never-split claim")
+		tmplName := "cpu-claim-never-split"
+		createClaimTemplate(ctx, fxt, tmplName, claimSpecWithSelector(claimSize, numaCEL(cfgValues, fragNUMA)))
+		pod := makeUnpinnedClaimPod(fxt.Namespace.Name, dracpuTesterImage, tmplName)
+		pod = e2epod.PinToNode(pod, target)
+		pod, err = fxt.K8SClientset.CoreV1().Pods(fxt.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+		ginkgo.By("verifying the pod stays Pending while no single cache has enough free CPUs")
+		gomega.Consistently(func(g gomega.Gomega) {
+			reread, err := fxt.K8SClientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(reread.Status.Phase).To(gomega.Equal(v1.PodPending))
+		}, 15*time.Second, 3*time.Second).Should(gomega.Succeed())
+
+		ginkgo.By("deleting fillers to free a whole cache")
+		for _, f := range fillers {
+			gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, f)).To(gomega.Succeed())
+		}
+
+		ginkgo.By("verifying the pod starts and runs once a whole cache is free")
+		gomega.Eventually(func(g gomega.Gomega) {
+			reread, err := fxt.K8SClientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			g.Expect(reread.Status.Phase).To(gomega.Equal(v1.PodRunning))
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed())
+
+		report, err := getPlacements(ctx, fxt.K8SClientset, target, false)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		alloc := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod)
+		gomega.Expect(spreadOf(report, alloc.CPUAssigned)).To(gomega.Equal(1),
+			"never-split claim was placed split across caches")
+		gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, pod)).To(gomega.Succeed())
 	})
 })
