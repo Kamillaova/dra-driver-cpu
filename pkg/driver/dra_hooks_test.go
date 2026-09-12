@@ -2789,6 +2789,9 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 func TestPrepareRefusesAClaimWhoseRecordedDeviceIsFull(t *testing.T) {
 	logger := testr.New(t)
 	d, built := newCacheGroupedPrepareDriver(t)
+	// The make-room target below is a defragmentation promise, so the feature is
+	// on here; TestNoMakeRoomTargetWithDefragmentationOff covers the other side.
+	d.defrag.enabled = true
 	reg := prometheus.NewRegistry()
 	d.metrics = cpumetrics.New(reg)
 	client := k8sfake.NewSimpleClientset()
