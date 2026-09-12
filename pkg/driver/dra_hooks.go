@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	opaqueapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
@@ -105,11 +107,9 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 	for _, claim := range claims {
 		start := time.Now()
 		cLogger := logger.WithValues("claim", ctxlog.KObj(claim), "claimUID", claim.UID)
-		if cp.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-			result[claim.UID] = cp.prepareGroupedResourceClaim(cLogger, claim)
-		} else {
-			result[claim.UID] = cp.prepareResourceClaim(cLogger, claim)
-		}
+		// CCX-FORK: upstream dispatches on the device mode here, having nothing
+		// to check before it.
+		result[claim.UID] = cp.prepareClaim(cLogger, claim)
 		prepareResult := cpumetrics.ResultSuccess
 		if result[claim.UID].Err != nil {
 			prepareResult = cpumetrics.ResultError
@@ -150,6 +150,78 @@ func (cp *CPUDriver) republishOnCacheOrderChange(ctx context.Context) {
 	go cp.PublishResources(context.WithoutCancel(ctx))
 }
 
+// prepareClaim checks what a claim says about its own placement and then places
+// it. The check comes first because the answer does not depend on the device
+// mode, and a claim that contradicts itself is the template's error rather than
+// the node's.
+func (cp *CPUDriver) prepareClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+	placement, err := cp.claimConfig(claim)
+	if err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+	if cp.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
+		return cp.prepareGroupedResourceClaim(logger, claim, placement)
+	}
+	return cp.prepareResourceClaim(logger, claim, placement)
+}
+
+// claimConfig is what a claim says about its own placement, folded from the
+// configurations its requests carry. Mobility and alignment describe the claim
+// and not one of its requests, so configurations that disagree about them are
+// refused rather than reconciled.
+//
+// Every configuration this driver is named in has to be readable, wherever it
+// came from, or the claim is refused. Only the claim's own are then read for
+// what they say: one attached to a DeviceClass is the cluster administrator's,
+// and whether a workload survives having its CPUs changed is for whoever writes
+// its template to state.
+func (cp *CPUDriver) claimConfig(claim *resourceapi.ResourceClaim) (opaqueapi.ClaimPlacement, error) {
+	placement := opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort}
+	if claim.Status.Allocation == nil {
+		return placement, nil
+	}
+
+	folded := false
+	for _, entry := range claim.Status.Allocation.Devices.Config {
+		if entry.Opaque == nil || entry.Opaque.Driver != cp.driverName || len(entry.Opaque.Parameters.Raw) == 0 {
+			continue
+		}
+		parsed, err := opaqueapi.ParseOpaqueConfig(entry.Opaque.Parameters.Raw)
+		if err != nil {
+			return opaqueapi.ClaimPlacement{}, err
+		}
+		if entry.Source != resourceapi.AllocationConfigSourceClaim {
+			continue
+		}
+		if folded && (parsed.Relocatable != placement.Relocatable || parsed.Alignment != placement.Alignment) {
+			return opaqueapi.ClaimPlacement{}, fmt.Errorf("claim %s/%s carries configurations that disagree about cpuConfig.relocatable or cpuConfig.alignment, which describe the claim rather than one of its requests",
+				claim.Namespace, claim.Name)
+		}
+		placement.Relocatable = parsed.Relocatable
+		placement.Alignment = parsed.Alignment
+		placement.AlignmentSet = placement.AlignmentSet || parsed.AlignmentSet
+		folded = true
+	}
+
+	if placement.AlignmentSet && !claimOffersSplitAlternatives(claim) {
+		return opaqueapi.ClaimPlacement{}, fmt.Errorf("claim %s/%s sets cpuConfig.alignment, but none of its requests offers the allocator alternatives, so it can only be placed whole",
+			claim.Namespace, claim.Name)
+	}
+	return placement, nil
+}
+
+// claimOffersSplitAlternatives reports whether any request of a claim leaves the
+// allocator a choice between placements of different shapes, which is what
+// cpuConfig.alignment answers.
+func claimOffersSplitAlternatives(claim *resourceapi.ResourceClaim) bool {
+	for _, request := range claim.Spec.Devices.Requests {
+		if len(request.FirstAvailable) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
 // reservedForPodUIDs returns the pod UIDs claim.Status.ReservedFor names,
 // ignoring any non-pod consumer reference: this driver only ever compares
 // against a requesting pod's own UID.
@@ -179,9 +251,11 @@ func claimUIDFromDeviceName(name string) (types.UID, bool) {
 // the shared-pool guard for currently running shared containers. A shared
 // container from the same pod may not have been created yet when this DRA hook
 // runs, so that case is detected later by the NRI CreateContainer check.
-func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, requests []store.RequestAllocation) error {
+//
+// CCX-FORK: upstream passes one cpuset for the whole claim.
+func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, record store.ClaimRecord) error {
 	hasSharedContainers := len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
-	return cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, requests, hasSharedContainers)
+	return cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, record, hasSharedContainers)
 }
 
 // requestAllocations orders what each request of a claim was given by request
@@ -211,7 +285,9 @@ func addRequestCPUs(byRequest map[string]store.RequestAllocation, name string, c
 	}
 }
 
-func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+// CCX-FORK: upstream takes the logger and the claim alone. Whether the claim's
+// CPUs may later change is the claim's own answer, read once above.
+func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
 	logger.V(4).Info("preparing grouped resource claim")
 
 	if claim.Status.Allocation == nil {
@@ -228,8 +304,8 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		}
 	}
 
-	if existing, ok := cp.cpuAllocationStore.GetResourceClaimRequests(claim.UID); ok {
-		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", store.UnionOf(existing).String())
+	if existing, ok := cp.cpuAllocationStore.GetClaimRecord(claim.UID); ok {
+		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", store.UnionOf(existing.Requests).String())
 		// Even if the claim is already allocated in our in-memory store (which happens when a duplicate prepare
 		// call is invoked without an intermediate unprepare), we must call prepareDevices and return the result back to Kubelet.
 		// If the CDI file is already created on disk, the CDI manager will safely overwrite it with the same configuration.
@@ -341,12 +417,12 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		return kubeletplugin.PrepareResult{}
 	}
 
-	requests := requestAllocations(byRequest)
+	record := store.ClaimRecord{Requests: requestAllocations(byRequest), Relocatable: placement.Relocatable}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
-	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, requests); err != nil {
+	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, requests)
+	result := cp.prepareDevices(logger, claim, record)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 		return result
@@ -392,7 +468,8 @@ func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, topo *cpuinfo.CPUTopo
 	return cp.cpuAllocator.Allocate(logger, available, preferred, numCPUs)
 }
 
-func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+// CCX-FORK: upstream takes the logger and the claim alone, as above.
+func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
 	logger.V(4).Info("preparing individual resource claim")
 
 	if claim.Status.Allocation == nil {
@@ -423,8 +500,8 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	}
 
 	claimCPUSet := cpuset.New(claimCPUIDs...)
-	if existing, ok := cp.cpuAllocationStore.GetResourceClaimRequests(claim.UID); ok {
-		existingCPUs := store.UnionOf(existing)
+	if existing, ok := cp.cpuAllocationStore.GetClaimRecord(claim.UID); ok {
+		existingCPUs := store.UnionOf(existing.Requests)
 		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", existingCPUs.String())
 		if !existingCPUs.Equals(claimCPUSet) {
 			// This should realistically never happen as the claim is immutable.
@@ -443,12 +520,12 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 		}
 	}
 
-	requests := requestAllocations(byRequest)
+	record := store.ClaimRecord{Requests: requestAllocations(byRequest), Relocatable: placement.Relocatable}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
-	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, requests); err != nil {
+	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, requests)
+	result := cp.prepareDevices(logger, claim, record)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 		return result
@@ -459,26 +536,33 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 }
 
 // cdiEnvValue is what the injected variable says about a claim's placement: the
-// cpuset while placement is fixed for the claim's lifetime, and cdiEnvDynamicValue
-// once a pass may move it.
+// cpuset when the claim's CPUs are fixed for the life of its containers, and
+// cdiEnvDynamicValue when the claim permits them to change.
+//
+// Keyed on the claim rather than on whether defragmentation is enabled now,
+// because the variable cannot be rewritten once the container exists: a claim
+// that permits moves would be handed a cpuset that becomes a lie the moment the
+// feature is switched on, and an immobile claim would be denied a cpuset that
+// is true for its whole life.
 //
 // CCX-FORK: upstream always writes the cpuset.
-func (cp *CPUDriver) cdiEnvValue(cpus cpuset.CPUSet) string {
-	if cp.defrag.enabled {
+func (cp *CPUDriver) cdiEnvValue(record store.ClaimRecord) string {
+	if record.Relocatable {
 		return cdiEnvDynamicValue
 	}
-	return cpus.String()
+	return store.UnionOf(record.Requests).String()
 }
 
-func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, requests []store.RequestAllocation) kubeletplugin.PrepareResult {
+// CCX-FORK: upstream is handed the claim's cpuset and nothing else about the
+// claim.
+func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, record store.ClaimRecord) kubeletplugin.PrepareResult {
 	deviceName := getCDIDeviceName(claim.UID)
-	byRequest := make(map[string]store.RequestAllocation, len(requests))
-	for _, request := range requests {
+	byRequest := make(map[string]store.RequestAllocation, len(record.Requests))
+	for _, request := range record.Requests {
 		byRequest[request.Request] = request
 	}
-	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, cp.cdiEnvValue(store.UnionOf(requests)))
-	// CCX-FORK: the requests argument is the fork's placement record.
-	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar, requests); err != nil {
+	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, cp.cdiEnvValue(record))
+	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
 

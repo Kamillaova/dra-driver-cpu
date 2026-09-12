@@ -27,6 +27,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
+	opaqueapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuallocator"
@@ -53,6 +55,10 @@ const (
 	testNodeName   = "test-node"
 	testDriverName = "dra-driver-cpu.k8s.io"
 )
+
+// defaultPlacement is what a claim carrying no opaque configuration says about
+// its own placement: never moved, and content with whatever shape it was given.
+var defaultPlacement = opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort}
 
 func requirePreparedResourceClaim(t testing.TB, logger logr.Logger, allocationStore *store.CPUAllocation, claimUID types.UID, cpus cpuset.CPUSet) {
 	t.Helper()
@@ -108,7 +114,7 @@ func (m *mockKubeletPlugin) Stop() {}
 
 type mockCdiMgr struct {
 	devices      map[string]string
-	placements   map[string][]store.RequestAllocation
+	placements   map[string]store.ClaimRecord
 	addError     error
 	refreshError error
 	getError     error
@@ -119,7 +125,7 @@ type mockCdiMgr struct {
 func newMockCdiMgr() *mockCdiMgr {
 	return &mockCdiMgr{
 		devices:    make(map[string]string),
-		placements: make(map[string][]store.RequestAllocation),
+		placements: make(map[string]store.ClaimRecord),
 	}
 }
 
@@ -131,35 +137,35 @@ func newMockCdiMgrWithAllocations(allocations map[types.UID]cpuset.CPUSet) *mock
 	return mgr
 }
 
-func (m *mockCdiMgr) AddDevice(_ logr.Logger, deviceName string, envVar string, requests []store.RequestAllocation) error {
+func (m *mockCdiMgr) AddDevice(_ logr.Logger, deviceName string, envVar string, record store.ClaimRecord) error {
 	if m.addError != nil {
 		return m.addError
 	}
 	m.devices[deviceName] = envVar
-	m.placements[deviceName] = requests
+	m.placements[deviceName] = record
 	return nil
 }
 
-func (m *mockCdiMgr) GetDeviceAllocations(deviceName string) ([]store.RequestAllocation, error) {
+func (m *mockCdiMgr) GetDeviceAllocations(deviceName string) (store.ClaimRecord, error) {
 	if m.getError != nil {
-		return nil, m.getError
+		return store.ClaimRecord{}, m.getError
 	}
-	if requests, ok := m.placements[deviceName]; ok {
-		return requests, nil
+	if record, ok := m.placements[deviceName]; ok {
+		return record, nil
 	}
 	// Mirror the real manager's fallback for specs that predate the annotation.
 	env, ok := m.devices[deviceName]
 	if !ok {
-		return nil, fmt.Errorf("device %q not found", deviceName)
+		return store.ClaimRecord{}, fmt.Errorf("device %q not found", deviceName)
 	}
 	allocations, err := parseDRAEnvToClaimAllocations(logr.Discard(), []string{env})
 	if err != nil {
-		return nil, err
+		return store.ClaimRecord{}, err
 	}
 	for _, cpus := range allocations {
-		return []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}}, nil
+		return store.ClaimRecord{Requests: []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}}}, nil
 	}
-	return nil, fmt.Errorf("device %q records no placement", deviceName)
+	return store.ClaimRecord{}, fmt.Errorf("device %q records no placement", deviceName)
 }
 
 func (m *mockCdiMgr) Refresh() error {
@@ -178,15 +184,15 @@ func (m *mockCdiMgr) GetDeviceEnv(deviceName string) ([]string, error) {
 	return []string{env}, nil
 }
 
-func (m *mockCdiMgr) PreparedClaimAllocations(logr.Logger) map[types.UID][]store.RequestAllocation {
-	allocations := make(map[types.UID][]store.RequestAllocation)
+func (m *mockCdiMgr) PreparedClaimAllocations(logr.Logger) map[types.UID]store.ClaimRecord {
+	allocations := make(map[types.UID]store.ClaimRecord)
 	for deviceName := range m.devices {
 		claimUID, ok := claimUIDFromDeviceName(deviceName)
 		if !ok {
 			continue
 		}
-		if requests, err := m.GetDeviceAllocations(deviceName); err == nil {
-			allocations[claimUID] = requests
+		if record, err := m.GetDeviceAllocations(deviceName); err == nil {
+			allocations[claimUID] = record
 		}
 	}
 	return allocations
@@ -2614,7 +2620,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
 		d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
 
-		result := d.prepareGroupedResourceClaim(logger, newClaim("claim-4", 4))
+		result := d.prepareGroupedResourceClaim(logger, newClaim("claim-4", 4), defaultPlacement)
 		require.NoError(t, result.Err)
 
 		got, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-4")
@@ -2627,7 +2633,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
 		d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
 
-		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-8", 8)).Err)
+		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-8", 8), defaultPlacement).Err)
 		got, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-8")
 
 		caches := map[int]struct{}{}
@@ -2643,7 +2649,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(0), newMockCdiMgr())
 		d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
 
-		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-14", 14)).Err)
+		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-14", 14), defaultPlacement).Err)
 		got, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-14")
 
 		require.Equal(t, 14, got.Size())
@@ -2655,7 +2661,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
 		d.topology.deviceThreadsPerCore = map[string]int{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}
 
-		result := d.prepareGroupedResourceClaim(logger, newClaim("claim-odd", 3))
+		result := d.prepareGroupedResourceClaim(logger, newClaim("claim-odd", 3), defaultPlacement)
 		require.Error(t, result.Err)
 		require.Contains(t, result.Err.Error(), "not a multiple of the 2-CPU core size")
 		require.Contains(t, result.Err.Error(), "DRAConsumableCapacity")
@@ -2665,7 +2671,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 		d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
 
 		// An odd count is allowed and satisfied exactly, as upstream does.
-		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-3", 3)).Err)
+		require.NoError(t, d.prepareGroupedResourceClaim(logger, newClaim("claim-3", 3), defaultPlacement).Err)
 		got, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-3")
 		require.Equal(t, 3, got.Size())
 	})
@@ -2707,7 +2713,7 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 	cache1 := devattr.CPUDeviceCacheGroupedPrefix + "001"
 	require.Contains(t, built.CPUs, cache1)
 	result := d.prepareGroupedResourceClaim(logger,
-		testClaim("claim-cache1", testDriverName, testNodeName, map[string]int64{cache1: 4}))
+		testClaim("claim-cache1", testDriverName, testNodeName, map[string]int64{cache1: 4}), defaultPlacement)
 	require.NoError(t, result.Err)
 
 	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-cache1")
@@ -2719,15 +2725,18 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 }
 
 func TestPreparedEnvSaysDynamicOnlyWhenPlacementCanChange(t *testing.T) {
-	// The variable cannot be rewritten once the container exists, so while the
-	// driver may move the claim it must not name a cpuset. With defragmentation
-	// off the placement is fixed for the claim's lifetime and the cpuset is the
-	// truth.
-	d := &CPUDriver{defrag: defragOptions{enabled: true}}
-	require.Equal(t, "dynamic", d.cdiEnvValue(cpuset.New(0, 1)))
+	// The variable cannot be rewritten once the container exists, so a claim the
+	// driver may move must not be handed a cpuset. A claim that permits no move
+	// keeps the same CPUs for the life of its containers, and the cpuset is the
+	// truth for it -- which is why this answer comes from the claim and not from
+	// whether the feature happens to be on right now.
+	d := &CPUDriver{}
+	require.Equal(t, "dynamic", d.cdiEnvValue(relocatableOn(cpuset.New(0, 1))))
+	require.Equal(t, "0-1", d.cdiEnvValue(exclusiveOn(cpuset.New(0, 1))))
 
-	d.defrag.enabled = false
-	require.Equal(t, "0-1", d.cdiEnvValue(cpuset.New(0, 1)))
+	d.defrag.enabled = true
+	require.Equal(t, "0-1", d.cdiEnvValue(exclusiveOn(cpuset.New(0, 1))),
+		"an immobile claim's cpuset is true whatever the node's configuration")
 }
 
 // smtPoolInfos is a 16-CPU node: 8 two-thread cores, two NUMA nodes, four
@@ -2817,8 +2826,9 @@ func TestPrepareGivesAClaimedPoolItsWholeDevice(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, results[claimUID].Err)
 
-	requests, ok := driver.cpuAllocationStore.GetResourceClaimRequests(claimUID)
+	record, ok := driver.cpuAllocationStore.GetClaimRecord(claimUID)
 	require.True(t, ok)
+	requests := record.Requests
 	require.Len(t, requests, 2)
 	require.Equal(t, "helpers", requests[0].Request)
 	require.Equal(t, store.RoleShared, requests[0].Role)
@@ -2882,8 +2892,9 @@ func TestPrepareRecordsEachRequestOfAClaim(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, results[claimUID].Err)
 
-	requests, ok := driver.cpuAllocationStore.GetResourceClaimRequests(claimUID)
+	record, ok := driver.cpuAllocationStore.GetClaimRecord(claimUID)
 	require.True(t, ok)
+	requests := record.Requests
 	require.Len(t, requests, 2)
 	require.Equal(t, "helpers", requests[0].Request)
 	require.Equal(t, 1, requests[0].CPUs.Size())
@@ -2895,6 +2906,194 @@ func TestPrepareRecordsEachRequestOfAClaim(t *testing.T) {
 		"two requests of one claim never share a CPU")
 	require.Equal(t, store.UnionOf(requests), driver.cpuAllocationStore.GetPreparedCPUs())
 
-	require.Equal(t, requests, mockCdi.placements[getCDIDeviceName(claimUID)],
+	require.Equal(t, record, mockCdi.placements[getCDIDeviceName(claimUID)],
 		"the device spec records the same split")
+}
+
+// claimWithRawConfigs attaches opaque configurations of the claim's own verbatim,
+// for the cases the typed helpers cannot express.
+func claimWithRawConfigs(claim *resourceapi.ResourceClaim, driverName string, raws ...string) *resourceapi.ResourceClaim {
+	for _, raw := range raws {
+		claim.Status.Allocation.Devices.Config = append(claim.Status.Allocation.Devices.Config,
+			resourceapi.DeviceAllocationConfiguration{
+				Source: resourceapi.AllocationConfigSourceClaim,
+				DeviceConfiguration: resourceapi.DeviceConfiguration{
+					Opaque: &resourceapi.OpaqueDeviceConfiguration{
+						Driver:     driverName,
+						Parameters: runtime.RawExtension{Raw: []byte(raw)},
+					},
+				},
+			})
+	}
+	return claim
+}
+
+// withSplitAlternatives gives a claim a request the allocator has a choice
+// about, which is what makes cpuConfig.alignment mean anything.
+func withSplitAlternatives(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+	claim.Spec.Devices.Requests = []resourceapi.DeviceRequest{{
+		Name: "vcpus",
+		FirstAvailable: []resourceapi.DeviceSubRequest{
+			{Name: "aligned"},
+			{Name: "split2"},
+		},
+	}}
+	return claim
+}
+
+func TestClaimConfig(t *testing.T) {
+	d := &CPUDriver{driverName: testDriverName}
+	claim := func() *resourceapi.ResourceClaim {
+		return testClaim("claim-1", testDriverName, testNodeName,
+			map[string]int64{devattr.CPUDeviceMachineGrouped: 2})
+	}
+	deviceClassConfig := func(c *resourceapi.ResourceClaim, raw string) *resourceapi.ResourceClaim {
+		c = claimWithRawConfigs(c, testDriverName, raw)
+		c.Status.Allocation.Devices.Config[0].Source = resourceapi.AllocationConfigSourceClass
+		return c
+	}
+
+	testCases := []struct {
+		name          string
+		claim         *resourceapi.ResourceClaim
+		expected      opaqueapi.ClaimPlacement
+		expectedError string
+	}{
+		{
+			name:     "a claim that says nothing is not moved",
+			claim:    claim(),
+			expected: opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			name:     "no allocation yet",
+			claim:    &resourceapi.ResourceClaim{},
+			expected: opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			name:     "relocatable stated",
+			claim:    claimWithRawConfigs(claim(), testDriverName, `{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`),
+			expected: opaqueapi.ClaimPlacement{Relocatable: true, Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			// Only this driver's configurations say anything to this driver.
+			name:     "another driver's configuration is not read",
+			claim:    claimWithRawConfigs(claim(), "other.example.com", `{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`),
+			expected: opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			// Mobility is what the workload tolerates, which the administrator
+			// who writes a DeviceClass does not know.
+			name:     "a DeviceClass configuration cannot grant mobility",
+			claim:    deviceClassConfig(claim(), `{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`),
+			expected: opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			// Ignored for what it says, still refused for being unreadable: a
+			// version this driver does not know may mean anything at all.
+			name:          "a DeviceClass configuration of an unknown version is refused",
+			claim:         deviceClassConfig(claim(), `{"apiVersion":"v1beta1","cpuConfig":{}}`),
+			expectedError: "unsupported opaque config apiVersion",
+		},
+		{
+			name: "two configurations agreeing",
+			claim: claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`),
+			expected: opaqueapi.ClaimPlacement{Relocatable: true, Alignment: v1alpha1.AlignmentBestEffort},
+		},
+		{
+			// Whether the claim may be moved is one answer for the claim, so
+			// there is nothing to reconcile between two of them.
+			name: "two configurations disagreeing",
+			claim: claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":true}}`,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"relocatable":false}}`),
+			expectedError: "disagree about cpuConfig.relocatable or cpuConfig.alignment",
+		},
+		{
+			name: "alignment on a claim the allocator has no choice about",
+			claim: claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"alignment":"BestEffort"}}`),
+			expectedError: "none of its requests offers the allocator alternatives",
+		},
+		{
+			name: "alignment on a claim offering alternatives",
+			claim: withSplitAlternatives(claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"alignment":"Repairable","relocatable":true}}`)),
+			expected: opaqueapi.ClaimPlacement{
+				Relocatable:  true,
+				Alignment:    v1alpha1.AlignmentRepairable,
+				AlignmentSet: true,
+			},
+		},
+		{
+			name: "repairable without relocatable",
+			claim: withSplitAlternatives(claimWithRawConfigs(claim(), testDriverName,
+				`{"apiVersion":"v1alpha1","cpuConfig":{"alignment":"Repairable"}}`)),
+			expectedError: "requires cpuConfig.relocatable",
+		},
+		{
+			name:          "an unknown configuration version is refused",
+			claim:         claimWithRawConfigs(claim(), testDriverName, `{"apiVersion":"v1beta1","cpuConfig":{}}`),
+			expectedError: "unsupported opaque config apiVersion",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := d.claimConfig(tc.claim)
+			if tc.expectedError != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.expectedError)
+				require.Equal(t, opaqueapi.ClaimPlacement{}, got)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+// TestPrepareFailsClosedOnAContradictoryConfig: a claim whose configuration the
+// driver cannot honour must fail Prepare rather than be placed as if it had said
+// nothing. Failing Prepare is what makes the kubelet record
+// FailedPrepareDynamicResources against the pod, which is the only channel this
+// driver has for telling an operator about a claim it refused.
+func TestPrepareFailsClosedOnAContradictoryConfig(t *testing.T) {
+	infos := mockCPUInfos_DualSocket_4CPUsPerSocket_HT
+
+	testCases := []struct {
+		name          string
+		claim         *resourceapi.ResourceClaim
+		expectedError string
+	}{
+		{
+			name: "unknown configuration version",
+			claim: claimWithRawConfigs(testClaim("claim-version", testDriverName, testNodeName,
+				map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}),
+				testDriverName, `{"apiVersion":"v1beta1","cpuConfig":{}}`),
+			expectedError: "unsupported opaque config apiVersion",
+		},
+		{
+			name: "a named cpuset that may move",
+			claim: claimWithRawConfigs(testClaim("claim-cpuset", testDriverName, testNodeName,
+				map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "0": 2}),
+				testDriverName, `{"apiVersion":"v1alpha1","cpuConfig":{"cpuset":"0,4","relocatable":true}}`),
+			expectedError: "cannot be combined with cpuConfig.relocatable",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := createCPUDriverForTest(t, devattr.GROUP_BY_NUMA_NODE, infos, nil, cpuset.New(), newMockCdiMgr())
+
+			result, err := d.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{tc.claim})
+			require.NoError(t, err, "the batch itself does not fail")
+			require.Error(t, result[tc.claim.UID].Err)
+			require.Contains(t, result[tc.claim.UID].Err.Error(), tc.expectedError)
+
+			// Nothing was placed, so the CPUs stay available.
+			require.True(t, d.cpuAllocationStore.GetPreparedCPUs().IsEmpty())
+		})
+	}
 }

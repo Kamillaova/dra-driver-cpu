@@ -21,6 +21,18 @@ spec:
               # whose step is the core size, so an odd request is rounded up by
               # the scheduler: asking for 3 here would consume 4.
               dra.cpu/cpu: "4"
+      config:
+      - requests:
+        - vcpus
+        opaque:
+          driver: dra.cpu
+          parameters:
+            apiVersion: v1alpha1
+            cpuConfig:
+              # This class's whole contract. Without it the defragmenter leaves
+              # the claim alone: mobility defaults to off, because a workload
+              # that cannot tolerate it must not be moved by accident.
+              relocatable: true
 ---
 apiVersion: v1
 kind: Pod
