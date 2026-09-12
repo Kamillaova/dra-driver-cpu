@@ -69,5 +69,32 @@ func (c Config) Validate() error {
 	if !filepath.IsAbs(c.KubeletRootDir) {
 		return fmt.Errorf("invalid kubeletRootDir %q: must be an absolute path", c.KubeletRootDir)
 	}
+	if err := c.validateDefrag(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c Config) validateDefrag() error {
+	if !c.DefragEnabled {
+		return nil
+	}
+	// Defragmentation moves claims the driver placed itself. In individual mode
+	// the scheduler picks the exact CPU devices, and with groupBy "machine" the
+	// cpuset comes from the claim's own opaque config, so in both cases the
+	// placement is not the driver's to change.
+	if c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
+		return fmt.Errorf("invalid defragEnabled: requires cpuDeviceMode %q, got %q",
+			device.CPU_DEVICE_MODE_GROUPED, c.CPUDeviceMode)
+	}
+	if c.GroupBy != device.GROUP_BY_NUMA_NODE && c.GroupBy != device.GROUP_BY_SOCKET {
+		return fmt.Errorf("invalid defragEnabled: requires groupBy %q or %q, got %q",
+			device.GROUP_BY_NUMA_NODE, device.GROUP_BY_SOCKET, c.GroupBy)
+	}
+	// A move is a container update the runtime did not ask for, which is exactly
+	// what that option asserts is safe here.
+	if !c.AssumeUnsolicitedUpdatesSafe {
+		return fmt.Errorf("invalid defragEnabled: requires assumeUnsolicitedUpdatesSafe")
+	}
 	return nil
 }
