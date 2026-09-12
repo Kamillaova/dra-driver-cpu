@@ -63,30 +63,30 @@ func (cp *CPUDriver) runReconcileWorker(ctx context.Context) {
 				cp.reconcileSharedContainers(ctx)
 			}
 			cp.defragPass(ctx)
-		case numaNodeID := <-cp.defragRetryDue:
-			cp.defragRetryPass(ctx, numaNodeID)
-			cp.defragRetries.Done(numaNodeID)
+		case scope := <-cp.defragRetryDue:
+			cp.defragRetryPass(ctx, scope)
+			cp.defragRetries.Done(scope)
 		}
 	}
 }
 
-// runDefragRetryWorker hands each NUMA node the rate limiter releases to the
-// worker above, which is the one goroutine that runs passes: a round's runtime
-// call happens with applyMu released, so a second goroutine planning the same
-// node would undo the one-round-per-node bound.
+// runDefragRetryWorker hands each scope the rate limiter releases to the worker
+// above, which is the one goroutine that runs passes: a round's runtime call
+// happens with applyMu released, so a second goroutine planning the same scope
+// would undo the one-round-per-scope bound.
 //
 // With defragmentation off there is no queue and no worker, and the receive from
 // the nil channel above blocks forever, which is what it should do.
 func (cp *CPUDriver) runDefragRetryWorker(ctx context.Context) {
 	for {
-		numaNodeID, shutdown := cp.defragRetries.Get()
+		scope, shutdown := cp.defragRetries.Get()
 		if shutdown {
 			return
 		}
 		select {
-		case cp.defragRetryDue <- numaNodeID:
+		case cp.defragRetryDue <- scope:
 		case <-ctx.Done():
-			cp.defragRetries.Done(numaNodeID)
+			cp.defragRetries.Done(scope)
 			return
 		}
 	}
