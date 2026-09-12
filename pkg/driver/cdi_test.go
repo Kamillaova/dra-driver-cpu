@@ -17,13 +17,18 @@ limitations under the License.
 package driver
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/go-logr/logr/testr"
 	"github.com/google/go-cmp/cmp"
+	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/cpuset"
 	cdiSpec "tags.cncf.io/container-device-interface/specs-go"
 )
 
@@ -38,6 +43,23 @@ func getSpecFromCache(mgr *CdiManager, targetSpecName string) *cdiSpec.Spec {
 		}
 	}
 	return nil
+}
+
+// exclusiveOn is the allocation shape of every claim this driver prepares
+// today: one request granting CPUs the claim holds alone.
+func exclusiveOn(cpus cpuset.CPUSet) store.ClaimRecord {
+	return store.ClaimRecord{
+		Requests:  []store.RequestAllocation{{Request: "cpus", CPUs: cpus, Role: store.RoleExclusive}},
+		Alignment: v1alpha1.AlignmentBestEffort,
+	}
+}
+
+// relocatableOn is a claim that permits its CPUs to change, which is what a
+// defragmentation pass needs before it will move anything.
+func relocatableOn(cpus cpuset.CPUSet) store.ClaimRecord {
+	record := exclusiveOn(cpus)
+	record.Relocatable = true
+	return record
 }
 
 func TestAddDevice(t *testing.T) {
@@ -81,7 +103,7 @@ func TestAddDevice(t *testing.T) {
 			expectedSpecName := mgr.getSpecName(tc.deviceName)
 			expectedFilePath := filepath.Join(tempCDIDir, expectedSpecName)
 
-			err = mgr.AddDevice(logger, tc.deviceName, tc.envVar)
+			err = mgr.AddDevice(logger, tc.deviceName, tc.envVar, exclusiveOn(cpuset.New(0, 1)))
 
 			if tc.expectedError != "" {
 				require.Error(t, err)
@@ -100,6 +122,14 @@ func TestAddDevice(t *testing.T) {
 				Devices: []cdiSpec.Device{
 					{
 						Name: tc.deviceName,
+						// The claim's record lives in CDI annotations, which are
+						// not injected into the container and so can be
+						// rewritten while it runs.
+						Annotations: map[string]string{
+							cdiPlacementsAnnotation:  `[{"request":"cpus","cpus":"0-1","role":"exclusive"}]`,
+							cdiRelocatableAnnotation: "false",
+							cdiAlignmentAnnotation:   "BestEffort",
+						},
 						ContainerEdits: cdiSpec.ContainerEdits{
 							Env: []string{tc.envVar},
 						},
@@ -157,7 +187,7 @@ func TestRemoveDevice(t *testing.T) {
 			expectedFilePath := filepath.Join(tempCDIDir, expectedSpecName)
 
 			if !tc.simulateErr {
-				err = mgr.AddDevice(logger, tc.deviceName, tc.envVar)
+				err = mgr.AddDevice(logger, tc.deviceName, tc.envVar, exclusiveOn(cpuset.New(0, 1)))
 				require.NoError(t, err)
 			}
 
@@ -197,7 +227,7 @@ func TestAddDeviceOverwrite(t *testing.T) {
 		require.Len(t, files, expected)
 	}
 
-	err = mgr.AddDevice(logger, deviceName, "CPU=0,1")
+	err = mgr.AddDevice(logger, deviceName, "CPU=0,1", exclusiveOn(cpuset.New(0, 1)))
 	require.NoError(t, err)
 	assertFileCount(1)
 
@@ -207,7 +237,7 @@ func TestAddDeviceOverwrite(t *testing.T) {
 	require.Equal(t, []string{"CPU=0,1"}, spec1.Devices[0].ContainerEdits.Env)
 
 	// Call AddDevice again with the same deviceName and same data
-	err = mgr.AddDevice(logger, deviceName, "CPU=0,1")
+	err = mgr.AddDevice(logger, deviceName, "CPU=0,1", exclusiveOn(cpuset.New(0, 1)))
 	require.NoError(t, err)
 	// Verify that we do not create a new file
 	assertFileCount(1)
@@ -222,7 +252,7 @@ func TestGetDeviceEnv(t *testing.T) {
 
 	deviceName := "claim-cpu-get-env"
 	expectedEnv := "DRA_CPUSET_claim-cpu-get-env=0,1"
-	err = mgr.AddDevice(logger, deviceName, expectedEnv)
+	err = mgr.AddDevice(logger, deviceName, expectedEnv, exclusiveOn(cpuset.New(0, 1)))
 	require.NoError(t, err)
 	err = mgr.Refresh()
 	require.NoError(t, err)
@@ -241,7 +271,7 @@ func TestRefreshKeepsValidDevicesWhenAnotherSpecIsInvalid(t *testing.T) {
 
 	deviceName := "claim-cpu-valid"
 	expectedEnv := "DRA_CPUSET_claim-cpu-valid=0,1"
-	err = mgr.AddDevice(logger, deviceName, expectedEnv)
+	err = mgr.AddDevice(logger, deviceName, expectedEnv, exclusiveOn(cpuset.New(0, 1)))
 	require.NoError(t, err)
 
 	err = os.WriteFile(filepath.Join(tempCDIDir, "unrelated-invalid.json"), []byte("{"), 0600)
@@ -263,4 +293,317 @@ func TestGetDeviceEnvMissingDevice(t *testing.T) {
 	_, err = mgr.GetDeviceEnv("missing-device")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), `failed to find CDI device "missing-device"`)
+}
+
+func TestGetDeviceAllocations(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-cpu-placement"
+	require.NoError(t, mgr.AddDevice(logger, deviceName,
+		"DRA_CPUSET_claim-cpu-placement=2-3", exclusiveOn(cpuset.New(2, 3))))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, exclusiveOn(cpuset.New(2, 3)), got)
+
+	// Rewriting the spec must move the recorded placement, since this is what
+	// makes a claim's CPUs mutable while its container runs.
+	require.NoError(t, mgr.AddDevice(logger, deviceName,
+		"DRA_CPUSET_claim-cpu-placement=2-3", exclusiveOn(cpuset.New(6, 7))))
+	require.NoError(t, mgr.Refresh())
+
+	got, err = mgr.GetDeviceAllocations(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, exclusiveOn(cpuset.New(6, 7)), got, "the annotation, not the env var, is the record")
+}
+
+func TestGetDeviceAllocationsFallsBackToEnv(t *testing.T) {
+	logger := testr.New(t)
+	tempCDIDir := t.TempDir()
+	mgr, err := NewCdiManager(logger, testDriverName, tempCDIDir)
+	require.NoError(t, err)
+
+	// A spec written before the driver recorded placement in an annotation: the
+	// env var is the only record, and unlike a container's environment the
+	// driver-owned spec file's value is current.
+	deviceName := "claim-cpu-legacy"
+	legacy := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name: deviceName,
+			ContainerEdits: cdiSpec.ContainerEdits{
+				Env: []string{"DRA_CPUSET_claim-cpu-legacy=4,5"},
+			},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(legacy, mgr.getSpecName(deviceName)))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, store.ClaimRecord{
+		Requests:  []store.RequestAllocation{{CPUs: cpuset.New(4, 5), Role: store.RoleExclusive}},
+		Alignment: v1alpha1.AlignmentBestEffort,
+	}, got)
+}
+
+func TestGetDeviceAllocationsMissingDevice(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	_, err = mgr.GetDeviceAllocations("claim-cpu-absent")
+	require.Error(t, err)
+}
+
+func TestPreparedClaimAllocationsRecoversRecordedPlacements(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	claimA := types.UID("claim-a")
+	claimB := types.UID("claim-b")
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimA),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimA, "0-1"), exclusiveOn(cpuset.New(0, 1))))
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimB),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimB, "dynamic"), exclusiveOn(cpuset.New(4, 5))))
+	require.NoError(t, mgr.Refresh())
+
+	got := mgr.PreparedClaimAllocations(logger)
+	require.Equal(t, map[types.UID]store.ClaimRecord{
+		claimA: exclusiveOn(cpuset.New(0, 1)),
+		claimB: exclusiveOn(cpuset.New(4, 5)),
+	}, got)
+}
+
+func TestPreparedClaimAllocationsEmptyWhenNothingOnDisk(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	require.Empty(t, mgr.PreparedClaimAllocations(logger))
+}
+
+func TestPreparedClaimAllocationsIgnoresDevicesThisDriverWouldNotHaveGenerated(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	// Neither is a "claim-<uid>" name, so recovering them would not name a real
+	// claim UID -- a hand-edited or foreign spec sharing this driver's kind.
+	foreign := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name:           "not-a-claim-device",
+			Annotations:    map[string]string{cdiCPUSetAnnotation: "2-3"},
+			ContainerEdits: cdiSpec.ContainerEdits{Env: []string{"UNRELATED=1"}},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(foreign, mgr.getSpecName("not-a-claim-device")))
+
+	claimA := types.UID("claim-a")
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimA),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimA, "0-1"), exclusiveOn(cpuset.New(0, 1))))
+	require.NoError(t, mgr.Refresh())
+
+	got := mgr.PreparedClaimAllocations(logger)
+	require.Equal(t, map[types.UID]store.ClaimRecord{claimA: exclusiveOn(cpuset.New(0, 1))}, got)
+}
+
+func TestPreparedClaimAllocationsSkipsOneUnrecoverableDeviceWithoutFailingTheRest(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	// A driver-written annotation that fails to parse: the spec was corrupted
+	// or hand-edited, and this one claim's placement is unrecoverable, but that
+	// must not cost every other claim its recovery too.
+	corrupt := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name:           "claim-corrupt",
+			Annotations:    map[string]string{cdiCPUSetAnnotation: "not-a-cpuset"},
+			ContainerEdits: cdiSpec.ContainerEdits{Env: []string{"UNRELATED=1"}},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(corrupt, mgr.getSpecName("claim-corrupt")))
+
+	claimA := types.UID("claim-a")
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimA),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimA, "0-1"), exclusiveOn(cpuset.New(0, 1))))
+	require.NoError(t, mgr.Refresh())
+
+	got := mgr.PreparedClaimAllocations(logger)
+	require.Equal(t, map[types.UID]store.ClaimRecord{claimA: exclusiveOn(cpuset.New(0, 1))}, got)
+}
+
+func TestGetDeviceAllocationsMalformedAnnotation(t *testing.T) {
+	// The annotation is driver-written, so a value that does not parse means the
+	// spec was corrupted or hand-edited. The claim's placement is then unknown,
+	// which must surface as an error rather than as an empty cpuset a caller
+	// would treat as "no CPUs".
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-cpu-corrupt"
+	spec := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name:        deviceName,
+			Annotations: map[string]string{cdiCPUSetAnnotation: "not-a-cpuset"},
+			ContainerEdits: cdiSpec.ContainerEdits{
+				Env: []string{"DRA_CPUSET_claim-cpu-corrupt=0-1"},
+			},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(spec, mgr.getSpecName(deviceName)))
+	require.NoError(t, mgr.Refresh())
+
+	_, err = mgr.GetDeviceAllocations(deviceName)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to parse")
+	require.Contains(t, err.Error(), cdiCPUSetAnnotation)
+}
+
+func TestGetDeviceAllocationsRecoversMobility(t *testing.T) {
+	// The driver does not watch ResourceClaims, so after a restart the spec is
+	// the only place the claim's own answer can come from.
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	require.NoError(t, mgr.AddDevice(logger, "claim-movable", "DRA_CPUSET_claim-movable=dynamic", relocatableOn(cpuset.New(2, 3))))
+	require.NoError(t, mgr.AddDevice(logger, "claim-fixed", "DRA_CPUSET_claim-fixed=4-5", exclusiveOn(cpuset.New(4, 5))))
+	require.NoError(t, mgr.Refresh())
+
+	movable, err := mgr.GetDeviceAllocations("claim-movable")
+	require.NoError(t, err)
+	require.True(t, movable.Relocatable)
+
+	fixed, err := mgr.GetDeviceAllocations("claim-fixed")
+	require.NoError(t, err)
+	require.False(t, fixed.Relocatable)
+}
+
+func TestGetDeviceAllocationsReadsAnAbsentMobilityAnnotationAsImmobile(t *testing.T) {
+	// A spec written before the driver recorded mobility, or one hand-edited
+	// into nonsense: refusing to move the claim costs it nothing but a repair,
+	// where moving one that never agreed costs it its CPU pinning.
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	for name, annotations := range map[string]map[string]string{
+		"claim-legacy":  {cdiCPUSetAnnotation: "0-1"},
+		"claim-garbage": {cdiCPUSetAnnotation: "0-1", cdiRelocatableAnnotation: "yes please"},
+	} {
+		spec := &cdiSpec.Spec{
+			Version: cdiSpecVersion,
+			Kind:    cdiVendor + "/" + cdiClass,
+			Devices: []cdiSpec.Device{{
+				Name:           name,
+				Annotations:    annotations,
+				ContainerEdits: cdiSpec.ContainerEdits{Env: []string{fmt.Sprintf("%s_%s=0-1", cdiEnvVarPrefix, name)}},
+			}},
+		}
+		require.NoError(t, mgr.cache.WriteSpec(spec, mgr.getSpecName(name)))
+	}
+	require.NoError(t, mgr.Refresh())
+
+	for _, name := range []string{"claim-legacy", "claim-garbage"} {
+		got, err := mgr.GetDeviceAllocations(name)
+		require.NoError(t, err, name)
+		require.False(t, got.Relocatable, name)
+		require.Equal(t, cpuset.New(0, 1), store.UnionOf(got.Requests), name)
+	}
+}
+
+func TestGetDeviceAllocationsRecoversChargedDevices(t *testing.T) {
+	// The published capacity of a device is corrected by the difference between
+	// what a claim's allocation charged it and what the claim occupies there, so
+	// a restart that loses the first half loses the correction.
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	record := relocatableOn(cpuset.New(2, 3))
+	record.Recorded = map[string]int{"cpudevcache000": 2}
+	require.NoError(t, mgr.AddDevice(logger, "claim-charged", "DRA_CPUSET_claim-charged=dynamic", record))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations("claim-charged")
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{"cpudevcache000": 2}, got.Recorded)
+}
+
+func TestGetDeviceAllocationsReadsAnAbsentChargedAnnotationAsUnknown(t *testing.T) {
+	// A spec written before the driver recorded them. Read as "charged nothing",
+	// every running claim would look like a tenant of a device its allocation
+	// never named and the node's caches would each shrink by their occupancy;
+	// read as unknown, the capacity is published uncorrected, which is what it
+	// was before the mirror existed.
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	require.NoError(t, mgr.AddDevice(logger, "claim-legacy", "DRA_CPUSET_claim-legacy=0-1", exclusiveOn(cpuset.New(0, 1))))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations("claim-legacy")
+	require.NoError(t, err)
+	require.Empty(t, got.Recorded)
+}
+
+func TestGetDeviceAllocationsMalformedChargedAnnotation(t *testing.T) {
+	// Unlike mobility, an unparsable value here has no safe default: reading it
+	// as unknown would silently drop a correction the driver had recorded.
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-charged-corrupt"
+	spec := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name: deviceName,
+			Annotations: map[string]string{
+				cdiCPUSetAnnotation:   "0-1",
+				cdiRecordedAnnotation: "{not json",
+			},
+			ContainerEdits: cdiSpec.ContainerEdits{Env: []string{fmt.Sprintf("%s_%s=0-1", cdiEnvVarPrefix, deviceName)}},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(spec, mgr.getSpecName(deviceName)))
+	require.NoError(t, mgr.Refresh())
+
+	_, err = mgr.GetDeviceAllocations(deviceName)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), cdiRecordedAnnotation)
+}
+
+func TestGetDeviceAllocationsRecoversAlignment(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	rec := exclusiveOn(cpuset.New(0, 1))
+	rec.Relocatable = true
+	rec.Alignment = v1alpha1.AlignmentRepairable
+
+	require.NoError(t, mgr.AddDevice(logger, "claim-repairable", "DRA_CPUSET_claim-repairable=0-1", rec))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations("claim-repairable")
+	require.NoError(t, err)
+	require.Equal(t, v1alpha1.AlignmentRepairable, got.Alignment)
+	require.True(t, got.Relocatable)
 }

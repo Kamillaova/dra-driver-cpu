@@ -19,10 +19,22 @@ package driverconfig
 import (
 	"flag"
 	"fmt"
+	"slices"
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 )
+
+// groupings are the values groupBy takes. One list, because the config file's
+// validator, the deprecated flag's and the generated schema have to accept the
+// same set, and a value added to one of them alone is a value the driver either
+// refuses or never hears about.
+var groupings = []string{
+	device.GROUP_BY_NUMA_NODE,
+	device.GROUP_BY_SOCKET,
+	device.GROUP_BY_MACHINE,
+	device.GROUP_BY_UNCORE_CACHE,
+}
 
 type FlagSource struct {
 	overrides map[string]any
@@ -60,13 +72,13 @@ func (c *Config) AddFlags(fs *flag.FlagSet) {
 	c.applyDefaults()
 
 	fs.StringVar(&c.Kubeconfig, "kubeconfig", c.Kubeconfig, "absolute path to the kubeconfig file")
-	fs.StringVar(&c.BindAddress, "bind-address", c.BindAddress, "The address to bind the HTTP server for /healthz and /metrics endpoints")
+	fs.StringVar(&c.BindAddress, "bind-address", c.BindAddress, "The address to bind the HTTP server for the /healthz, /metrics and /placements endpoints")
 	fs.BoolVar(&c.ExposePCIeRoots, "expose-pcie-roots", c.ExposePCIeRoots, "Discover and expose PCIe roots as device attributes. Requires the DRAListTypeAttributes=true Feature Gate in the cluster.")
 	fs.StringVar(&c.KubeletRootDir, "kubelet-root-dir", c.KubeletRootDir, "The kubelet root directory. The plugin registration and plugin data directories are derived from it as <root>/plugins_registry and <root>/plugins/<driver-name>. The Helm chart supplies this together with the matching hostPath mounts; set it only if the kubelet --root-dir is not the default /var/lib/kubelet.")
 	fs.Var(newCPUDeviceModeValue(&c.CPUDeviceMode, c.CPUDeviceMode), "cpu-device-mode", deprecatedUsage("cpuDeviceMode",
 		"Sets the mode for exposing CPU devices. 'grouped' exposes a single device per socket or numa node (based on --group-by). 'individual' exposes each CPU as a separate device."))
 	fs.Var(newGroupByValue(&c.GroupBy, c.GroupBy), "group-by", deprecatedUsage("groupBy",
-		"When --cpu-device-mode=grouped, sets the criteria for grouping CPUs. Can be set to 'socket', 'numanode', or 'machine' (machine mode requires an external scheduler to include cpuset configuration in claim allocation results)."))
+		"When --cpu-device-mode=grouped, sets the criteria for grouping CPUs. Can be set to 'socket', 'numanode', 'uncorecache', or 'machine' (machine mode requires an external scheduler to include cpuset configuration in claim allocation results)."))
 	fs.StringVar(&c.ReservedCPUs, "reserved-cpus", c.ReservedCPUs, deprecatedUsage("reservedCPUs",
 		"cpuset of CPUs to be excluded from ResourceSlice."))
 	fs.StringVar(&c.HostnameOverride, "hostname-override", c.HostnameOverride, deprecatedUsage("hostnameOverride",
@@ -138,8 +150,8 @@ func (v *groupByValue) String() string {
 }
 
 func (v *groupByValue) Set(s string) error {
-	if s != device.GROUP_BY_SOCKET && s != device.GROUP_BY_NUMA_NODE && s != device.GROUP_BY_MACHINE {
-		return fmt.Errorf("invalid value: %q, must be %s, %s or %s", s, device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_MACHINE)
+	if !slices.Contains(groupings, s) {
+		return fmt.Errorf("invalid value: %q, must be one of %q", s, groupings)
 	}
 	*v.value = s
 	return nil

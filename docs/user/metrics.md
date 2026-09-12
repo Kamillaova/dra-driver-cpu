@@ -13,30 +13,78 @@ dracpu introspect metrics
 
 The command prints JSON metadata for custom `dra_cpu_*` metrics only. It does not include default Go runtime, process, or Prometheus client metrics.
 
-| Metric                                          | Type      | Labels                          | Description                                                                                                                                    |
-| ----------------------------------------------- | --------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `dra_cpu_allocated_cpus`                        | Gauge     | none                            | CPUs currently allocated to prepared resource claims.                                                                                          |
-| `dra_cpu_available_cpus`                        | Gauge     | none                            | CPUs still available for allocation after reserved and active claim CPUs are excluded.                                                         |
-| `dra_cpu_reserved_cpus`                         | Gauge     | none                            | CPUs excluded from DRA management by driver configuration.                                                                                     |
-| `dra_cpu_resource_claims_active`                | Gauge     | none                            | Resource claims currently recorded as active by the allocation store.                                                                          |
-| `dra_cpu_prepare_claims_total`                  | Counter   | `result`                        | Per-claim `PrepareResourceClaims` results. `result` is `success`, `error`, or `unknown`.                                                       |
-| `dra_cpu_unprepare_claims_total`                | Counter   | `result`                        | Per-claim `UnprepareResourceClaims` results. `result` is `success`, `error`, or `unknown`.                                                     |
-| `dra_cpu_prepare_claim_duration_seconds`        | Histogram | none                            | Per-claim prepare latency in seconds.                                                                                                          |
-| `dra_cpu_unprepare_claim_duration_seconds`      | Histogram | none                            | Per-claim unprepare latency in seconds.                                                                                                        |
-| `dra_cpu_claim_allocated_cpus`                  | Histogram | none                            | CPUs allocated for each newly successful claim allocation.                                                                                     |
-| `dra_cpu_nri_synchronize_duration_seconds`      | Histogram | `result`                        | Duration of the NRI `Synchronize` callback in seconds. `result` is `success` or `error`.                                                       |
-| `dra_cpu_nri_create_container_duration_seconds` | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `CreateContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`. |
-| `dra_cpu_nri_stop_container_duration_seconds`   | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `StopContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`.   |
-| `dra_cpu_nri_remove_container_duration_seconds` | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `RemoveContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`. |
+| Metric                                          | Type      | Labels                          | Description                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------------- | --------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `dra_cpu_allocated_cpus`                        | Gauge     | none                            | CPUs currently allocated to prepared resource claims.                                                                                                                                                                                                                                                                    |
+| `dra_cpu_available_cpus`                        | Gauge     | none                            | CPUs still available for allocation after reserved and active claim CPUs are excluded.                                                                                                                                                                                                                                   |
+| `dra_cpu_reserved_cpus`                         | Gauge     | none                            | CPUs excluded from DRA management by driver configuration.                                                                                                                                                                                                                                                               |
+| `dra_cpu_resource_claims_active`                | Gauge     | none                            | Resource claims currently recorded as active by the allocation store.                                                                                                                                                                                                                                                    |
+| `dra_cpu_prepare_claims_total`                  | Counter   | `result`                        | Per-claim `PrepareResourceClaims` results. `result` is `success`, `error`, or `unknown`.                                                                                                                                                                                                                                 |
+| `dra_cpu_unprepare_claims_total`                | Counter   | `result`                        | Per-claim `UnprepareResourceClaims` results. `result` is `success`, `error`, or `unknown`.                                                                                                                                                                                                                               |
+| `dra_cpu_prepare_claim_duration_seconds`        | Histogram | none                            | Per-claim prepare latency in seconds.                                                                                                                                                                                                                                                                                    |
+| `dra_cpu_unprepare_claim_duration_seconds`      | Histogram | none                            | Per-claim unprepare latency in seconds.                                                                                                                                                                                                                                                                                  |
+| `dra_cpu_claim_allocated_cpus`                  | Histogram | none                            | CPUs allocated for each newly successful claim allocation.                                                                                                                                                                                                                                                               |
+| `dra_cpu_prepare_no_room_total`                 | Counter   | `shape`                         | Claims refused at Prepare because the device their allocation names cannot hold what it was charged for there. `shape` is `never-split` for a claim the allocator could not have split, `flexible` for one it could.                                                                                                     |
+| `dra_cpu_nri_synchronize_duration_seconds`      | Histogram | `result`                        | Duration of the NRI `Synchronize` callback in seconds. `result` is `success` or `error`.                                                                                                                                                                                                                                 |
+| `dra_cpu_nri_create_container_duration_seconds` | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `CreateContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`.                                                                                                                                                                           |
+| `dra_cpu_nri_stop_container_duration_seconds`   | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `StopContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`.                                                                                                                                                                             |
+| `dra_cpu_nri_remove_container_duration_seconds` | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `RemoveContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`.                                                                                                                                                                           |
+| `dra_cpu_synchronize_skipped_claims_total`      | Counter   | none                            | Claims or containers `Synchronize` could not adopt from the runtime's reported state, skipped rather than aborting the whole call.                                                                                                                                                                                       |
+| `dra_cpu_misplaced_claims_total`                | Counter   | none                            | Restored claims whose CPUs no single CPU partition holds, which is what a partition list edited under a running node looks like.                                                                                                                                                                                         |
+| `dra_cpu_partition_verified`                    | Gauge     | `partition`                     | Whether a CPU partition's declaration matches this machine (1) or contradicts it, in which case the partition publishes no devices (0).                                                                                                                                                                                  |
+| `dra_cpu_capacity_mirror_floored_devices`       | Gauge     | none                            | Devices whose published CPU capacity is held above the amount the driver computed, because publishing that amount would put the device below its own request policy. Each of them is tainted, so the capacity the number over-states is withdrawn rather than handed out. See [The Capacity Mirror](capacity-mirror.md). |
 
 Note about `dra_cpu_nri_remove_container_duration_seconds`: due to how the driver is implemented and how it uses the NRI APIs, this metric reports
 cases on which the hook recovered an internal faulty state. The cleanup action should be carried at the `StopContainer` stage and the real work
 should be reflected in `dra_cpu_nri_stop_container_duration_seconds`.
 Note this is a current implementation detail which leaks in the metrics, and it is subject to change in the next releases.
 
-The custom metrics intentionally avoid labels for namespace, pod, claim, device, node, socket, NUMA node, group mode, and error reason. Those labels would either be
-high-cardinality or need more API design before becoming part of the driver's metric surface. Node identity should come from scrape target labels.
+## Defragmentation
 
-The NRI callback histograms use bucket boundaries tailored to the NRI plugin request timeout.
-This serves both performance and reliability concerns, because the runtime close the plugin connection if a callback does not return within the configured
-request timeout (2 seconds by default).
+Reported only when [`defragEnabled`](configuration.md#driver-configuration) is on. A node with one
+uncore cache per NUMA node has no spread to recover, so its excess is permanently zero.
+
+| Metric                                       | Type      | Labels      | Description                                                                                                                        |
+| -------------------------------------------- | --------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `dra_cpu_defrag_excess_uncore_caches`        | Gauge     | none        | Uncore caches the node's claims span beyond the fewest their sizes allow. Zero means every claim is as well placed as it can be.   |
+| `dra_cpu_defrag_largest_alignable_free_cpus` | Gauge     | `numa_node` | Largest claim that node can still take inside a single uncore cache, which is the best any one of its CPU partitions can offer.     |
+| `dra_cpu_defrag_passes_total`                | Counter   | `result`    | Defragmentation passes. `error` covers a pass that reverted a move the runtime refused, or could not confirm what the runtime did. |
+| `dra_cpu_defrag_moves_total`                 | Counter   | `result`    | Claim moves attempted. `error` is a move the runtime refused and the driver reverted.                                              |
+| `dra_cpu_defrag_blocked_moves_total`         | Counter   | none        | Moves a better placement called for that a pass could not make, usually because another claim is in the way.                       |
+| `dra_cpu_defrag_pass_duration_seconds`       | Histogram | none        | Defragmentation pass latency in seconds.                                                                                           |
+| `dra_cpu_defrag_swap_overlap_seconds`        | Histogram | none        | Duration of a batch that carried an exchange and was answered, which bounds the window in which both claims hold the same CPUs.    |
+| `dra_cpu_defrag_partial_batches_total`       | Counter   | none        | Exchanges the runtime applied for some of their containers and refused for the rest.                                               |
+| `dra_cpu_defrag_rollbacks_total`             | Counter   | `result`    | Attempts to put the applied half of an exchange back. An `error` leaves two claims sharing CPUs.                                   |
+| `dra_cpu_defrag_numa_node_poisoned`          | Gauge     | `numa_node` | Whether the driver has stopped vouching for a NUMA node (1) because an exchange there could be neither finished nor undone.        |
+| `dra_cpu_defrag_poisoned_nodes_total`        | Counter   | none        | Times a NUMA node was fenced after such an exchange.                                                                               |
+| `dra_cpu_defrag_poisoned_duration_seconds`   | Histogram | none        | How long each fenced NUMA node stayed fenced, from the unsettled exchange to the read-back that agreed with the driver's records.  |
+| `dra_cpu_defrag_readback_mismatches_total`   | Counter   | none        | Read-backs that left a fenced node fenced, because its containers' CPUs match neither the driver's record nor what they came from. |
+| `dra_cpu_defrag_unpublished_rounds_total`    | Counter   | none        | Rounds abandoned because the capacity they shrink was not stored by the API server in time. While this rises, no claim on the node is being moved. |
+
+`dra_cpu_defrag_swap_overlap_seconds` measures the batch rather than the window itself: the instant
+the two claims share CPUs is inside the runtime, between the two writes it applies in order, so the
+batch is the tightest bound a plugin can observe. A batch that ran out of time is not observed at all
+— its duration is the deadline, which says how long the driver waited and nothing about the window.
+
+`dra_cpu_defrag_rollbacks_total{result="error"}` and
+`dra_cpu_defrag_numa_node_poisoned` are the ones to alert on: the first means the driver could neither
+finish an exchange nor undo it, and the second is the fence it raised in response. A fenced node
+refuses new claims and plans no further moves until a read-back of its containers agrees with the
+driver's records, so a fence that does not lift is a runtime refusing container updates it should be
+accepting.
+
+`dra_cpu_defrag_largest_alignable_free_cpus` is the leading indicator: it says whether the *next*
+large claim will land aligned, where the excess count says whether the last ones did. A steady
+`dra_cpu_defrag_blocked_moves_total` with a non-zero excess means the node cannot reach a better
+placement on its own — the claims in the way never asked to be moved, or there is no slack to move
+them through.
+
+The custom metrics intentionally avoid labels for namespace, pod, claim, device, node, socket, group
+mode, and error reason. Those labels would either be high-cardinality or need more API design before
+becoming part of the driver's metric surface. Node identity should come from scrape target labels.
+Two labels are exceptions, each on the one metric where a total would hide what matters, and each
+with a domain something other than the workload fixes. `numa_node`: claims are allocated per NUMA
+node, so free space in the wrong node is no help, and the hardware fixes the cardinality. `shape`: a
+claim the allocator could not have placed anywhere else has nowhere to go when the device its
+allocation names is full, which is a different thing from one that could, and the domain is two
+values.

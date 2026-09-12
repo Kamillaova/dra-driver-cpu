@@ -39,6 +39,24 @@ func ProcfsRoot() string {
 	return path.Join(os.Getenv("HOST_ROOT"), procfsRoot)
 }
 
+// OnlineCPUs reports the kernel's online CPU set as it stands now.
+//
+// CCX-FORK: upstream unexported its reader, on the ground that callers should
+// consume the topology-validated subset instead. That holds for everything
+// derived once at start-up, and this fork follows it there. The defragmenter is
+// the exception it does not cover: a pass must notice that a CPU went offline
+// after the driver started, which a start-time set cannot express by
+// construction. Callers intersect what they get back with the scope they are
+// planning, so a CPU that came online later is not mistaken for free space.
+func OnlineCPUs(logger logr.Logger, sysfs fs.ReadLinkFS) (cpuset.CPUSet, error) {
+	online, err := readOnlineCPUs(sysfs)
+	if err != nil {
+		return cpuset.New(), err
+	}
+	logger.V(4).Info("read online CPUs", "cpus", online.String())
+	return online, nil
+}
+
 // readOnlineCPUs returns the kernel's raw online CPU set. Callers that need
 // CPUs usable by the driver should use CPUTopology.CPUDetails instead.
 func readOnlineCPUs(sysfs fs.ReadLinkFS) (cpuset.CPUSet, error) {
@@ -51,6 +69,21 @@ func readOnlineCPUs(sysfs fs.ReadLinkFS) (cpuset.CPUSet, error) {
 		return cpuset.New(), err
 	}
 	return allCPUs, nil
+}
+
+// PresentCPUs returns the kernel's cpu_present_mask: every CPU the kernel knows
+// about, online or not. An offline CPU has no topology or cache sysfs at all, so
+// it can be counted here and nowhere else.
+func PresentCPUs(logger logr.Logger, sysfs fs.ReadLinkFS) (cpuset.CPUSet, error) {
+	cpuData, err := fs.ReadFile(sysfs, filepath.Join("devices", "system", "cpu", "present"))
+	if err != nil {
+		return cpuset.New(), err
+	}
+	presentCPUs, err := cpuset.Parse(strings.TrimSpace(string(cpuData)))
+	if err != nil {
+		return cpuset.New(), err
+	}
+	return presentCPUs, nil
 }
 
 // CoreType is an enum for the type of CPU core.
@@ -132,6 +165,14 @@ type CPUInfo struct {
 
 	// CPU Sibling of the CpuID
 	SiblingCPUID int `json:"sibling"`
+
+	// SiblingCPUSet is every logical CPU sharing this CPU's physical core,
+	// including itself, read from the kernel's own topology/core_cpus_list (or
+	// the deprecated topology/thread_siblings_list on older kernels). Unlike
+	// SiblingCPUID and the (SocketID, ClusterID, CoreID) triple, this is exact
+	// for any number of threads per core and does not depend on those
+	// identifiers' platform-specific uniqueness.
+	SiblingCPUSet cpuset.CPUSet `json:"siblingCPUSet"`
 
 	// Core Type (e-core or p-core)
 	CoreType CoreType `json:"coreType,omitempty"`
@@ -339,6 +380,27 @@ func populateTopologyInfo(sfs sysfs.FS, cpuInfo *CPUInfo, logger logr.Logger) er
 		return fmt.Errorf("could not parse core_id %q for cpu %d: %w", coreStr, cpuID, err)
 	}
 	cpuInfo.CoreID = coreID
+
+	// Get SMT siblings from sysfs. core_cpus_list is the kernel's own,
+	// architecture-neutral list of every CPU sharing this CPU's physical core;
+	// thread_siblings_list is its deprecated name, kept as a fallback for older
+	// kernels. Unlike physical_package_id/cluster_id/core_id, neither file's
+	// correctness depends on a platform-specific uniqueness convention, and
+	// both list all threads of a core regardless of arity.
+	siblingsPath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "topology", "core_cpus_list")
+	siblingsStr, err := readFile(sfs, siblingsPath)
+	if err != nil {
+		siblingsPath = path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "topology", "thread_siblings_list")
+		siblingsStr, err = readFile(sfs, siblingsPath)
+		if err != nil {
+			return fmt.Errorf("could not read core_cpus_list or thread_siblings_list for cpu %d from sysfs: %w", cpuID, err)
+		}
+	}
+	siblingCPUSet, err := cpuset.Parse(strings.TrimSpace(siblingsStr))
+	if err != nil {
+		return fmt.Errorf("could not parse sibling CPU list %q for cpu %d: %w", siblingsStr, cpuID, err)
+	}
+	cpuInfo.SiblingCPUSet = siblingCPUSet
 
 	// Get NUMA Node ID from sysfs
 	nodePath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID))

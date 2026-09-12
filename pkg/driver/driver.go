@@ -20,26 +20,36 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuallocator"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
+	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/workqueue"
 	drametadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
@@ -66,9 +76,13 @@ type KubeletPlugin interface {
 }
 
 type cdiManager interface {
-	AddDevice(logger logr.Logger, deviceName string, envVar string) error
+	AddDevice(logger logr.Logger, deviceName string, envVar string, record store.ClaimRecord) error
 	Refresh() error
 	GetDeviceEnv(deviceName string) ([]string, error)
+	// CCX-FORK: added; GetDeviceEnv is upstream's and now unused by the driver.
+	GetDeviceAllocations(deviceName string) (store.ClaimRecord, error)
+	// CCX-FORK: added, seeds the allocation store from disk before Start registers with the kubelet.
+	PreparedClaimAllocations(logger logr.Logger) map[types.UID]store.ClaimRecord
 	RemoveDevice(logger logr.Logger, deviceName string) error
 }
 
@@ -111,24 +125,130 @@ type CPUAllocator interface {
 
 // CPUDriver is the structure that holds all the driver runtime information.
 type CPUDriver struct {
-	driverName              string
-	nodeName                string
-	kubeClient              kubernetes.Interface
-	draPlugin               KubeletPlugin
-	nriPlugin               stub.Stub
-	podConfigStore          *store.PodConfig
-	cpuAllocationStore      *store.CPUAllocation
-	cdiMgr                  cdiManager
-	topology                deviceTopology
-	cpuDeviceMode           string
-	cpuDeviceGroupBy        string
+	driverName         string
+	nodeName           string
+	namespace          string
+	kubeClient         kubernetes.Interface
+	draPlugin          KubeletPlugin
+	nriPlugin          stub.Stub
+	podConfigStore     *store.PodConfig
+	cpuAllocationStore *store.CPUAllocation
+	cdiMgr             cdiManager
+	topology           deviceTopology
+	cpuDeviceMode      string
+	cpuDeviceGroupBy   string
+	// fullPhysicalCPUsOnly mirrors Config.FullPhysicalCPUsOnly: whether the
+	// operator has asked for whole-core allocation at all. Whether it is
+	// actually in effect for a given device is per device -- see
+	// deviceTopology.deviceThreadsPerCore -- since one device's non-uniform
+	// cores must not disable it for another.
+	fullPhysicalCPUsOnly    bool
+	placementPolicy         coreselect.Policy
 	claimTracker            *store.ClaimTracker
 	pcieRootMapper          *store.PCIeRootMapper
 	devicesPerResourceSlice int
 	metrics                 Recorder
 	health                  healthTracker
-	kubeletRootDir          string
-	cpuAllocator            CPUAllocator
+	// containerUpdater pushes unsolicited container updates. Nil until Start
+	// registers the NRI plugin, and left nil when the operator has not asserted
+	// the runtime tolerates such updates.
+	containerUpdater containerUpdater
+	// storedSlices reads back the ResourceSlices the API server holds for this
+	// node, which is how a defragmentation round finds out that the capacity its
+	// move depends on has been stored. Nil until Start fills its cache, and left
+	// nil when nothing moves a claim.
+	storedSlices    storedSliceReader
+	claimReader     claimReader
+	makeRoomTargets map[types.UID]*makeRoomTarget
+	// reconcileTrigger carries coalesced reconcile requests to the worker
+	// goroutine. Nil when no feature needs it.
+	reconcileTrigger chan struct{}
+	// reconcileSharedOnUnprepare widens shared containers as soon as a claim is
+	// released rather than at their next lifecycle event.
+	reconcileSharedOnUnprepare bool
+	// defrag configures the defragmentation pass, and is zero when it is off.
+	defrag defragOptions
+	// partitions is the node's cores as described, always ending with the
+	// implicit partition holding whatever the described ones left. Set in New,
+	// read-only after that.
+	partitions []device.Partition
+	// degradedPartitions are the partitions whose declared thread arity the
+	// machine contradicts, mapped to what would fix each. They publish no
+	// devices; the rest of the node serves as usual.
+	degradedPartitions map[string]string
+	// defaultPartitionCPUs is where a container holding no claim runs: the
+	// partitions of role "default", which on an undescribed node is every
+	// allocatable CPU. An exclusive partition never hosts such a container.
+	defaultPartitionCPUs cpuset.CPUSet
+	// sysfs is kept so a defragmentation pass can re-read which CPUs are online;
+	// the set read in New is only true of startup.
+	sysfs sysfs.FS
+	// cgroupfs is the host's cgroup2 tree, read only to find out which CPUs a
+	// container is really running on. Nil when defragmentation is off, which is
+	// when nothing can leave a placement in doubt.
+	cgroupfs cgroupfs.FS
+	// poisonedNodes are the NUMA nodes the driver cannot vouch for: an exchange
+	// there ended in a state nobody can name, so two claims may be sharing CPUs.
+	// Guarded by applyMu.
+	poisonedNodes map[int]*poisonedNode
+	// pendingRounds is, per scope, a set of moves the runtime never confirmed,
+	// held so the next attempt at that scope can send it again. Guarded by
+	// applyMu.
+	pendingRounds map[defragScope]*defragRound
+	// activeExactPlans holds, per NUMA node, an in-progress exact plan whose
+	// moves take precedence over greedy planning. Guarded by applyMu.
+	activeExactPlans map[int]*defrag.ExactPlan
+	// defragRetries holds the scopes whose last round the runtime left
+	// unsettled, each released again once its own backoff has elapsed.
+	defragRetries workqueue.TypedRateLimitingInterface[defragScope]
+	// defragRetryDue carries those scopes to the reconcile worker.
+	defragRetryDue chan defragScope
+	// applyMu serializes the work that decides which CPUs back a claim: the DRA
+	// prepare and unprepare hooks, the NRI hooks that read a placement or record
+	// container state, and the background worker's local phases. It also covers
+	// the store pointers themselves, which Synchronize replaces wholesale.
+	//
+	// It must never be held across a call into the runtime. The runtime may be
+	// holding, on behalf of an inbound hook of ours, the lock our outbound call
+	// needs; if that hook is waiting here meanwhile, neither side can proceed.
+	// Inbound hooks may hold it freely, since answering one makes no call out.
+	applyMu sync.Mutex
+	// publishMu serializes ResourceSlice publication, so that two publishers
+	// cannot read the device order and then hand it to the controller in the
+	// opposite order, leaving the older one standing. Taken before applyMu,
+	// never after.
+	publishMu sync.Mutex
+	// publishedOccupancy is, per device, whether it held a claim when the device
+	// order was last published, which is one of the two inputs the published
+	// slices have. Guarded by applyMu.
+	publishedOccupancy map[string]bool
+	// publishedPoison is the second: the NUMA nodes that were fenced when the
+	// slices were last published, whose devices carry the poison taint. Guarded
+	// by applyMu.
+	publishedPoison map[int]bool
+	// publishedCorrection is the third: how far each device's published capacity
+	// stood from its physical size, for the devices where the two differ.
+	// Guarded by applyMu.
+	publishedCorrection map[string]int
+	// publishedFrontier is the repair frontier published per (partition, NUMA node).
+	// Guarded by applyMu.
+	publishedFrontier map[string]string
+	// publishedFrontierInput is the SHA-256 digest of the sorted UIDs of claims
+	// whose exclusive allocations were accounted for when computing publishedFrontier.
+	// Guarded by applyMu.
+	publishedFrontierInput map[string]string
+
+	promiseObligations map[types.UID]*promiseObligation
+
+	kubeletRootDir string
+	cpuAllocator   CPUAllocator
+}
+
+type promiseObligation struct {
+	claimUID         types.UID
+	prepareTime      time.Time
+	advertisedRounds string
+	actualRounds     int
 }
 
 // deviceHealthEntry is the last known health of a single device.
@@ -137,21 +257,77 @@ type deviceHealthEntry struct {
 	message string
 }
 
+type makeRoomTarget struct {
+	claimUID   types.UID
+	namespace  string
+	name       string
+	cacheID    int
+	numaNodeID int
+	partition  string
+	device     string
+}
+
 // deviceTopology holds the CPU topology and device-to-CPU/socket/NUMA
-// mappings. Set once in New(), read-only after that.
+// mappings. Set once in New() and read-only after that, except deviceSlices,
+// whose order is a live quantity under cache grouping.
 type deviceTopology struct {
 	cpuTopology            *cpuinfo.CPUTopology
 	deviceNameToCPUID      map[string]int
 	deviceNameToSocketID   map[string]int
 	deviceNameToNUMANodeID map[string]int
-	deviceSlices           [][]resourceapi.Device
-	reservedCPUs           cpuset.CPUSet
+	// devicesByPartition is each publishing partition's devices, which is what
+	// the published slices are cut from. A partition's devices never share a
+	// slice with another's, so its taints cannot travel in another's.
+	devicesByPartition [][]resourceapi.Device
+	// deviceSlices is devicesByPartition as it was last published: ordered and
+	// chunked. Order is a live quantity under cache grouping, so this is rebuilt
+	// on publication rather than fixed in New. Guarded by applyMu.
+	deviceSlices [][]resourceapi.Device
+	reservedCPUs cpuset.CPUSet
+	// deviceNameToCPUs is each grouped device's own allocatable CPUs, which is
+	// where a claim allocated onto that device takes its CPUs from: the group's,
+	// inside its partition, and without the cores whole-core allocation dropped.
+	deviceNameToCPUs map[string]cpuset.CPUSet
+	// deviceNameToRole is each grouped device's partition role, which is what
+	// tells a claim's share of a pool from the CPUs it holds alone.
+	deviceNameToRole map[string]string
+	// deviceThreadsPerCore is each grouped device's own effective whole-core
+	// allocation step (0 when the feature is off or that device has no single
+	// thread count), from BuildGrouped. Keyed by device name, which a caller
+	// preparing a claim already has (alloc.Device).
+	deviceThreadsPerCore      map[string]int
+	deviceNameToPartition     map[string]string
+	deviceNameToUncoreCacheID map[string]int
+}
+
+// deviceIsPool reports whether a device grants a share of a pool rather than
+// CPUs its claim holds alone.
+//
+// The question is asked wherever a caller must not treat a pool's capacity as a
+// count of CPUs one claim occupies: it bounds how much work lands on CPUs every
+// claim asking for it holds at the same time. One predicate, because two of
+// those callers have to agree exactly or the published capacity stops
+// describing the node.
+func (t deviceTopology) deviceIsPool(deviceName string) bool {
+	return t.deviceNameToRole[deviceName] == device.PARTITION_ROLE_SHARED
+}
+
+func (t deviceTopology) devicePartition(deviceName string) string {
+	if t.deviceNameToPartition == nil {
+		return ""
+	}
+	return t.deviceNameToPartition[deviceName]
+}
+
+func (cp *CPUDriver) devicePartition(deviceName string) string {
+	return cp.topology.devicePartition(deviceName)
 }
 
 // Providers group the interfaces the CPUDriver depends on
 type Providers struct {
 	CPUInfo   CPUInfoProvider
 	SysFS     sysfs.FS
+	CgroupFS  cgroupfs.FS
 	K8SClient kubernetes.Interface
 }
 
@@ -169,10 +345,18 @@ func (pr Providers) EnsureSysFS() sysfs.FS {
 	return pr.SysFS
 }
 
+func (pr Providers) EnsureCgroupFS() cgroupfs.FS {
+	if pr.CgroupFS == nil {
+		return cgroupfs.Host()
+	}
+	return pr.CgroupFS
+}
+
 // Config is the configuration for the CPUDriver.
 type Config struct {
 	DriverName       string
 	NodeName         string
+	Namespace        string
 	ReservedCPUs     cpuset.CPUSet
 	CPUDeviceMode    string
 	CPUDeviceGroupBy string
@@ -187,6 +371,30 @@ type Config struct {
 	// PublishNodeAllocatableResourceMapping publishes KEP-5517 nodeAllocatableResources mappings in
 	// ResourceSlice devices. Requires the DRANodeAllocatableResources feature gate to be enabled in the cluster.
 	PublishNodeAllocatableResourceMapping bool
+	// FullPhysicalCPUsOnly allocates whole physical cores, so a core's SMT siblings are never split
+	// between two claims or between a claim and the shared pool. Grouped mode only.
+	FullPhysicalCPUsOnly bool
+	// CachePlacementStrategy is how a claim choosing among caches that fit it
+	// picks one; empty means coreselect.Pack.
+	CachePlacementStrategy coreselect.Policy
+	// AssumeUnsolicitedUpdatesSafe permits pushing container updates the runtime did not ask for.
+	// Required by every feature that reacts without waiting for a container lifecycle event.
+	AssumeUnsolicitedUpdatesSafe bool
+	// ReconcileSharedOnUnprepare widens shared containers onto released CPUs immediately.
+	// Requires AssumeUnsolicitedUpdatesSafe.
+	ReconcileSharedOnUnprepare bool
+	// DefragEnabled moves running claims to recover uncore cache alignment.
+	// Requires AssumeUnsolicitedUpdatesSafe and grouped mode by NUMA node or socket.
+	DefragEnabled bool
+	// DefragAllowTransientOverlap permits exchanging the CPUs of two claims,
+	// which is the only repair a node with no free CPUs has and which costs the
+	// instant between the two container updates of one batch. Inert without
+	// DefragEnabled.
+	DefragAllowTransientOverlap bool
+	// CPUPartitions describes the node's cores, already parsed and validated as
+	// far as that is possible without the node's topology. Empty leaves the whole
+	// node in the implicit partition, which is what an undescribed node has.
+	CPUPartitions []device.Partition
 }
 
 func (cfg Config) DevicesPerResourceSlice() int {
@@ -207,9 +415,14 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	if metricsRecorder == nil {
 		metricsRecorder = cpumetrics.Noop()
 	}
+	ns := config.Namespace
+	if ns == "" {
+		ns = metav1.NamespaceDefault
+	}
 	plugin := &CPUDriver{
 		driverName: config.DriverName,
 		nodeName:   config.NodeName,
+		namespace:  ns,
 		kubeClient: providers.K8SClient,
 		topology: deviceTopology{
 			deviceNameToCPUID:      make(map[string]int),
@@ -224,8 +437,12 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		devicesPerResourceSlice: config.DevicesPerResourceSlice(),
 		metrics:                 metricsRecorder,
 		health:                  newHealthTracker(),
+		makeRoomTargets:         make(map[types.UID]*makeRoomTarget),
 		kubeletRootDir:          config.KubeletRootDir,
 	}
+	sfs := providers.EnsureSysFS()
+	plugin.sysfs = sfs
+
 	topo, err := providers.EnsureCPUInfo().GetCPUTopology(logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get CPU topology: %w", err)
@@ -243,37 +460,167 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		}
 	}
 
-	plugin.cpuAllocationStore = store.NewCPUAllocation(plugin.topology.cpuTopology, config.ReservedCPUs)
+	// CCX-FORK: the cores an operator described as partitions. Those no workload
+	// may claim -- the reserved ones and the pools -- join the effective reserved
+	// set, so capacity, allocation and defragmentation exclude them.
+	if len(config.CPUPartitions) > 0 {
+		// The raw online set, not the topology-validated one: a partition naming
+		// a CPU that is merely offline and one naming a CPU the node does not
+		// have are different operator errors, and only the online set separates
+		// them.
+		onlineCPUs, err := cpuinfo.OnlineCPUs(logger, sfs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read online CPUs: %w", err)
+		}
+		degraded, err := validatePartitions(topo, onlineCPUs, config.CPUPartitions)
+		if err != nil {
+			return nil, err
+		}
+		plugin.degradedPartitions = degraded
+		plugin.topology.reservedCPUs = plugin.topology.reservedCPUs.Union(unclaimablePartitionCPUs(config.CPUPartitions))
+		presentCPUs, err := cpuinfo.PresentCPUs(logger, sfs)
+		if err != nil {
+			logger.Info("cannot read the present CPU set, so offline CPUs are unaccounted for", "err", err)
+		} else {
+			verifyOfflineAccounting(logger, topo, presentCPUs, onlineCPUs, config.CPUPartitions)
+		}
+	}
+	plugin.partitions = device.WithImplicitDefault(config.CPUPartitions, managedCPUs.Difference(plugin.topology.reservedCPUs))
+	plugin.defaultPartitionCPUs = cpuset.New()
+	for _, partition := range plugin.partitions {
+		if partition.Role == device.PARTITION_ROLE_DEFAULT {
+			plugin.defaultPartitionCPUs = plugin.defaultPartitionCPUs.Union(partition.CPUs)
+		}
+	}
+	if len(config.CPUPartitions) > 0 {
+		verified := make(map[string]bool, len(plugin.partitions))
+		for _, partition := range plugin.partitions {
+			reason, bad := plugin.degradedPartitions[partition.Name]
+			verified[partition.Name] = !bad
+			if bad {
+				logger.Info("partition publishes no devices: the machine does not match what it declares",
+					"partition", partition.Name, "reason", reason)
+				continue
+			}
+			logger.Info("resolved CPU partition", "partition", partition.Name, "role", partition.Role, "cpus", partition.CPUs.String())
+		}
+		metricsRecorder.SetPartitionState(verified)
+		if implicit := plugin.partitions[len(plugin.partitions)-1]; implicit.CPUs.IsEmpty() {
+			logger.Info("the implicit default partition holds no CPUs: a claim that names no partition has nowhere to land on this node")
+		}
+	}
+
+	plugin.cpuAllocationStore = store.NewCPUAllocation(plugin.topology.cpuTopology, plugin.topology.reservedCPUs)
 	plugin.refreshAllocationMetrics()
 	plugin.podConfigStore = store.NewPodConfig()
+	plugin.promiseObligations = make(map[types.UID]*promiseObligation)
 
 	logger.Info("creating CPU allocator", "method", config.Allocator)
 	switch config.Allocator {
 	case driverconfig.AllocatorExternal:
-		plugin.cpuAllocator = cpuallocator.NewExternal(config.DriverName, managedCPUs, config.ReservedCPUs)
+		external := cpuallocator.NewExternal(config.DriverName, managedCPUs, config.ReservedCPUs)
+		if config.FullPhysicalCPUsOnly {
+			external.RequireWholeCores(topo)
+		}
+		plugin.cpuAllocator = external
 	default:
 		plugin.cpuAllocator = cpuallocator.NewCPUManager(config.DriverName, topo)
 	}
+	plugin.fullPhysicalCPUsOnly = config.FullPhysicalCPUsOnly
+	if plugin.fullPhysicalCPUsOnly {
+		if err := validateReservedCPUsAlignment(topo, config.ReservedCPUs); err != nil {
+			return nil, err
+		}
+	}
+	plugin.placementPolicy = config.CachePlacementStrategy
+	if plugin.placementPolicy == "" {
+		plugin.placementPolicy = coreselect.Pack
+	}
+
+	// Unsolicited updates deadlock runtimes with a pre-nri#301 Adaptation, and
+	// the driver cannot tell from the handshake, so the operator asserts it.
+	if config.AssumeUnsolicitedUpdatesSafe {
+		plugin.reconcileSharedOnUnprepare = config.ReconcileSharedOnUnprepare
+		// CCX-FORK: defragmentation, like the reconcile, presupposes unsolicited
+		// updates.
+		plugin.defrag = defragOptions{
+			enabled:               config.DefragEnabled,
+			allowTransientOverlap: config.DefragAllowTransientOverlap,
+			batchTimeout:          defaultDefragBatchTimeout,
+			publishTimeout:        defaultDefragPublishTimeout,
+		}
+		if plugin.defrag.enabled {
+			plugin.cgroupfs = providers.EnsureCgroupFS()
+			plugin.poisonedNodes = make(map[int]*poisonedNode)
+			plugin.pendingRounds = make(map[defragScope]*defragRound)
+			plugin.activeExactPlans = make(map[int]*defrag.ExactPlan)
+			plugin.defragRetries = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[defragScope]())
+			plugin.defragRetryDue = make(chan defragScope)
+		}
+		if plugin.reconcileSharedOnUnprepare || plugin.defrag.enabled {
+			plugin.reconcileTrigger = make(chan struct{}, 1)
+		}
+	} else {
+		if config.ReconcileSharedOnUnprepare {
+			logger.V(2).Info("shared container reconcile is inert: set assumeUnsolicitedUpdatesSafe to enable it")
+		}
+		if config.DefragEnabled {
+			logger.Info("defragmentation is inert: set assumeUnsolicitedUpdatesSafe to enable it")
+		}
+	}
 
 	var devices []resourceapi.Device
+	// CCX-FORK: grouped devices are built per partition, so that one partition's
+	// taints never travel in another's ResourceSlice.
+	var devicesByPartition [][]resourceapi.Device
 
 	if plugin.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-		var nameToID map[string]int
-		devices, nameToID = device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping)
+		publishable := slices.DeleteFunc(slices.Clone(plugin.partitions), func(p device.Partition) bool {
+			_, degraded := plugin.degradedPartitions[p.Name]
+			return degraded
+		})
+		built := device.BuildGrouped(logger, plugin.cpuDeviceGroupBy, plugin.topology.cpuTopology, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping, config.FullPhysicalCPUsOnly, publishable)
+		devicesByPartition = built.ByPartition
+		for _, partitionDevices := range devicesByPartition {
+			devices = append(devices, partitionDevices...)
+		}
+		plugin.topology.deviceThreadsPerCore = built.ThreadsPerCore
+		plugin.topology.deviceNameToCPUs = built.CPUs
+		plugin.topology.deviceNameToRole = built.Roles
+		plugin.topology.deviceNameToPartition = built.Partitions
+		plugin.topology.deviceNameToUncoreCacheID = built.UncoreCacheID
 		switch plugin.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET:
-			plugin.topology.deviceNameToSocketID = nameToID
-		case device.GROUP_BY_NUMA_NODE:
-			plugin.topology.deviceNameToNUMANodeID = nameToID
+			plugin.topology.deviceNameToSocketID = built.NameToID
+		case device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
+			plugin.topology.deviceNameToNUMANodeID = built.NameToID
 		}
 	} else {
 		devices, plugin.topology.deviceNameToCPUID = device.Build(plugin.topology.cpuTopology, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping)
+		devicesByPartition = [][]resourceapi.Device{devices}
 	}
 
-	if len(devices) > 0 {
-		// Chunk devices into slices of at most devicesPerResourceSlice
-		plugin.topology.deviceSlices = slices.Collect(slices.Chunk(devices, plugin.devicesPerResourceSlice))
+	// A slice holding a tainted device may carry half as many devices as one
+	// without, so the limit follows what was actually built rather than the
+	// options alone -- and, where a device may be tainted at any moment, what may
+	// yet be built. Two things taint one: a fence, and a capacity the mirror
+	// cannot publish the truth for. The second needs a claim sitting on a device
+	// its allocation did not name, which takes either a move or a partition list
+	// edited under a running node -- and a node with a partition list has a named
+	// partition, whose devices are tainted already. Deciding the chunk size at
+	// publication time instead would change how many slices the pool has while a
+	// device is tainted, which is a worse thing to do to a pool's generation than
+	// losing half a slice's capacity on a node that has a handful of grouped
+	// devices.
+	if plugin.defrag.enabled || slices.ContainsFunc(devices, func(d resourceapi.Device) bool { return len(d.Taints) > 0 }) {
+		plugin.devicesPerResourceSlice = min(plugin.devicesPerResourceSlice, resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures)
 	}
+
+	plugin.topology.devicesByPartition = devicesByPartition
+	plugin.refreshDeviceOrder()
+	logger.Info("chunked devices into ResourceSlices", "numDevices", len(devices),
+		"devicesPerResourceSlice", plugin.devicesPerResourceSlice, "numResourceSlices", len(plugin.topology.deviceSlices),
+		"exposePCIeRoots", config.ExposePCIeRoots)
 
 	for _, d := range devices {
 		plugin.health.devices[d.Name] = &deviceHealthEntry{
@@ -283,6 +630,143 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	}
 
 	return plugin, nil
+}
+
+// unclaimablePartitionCPUs is every CPU a partition holds that no claim may
+// take: the reserved partitions, and the pools, which are reached by claiming
+// a pool device rather than by taking exclusive CPUs.
+func unclaimablePartitionCPUs(partitions []device.Partition) cpuset.CPUSet {
+	unclaimable := cpuset.New()
+	for _, partition := range partitions {
+		if !partition.PublishesExclusiveDevices() {
+			unclaimable = unclaimable.Union(partition.CPUs)
+		}
+	}
+	return unclaimable
+}
+
+// validatePartitions checks the described cores against the node the driver
+// stands on: the checks that need no topology already ran in driverconfig. It
+// returns the partitions whose declared thread arity the machine contradicts,
+// keyed by name, with what would fix each.
+//
+// A thread arity the platform did not provide degrades that partition rather
+// than the node: the machine configuration that offlines siblings is separate
+// from this configuration, the two are rolled out separately, and a dataplane
+// partition an operator has not finished preparing must not take the node's
+// virtual machines down with it. Everything else is a hard error, because it
+// describes CPUs this node cannot offer at all.
+//
+// A partition names whole cores, which is what makes a device's thread arity
+// its own: half a core in one partition and half in another leaves neither able
+// to promise anything about SMT siblings. Under smt: false the offline siblings
+// do not exist to the kernel, so the surviving thread is a whole core here --
+// which is why the arity check runs first, or a partition still waiting for its
+// siblings to be offlined would be reported as splitting cores instead.
+func validatePartitions(topo *cpuinfo.CPUTopology, onlineCPUs cpuset.CPUSet, partitions []device.Partition) (map[string]string, error) {
+	degraded := make(map[string]string)
+	for _, partition := range partitions {
+		if offline := partition.CPUs.Difference(onlineCPUs); !offline.IsEmpty() {
+			return nil, fmt.Errorf("partition %q names offline CPUs: %s", partition.Name, offline.String())
+		}
+		if unknown := partition.CPUs.Difference(topo.CPUDetails.CPUs()); !unknown.IsEmpty() {
+			return nil, fmt.Errorf("partition %q names CPUs this node does not have: %s", partition.Name, unknown.String())
+		}
+		if reason := verifyThreadArity(topo, partition); reason != "" {
+			degraded[partition.Name] = reason
+			continue
+		}
+		if split := partition.CPUs.Difference(topo.CPUDetails.CompleteCores(partition.CPUs)); !split.IsEmpty() {
+			return nil, fmt.Errorf("partition %q splits physical cores on %s: a partition holds whole cores, so that what it says about threads per core is true of every core in it",
+				partition.Name, split.String())
+		}
+	}
+	return degraded, nil
+}
+
+// verifyThreadArity compares a partition's declared threads per core against
+// what the kernel leaves online, and returns what would make the declaration
+// true, or the empty string when it already is. A partition that declared
+// nothing accepts whatever the platform provides.
+//
+// The surplus threads are named as Talos machine.sysfs keys, which is the
+// configuration that offlines them; the kernel path they set is
+// /sys/devices/system/cpu/cpuN/online.
+func verifyThreadArity(topo *cpuinfo.CPUTopology, partition device.Partition) string {
+	if partition.ThreadsPerCore == 0 {
+		return ""
+	}
+	surplus := cpuset.New()
+	for _, cpuID := range partition.CPUs.List() {
+		siblings := topo.CPUDetails.SiblingsOf(cpuID)
+		if siblings.Size() <= partition.ThreadsPerCore {
+			continue
+		}
+		// The partition keeps the threads it named; the rest of the core is what
+		// the platform was asked to take offline.
+		surplus = surplus.Union(siblings.Difference(partition.CPUs))
+	}
+	if surplus.IsEmpty() {
+		return ""
+	}
+	keys := make([]string, 0, surplus.Size())
+	for _, cpuID := range surplus.List() {
+		keys = append(keys, fmt.Sprintf("devices.system.cpu.cpu%d.online: \"0\"", cpuID))
+	}
+	return fmt.Sprintf("partition %q expects at most %d online thread(s) per core, but %s are online too; offline them with machine.sysfs %s",
+		partition.Name, partition.ThreadsPerCore, surplus.String(), strings.Join(keys, ", "))
+}
+
+// verifyOfflineAccounting compares the CPUs the kernel knows about but does not
+// run against the ones the partitions asked for. A surplus is an offline CPU
+// nobody declared, which is a warning rather than an error: it costs capacity
+// and says the machine and this configuration disagree, but every partition
+// that did state an arity has already been checked against the kernel.
+func verifyOfflineAccounting(logger logr.Logger, topo *cpuinfo.CPUTopology, presentCPUs, onlineCPUs cpuset.CPUSet, partitions []device.Partition) {
+	offline := presentCPUs.Difference(onlineCPUs)
+	if offline.IsEmpty() {
+		return
+	}
+	nativeThreadsPerCore := 0
+	for _, cpuID := range onlineCPUs.List() {
+		if threads := topo.CPUDetails.SiblingsOf(cpuID).Size(); threads > nativeThreadsPerCore {
+			nativeThreadsPerCore = threads
+		}
+	}
+	if nativeThreadsPerCore <= 1 {
+		// Every core the driver can see has one thread, and an offline thread is
+		// in no core, so nothing here can tell a core the platform halved from a
+		// core that never had a sibling.
+		logger.Info("offline CPUs cannot be accounted for: every online core has one thread, so this node's own arity is unknowable from here",
+			"offline", offline.String())
+		return
+	}
+	accounted := 0
+	for _, partition := range partitions {
+		if partition.ThreadsPerCore == 0 || partition.ThreadsPerCore >= nativeThreadsPerCore {
+			continue
+		}
+		cores := topo.CPUDetails.CompleteCores(partition.CPUs).Size() / partition.ThreadsPerCore
+		accounted += cores * (nativeThreadsPerCore - partition.ThreadsPerCore)
+	}
+	if offline.Size() == accounted {
+		return
+	}
+	logger.Info("offline CPUs the partitions do not account for: they are lost capacity, and the machine configuration and the partition list disagree about this node",
+		"offline", offline.String(), "offlineCount", offline.Size(), "accountedFor", accounted, "nativeThreadsPerCore", nativeThreadsPerCore)
+}
+
+// validateReservedCPUsAlignment checks reservedCPUs against the node when
+// fullPhysicalCPUsOnly is set: a reservation splitting a physical core leaves
+// the orphaned sibling neither reserved nor usable by a whole-core claim,
+// silently exposing it to the shared pool where a claimless container can
+// SMT-contend whatever the claim on its sibling is running.
+func validateReservedCPUsAlignment(topo *cpuinfo.CPUTopology, reservedCPUs cpuset.CPUSet) error {
+	if split := reservedCPUs.Difference(topo.CPUDetails.CompleteCores(reservedCPUs)); !split.IsEmpty() {
+		return fmt.Errorf("reservedCPUs %q splits physical cores on %s, which fullPhysicalCPUsOnly requires never happens: reserve entire cores or none of them",
+			reservedCPUs.String(), split.String())
+	}
+	return nil
 }
 
 // registrarDir is the kubelet plugin registration directory, always
@@ -340,11 +824,14 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, fmt.Errorf("failed to create plugin path %s: %w", driverPluginPath, err)
 	}
 
+	cp.reportDegradedPartitions(ctx)
+
 	cdiMgr, err := NewCdiManager(logger, cp.driverName, cdiSpecDir)
 	if err != nil {
 		return asyncErr, fmt.Errorf("failed to create CDI manager: %w", err)
 	}
 	cp.cdiMgr = cdiMgr
+	cp.seedAllocationStoreFromDisk(logger)
 
 	kubeletOpts := []kubeletplugin.Option{
 		kubeletplugin.DriverName(cp.driverName),
@@ -379,9 +866,32 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, fmt.Errorf("failed to create plugin stub: %w", err)
 	}
 	cp.nriPlugin = stub
+	// CCX-FORK: a move publishes a capacity the scheduler has to have stored
+	// before any container is told about it, and publication is asynchronous, so
+	// the driver reads its own node's slices back. Only a driver that moves
+	// claims needs it, and only one with a client can have it.
+	if cp.defrag.enabled && cp.kubeClient != nil {
+		reader, err := watchStoredSlices(ctx, cp)
+		if err != nil {
+			return asyncErr, fmt.Errorf("failed to watch this node's ResourceSlices: %w", err)
+		}
+		cp.storedSlices = reader
+
+		claimReader, err := watchAllocatedClaims(ctx, cp)
+		if err != nil {
+			return asyncErr, fmt.Errorf("failed to watch projected claim ConfigMap: %w", err)
+		}
+		cp.claimReader = claimReader
+	}
+	// CCX-FORK: upstream starts no worker here and never pushes an update the
+	// runtime did not ask for, so it hands the stub to nothing.
+	if cp.reconcileTrigger != nil {
+		cp.containerUpdater = stub
+		go cp.runReconcileWorker(ctx)
+	}
 
 	go func() {
-		if err := runNRIPluginWithRetry(ctx, cp.nriPlugin, maxAttempts); err != nil && ctx.Err() == nil {
+		if err := runNRIPluginWithRetry(ctx, cp.nriPlugin, maxAttempts, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration); err != nil && ctx.Err() == nil {
 			logger.Error(err, "NRI plugin failed to be restarted", "maxAttempts", maxAttempts)
 			asyncErr <- err
 		}
@@ -396,6 +906,63 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	go cp.healthResendLoop(ctx)
 
 	return asyncErr, nil
+}
+
+// reportDegradedPartitions puts each withheld partition on the node's own event
+// stream, where an operator looking at the node they just configured will find
+// it. The driver's log says the same thing, but only to whoever thinks to read
+// a DaemonSet pod's log on the right node.
+func (cp *CPUDriver) reportDegradedPartitions(ctx context.Context) {
+	logger := ctxlog.FromContext(ctx)
+	if cp.kubeClient == nil {
+		return
+	}
+	for _, partition := range slices.Sorted(maps.Keys(cp.degradedPartitions)) {
+		event := &v1.Event{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: cp.nodeName + ".",
+				Namespace:    metav1.NamespaceDefault,
+			},
+			// A Node has no namespace and the driver holds no reference to the
+			// object, so this is the reference the kubelet itself writes for
+			// node events: kind and name, with the name as the UID.
+			InvolvedObject: v1.ObjectReference{Kind: "Node", Name: cp.nodeName, UID: types.UID(cp.nodeName)},
+			Reason:         "CPUPartitionDegraded",
+			Message:        cp.degradedPartitions[partition],
+			Type:           v1.EventTypeWarning,
+			Source:         v1.EventSource{Component: cp.driverName, Host: cp.nodeName},
+			FirstTimestamp: metav1.Now(),
+			LastTimestamp:  metav1.Now(),
+			Count:          1,
+		}
+		if _, err := cp.kubeClient.CoreV1().Events(metav1.NamespaceDefault).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+			logger.Error(err, "cannot report a degraded partition as an event", "partition", partition)
+		}
+	}
+}
+
+// seedAllocationStoreFromDisk recovers claim allocations from CDI specs on
+// disk before the kubelet plugin below registers and can replay Prepare
+// calls its own checkpoint remembers but this driver's in-memory store does
+// not. It only prevents a new allocation from colliding with an
+// already-recorded one; reconciling against the runtime's actual committed
+// state remains Synchronize's job (C38: CDI specs alone are not a safe
+// general convergence source).
+func (cp *CPUDriver) seedAllocationStoreFromDisk(logger logr.Logger) {
+	if err := cp.cdiMgr.Refresh(); err != nil {
+		logger.Error(err, "cannot seed the allocation store from disk: CDI cache refresh failed")
+		return
+	}
+	for claimUID, record := range cp.cdiMgr.PreparedClaimAllocations(logger) {
+		cLogger := logger.WithValues("claimUID", claimUID)
+		if err := cp.cpuAllocationStore.ReserveResourceClaimAllocation(cLogger, claimUID, record, false); err != nil {
+			cLogger.Error(err, "ignoring a recorded claim allocation inconsistent with another one during startup recovery")
+			continue
+		}
+		cLogger.Info("recovered claim allocation from disk", "cpus", store.UnionOf(record.Requests).String(),
+			"relocatable", record.Relocatable)
+	}
+	cp.refreshAllocationMetrics()
 }
 
 // Stop stops the CPUDriver.
@@ -462,19 +1029,51 @@ type nriRunner interface {
 	Run(context.Context) error
 }
 
-func runNRIPluginWithRetry(ctx context.Context, plugin nriRunner, maxAttempts int) error {
+const (
+	nriRetryInitialBackoff     = 1 * time.Second
+	nriRetryMaxBackoff         = 30 * time.Second
+	nriRetryHealthyRunDuration = nriRetryMaxBackoff
+)
+
+// runNRIPluginWithRetry keeps plugin connected, backing off between attempts
+// so a down socket cannot burn through maxAttempts in microseconds. backoff
+// doubles on each failure up to maxBackoff; a connection lasting at least
+// healthyRunDuration resets both, so a past crash loop does not spend the
+// budget a fresh failure needs.
+func runNRIPluginWithRetry(ctx context.Context, plugin nriRunner, maxAttempts int, initialBackoff, maxBackoff, healthyRunDuration time.Duration) error {
 	logger := ctxlog.FromContext(ctx)
-	for i := range maxAttempts {
+	backoff := initialBackoff
+	attempts := 0
+	for {
+		started := time.Now()
 		err := plugin.Run(ctx)
 		if ctx.Err() != nil {
 			logger.Info("NRI plugin stopped", "reason", "context cancelled")
 			return ctx.Err()
 		}
+		if time.Since(started) >= healthyRunDuration {
+			attempts = 0
+			backoff = initialBackoff
+		}
+		attempts++
 		if err != nil {
-			logger.Error(err, "NRI plugin failed, restarting", "attempt", i+1, "maxAttempts", maxAttempts)
+			logger.Error(err, "NRI plugin failed, restarting", "attempt", attempts, "maxAttempts", maxAttempts, "backoff", backoff)
+		}
+		if attempts >= maxAttempts {
+			return fmt.Errorf("NRI plugin failed %d times within %s, giving up", attempts, healthyRunDuration)
+		}
+
+		select {
+		case <-ctx.Done():
+			logger.Info("NRI plugin stopped", "reason", "context cancelled")
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
 		}
 	}
-	return fmt.Errorf("NRI plugin failed for %d times to be restarted", maxAttempts)
 }
 
 // generateShortID generates a non-crypto safe unique ID in cases on which a full UUID would be a overkill.

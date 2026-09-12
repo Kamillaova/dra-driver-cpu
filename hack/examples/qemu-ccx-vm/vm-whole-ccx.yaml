@@ -1,0 +1,116 @@
+# A VM class whose vCPUs get one whole uncore cache (an AMD CCX / one slice of
+# a split L3) to themselves.
+#
+# QEMU's own threads -- main loop, iothreads, vhost workers -- need CPU time
+# too, and left beside the vCPUs they steal it from them. On a node with a
+# shared partition the claim asks for a share of it in a second request, and the
+# launcher reads that request's CPUs from its own device metadata file. Where no
+# such partition exists, drop the helpers request and set CONTROL_CPUS instead:
+# it sets that many of the claim's own CPUs aside for the control threads -- it
+# counts CPUs, not cores, so a whole core is 2 on an SMT2 part -- and the VM runs
+# on the rest.
+#
+# The CEL selector keeps the pod off nodes whose caches are too small to ever
+# hold the vCPU set aligned. On a 7950X3D one CCX is 8 cores / 16 CPUs --
+# adjust the capacity and the selector to your parts.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: vm-whole-ccx-cpus
+spec:
+  spec:
+    devices:
+      requests:
+      - name: vcpus
+        exactly:
+          deviceClassName: dra.cpu
+          capacity:
+            requests:
+              dra.cpu/cpu: "16"
+          selectors:
+          - cel:
+              # Only nodes where a single uncore cache can hold the whole claim.
+              # dra.cpu/uncoreCachesInGroup is also published, for spreading
+              # across a known number of caches instead.
+              expression: device.attributes["dra.cpu"].largestUncoreCacheCPUs >= 16
+      # A share of the node's pool, for every thread that is not a vCPU. One
+      # claim with two requests rather than two claims: a container holding two
+      # claims is pinned to their union and nothing inside it can tell which
+      # CPUs came from which.
+      - name: helpers
+        exactly:
+          deviceClassName: dra.cpu-helpers
+          capacity:
+            requests:
+              dra.cpu/cpu: "500m"
+          tolerations:
+          - key: dra.cpu/partition
+            operator: Equal
+            value: helpers
+            effect: NoSchedule
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vm-whole-ccx
+spec:
+  restartPolicy: Never
+  containers:
+  - name: qemu
+    # Any image carrying qemu-system-x86_64, python3 and inotify-tools.
+    image: your-registry/qemu-launcher:latest
+    command: ["/scripts/launch-qemu.sh"]
+    env:
+    # NOTE: DRA_CPUSET_<claimUID> is injected automatically. Do NOT parse it:
+    # for a claim stating cpuConfig.relocatable its value is the literal string "dynamic",
+    # and with it disabled it is only where the claim was when this container
+    # started. The launcher reads the live set from the cgroup instead.
+    - name: VM_MEMORY_MB
+      value: "16384"
+    # Zero because the helpers request above holds the control threads. Without
+    # that request, set this to a whole core's worth of the claim's own CPUs --
+    # it counts CPUs, so 2 on an SMT2 part -- and the launcher runs 14 vCPUs on
+    # what is left. A value that is not a multiple of the SMT width splits a
+    # core, because the tail it carves is whole cores only at those sizes.
+    - name: CONTROL_CPUS
+      value: "0"
+    resources:
+      # KEP-5517 mode (publishNodeAllocatableResourceMapping: true): the claim's
+      # CPUs are accounted by the scheduler and added to the cgroup limits by
+      # the kubelet -- do not mirror them here, that counts them twice.
+      # Without the mapping, follow docs/user/workload-requirements.md and
+      # mirror the claim size into cpu requests/limits instead.
+      requests:
+        memory: 2Gi
+        hugepages-2Mi: 16Gi
+      limits:
+        memory: 2Gi
+        hugepages-2Mi: 16Gi
+      claims:
+      - name: vcpus
+    volumeMounts:
+    - name: scripts
+      mountPath: /scripts
+    - name: hugepages
+      mountPath: /dev/hugepages
+    - name: kvm
+      mountPath: /dev/kvm
+    securityContext:
+      # For brevity. Production should grant /dev/kvm through a device plugin
+      # (e.g. the KubeVirt one) instead of privilege.
+      privileged: true
+  resourceClaims:
+  - name: vcpus
+    resourceClaimTemplateName: vm-whole-ccx-cpus
+  volumes:
+  - name: scripts
+    configMap:
+      name: qemu-launcher
+      defaultMode: 0755
+  - name: hugepages
+    emptyDir:
+      medium: HugePages-2Mi
+  - name: kvm
+    hostPath:
+      path: /dev/kvm
+      type: CharDevice

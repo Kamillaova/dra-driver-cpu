@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/stdr"
@@ -37,10 +38,64 @@ import (
 const (
 	cgroupPath = "fs/cgroup"
 	cpusetFile = "cpuset.cpus.effective"
+	// metadataRoot is where the kubelet mounts one KEP-5304 metadata file per
+	// request of every claim the container holds.
+	metadataRoot = "/var/run/kubernetes.io/dra-device-attributes"
 	// affinityScanMax is the upper bound when scanning sched_getaffinity if topology is unavailable.
 	// Using runtime.NumCPU() would miss CPUs when the cgroup cpuset is non-contiguous (e.g. 2-5,9-13).
 	affinityScanMax = 2048
+	// cpuSetSampleInterval is how often the container looks at its own cpuset.
+	// The window a test measures with it -- the instant during an exchange in
+	// which two claims hold the same CPUs -- is the runtime's two writes apart,
+	// so a report interval is orders of magnitude too coarse and only the
+	// container itself can sample fast enough.
+	cpuSetSampleInterval = 200 * time.Microsecond
+	// cpuSetHistoryMax bounds what one container remembers. A long-lived tester
+	// pod outlives many passes, and the interesting changes are the recent ones.
+	cpuSetHistoryMax = 64
 )
+
+// cpuSetWatcher remembers every cpuset its container has been seen on, so a test
+// can line the two sides of an exchange up on one clock afterwards.
+type cpuSetWatcher struct {
+	mu      sync.Mutex
+	changes []discovery.DRACPUCPUSetChange
+}
+
+func (w *cpuSetWatcher) observe(cpus cpuset.CPUSet) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	seen := cpus.String()
+	if len(w.changes) > 0 && w.changes[len(w.changes)-1].CPUs == seen {
+		return
+	}
+	w.changes = append(w.changes, discovery.DRACPUCPUSetChange{
+		At:   time.Now().Format(time.RFC3339Nano),
+		CPUs: seen,
+	})
+	if len(w.changes) > cpuSetHistoryMax {
+		w.changes = w.changes[len(w.changes)-cpuSetHistoryMax:]
+	}
+}
+
+func (w *cpuSetWatcher) history() []discovery.DRACPUCPUSetChange {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]discovery.DRACPUCPUSetChange(nil), w.changes...)
+}
+
+// watch samples the container's own cpuset until the process ends. Polling
+// rather than watching with inotify, because the point here is the shortest
+// window the file can be caught in rather than a workload's own re-pinning; a
+// real workload uses inotify, as the QEMU launcher example does.
+func (w *cpuSetWatcher) watch(sfs fs.FS) {
+	for {
+		if cpus, err := cpuSet(sfs); err == nil {
+			w.observe(cpus)
+		}
+		time.Sleep(cpuSetSampleInterval)
+	}
+}
 
 func cpuSetPath() string {
 	return filepath.Join(cgroupPath, cpusetFile)
@@ -86,10 +141,73 @@ func affinityScanBoundFromTopology(topo *cpuinfo.CPUTopology) int {
 	return list[len(list)-1] + 1
 }
 
+// deviceMetadata mirrors the fields of the metadata file this test reads. It
+// is deliberately a local shape rather than the library type: the point is to
+// exercise the file as a workload sees it.
+type deviceMetadata struct {
+	Requests []struct {
+		Name    string `json:"name"`
+		Devices []struct {
+			Name       string `json:"name"`
+			Attributes map[string]struct {
+				String *string `json:"string"`
+			} `json:"attributes"`
+		} `json:"devices"`
+	} `json:"requests"`
+}
+
+// requestMetadata reports what every mounted metadata file says, one entry per
+// device of every request. The file is a stream of the same object once per
+// API version, newest first, so only the first is decoded.
+func requestMetadata() []discovery.DRACPURequestMetadata {
+	claims, err := os.ReadDir(metadataRoot)
+	if err != nil {
+		return nil
+	}
+	var entries []discovery.DRACPURequestMetadata
+	for _, claim := range claims {
+		requests, err := os.ReadDir(filepath.Join(metadataRoot, claim.Name()))
+		if err != nil {
+			continue
+		}
+		for _, request := range requests {
+			raw, err := os.ReadFile(filepath.Join(metadataRoot, claim.Name(), request.Name(), "metadata.json"))
+			if err != nil {
+				continue
+			}
+			var metadata deviceMetadata
+			if err := json.NewDecoder(strings.NewReader(string(raw))).Decode(&metadata); err != nil {
+				continue
+			}
+			for _, req := range metadata.Requests {
+				if req.Name != request.Name() {
+					continue
+				}
+				for _, dev := range req.Devices {
+					entry := discovery.DRACPURequestMetadata{Claim: claim.Name(), Request: req.Name}
+					if v, ok := dev.Attributes["dra.cpu/partition"]; ok && v.String != nil {
+						entry.Partition = *v.String
+					}
+					if v, ok := dev.Attributes["dra.cpu/role"]; ok && v.String != nil {
+						entry.Role = *v.String
+					}
+					if v, ok := dev.Attributes["dra.cpu/cpuset"]; ok && v.String != nil {
+						entry.CPUs = *v.String
+					}
+					entries = append(entries, entry)
+				}
+			}
+		}
+	}
+	return entries
+}
+
 func main() {
 	logger := stdr.New(log.Default())
 	// Read the container's cgroup view, intentionally ignoring HOST_ROOT.
 	containerSysfs := os.DirFS("/sys")
+	watcher := &cpuSetWatcher{}
+	go watcher.watch(containerSysfs)
 	for {
 		cpus, err := cpuSet(containerSysfs)
 		if err != nil {
@@ -109,6 +227,7 @@ func main() {
 			Runtimeinfo: discovery.DRACPURuntimeinfo{
 				CPUAffinity: cpuAff.String(),
 			},
+			CPUSetHistory: watcher.history(),
 		}
 		err = json.NewEncoder(os.Stdout).Encode(info)
 		if err != nil {

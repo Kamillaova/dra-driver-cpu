@@ -1,0 +1,242 @@
+# Fork notes
+
+This is a fork of [kubernetes-sigs/dra-driver-cpu](https://github.com/kubernetes-sigs/dra-driver-cpu)
+adding **mutable CPU placement** and **CCX-aware runtime defragmentation**: the driver may move a
+running claim's CPUs between uncore caches (AMD CCX / L3) without restarting the container, so that
+alignment lost to claim churn is recovered.
+
+See [docs/user/defragmentation.md](docs/user/defragmentation.md) for how to enable and operate it,
+[docs/user/capacity-mirror.md](docs/user/capacity-mirror.md) for what a move does to the capacity the
+scheduler reads, and [docs/user/ccx-aligned-scheduling.md](docs/user/ccx-aligned-scheduling.md) for the
+CCX cache-device model, the producer contract, rollout and rollback rules.
+
+## Baseline
+
+| Component         | Baseline                                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Upstream commit   | `50414a5a702bacc485c7fed219d6fc015f9979d2` (`v0.2.0-270-g50414a5`, "Merge pull request #229 from ffromani/external-allocator")                                 |
+| Kubernetes API    | `k8s.io/*` v0.37.0                                                                                                                          |
+| Go                | 1.26.0                                                                                                                                      |
+| Container runtime | containerd >= v2.4.0-beta.0 (requires [containerd/nri#301](https://github.com/containerd/nri/pull/301), first vendored as nri v0.12.1)      |
+| CRI-O             | unsupported: v1.36 still vendors nri v0.12.0, which holds the `Adaptation` lock across `updateFn` and can deadlock on an unsolicited update |
+
+## Required cluster feature gates and gate register
+
+Cluster feature gates relevant to this fork and CCX-aligned scheduling, verified against Kubernetes v1.37.0 (`pkg/features/kube_features.go`):
+
+| Gate | Stage at v1.37.0 | Requirement / Role |
+|---|---|---|
+| `DRAConsumableCapacity` | Beta on (since 1.36) | **Required**. Enables consumable capacity accounting on cache devices and `requestPolicy` validation. |
+| `DRAPrioritizedList` | GA locked (1.36) | **Required**. Enables `firstAvailable` subrequest evaluation for split-capable claim shapes. |
+| `DRAResourceClaimDeviceStatus` | GA locked (1.37) | **Required**. Enables driver writing allocated device data into `status.devices`. |
+| `DRAResourceClaimGranularStatusAuthorization` | Beta on (since 1.36) | **Required**. Authorizes driver writing `status.devices` via `resourceclaims/driver` subresource with `associated-node:*`. |
+| `DRADeviceTaints`, `DRADeviceTaintRules` | GA (1.37) | **Required**. Enables `dra.cpu/partition`, `dra.cpu/floor`, and `dra.cpu/poisoned` device taints. |
+| `DRAExtendedResource` | GA locked (1.37) | GA in 1.37; not used by this fork's VM claims (extended resources count devices, not CPUs). |
+| `DRADeviceBindingConditions` | Beta on (since 1.36) | Driver binding condition evaluation. |
+| `DRAPartitionableDevices` | Beta on (since 1.36) | Counters infrastructure. |
+| `DRASchedulerFilterTimeout` | Beta on (since 1.34) | Per-node filter timeout in DynamicResources (default 10 s). |
+| `DRANodeAllocatableResources` | Alpha off (since 1.36) | Optional. When off, pods mirror claim CPUs into `requests.cpu`/`limits.cpu` for node-level accounting. When on, apiserver maps claim CPUs into node allocatable. |
+| `MutatingAdmissionPolicy` | GA (1.36) | GA cluster feature. |
+| `DRAWorkloadResourceClaims` | Beta off (1.37) | Not required for single-pod VMs. |
+
+## Migration between upstream and this fork
+
+The `DRA_CPUSET_<claimUID>` variable keeps upstream's name and format, so neither direction needs a
+reader for a legacy format and a claim's identity survives either swap.
+
+For a claim stating `cpuConfig.relocatable: true` the injected value is the literal string `dynamic`
+rather than a cpuset, because a claim whose placement may change has none to name for the life of its
+container. A claim that permits no move keeps its cpuset there, whatever the node's configuration.
+
+**upstream → fork: no drain.** Identity comes from the variable's name. A spec written by upstream
+carries no `dra.cpu/placements` annotation, so the fork falls back to parsing that spec's own env value,
+which for an upstream spec is the real placement. Each claim gains an annotation the next time its spec
+is written.
+
+**A claim's charged devices are recovered at its next Prepare.** A spec written before
+`dra.cpu/recorded` existed does not say how many CPUs the claim's allocation charged each device, and
+an absent answer is read as unknown rather than as zero: read as zero, every running claim would look
+like a tenant of a device its allocation never named. The kubelet replays `NodePrepareResources` for
+every claim when the driver restarts, and the claim object it hands over carries the allocation, which
+is immutable — so the answer comes back one restart after an upgrade, and the spec is rewritten with it.
+
+**Within the fork, a claim's mobility does not survive the driver version that introduced it.** A spec
+written before `dra.cpu/relocatable` existed carries no such annotation, and an absent one reads as
+immobile — the field's default, and the safe reading. So upgrading a node past that version leaves its
+already-running claims unmovable, however their templates were written, until their pods are recreated:
+nothing rewrites a spec except a Prepare or a move, and a move is what the claim can no longer have.
+Defragmentation therefore appears to stop on that node and resume as its pods turn over. Recreate the
+pods to have it resume at once.
+
+**fork → upstream: no drain while nothing moves a claim**, which holds while `defragEnabled` is off.
+The annotation always agrees with the env value, so an upstream driver reading these specs behaves
+exactly as it does with its own.
+
+Once claims can move, **a rollback requires draining the node first.** An upstream driver treats the
+env value as the claim's placement, and a moved claim's value no longer describes its container.
+`dynamic` is the value it does least harm with: it cannot parse it, so it passes the container over
+and leaves its cpuset alone, and only the CPUs that claim holds are then handed out to others as well.
+Had the value been a stale-looking cpuset, upstream would instead reject the claim and, finding the
+container holding none, classify it as shared and flatten a guaranteed container onto the shared pool.
+Draining avoids either. Runbook: drain the node, confirm no remaining pod holds a `dra.cpu` claim
+(`--ignore-daemonsets` skips DaemonSet pods, and static pods cannot be evicted at all), then roll the
+DaemonSet. See [docs/user/ccx-aligned-scheduling.md](docs/user/ccx-aligned-scheduling.md#5-upgrade-and-downgrade-matrix)
+for the complete upgrade and downgrade matrix across components.
+
+## Conventions
+
+- **Minimal diff to upstream.** New behaviour lives in new packages (`pkg/defrag`, additions to
+  `pkg/cpuinfo`). Touch points inside existing files are single thin calls rather than inline logic.
+- **Every upstream declaration or block the fork changes carries a `// CCX-FORK:` comment** naming what
+  upstream does instead, so `git grep 'CCX-FORK:'` enumerates every point a rebase has to reconcile. A
+  symbol the fork *adds* needs no marker: there is nothing upstream to reconcile it against; the
+  divergence surface below lists them.
+- Commits follow upstream's conventions (`type:` / `component:` subjects, `Signed-off-by`) and are kept
+  atomic so the upstreamable ones cherry-pick cleanly.
+
+### Divergence surface
+
+Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
+to an upstreamable piece (see below) are not repeated here: they leave with their PR.
+
+- `pkg/driver/cdi.go`: `cdiSpecVersion`, `cdiPlacementsAnnotation`, `cdiRelocatableAnnotation`,
+  `cdiAlignmentAnnotation`, `cdiRecordedAnnotation`, `cdiRoundIDAnnotation`, `cdiRoundOriginAnnotation`,
+  `cdiRoundTargetAnnotation`, `cdiRoundPartnersAnnotation`, `cdiCorrelationAnnotation`, `cdiEnvDynamicValue`,
+  `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`, `decodePlacements`,
+  `decodeRecordedDevices`, `decodeRoundPartners`
+
+- `pkg/driver/claim_reader.go`: whole file
+
+- `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `activeExactPlans`,
+  `defragRetries` and `defragRetryDue`, `cgroupfs`, `poisonedNodes`, `publishedCorrection`,
+  `publishedFrontier`, `publishedFrontierInput`, `storedSlices`, `claimReader`, `namespace`, `placementPolicy` and `makeRoomTargets` fields, `makeRoomTarget`, `deviceTopology.deviceIsPool`, `deviceTopology.deviceNameToPartition`, `deviceTopology.deviceNameToUncoreCacheID`, `devicePartition`, `Providers.CgroupFS` and
+  `EnsureCgroupFS`, and `Config.DefragEnabled`, `Config.DefragAllowTransientOverlap` and `Config.Namespace`
+
+- `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values,
+  the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields, `ProjectedClaim.OffersSplitAlternatives`,
+  `ProjectedClaim.Shape` and `ProjectedClaim.IsNeverSplit`
+
+- `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
+  `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `recordedDevices`,
+  `recordedDeviceFull`, `recordClaimEvent`, `recordClaimEventRef`, `ensureMakeRoomTarget`, `secureRepairWitness`, `releaseActiveExactPlanAndClosure`,
+  `buildClaimCorrelation`, `claimNameAndNamespace`,
+  `publishResources`, `republishStaleSlices`, `rehomeCandidate`, `rehomeShare`
+
+- `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses, and the namespace lookup from POD_NAMESPACE
+
+- `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
+  `containerClassification`, `classifyContainer`, `reconcileActiveRounds`
+
+- `pkg/driver/poison.go`: `poisonNUMANodeForCPUs`
+
+- `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
+  `RoundProvenance`, `ClaimCorrelation`, `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
+  `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
+  `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
+  `GetClaimRecord`, `SetClaimCorrelation`, `UpdateClaimRuntimeOutcome`, `SetRecordedDevices`, `IsRelocatable`, `IsRepairable`, `Alignment`, `ReserveClosure`,
+  `ReleaseClosure`, `ReservedClosures`, `ReservedClosure`, `HoldsExclusiveCPUs`,
+  `ExclusiveClaimAllocations`, `ClaimHolding` and `ClaimHoldings`
+
+- `pkg/store/claim_tracker.go`: `Owner`
+
+- `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`,
+  `ContainerState.WithCgroup`, `ContainerState.CgroupPath`
+
+- `go.mod`: the `require` and `replace` of the nested `api` module, which upstream builds as part of
+  the root module
+
+- `internal/driverconfig`: `DefragEnabled`, `DefragAllowTransientOverlap` and `validateDefrag`;
+  `CachePlacementStrategy` and `validateCachePlacementStrategy`; the `Profiles` map, `Profile`,
+  `ProfileLabel`, `DefaultProfileName`, `WithProfile`, `asProfile`, `validateProfiles` and
+  `WarnDeprecatedCPUFields`
+
+- `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods,
+  `SetFlooredCapacityDevices`, `RecordPrepareNoRoom` and `RecordPrepareNoWitness`, promise accounting,
+  slice write amplification and downgrade gate methods, and the collectors behind them
+
+- `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
+  `e2e_suite_test.go`, and the `defragEnabled`/`defragAllowTransientOverlap`/`fullPhysicalCPUsOnly`
+  config read-back
+
+- `test/image/dracputester`: the cpuset watcher, and `discovery.DRACPUCPUSetChange` with the history
+  it reports; upstream's tester reports the cpuset it is on, not the ones it has been on
+
+- the packages' existing `_test.go` files: the fork's unit tests are added in place, beside the code
+  they pin, rather than kept apart
+
+Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/cgroupfs`, `pkg/driver/defrag.go`,
+`reconcile.go`, `placements.go`, `deviceorder.go`, `poison.go`, `mirror.go`,
+`slicewatch.go`, `pkg/cpuinfo/coretopology.go`, `pkg/device/partition.go`, `api/attributes.go`,
+`api/v1alpha1/projection.go`, `deployment/helm/dra-driver-cpu/templates/role.yaml`,
+`rolebinding.yaml`) are visible to `git diff --stat` on their own and are not repeated
+here.
+
+`api/` is a nested module here (`api/go.mod`), because the scheduler plugin that reads the driver's
+device attributes pins it independently and importing it must not drag in the whole driver. Upstream
+builds `api/` as part of the root module, so `./...` reaches it there and does not here: the build,
+lint, modernize and unit-test targets run over the nested module as a second step.
+
+`CdiManager.GetDeviceEnv` is upstream's and is kept, but the fork's driver no longer calls it now that
+placement comes from the annotation. It stays on the `cdiManager` interface to keep the diff small.
+`CPUAllocation.GetResourceClaimAllocation` is upstream's and is kept for the same reason: the fork reads
+a claim's placement per request instead.
+
+## Upstreamable pieces
+
+These carry no fork-only code and are intended to be offered upstream as separate PRs:
+
+- physical-core identity helpers in `pkg/cpuinfo`
+- the nested `api` module holding the opaque claim schema and the device attribute names, so a
+  consumer can pin the schema without pinning the driver
+- uncore cache geometry device attributes
+- `groupBy: uncorecache`, one device per uncore cache
+- claim-ownership authentication against `Container.CDIDevices` (as an *additive* check)
+- `fullPhysicalCPUsOnly` — upstream issue #45
+- CPU partitions: the `cpuPartitions` list, the devices and taints it publishes, and its
+  verification against the node's own thread arity
+- shared-pool reconcile after unprepare — upstream issue #279
+
+The defragmenter itself is not upstreamable in the near term: it needs a runtime opt-in, and moving a
+running container's cpuset is a semantic upstream has not sanctioned.
+
+## Deviations
+
+Record here any place where reality contradicted the design (renamed upstream API, different observed
+behaviour) rather than silently adapting.
+
+- **The planner's progress rule is not distance to the ideal packing.** That rule deadlocks. A node
+  whose free CPUs are scattered one per cache has no claim that can reach its ideal in a single step,
+  and a small claim sitting in the cache a large one needs gets no closer to its own ideal by stepping
+  aside, so nothing is ever emitted. A pass instead ranks a placement by wasted caches first and by
+  CPUs occupied that the ideal owes to another claim second, and moves a claim only when that strictly
+  falls. Tests cover both deadlocks: removing either term of the measure makes them fail.
+- **A move can leave its own claim worse placed, so that is checked separately.** The ideal minimises
+  the node's total cost, which does not minimise every claim's: a claim sitting neatly inside one
+  cache can be dealt an awkward remnant once larger claims are packed first. Such a move is skipped.
+- **`BeginRebind` validates only the claim's CPU count**, plus the overlap and state-machine invariants
+  the store owns. Preserving the per-NUMA footprint and taking whole cores are properties of the
+  target, enforced where the target is chosen; duplicating them in the store would give the same
+  policy two homes.
+- **The defragmentation option is a flat `defrag*` field, not a nested block.** `Config` is flat
+  throughout, its dump mirror is a field-for-field type conversion, and two reflection tests walk its
+  fields to enforce that each one is logged and dumped. A nested struct would have weakened all three.
+- **Two metrics carry a label the rule stated in `docs/user/metrics.md` would forbid**, `numa_node`
+  and `shape`. The rule is amended there rather than quietly broken.
+- **Allocation-time cache placement is a policy, not a constant.** The design held that upstream's
+  packed order "needs no improvement" because it preserves whole caches for future large claims. The
+  platform wants the opposite for its small tenants -- one VM per cache while there is slack, L3
+  isolation first, with defragmentation consolidating the small tenants when a whole-cache claim
+  actually arrives instead of caches being hoarded against its possible arrival. That is
+  `cachePlacementStrategy: spread`; `pack` stays the default and upstream-identical. The same decision
+  reshaped the planner: the ideal packing is a repair target for misaligned claims only, and a claim
+  already spread as little as its size allows is never herded into the ideal's preferred slots for
+  tidiness (watched on hardware: six moves where three were needed, one of them intra-cache).
+- **The opt-out of being moved is the claim's, not the pod's.** The design put it on the pod, as an
+  annotation carried through `ContainerState`. It belongs on the claim: mobility is a property of the
+  CPUs a claim holds, the claim already carries a configuration the tenant writes, and a pod
+  annotation would have said nothing about a claim two pods share. It is also an opt-*in* rather than
+  an opt-out, because a wrong `true` silently costs a workload its per-vCPU pinning while a wrong
+  `false` costs only capacity, and visibly.
+- **Not implemented from the design:** skipping passes on a cordoned or draining node, which needs a
+  node informer and the RBAC for it. It does not affect correctness — it only lets a pass do avoidable
+  work on a node about to be emptied.

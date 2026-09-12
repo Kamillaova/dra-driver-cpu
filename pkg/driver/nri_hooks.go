@@ -19,15 +19,18 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
+	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 )
 
 // Synchronize is called by the NRI to synchronize the state of the driver during bootstrap.
@@ -39,11 +42,16 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	defer logger.Info("end: synchronize state with the runtime", "numPods", len(pods), "numContainers", len(containers))
 
 	defer func() { cp.metrics.RecordNRISynchronize(rerr, time.Since(startTime)) }()
+	// Synchronize rebuilds all three stores and swaps them in, so nothing that
+	// reads or writes a placement may run while it does.
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
 
 	cpuAllocationStore := store.NewCPUAllocation(cp.topology.cpuTopology, cp.topology.reservedCPUs)
 	podConfigStore := store.NewPodConfig()
 	claimTracker := store.NewClaimTracker()
 	var containerUpdates []*api.ContainerUpdate
+	var claimsToClearRound []types.UID
 	cdiCacheRefreshAttempted := false
 
 	for _, pod := range pods {
@@ -55,66 +63,166 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 			}
 			cLogger := pLogger.WithValues("container", container.Name)
 
-			claimAllocations, err := parseDRAEnvToClaimAllocations(cLogger, container.Env)
+			entries, err := parseDRAEnv(cLogger, container.Env)
 			if err != nil {
 				cLogger.Error(err, "ignoring container with malformed DRA env during synchronize")
 				continue
 			}
 			containerUID := types.UID(container.GetId())
 			var claimUIDs []types.UID
-			allGuaranteedCPUs := cpuset.New()
-			validatedClaimAllocations := make(map[types.UID]cpuset.CPUSet)
-			for uid, cpus := range claimAllocations {
+			reportedCDIDevices := runtimeCDIDevices(container)
+			for _, entry := range entries {
+				uid := entry.claimUID
 				caLogger := cLogger.WithValues("claimUID", uid)
+				if !claimInjectedByRuntime(reportedCDIDevices, uid) {
+					caLogger.Info("ignoring claim the runtime injected no CDI device for during synchronize")
+					continue
+				}
+
 				if !cdiCacheRefreshAttempted {
 					err = cp.cdiMgr.Refresh()
 					cdiCacheRefreshAttempted = true
 					if err != nil {
 						logger.Error(err, "failed to refresh CDI cache, continuing with available CDI devices")
 					}
+					cp.reconcileActiveRounds(logger)
 				}
 
 				deviceName := getCDIDeviceName(uid)
-				envs, err := cp.cdiMgr.GetDeviceEnv(deviceName)
+				// CCX-FORK: upstream instead requires the container's env to
+				// equal the CDI spec's, and drops the claim when it does not.
+				//
+				// The CDI spec is the driver's own record of where the claim
+				// belongs, and it is rewritten whenever placement changes. The
+				// container's env is only where it belonged when the container
+				// started, so it cannot decide anything here.
+				recorded, err := cp.cdiMgr.GetDeviceAllocations(deviceName)
 				if err != nil {
 					caLogger.Error(err, "ignoring claim not prepared by this driver during synchronize")
 					continue
 				}
-				err = validateSynchronizedClaimAllocation(caLogger, uid, cpus, envs)
-				if err != nil {
-					caLogger.Error(err, "ignoring invalid claim allocation during synchronize")
+				desired := store.UnionOf(recorded.Requests)
+				if !entry.dynamic && !desired.Equals(entry.cpus) {
+					// Expected whenever the claim was moved after its container
+					// started. The ContainerUpdate below carries the container to
+					// the desired set, so log and converge rather than dropping
+					// the claim and leaking its CPUs into the shared pool.
+					caLogger.V(2).Info("container was created for a cpuset the claim has since left, converging",
+						"createdWithCPUs", entry.cpus.String(), "desiredCPUs", desired.String())
+				}
+				// An overlapping claim rebuilt earlier in this call must not fail
+				// the whole synchronize; skip it instead of leaving every other pod
+				// and container on the node without a driver.
+				if err := cpuAllocationStore.ReserveResourceClaimAllocation(caLogger, uid, recorded, false); err != nil {
+					caLogger.Error(err, "skipping claim with an allocation inconsistent with an earlier one during synchronize")
+					cp.metrics.RecordSynchronizeSkippedClaim()
 					continue
 				}
-				// Synchronize restores an allocation that already exists in the runtime;
-				// the shared-pool guard applies only to new reservations.
-				if err := cpuAllocationStore.ReserveResourceClaimAllocation(caLogger, uid, cpus, false); err != nil {
-					return nil, err
-				}
-
-				allGuaranteedCPUs = allGuaranteedCPUs.Union(cpus)
+				cp.checkClaimPartition(caLogger, desired)
 				claimUIDs = append(claimUIDs, uid)
-				validatedClaimAllocations[uid] = cpus
+			}
+
+			// CCX-FORK: upstream binds every claim the container names.
+			if owned := exclusiveClaimUIDs(cpuAllocationStore, claimUIDs); len(owned) > 0 {
+				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, owned...); err != nil {
+					// An inconsistency in the runtime's own reported state, not a
+					// reason to fail every other pod and container being
+					// synchronized: treat this container as unclaimed instead.
+					cLogger.Error(err, "treating container as unclaimed: its claim ownership conflicts with an earlier one during synchronize")
+					cp.metrics.RecordSynchronizeSkippedClaim()
+					claimUIDs = nil
+				}
+			}
+			// This container is exactly as trustworthy a source as a fresh
+			// Prepare: CreateContainer's CRI-O fallback reads this to
+			// authenticate a container recreated after this driver restarts, on
+			// a runtime that never reports CDI devices. Every claim it holds
+			// needs one, ownership or not, since that fallback checks them all.
+			for _, uid := range claimUIDs {
+				claimTracker.SetReservedFor(uid, []types.UID{types.UID(pod.Uid)})
 			}
 
 			var state *store.ContainerState
 			if len(claimUIDs) == 0 {
-				state = store.NewContainerState(container.GetName(), containerUID)
+				state = store.NewContainerState(container.GetName(), containerUID).WithCgroup(container.GetLinux().GetCgroupsPath())
 			} else {
-				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, claimUIDs...); err != nil {
-					return nil, err
-				}
-				if err := cpuAllocationStore.ValidateResourceClaimAllocations(validatedClaimAllocations); err != nil {
+				allGuaranteedCPUs, err := cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
+				if err != nil {
 					return nil, err
 				}
 				cLogger.V(2).Info("found guaranteed CPUs", "cpus", allGuaranteedCPUs.String())
-				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...)
-
-				// Reconcile guaranteed container CPU mask.
-				guaranteedUpdate := &api.ContainerUpdate{
-					ContainerId: container.GetId(),
+				cgroupsPath := ""
+				if linux := container.GetLinux(); linux != nil {
+					cgroupsPath = linux.GetCgroupsPath()
 				}
-				guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
-				containerUpdates = append(containerUpdates, guaranteedUpdate)
+				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...).WithCgroup(cgroupsPath)
+
+				originUnion := cpuset.New()
+				targetUnion := cpuset.New()
+				hadRound := false
+				for _, uid := range claimUIDs {
+					rec, err := cp.cdiMgr.GetDeviceAllocations(getCDIDeviceName(uid))
+					if err == nil && rec.Round != nil && rec.Round.RoundID != "" {
+						hadRound = true
+						originUnion = originUnion.Union(rec.Round.Origin)
+						targetUnion = targetUnion.Union(rec.Round.Target)
+					} else if claimCPUs, ok := cpuAllocationStore.GetResourceClaimAllocation(uid); ok {
+						originUnion = originUnion.Union(claimCPUs)
+						targetUnion = targetUnion.Union(claimCPUs)
+					}
+				}
+				if !hadRound {
+					originUnion = allGuaranteedCPUs
+					targetUnion = allGuaranteedCPUs
+				}
+
+				var committedCPUs cpuset.CPUSet
+				if linux := container.GetLinux(); linux != nil {
+					if res := linux.GetResources(); res != nil && res.GetCpu() != nil {
+						committedCPUs, _ = cpuset.Parse(res.GetCpu().GetCpus())
+					}
+				}
+
+				var kernelCPUs cpuset.CPUSet
+				var kernelErr error
+				if cp.cgroupfs != nil && cgroupsPath != "" {
+					kernelCPUs, kernelErr = cgroupfs.CPUSet(cp.cgroupfs, cgroupsPath)
+				} else if cp.cgroupfs != nil || cgroupsPath != "" {
+					kernelErr = fmt.Errorf("cgroupfs is not mounted or cgroupsPath is empty")
+				}
+
+				classification := cp.classifyContainer(allGuaranteedCPUs, committedCPUs, kernelCPUs, originUnion, targetUnion, kernelErr)
+				switch classification {
+				case containerSettled:
+					cLogger.V(2).Info("owned container is settled", "cpus", allGuaranteedCPUs.String())
+					if hadRound {
+						claimsToClearRound = append(claimsToClearRound, claimUIDs...)
+					}
+				case containerForwardApplicable:
+					cLogger.Info("owned container is forward-applicable, converging", "cpus", allGuaranteedCPUs.String())
+					guaranteedUpdate := &api.ContainerUpdate{
+						ContainerId: container.GetId(),
+					}
+					guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
+					containerUpdates = append(containerUpdates, guaranteedUpdate)
+					if hadRound {
+						claimsToClearRound = append(claimsToClearRound, claimUIDs...)
+					}
+				case containerRollbackApplicable:
+					cLogger.Info("owned container is rollback-applicable, reverting", "cpus", allGuaranteedCPUs.String())
+					guaranteedUpdate := &api.ContainerUpdate{
+						ContainerId: container.GetId(),
+					}
+					guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
+					containerUpdates = append(containerUpdates, guaranteedUpdate)
+					if hadRound {
+						claimsToClearRound = append(claimsToClearRound, claimUIDs...)
+					}
+				case containerUnknown:
+					cLogger.Error(kernelErr, "owned container is in unknown state from three-way check, poisoning NUMA node",
+						"desired", allGuaranteedCPUs.String(), "committed", committedCPUs.String(), "kernel", kernelCPUs.String())
+					cp.poisonNUMANodeForCPUs(cLogger, allGuaranteedCPUs.Union(originUnion).Union(kernelCPUs))
+				}
 			}
 			podConfigStore.SetContainerState(types.UID(pod.GetUid()), state)
 			cLogger.V(6).Info("set container state", "claims", len(claimUIDs))
@@ -126,6 +234,10 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	cp.claimTracker = claimTracker
 	cp.refreshAllocationMetrics()
 
+	for _, uid := range claimsToClearRound {
+		_ = cp.writeClaimPlacement(logger, uid)
+	}
+
 	// Reconcile container CPU masks to handle cases where the NRI plugin might have crashed
 	// or restarted and missed updating the cgroup settings.
 	// See: https://github.com/containerd/nri/issues/282
@@ -135,58 +247,176 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	}
 	containerUpdates = append(containerUpdates, sharedContainerUpdates...)
 	logger.V(6).Info("synchronization complete", "updatesCount", len(containerUpdates))
+	// CCX-FORK: the store was just rebuilt from what is actually running, which
+	// is the other way a cache stops being empty.
+	cp.republishStaleSlices(ctx)
+	// CCX-FORK: a driver that has just learnt the node's real placements is
+	// looking at a node nothing has defragmented since it went down, which is
+	// exactly when the spread is worst.
+	if cp.defrag.enabled {
+		cp.requestReconcile()
+	}
 	return containerUpdates, nil
 }
 
-func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types.UID]cpuset.CPUSet, error) {
-	allocations := make(map[types.UID]cpuset.CPUSet)
+// checkClaimPartition reports a restored claim whose CPUs no single partition
+// holds, which is what a partition list edited under a running node looks like
+// from here. The claim is kept: its container is running on those CPUs, and
+// taking them away would stop a workload to enforce a description that changed
+// after it started. A pass moves it home once one may.
+//
+// It checks that the claim sits inside some one partition, not inside the
+// partition of the device its allocation charged, so a claim that drifted wholly
+// into another partition passes. The narrower reading would report nothing on
+// exactly the nodes it matters on: this runs while the store is being rebuilt
+// from the specs on disk, and a spec written by an older driver names no charged
+// device to compare against.
+func (cp *CPUDriver) checkClaimPartition(logger logr.Logger, cpus cpuset.CPUSet) {
+	if cpus.IsEmpty() {
+		return
+	}
+	for _, partition := range cp.partitions {
+		if cpus.IsSubsetOf(partition.CPUs) {
+			return
+		}
+	}
+	logger.Info("restored claim is held by no single partition, leaving it where it is", "cpus", cpus.String())
+	cp.metrics.RecordMisplacedClaim()
+}
+
+// A claim given no CPUs of its own takes nothing away from anything else, so it
+// binds to no single container and several containers and pods may reference it.
+func exclusiveClaimUIDs(allocations *store.CPUAllocation, claimUIDs []types.UID) []types.UID {
+	var owned []types.UID
+	for _, claimUID := range claimUIDs {
+		if allocations.HoldsExclusiveCPUs(claimUID) {
+			owned = append(owned, claimUID)
+		}
+	}
+	return owned
+}
+
+// runtimeCDIDevices returns the CDI device names the runtime reports for the
+// container, or nil when it reports none.
+//
+// A nil result means "unknown", not "none": not every runtime fills the field
+// in. Callers must treat nil as inconclusive rather than as a rejection.
+func runtimeCDIDevices(ctr *api.Container) map[string]struct{} {
+	devices := ctr.GetCDIDevices()
+	if len(devices) == 0 {
+		return nil
+	}
+	names := make(map[string]struct{}, len(devices))
+	for _, dev := range devices {
+		names[dev.GetName()] = struct{}{}
+	}
+	return names
+}
+
+// claimInjectedByRuntime reports whether the runtime confirms this driver's CDI
+// device for claimUID was injected into the container.
+//
+// The DRA_CPUSET entry a container carries comes from its own pod spec, so a pod
+// can name another pod's claim and, by winning the race to CreateContainer, take
+// that claim's CPUs. The runtime's own record of the CDI devices kubelet asked it
+// to inject cannot be forged that way, which makes it the stronger signal.
+//
+// reported must come from runtimeCDIDevices. A nil map means the runtime does not
+// report CDI devices, and this returns true so the remaining checks decide.
+func claimInjectedByRuntime(reported map[string]struct{}, claimUID types.UID) bool {
+	if reported == nil {
+		return true
+	}
+	_, ok := reported[cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName(claimUID))]
+	return ok
+}
+
+// draEnvEntry is one DRA_CPUSET_* variable a container carries.
+type draEnvEntry struct {
+	claimUID types.UID
+	// cpus is the placement the value named, and is unset when dynamic is true:
+	// a claim whose placement may change has none to name.
+	cpus    cpuset.CPUSet
+	dynamic bool
+}
+
+// parseDRAEnv returns the claims a container's environment names.
+//
+// CCX-FORK: upstream returns only claim-to-cpuset pairs, since to it the value is
+// the placement. Here the name is what matters and the value may say "dynamic".
+func parseDRAEnv(logger logr.Logger, envs []string) ([]draEnvEntry, error) {
+	var entries []draEnvEntry
 	for _, env := range envs {
 		if !strings.HasPrefix(env, cdiEnvVarPrefix) {
 			continue
 		}
 		logger.V(4).Info("parsing DRA env entry", "env", env)
-		parts := strings.SplitN(env, "=", 2)
-		if len(parts) != 2 {
+		key, value, found := strings.Cut(env, "=")
+		if !found {
 			return nil, fmt.Errorf("malformed DRA env entry %q", env)
 		}
-		key, value := parts[0], parts[1]
-		var claimUID types.UID
-		if after, ok := strings.CutPrefix(key, cdiEnvVarPrefix+"_"); ok {
-			uidStr := after
-			claimUID = types.UID(uidStr)
-		} else {
+		uidStr, ok := strings.CutPrefix(key, cdiEnvVarPrefix+"_")
+		if !ok {
 			continue
 		}
 
-		parsedSet, err := cpuset.Parse(value)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse cpuset value %q from env %q: %w", value, env, err)
+		entry := draEnvEntry{claimUID: types.UID(uidStr)}
+		if value == cdiEnvDynamicValue {
+			entry.dynamic = true
+		} else {
+			cpus, err := cpuset.Parse(value)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse cpuset value %q from env %q: %w", value, env, err)
+			}
+			entry.cpus = cpus
 		}
-		allocations[claimUID] = parsedSet
+		entries = append(entries, entry)
 	}
 
+	return entries, nil
+}
+
+// parseDRAEnvToClaimAllocations returns the placements recorded by the
+// environment edits of a driver-owned CDI spec, which unlike a container's
+// environment is rewritten whenever a placement changes. Entries that name no
+// placement are left out.
+func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types.UID]cpuset.CPUSet, error) {
+	entries, err := parseDRAEnv(logger, envs)
+	if err != nil {
+		return nil, err
+	}
+	allocations := make(map[types.UID]cpuset.CPUSet, len(entries))
+	for _, entry := range entries {
+		if entry.dynamic {
+			continue
+		}
+		allocations[entry.claimUID] = entry.cpus
+	}
 	return allocations, nil
 }
 
-func validateSynchronizedClaimAllocation(logger logr.Logger, uid types.UID, cpus cpuset.CPUSet, envs []string) error {
-	allocations, err := parseDRAEnvToClaimAllocations(logger, envs)
-	if err != nil {
-		return fmt.Errorf("failed to parse CDI env for claim %q: %w", uid, err)
+// sharedContainerCPUs is the mask a container without a claim is confined to:
+// whatever the claims have left over inside the partitions such a container may
+// run in.
+//
+// CCX-FORK: upstream's dynamic pool spans the whole node, with no partition to
+// keep a claimless container out of the cores claims are meant to have.
+func (cp *CPUDriver) sharedContainerCPUs() cpuset.CPUSet {
+	shared := cp.cpuAllocationStore.GetSharedCPUs()
+	// A driver whose cores have not been resolved into partitions has no
+	// description to enforce and keeps upstream's node-wide pool. On a node
+	// whose cores nobody described the resolution is one default partition over
+	// every allocatable CPU, so that is upstream's pool too; where an exclusive
+	// partition exists, its free CPUs are not the pool's to hand out.
+	if len(cp.partitions) == 0 {
+		return shared
 	}
-
-	preparedCPUs, ok := allocations[uid]
-	if !ok {
-		return fmt.Errorf("validation failed for claim %q: driver-owned CDI spec %q does not contain a matching DRA allocation", uid, getCDIDeviceName(uid))
-	}
-	if !preparedCPUs.Equals(cpus) {
-		return fmt.Errorf("validation failed for claim %q during synchronize: cpuset mismatch (expected %q from CDI, got %q from runtime)", uid, preparedCPUs.String(), cpus.String())
-	}
-	return nil
+	return shared.Intersection(cp.defaultPartitionCPUs)
 }
 
 func (cp *CPUDriver) getSharedContainerUpdates(logger logr.Logger, excludeID types.UID) ([]*api.ContainerUpdate, error) {
 	updates := []*api.ContainerUpdate{}
-	sharedCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+	sharedCPUs := cp.sharedContainerCPUs()
 	preparedCPUs := cp.cpuAllocationStore.GetPreparedCPUs()
 	sharedCPUContainers := cp.podConfigStore.GetContainersWithSharedCPUs()
 	// An empty CPUSet is serialized by NRI as Cpus="", which means "do not
@@ -221,53 +451,77 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	logger.V(2).Info("begin: CreateContainer")
 	defer logger.V(2).Info("end: CreateContainer")
 
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
 	adjust := &api.ContainerAdjustment{}
 	var updates []*api.ContainerUpdate
 
 	claimCount := -1
-	claimAllocations, err := parseDRAEnvToClaimAllocations(logger, ctr.Env)
+	entries, err := parseDRAEnv(logger, ctr.Env)
 	defer func() { cp.metrics.RecordNRICreateContainer(rerr, claimCount, time.Since(startTime)) }()
 	if err != nil {
 		logger.Error(err, "error parsing DRA env for container")
 		return nil, nil, err
 	}
-	claimCount = len(claimAllocations)
+	claimCount = len(entries)
 
 	containerId := types.UID(ctr.GetId())
 	podUID := types.UID(pod.GetUid())
 
 	if claimCount == 0 {
 		// This is a shared container.
-		sharedCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+		sharedCPUs := cp.sharedContainerCPUs()
 		if sharedCPUs.IsEmpty() && !cp.cpuAllocationStore.GetPreparedCPUs().IsEmpty() {
 			// NRI cannot represent an empty CPUSet as a ContainerAdjustment. Fail
 			// closed instead of allowing the runtime to keep its default affinity.
 			return nil, nil, fmt.Errorf("cannot create shared container: no shared CPUs available")
 		}
-		state := store.NewContainerState(ctr.GetName(), containerId)
+		state := store.NewContainerState(ctr.GetName(), containerId).WithCgroup(ctr.GetLinux().GetCgroupsPath())
 		cp.podConfigStore.SetContainerState(podUID, state)
 
 		logger.V(2).Info("no guaranteed CPUs found, using shared CPUs", "sharedCPUs", sharedCPUs.String())
 		adjust.SetLinuxCPUSetCPUs(sharedCPUs.String())
 	} else {
-		// NRI invokes CreateContainer for all containers. Only trust DRA env
-		// entries that match a claim prepared by this driver.
-		guaranteedCPUs := cpuset.New()
+		// CCX-FORK: upstream pins the container to the cpuset parsed out of its
+		// env, after checking that value against the store for equality.
+		//
+		// NRI invokes CreateContainer for all containers. The DRA env only names
+		// which claims the container holds; where each one is placed comes from
+		// the store, so a claim moved between Prepare and CreateContainer is
+		// applied at its current placement rather than at the stale one the
+		// container's immutable environment carries.
 		claimUIDs := []types.UID{}
-		for uid, cpus := range claimAllocations {
-			guaranteedCPUs = guaranteedCPUs.Union(cpus)
-			claimUIDs = append(claimUIDs, uid)
+		reportedCDIDevices := runtimeCDIDevices(ctr)
+		for _, entry := range entries {
+			if !claimInjectedByRuntime(reportedCDIDevices, entry.claimUID) {
+				return nil, nil, fmt.Errorf("container claims %q but the runtime injected no CDI device for it", entry.claimUID)
+			}
+			if reportedCDIDevices == nil {
+				// The runtime reports no CDI devices at all (CRI-O today); fall
+				// back to the claim's own API-server reservation, which a pod
+				// spec cannot forge the way it can a DRA_CPUSET_* env value.
+				if reserved, recorded := cp.claimTracker.ReservedFor(entry.claimUID, podUID); !reserved || !recorded {
+					return nil, nil, fmt.Errorf("container claims %q but the pod is not in its reservation", entry.claimUID)
+				}
+			}
+			claimUIDs = append(claimUIDs, entry.claimUID)
 		}
-		newOwners, err := cp.claimTracker.SetOwner(logger, podUID, ctr.Name, claimUIDs...)
+		// CCX-FORK: upstream binds every claim the container names.
+		var newOwners []types.UID
+		if owned := exclusiveClaimUIDs(cp.cpuAllocationStore, claimUIDs); len(owned) > 0 {
+			newOwners, err = cp.claimTracker.SetOwner(logger, podUID, ctr.Name, owned...)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		guaranteedCPUs, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
 		if err != nil {
-			return nil, nil, err
-		}
-		if err := cp.cpuAllocationStore.ValidateResourceClaimAllocations(claimAllocations); err != nil {
 			cp.claimTracker.Cleanup(newOwners...)
 			return nil, nil, err
 		}
 		logger.V(2).Info("guaranteed CPUs found", "cpus", guaranteedCPUs.String())
-		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...)
+		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...).WithCgroup(ctr.GetLinux().GetCgroupsPath())
 		adjust.SetLinuxCPUSetCPUs(guaranteedCPUs.String())
 		// A new owner means this is the first CreateContainer after Prepare, so
 		// existing shared containers must be moved off the newly claimed CPUs.
@@ -302,6 +556,9 @@ func (cp *CPUDriver) StopContainer(ctx context.Context, pod *api.PodSandbox, ctr
 	logger.V(2).Info("begin: StopContainer")
 	defer logger.V(2).Info("end: StopContainer")
 
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
 	updates := []*api.ContainerUpdate{}
 	claimUIDs, removed := cp.podConfigStore.RemoveContainerState(types.UID(pod.GetUid()), ctr.GetName(), types.UID(ctr.GetId()))
 	if !removed {
@@ -321,6 +578,9 @@ func (cp *CPUDriver) RemoveContainer(ctx context.Context, pod *api.PodSandbox, c
 	_, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen), "pod", ctxlog.KObj(pod), "podUID", pod.Uid, "container", ctr.Name, "containerID", ctr.Id)
 	logger.V(2).Info("begin: RemoveContainer")
 	defer logger.V(2).Info("end: RemoveContainer")
+
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
 
 	claimUIDs, removed := cp.podConfigStore.RemoveContainerState(types.UID(pod.GetUid()), ctr.GetName(), types.UID(ctr.GetId()))
 	if !removed {
@@ -342,4 +602,120 @@ func (cp *CPUDriver) RemoveContainer(ctx context.Context, pod *api.PodSandbox, c
 	// we leaked state and StopContainer didn't clean up properly.
 	cp.metrics.RecordNRIRemoveContainer(nil, len(claimUIDs), time.Since(startTime))
 	return nil
+}
+
+type containerClassification int
+
+const (
+	containerSettled containerClassification = iota
+	containerForwardApplicable
+	containerRollbackApplicable
+	containerUnknown
+)
+
+func (cp *CPUDriver) classifyContainer(desired, committed, kernel, origin, target cpuset.CPUSet, kernelErr error) containerClassification {
+	if kernelErr != nil {
+		return containerUnknown
+	}
+
+	if kernel.IsEmpty() {
+		if committed.IsEmpty() {
+			if desired.Equals(target) {
+				return containerForwardApplicable
+			}
+			return containerRollbackApplicable
+		}
+		if committed.Equals(desired) {
+			return containerSettled
+		}
+		if desired.Equals(target) && committed.Equals(origin) {
+			return containerForwardApplicable
+		}
+		if desired.Equals(origin) && committed.Equals(target) {
+			return containerRollbackApplicable
+		}
+		return containerUnknown
+	}
+
+	if kernel.Equals(desired) && (committed.IsEmpty() || committed.Equals(desired)) {
+		return containerSettled
+	}
+
+	if desired.Equals(target) {
+		if (kernel.Equals(origin) || kernel.Equals(target)) && (committed.IsEmpty() || committed.Equals(origin) || committed.Equals(target)) {
+			return containerForwardApplicable
+		}
+		return containerUnknown
+	}
+
+	if desired.Equals(origin) {
+		if (kernel.Equals(target) || committed.Equals(target)) && (kernel.Equals(origin) || kernel.Equals(target)) && (committed.IsEmpty() || committed.Equals(origin) || committed.Equals(target)) {
+			return containerRollbackApplicable
+		}
+		if kernel.Equals(origin) && (committed.IsEmpty() || committed.Equals(origin)) {
+			return containerSettled
+		}
+		return containerUnknown
+	}
+
+	return containerUnknown
+}
+
+func (cp *CPUDriver) reconcileActiveRounds(logger logr.Logger) {
+	allocations := cp.cdiMgr.PreparedClaimAllocations(logger)
+	if len(allocations) == 0 {
+		return
+	}
+
+	rounds := make(map[string]map[types.UID]store.ClaimRecord)
+	for uid, record := range allocations {
+		if record.Round != nil && record.Round.RoundID != "" {
+			if rounds[record.Round.RoundID] == nil {
+				rounds[record.Round.RoundID] = make(map[types.UID]store.ClaimRecord)
+			}
+			rounds[record.Round.RoundID][uid] = record
+		}
+	}
+
+	if len(rounds) == 0 {
+		return
+	}
+
+	for roundID, participants := range rounds {
+		isComplete := true
+		for uid, rec := range participants {
+			for _, partnerUID := range rec.Round.Partners {
+				partnerRec, exists := participants[partnerUID]
+				if !exists {
+					isComplete = false
+					break
+				}
+				if !slices.Contains(partnerRec.Round.Partners, uid) {
+					isComplete = false
+					break
+				}
+			}
+			if !isComplete {
+				break
+			}
+		}
+
+		if isComplete {
+			logger.Info("active defrag round is complete, converging forward", "roundID", roundID, "participants", len(participants))
+			continue
+		}
+
+		logger.Info("active defrag round is incomplete, reverting to origin", "roundID", roundID, "participants", len(participants))
+		for uid, rec := range participants {
+			origin := rec.Round.Origin
+			if len(rec.Requests) > 0 && !origin.IsEmpty() {
+				rec.Requests[0].CPUs = origin
+			}
+			envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, uid, cp.cdiEnvValue(rec))
+			if err := cp.cdiMgr.AddDevice(logger, getCDIDeviceName(uid), envVar, rec); err != nil {
+				logger.Error(err, "failed to revert incomplete round CDI spec", "roundID", roundID, "claimUID", uid)
+			}
+		}
+		_ = cp.cdiMgr.Refresh()
+	}
 }

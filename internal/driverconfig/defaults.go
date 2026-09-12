@@ -16,7 +16,10 @@ limitations under the License.
 
 package driverconfig
 
-import "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+import (
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+)
 
 // DefaultKubeletRootDir is the standard kubelet root directory, so behaviour is
 // unchanged unless the kubelet --root-dir is relocated.
@@ -30,5 +33,14 @@ func Default() Config {
 		GroupBy:        device.GROUP_BY_NUMA_NODE,
 		KubeletRootDir: DefaultKubeletRootDir,
 		Allocator:      AllocatorCPUManager,
+		// On by default but inert until unsolicited updates are permitted, so
+		// enabling that one option gets the prompt reconcile without a second
+		// switch.
+		ReconcileSharedOnUnprepare: true,
+		// On by default, and inert until defragmentation is enabled: a node
+		// packed full has no free CPUs to move a claim through, so forbidding
+		// the instant of overlap forbids repairing it at all.
+		DefragAllowTransientOverlap: true,
+		CachePlacementStrategy:      string(coreselect.Pack),
 	}
 }

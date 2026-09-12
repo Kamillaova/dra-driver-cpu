@@ -30,6 +30,9 @@ type ContainerState struct {
 	containerUID types.UID
 	// resourceClaimUIDs is a list of resource claims associated with this container.
 	resourceClaimUIDs []types.UID
+	// cgroupPath is where the runtime put the container's cgroup, as it reported
+	// it. Empty until a caller records it.
+	cgroupPath string
 }
 
 // NewContainerState creates a new ContainerState.
@@ -39,6 +42,23 @@ func NewContainerState(containerName string, containerUID types.UID, claimUIDs .
 		containerUID:      containerUID,
 		resourceClaimUIDs: claimUIDs,
 	}
+}
+
+// WithCgroup records where the runtime placed the container's cgroup, which is
+// the only way to read back the CPUs it is really running on.
+//
+// A setter rather than a constructor argument: every caller that has the path
+// has it from the same NRI field, and the ones that do not are not asking the
+// kernel anything.
+func (cs *ContainerState) WithCgroup(path string) *ContainerState {
+	cs.cgroupPath = path
+	return cs
+}
+
+// CgroupPath returns what the runtime reported, or the empty string when nothing
+// recorded it.
+func (cs *ContainerState) CgroupPath() string {
+	return cs.cgroupPath
 }
 
 // PodCPUAssignments maps a container name to its state.
@@ -142,4 +162,17 @@ func (s *PodConfig) Len() int {
 // HasExclusiveCPUAllocation returns true if the container has associated resource claims.
 func (cs *ContainerState) HasExclusiveCPUAllocation() bool {
 	return len(cs.resourceClaimUIDs) > 0
+}
+
+// ContainerUID returns the runtime's identifier for this container, which is what
+// addresses it in an NRI update.
+func (cs *ContainerState) ContainerUID() types.UID {
+	return cs.containerUID
+}
+
+// ClaimUIDs returns the claims this container holds. A container pinned from its
+// claims must be pinned to all of them at once, so a caller changing one still
+// needs the rest.
+func (cs *ContainerState) ClaimUIDs() []types.UID {
+	return append([]types.UID(nil), cs.resourceClaimUIDs...)
 }

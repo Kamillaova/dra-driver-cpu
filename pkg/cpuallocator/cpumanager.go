@@ -18,6 +18,7 @@ package cpuallocator
 
 import (
 	"github.com/go-logr/logr"
+	opaqueapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
 	topology "github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpumanager"
 	resourceapi "k8s.io/api/resource/v1"
@@ -57,6 +58,22 @@ func (alc *CPUManager) GetPreferredCPUs(logger logr.Logger, allocation *resource
 	// external opaque hints are not supported and must be rejected with the sentinel error.
 	for _, config := range resourceclaim.ConfigForResult(allocation.Devices.Config, alloc) {
 		if config.Opaque == nil || config.Opaque.Driver != alc.driverName {
+			continue
+		}
+		// CCX-FORK: upstream refuses every configuration this driver owns,
+		// because to it a configuration is a cpuset and nothing else. A claim may
+		// now carry one that names only what it tolerates -- relocatable, and the
+		// alignment it asks for -- which the driver acts on and this allocator is
+		// never asked to honour. Only a named cpuset is a hint it would have to
+		// ignore, so only a named cpuset is refused.
+		if len(config.Opaque.Parameters.Raw) == 0 {
+			continue
+		}
+		parsed, err := opaqueapi.ParseOpaqueConfig(config.Opaque.Parameters.Raw)
+		if err != nil {
+			return cpuset.New(), err
+		}
+		if !parsed.HasCPUs {
 			continue
 		}
 		return cpuset.New(), ErrUnsupportedPreferredCPUs

@@ -21,12 +21,29 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/containerd/nri/pkg/api"
+	"github.com/go-logr/logr/funcr"
+	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
+	"k8s.io/utils/cpuset"
 )
 
 type mockNRIRunner struct {
@@ -39,6 +56,15 @@ func (m *mockNRIRunner) Run(ctx context.Context) error {
 	return m.runFunc(ctx)
 }
 
+// Tiny durations so the backoff and the healthy-run threshold do not slow the
+// suite down; only their relative order (initial < max, and both far below
+// healthyRun) matters to the behaviour under test.
+const (
+	testRetryInitialBackoff = time.Millisecond
+	testRetryMaxBackoff     = 4 * time.Millisecond
+	testRetryHealthyRun     = time.Hour
+)
+
 func TestRunNRIPluginWithRetry_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -49,7 +75,7 @@ func TestRunNRIPluginWithRetry_ContextCancelled(t *testing.T) {
 		},
 	}
 
-	err := runNRIPluginWithRetry(ctx, runner, maxAttempts)
+	err := runNRIPluginWithRetry(ctx, runner, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
 	require.ErrorIs(t, err, context.Canceled, "should return context.Canceled when context is cancelled")
 	require.Equal(t, int32(1), runner.calls.Load(), "Run should be called exactly once before context cancel")
 }
@@ -69,7 +95,7 @@ func TestRunNRIPluginWithRetry_ContextCancelledAfterSeveralRetries(t *testing.T)
 		},
 	}
 
-	err := runNRIPluginWithRetry(ctx, runner, maxAttempts)
+	err := runNRIPluginWithRetry(ctx, runner, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
 	require.ErrorIs(t, err, context.Canceled, "should return context.Canceled when context is cancelled")
 	require.Equal(t, int32(3), calls.Load(), "Run should be called 3 times before context cancel")
 }
@@ -83,7 +109,7 @@ func TestRunNRIPluginWithRetry_ExhaustsAttempts(t *testing.T) {
 		},
 	}
 
-	err := runNRIPluginWithRetry(ctx, runner, 3)
+	err := runNRIPluginWithRetry(ctx, runner, 3, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
 	require.Error(t, err, "should return error after exhausting attempts")
 	require.Equal(t, int32(3), runner.calls.Load(), "Run should be called exactly maxAttempts times")
 }
@@ -99,9 +125,207 @@ func TestRunNRIPluginWithRetry_SuccessfulRunNoRetry(t *testing.T) {
 		},
 	}
 
-	err := runNRIPluginWithRetry(ctx, runner, maxAttempts)
+	err := runNRIPluginWithRetry(ctx, runner, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, int32(1), runner.calls.Load())
+}
+
+func TestRunNRIPluginWithRetry_BacksOffBetweenAttempts(t *testing.T) {
+	// The original bug: a down socket fails to dial instantly, so without a
+	// delay every attempt is spent within microseconds. Assert real time
+	// elapses between attempts, proportional to the number of retries.
+	ctx := context.Background()
+	var timestamps []time.Time
+	runner := &mockNRIRunner{
+		runFunc: func(ctx context.Context) error {
+			timestamps = append(timestamps, time.Now())
+			return fmt.Errorf("connection refused")
+		},
+	}
+
+	err := runNRIPluginWithRetry(ctx, runner, 4, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
+	require.Error(t, err)
+	require.Len(t, timestamps, 4)
+	for i := 1; i < len(timestamps); i++ {
+		require.GreaterOrEqual(t, timestamps[i].Sub(timestamps[i-1]), testRetryInitialBackoff,
+			"attempt %d ran without waiting for the backoff", i)
+	}
+}
+
+func TestRunNRIPluginWithRetry_BackoffDoublesUpToTheCap(t *testing.T) {
+	ctx := context.Background()
+	var gaps []time.Duration
+	var last time.Time
+	runner := &mockNRIRunner{
+		runFunc: func(ctx context.Context) error {
+			now := time.Now()
+			if !last.IsZero() {
+				gaps = append(gaps, now.Sub(last))
+			}
+			last = now
+			return fmt.Errorf("connection refused")
+		},
+	}
+
+	err := runNRIPluginWithRetry(ctx, runner, 5, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
+	require.Error(t, err)
+	require.Len(t, gaps, 4)
+	// Doubles: 1x, 2x, then capped at testRetryMaxBackoff (4x the initial).
+	require.GreaterOrEqual(t, gaps[1], 2*testRetryInitialBackoff)
+	require.GreaterOrEqual(t, gaps[2], testRetryMaxBackoff)
+	require.GreaterOrEqual(t, gaps[3], testRetryMaxBackoff)
+}
+
+func TestRunNRIPluginWithRetry_HealthyRunResetsTheBudget(t *testing.T) {
+	// A connection that lasted a while before failing again must not be
+	// charged against the crash-loop budget from a fast failure long before it
+	// connected. maxAttempts is 2: without the reset, the one fast failure
+	// below plus the failure after the healthy run would exhaust it and the
+	// function would return before a third call ever happens.
+	const maxAttempts = 2
+	const healthyRun = 2 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+	runner := &mockNRIRunner{
+		runFunc: func(ctx context.Context) error {
+			calls++
+			switch calls {
+			case 1:
+				return fmt.Errorf("crash loop")
+			case 2:
+				time.Sleep(2 * healthyRun)
+				return fmt.Errorf("fresh problem")
+			default:
+				cancel()
+				return context.Canceled
+			}
+		},
+	}
+
+	err := runNRIPluginWithRetry(ctx, runner, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, healthyRun)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 3, calls, "the healthy second run must have bought a fresh attempt budget")
+}
+
+// TestNewReportsResourceSliceCountUnderExposePCIeRoots: exposePCIeRoots halves
+// devicesPerResourceSlice (128 -> 64) invisibly to the config, which can
+// double how many ResourceSlices a node publishes; New must report the actual
+// count reached rather than leave it something only a slice count in the API
+// would reveal.
+func TestNewReportsResourceSliceCountUnderExposePCIeRoots(t *testing.T) {
+	var logs strings.Builder
+	logger := funcr.New(func(prefix, args string) {
+		logs.WriteString(prefix + " " + args + "\n")
+	}, funcr.Options{})
+
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_DualSocket_120CPUsPerSocket_HT},
+		SysFS:   testSysFS(mockCPUInfos_DualSocket_120CPUsPerSocket_HT),
+	}
+	conf := Config{
+		DriverName:      testDriverName,
+		NodeName:        testNodeName,
+		ReservedCPUs:    cpuset.New(),
+		ExposePCIeRoots: true,
+	}
+	_, err := New(logger, prov, &conf)
+	require.NoError(t, err)
+
+	logged := logs.String()
+	require.Contains(t, logged, `"msg"="chunked devices into ResourceSlices"`)
+	require.Contains(t, logged, `"numDevices"=240`)
+	require.Contains(t, logged, `"devicesPerResourceSlice"=64`)
+	require.Contains(t, logged, `"numResourceSlices"=4`)
+	require.Contains(t, logged, `"exposePCIeRoots"=true`)
+}
+
+// TestSeedAllocationStoreFromDiskRecoversPriorPlacements: a kubelet replaying
+// Prepare for an already-running claim after a restart must not be told the
+// claim's CPUs are free, or a different claim allocated afresh in that window
+// could pick the same ones.
+func TestSeedAllocationStoreFromDiskRecoversPriorPlacements(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-recovered")
+	cdiMgr := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: cpuset.New(0, 1)})
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		cdiMgr:             cdiMgr,
+		metrics:            cpumetrics.Noop(),
+	}
+
+	d.seedAllocationStoreFromDisk(logger)
+
+	require.Equal(t, 1, cdiMgr.refreshCalls, "must refresh the CDI cache before reading it")
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
+	require.True(t, ok, "the recovered claim must be reserved")
+	require.Equal(t, cpuset.New(0, 1), got)
+
+	// A Prepare replayed for a different, new claim must not be able to land on
+	// the recovered claim's CPUs.
+	require.Error(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-new", exclusiveOn(cpuset.New(0)), false))
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(logger, "claim-new", exclusiveOn(cpuset.New(2)), false))
+}
+
+// TestSeedAllocationStoreFromDiskSkipsAConflictingRecordWithoutFailingStartup:
+// self-consistent CDI specs never conflict, but a corrupted or hand-edited one
+// must not cost every other recovered claim its own recovery.
+func TestSeedAllocationStoreFromDiskSkipsAConflictingRecordWithoutFailingStartup(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	cdiMgr := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+		"claim-good":       cpuset.New(0, 1),
+		"claim-conflicted": cpuset.New(0, 1),
+	})
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		cdiMgr:             cdiMgr,
+		metrics:            cpumetrics.Noop(),
+	}
+
+	d.seedAllocationStoreFromDisk(logger)
+
+	// One of the two conflicting claims won recovery; the other is absent
+	// rather than the whole recovery having failed.
+	_, goodOK := d.cpuAllocationStore.GetResourceClaimAllocation("claim-good")
+	_, conflictedOK := d.cpuAllocationStore.GetResourceClaimAllocation("claim-conflicted")
+	require.True(t, goodOK != conflictedOK, "exactly one of the conflicting claims must have been recovered")
+}
+
+// TestSeedAllocationStoreFromDiskToleratesARefreshFailure: a failed refresh
+// must not panic or otherwise stop Start from proceeding.
+func TestSeedAllocationStoreFromDiskToleratesARefreshFailure(t *testing.T) {
+	logger := testr.New(t)
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: []cpuinfo.CPUInfo{{CpuID: 0}}}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	cdiMgr := newMockCdiMgr()
+	cdiMgr.refreshError = fmt.Errorf("cannot read CDI spec directory")
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		cdiMgr:             cdiMgr,
+		metrics:            cpumetrics.Noop(),
+	}
+
+	require.NotPanics(t, func() { d.seedAllocationStoreFromDisk(logger) })
+	require.True(t, d.cpuAllocationStore.GetSharedCPUs().Equals(cpuset.New(0)), "nothing must have been recovered")
 }
 
 // TestWaitForRegistration covers an unexported function, which we would normally
@@ -323,10 +547,375 @@ func TestStartRefusesARootWithNoRoomForTheSocket(t *testing.T) {
 	cp := &CPUDriver{
 		kubeletRootDir: "/" + strings.Repeat("x", unixPathMax),
 		driverName:     "dra.cpu",
+		metrics:        cpumetrics.Noop(),
 	}
 
 	_, err := cp.Start(context.Background())
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Unix socket path")
+}
+
+func TestValidateReservedCPUsAlignment(t *testing.T) {
+	// Two 2-way SMT cores: (0,2) and (1,3).
+	topo := &cpuinfo.CPUTopology{CPUDetails: cpuinfo.CPUDetails{
+		0: {CpuID: 0, CoreID: 0, SocketID: 0},
+		1: {CpuID: 1, CoreID: 1, SocketID: 0},
+		2: {CpuID: 2, CoreID: 0, SocketID: 0},
+		3: {CpuID: 3, CoreID: 1, SocketID: 0},
+	}}
+
+	require.NoError(t, validateReservedCPUsAlignment(topo, cpuset.New(0, 2)), "whole core reserved")
+	require.NoError(t, validateReservedCPUsAlignment(topo, cpuset.New()), "nothing reserved")
+
+	err := validateReservedCPUsAlignment(topo, cpuset.New(0))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "splits physical cores")
+	require.Contains(t, err.Error(), "0")
+}
+
+func TestNewRejectsReservedCPUsSplittingACoreUnderFullPhysicalCPUsOnly(t *testing.T) {
+	infos := []cpuinfo.CPUInfo{
+		{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 2},
+		{CpuID: 1, CoreID: 1, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 3},
+		{CpuID: 2, CoreID: 0, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 0},
+		{CpuID: 3, CoreID: 1, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 1},
+	}
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}
+
+	_, err := New(testr.New(t), prov, &Config{
+		DriverName:           testDriverName,
+		NodeName:             testNodeName,
+		CPUDeviceMode:        devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy:     devattr.GROUP_BY_NUMA_NODE,
+		ReservedCPUs:         cpuset.New(0),
+		FullPhysicalCPUsOnly: true,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "splits physical cores")
+
+	_, err = New(testr.New(t), prov, &Config{
+		DriverName:           testDriverName,
+		NodeName:             testNodeName,
+		CPUDeviceMode:        devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy:     devattr.GROUP_BY_NUMA_NODE,
+		ReservedCPUs:         cpuset.New(0, 2),
+		FullPhysicalCPUsOnly: true,
+	})
+	require.NoError(t, err, "reserving both siblings does not split the core")
+}
+
+// TestPlacementChangesAreSerialized drives every hook that reads or writes a
+// placement against Synchronize, which replaces all three stores wholesale.
+//
+// Under -race this is what catches the pointer swap going unsynchronized: before
+// applyMu, a hook could be reading the store Synchronize was in the middle of
+// replacing. It also covers the CDI manager, which the same lock is what keeps
+// serial.
+func TestPlacementChangesAreSerialized(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-uid-1")
+	claimedCPUs := cpuset.New(0, 1)
+	pod := &api.PodSandbox{Id: "pod-id-1", Name: "pod", Namespace: "ns", Uid: "pod-uid-1"}
+	ctr := &api.Container{
+		Id:           "ctr-id-1",
+		PodSandboxId: pod.Id,
+		Name:         "ctr",
+		Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, claimedCPUs.String())},
+	}
+
+	allocationStore := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, allocationStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(claimedCPUs), false))
+
+	d := &CPUDriver{
+		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: claimedCPUs}),
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: allocationStore,
+		claimTracker:       store.NewClaimTracker(),
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		metrics:            cpumetrics.Noop(),
+	}
+
+	ctx := context.Background()
+	claims := []kubeletplugin.NamespacedObject{{UID: claimUID}}
+	var wg sync.WaitGroup
+	for range 30 {
+		wg.Add(4)
+		// Every one of these may legitimately fail depending on the interleaving;
+		// what must not happen is a race or a torn view of the stores.
+		go func() { defer wg.Done(); _, _ = d.Synchronize(ctx, []*api.PodSandbox{pod}, []*api.Container{ctr}) }()
+		go func() { defer wg.Done(); _, _, _ = d.CreateContainer(ctx, pod, ctr) }()
+		go func() { defer wg.Done(); _, _ = d.StopContainer(ctx, pod, ctr) }()
+		go func() { defer wg.Done(); _, _ = d.UnprepareResourceClaims(ctx, claims) }()
+	}
+	wg.Wait()
+
+	// Whatever order they ran in, the node still accounts for every CPU exactly
+	// once: prepared and shared partition the allocatable set.
+	prepared := d.cpuAllocationStore.GetPreparedCPUs()
+	shared := d.cpuAllocationStore.GetSharedCPUs()
+	require.True(t, prepared.Intersection(shared).IsEmpty(), "a CPU is both claimed and shared")
+	require.True(t, prepared.Union(shared).Equals(allCPUs), "CPUs went missing")
+}
+
+// partitionTestInfos is a single-socket, single-NUMA part of four two-way SMT
+// cores: CPUs 0-3 and their siblings 4-7.
+func partitionTestInfos() []cpuinfo.CPUInfo {
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 8 {
+		core := cpu % 4
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID:         cpu,
+			CoreID:        core,
+			SocketID:      0,
+			NUMANodeID:    0,
+			UncoreCacheID: 0,
+			SiblingCPUID:  (cpu + 4) % 8,
+			SiblingCPUSet: cpuset.New(core, core+4),
+		})
+	}
+	return infos
+}
+
+func TestNewPublishesOneSlicePerPartition(t *testing.T) {
+	infos := partitionTestInfos()
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}
+
+	cp, err := New(testr.New(t), prov, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		CPUPartitions: []devattr.Partition{
+			{Name: "system", Role: devattr.PARTITION_ROLE_RESERVED, CPUs: cpuset.New(0, 4)},
+			{Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Len(t, cp.topology.deviceSlices, 2, "a partition's taints must not travel in another partition's slice")
+	require.Len(t, cp.topology.deviceSlices[0], 1)
+	require.Len(t, cp.topology.deviceSlices[1], 1)
+	require.Equal(t, devattr.CPUDeviceNUMAGroupedPrefix+"000-dataplane", cp.topology.deviceSlices[0][0].Name)
+	require.NotEmpty(t, cp.topology.deviceSlices[0][0].Taints)
+	require.Equal(t, devattr.CPUDeviceNUMAGroupedPrefix+"000", cp.topology.deviceSlices[1][0].Name)
+	require.Empty(t, cp.topology.deviceSlices[1][0].Taints)
+
+	require.Equal(t, cpuset.New(0, 4), cp.topology.reservedCPUs, "a reserved partition is reserved")
+	require.Equal(t, resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures, cp.devicesPerResourceSlice,
+		"a slice holding a tainted device carries half as many devices")
+}
+
+func TestNewRejectsPartitionsTheNodeContradicts(t *testing.T) {
+	infos := partitionTestInfos()
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}
+	newWith := func(partitions ...devattr.Partition) error {
+		_, err := New(testr.New(t), prov, &Config{
+			DriverName:       testDriverName,
+			NodeName:         testNodeName,
+			CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+			CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+			CPUPartitions:    partitions,
+		})
+		return err
+	}
+
+	require.NoError(t, newWith(devattr.Partition{Name: "vm", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)}))
+
+	err := newWith(devattr.Partition{Name: "vm", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 99)})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "offline CPUs")
+
+	err = newWith(devattr.Partition{Name: "vm", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1)})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "splits physical cores")
+}
+
+// partitionedDriver is a driver over partitionTestInfos with cores 1 and 5
+// declared as a dataplane partition, so CPUs 0,4,2,6,3,7 are the implicit one.
+func partitionedDriver(t *testing.T) *CPUDriver {
+	t.Helper()
+	infos := partitionTestInfos()
+	cp, err := New(testr.New(t), Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		CPUPartitions: []devattr.Partition{
+			{Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)},
+		},
+	})
+	require.NoError(t, err)
+	cp.cdiMgr = newMockCdiMgr()
+	return cp
+}
+
+func TestPrepareTakesCPUsInsideTheDevicesPartition(t *testing.T) {
+	cp := partitionedDriver(t)
+
+	claim := testClaim("claim-dataplane", testDriverName, testNodeName,
+		map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "000-dataplane": 2})
+	results, err := cp.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.NoError(t, results[claim.UID].Err)
+
+	got, ok := cp.cpuAllocationStore.GetResourceClaimAllocation(claim.UID)
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(1, 5), got, "a claim on the dataplane device takes the dataplane partition's CPUs")
+}
+
+func TestPrepareRefusesADeviceThisNodeDoesNotPublish(t *testing.T) {
+	cp := partitionedDriver(t)
+
+	claim := testClaim("claim-elsewhere", testDriverName, testNodeName,
+		map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "000-storage": 2})
+	results, err := cp.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.ErrorContains(t, results[claim.UID].Err, "was not published by this driver")
+}
+
+func TestSharedContainersStayInTheDefaultPartition(t *testing.T) {
+	cp := partitionedDriver(t)
+
+	require.Equal(t, cpuset.New(0, 2, 3, 4, 6, 7), cp.sharedContainerCPUs(),
+		"a container holding no claim never runs on an exclusive partition's CPUs")
+
+	claim := testClaim("claim-dataplane", testDriverName, testNodeName,
+		map[string]int64{devattr.CPUDeviceNUMAGroupedPrefix + "000-dataplane": 2})
+	_, err := cp.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(0, 2, 3, 4, 6, 7), cp.sharedContainerCPUs(),
+		"claiming inside another partition changes nothing for them either")
+}
+
+func TestCheckClaimPartitionCountsAClaimNoPartitionHolds(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cp := partitionedDriver(t)
+	cp.metrics = cpumetrics.New(reg)
+
+	cp.checkClaimPartition(testr.New(t), cpuset.New(1, 5))
+	require.Equal(t, float64(0), metricValue(t, reg, "dra_cpu_misplaced_claims_total", nil),
+		"a claim inside one partition is where it belongs")
+
+	cp.checkClaimPartition(testr.New(t), cpuset.New(1, 2))
+	require.Equal(t, float64(1), metricValue(t, reg, "dra_cpu_misplaced_claims_total", nil),
+		"a claim straddling two partitions is counted and kept")
+}
+
+func TestNewDegradesAPartitionTheMachineContradicts(t *testing.T) {
+	// The operator declared one thread per core on the dataplane partition but
+	// has not offlined the siblings yet.
+	infos := partitionTestInfos()
+	reg := prometheus.NewRegistry()
+	cp, err := New(testr.New(t), Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		Metrics:          cpumetrics.New(reg),
+		CPUPartitions: []devattr.Partition{
+			{Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1), ThreadsPerCore: 1},
+		},
+	})
+	require.NoError(t, err, "one partition's machine configuration must not fail the node")
+
+	require.Contains(t, cp.degradedPartitions, "dataplane")
+	require.Contains(t, cp.degradedPartitions["dataplane"], `devices.system.cpu.cpu5.online: "0"`,
+		"the message names the key that would make the declaration true")
+
+	require.Len(t, cp.topology.deviceSlices, 1, "the degraded partition publishes nothing")
+	require.Equal(t, devattr.CPUDeviceNUMAGroupedPrefix+"000", cp.topology.deviceSlices[0][0].Name)
+	require.Equal(t, float64(0), metricValue(t, reg, "dra_cpu_partition_verified", map[string]string{"partition": "dataplane"}))
+	require.Equal(t, float64(1), metricValue(t, reg, "dra_cpu_partition_verified", map[string]string{"partition": "default"}))
+}
+
+func TestNewAcceptsAPartitionWhoseSiblingsAreOffline(t *testing.T) {
+	// The same declaration once the platform has taken the siblings offline: the
+	// surviving thread is a whole core, and the partition publishes as usual.
+	var infos []cpuinfo.CPUInfo
+	for _, info := range partitionTestInfos() {
+		if info.CpuID == 5 {
+			continue
+		}
+		if info.CpuID == 1 {
+			info.SiblingCPUSet = cpuset.New(1)
+		}
+		infos = append(infos, info)
+	}
+	cp, err := New(testr.New(t), Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+		CPUPartitions: []devattr.Partition{
+			{Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1), ThreadsPerCore: 1},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Empty(t, cp.degradedPartitions)
+	require.Len(t, cp.topology.deviceSlices, 2)
+	require.Equal(t, devattr.CPUDeviceNUMAGroupedPrefix+"000-dataplane", cp.topology.deviceSlices[0][0].Name)
+}
+
+func TestVerifyThreadArityAcceptsWhatItWasNotToldAbout(t *testing.T) {
+	logger := testr.New(t)
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: partitionTestInfos()}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	require.Empty(t, verifyThreadArity(topo, devattr.Partition{Name: "vm", CPUs: cpuset.New(1, 5)}),
+		"a partition that declared no arity accepts what the platform provides")
+	require.Empty(t, verifyThreadArity(topo, devattr.Partition{Name: "vm", CPUs: cpuset.New(1, 5), ThreadsPerCore: 2}))
+	require.NotEmpty(t, verifyThreadArity(topo, devattr.Partition{Name: "vm", CPUs: cpuset.New(1), ThreadsPerCore: 1}))
+}
+
+func TestReportDegradedPartitionsWritesANodeEvent(t *testing.T) {
+	client := k8sfake.NewSimpleClientset()
+	cp := &CPUDriver{
+		driverName: testDriverName,
+		nodeName:   testNodeName,
+		kubeClient: client,
+		degradedPartitions: map[string]string{
+			"dataplane": `partition "dataplane" expects at most 1 online thread(s) per core, but 5 are online too`,
+		},
+		metrics: cpumetrics.Noop(),
+	}
+
+	cp.reportDegradedPartitions(ctxlog.NewContext(context.Background(), testr.New(t)))
+
+	events, err := client.CoreV1().Events(metav1.NamespaceDefault).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, events.Items, 1)
+	event := events.Items[0]
+	require.Equal(t, "CPUPartitionDegraded", event.Reason)
+	require.Equal(t, corev1.EventTypeWarning, event.Type)
+	require.Equal(t, "Node", event.InvolvedObject.Kind)
+	require.Equal(t, testNodeName, event.InvolvedObject.Name)
+	require.Contains(t, event.Message, "dataplane")
 }

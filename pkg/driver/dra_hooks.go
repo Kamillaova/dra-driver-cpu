@@ -18,16 +18,28 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	opaqueapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -39,18 +51,41 @@ import (
 
 // PublishResources publishes ResourceSlice for CPU resources.
 func (cp *CPUDriver) PublishResources(ctx context.Context) {
+	if err := cp.publishResources(ctx); err != nil {
+		ctxlog.FromContext(ctx).Error(err, "error publishing resources")
+	}
+}
+
+// publishResources is PublishResources for a caller that has to know whether
+// the inventory reached the controller at all.
+//
+// CCX-FORK: upstream publishes once at startup and logs whatever comes back. A
+// defragmentation round publishes the capacity its move depends on and may not
+// touch a container until that capacity is stored, so a handoff that failed is
+// the round's answer rather than a log line.
+func (cp *CPUDriver) publishResources(ctx context.Context) error {
 	ctx, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen), "deviceMode", cp.cpuDeviceMode, "groupBy", cp.cpuDeviceGroupBy)
 
 	logger.V(4).Info("begin: publishing resources")
 	defer logger.V(4).Info("end: publishing resources")
 
-	if cp.topology.deviceSlices == nil {
+	// CCX-FORK: upstream publishes the slices New cut, once and for all. The
+	// order of cache devices tracks which caches hold a claim, so it is rebuilt
+	// here; publishMu keeps a slower publisher from leaving the controller with
+	// an order a faster one has already superseded.
+	cp.publishMu.Lock()
+	defer cp.publishMu.Unlock()
+	cp.applyMu.Lock()
+	chunks := cp.refreshDeviceOrder()
+	cp.applyMu.Unlock()
+
+	if chunks == nil {
 		logger.Info("no devices to publish or error occurred")
-		return
+		return nil
 	}
 
-	slices := make([]resourceslice.Slice, 0, len(cp.topology.deviceSlices))
-	for _, chunk := range cp.topology.deviceSlices {
+	slices := make([]resourceslice.Slice, 0, len(chunks))
+	for _, chunk := range chunks {
 		slices = append(slices, resourceslice.Slice{Devices: chunk})
 	}
 
@@ -61,15 +96,29 @@ func (cp *CPUDriver) PublishResources(ctx context.Context) {
 		},
 	}
 
+	rawBytes, _ := json.Marshal(resources)
+	cp.metrics.RecordSliceUpdate(len(rawBytes))
+	cp.metrics.RecordSliceUpdateRetryDepth(0)
+
 	err := cp.draPlugin.PublishResources(ctx, resources)
 	if err != nil {
-		logger.Error(err, "error publishing resources")
+		if apierrors.IsConflict(err) {
+			cp.metrics.RecordSliceUpdateConflict()
+		}
+		if apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) {
+			cp.metrics.RecordSliceUpdateValidationError()
+		}
+		if apierrors.IsTooManyRequests(err) {
+			cp.metrics.RecordSliceUpdateRateLimit()
+		}
+		return err
 	}
+	return nil
 }
 
 // PrepareResourceClaims is called by the kubelet to prepare a resource claim.
 func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
-	_, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen))
+	ctx, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen))
 
 	logger.V(4).Info("begin: preparing resource claims", "numClaims", len(claims))
 	defer logger.V(4).Info("end: preparing resource claims", "numClaims", len(claims))
@@ -80,37 +129,224 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 		return result, nil
 	}
 
+	// Held across the whole batch: a claim's CPUs are chosen from what the store
+	// says is free and then written to its CDI spec, and the two must not be
+	// separated. Both prepare paths also reuse an existing allocation when they
+	// find one, so the read belongs inside as well.
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
 	for _, claim := range claims {
 		start := time.Now()
 		cLogger := logger.WithValues("claim", ctxlog.KObj(claim), "claimUID", claim.UID)
-		if cp.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-			result[claim.UID] = cp.prepareGroupedResourceClaim(cLogger, claim)
-		} else {
-			result[claim.UID] = cp.prepareResourceClaim(cLogger, claim)
-		}
+		// CCX-FORK: upstream dispatches on the device mode here, having nothing
+		// to check before it.
+		result[claim.UID] = cp.prepareClaim(ctx, cLogger, claim)
 		prepareResult := cpumetrics.ResultSuccess
 		if result[claim.UID].Err != nil {
 			prepareResult = cpumetrics.ResultError
+		} else {
+			// The API server's reservation cannot be forged by a pod spec the
+			// way a DRA_CPUSET_* env var can; CreateContainer falls back to
+			// this when the runtime reports no CDI devices at all.
+			cp.claimTracker.SetReservedFor(claim.UID, reservedForPodUIDs(claim))
+			cp.publishClaimPlacementStatus(ctx, cLogger, claim.UID)
 		}
 		cp.metrics.RecordPrepare(prepareResult, time.Since(start))
+		// CCX-FORK: a claim that just landed split across caches is exactly what a
+		// pass exists to repair, and it is cheapest to move while the container is
+		// still starting. Only defragmentation wants this: after a prepare there is
+		// nothing for the shared reconcile to do that CreateContainer will not.
+		if cp.defrag.enabled && result[claim.UID].Err == nil {
+			cp.requestReconcile()
+		}
 	}
+	// CCX-FORK: upstream's slices never change after startup, so it publishes
+	// them once and nothing here republishes.
+	cp.republishStaleSlices(ctx)
 	return result, nil
+}
+
+// republishStaleSlices sends the slices out again when what they carry has
+// stopped describing the node: a cache that changed between holding a claim and
+// holding none, since the published order says which cache the allocator meets
+// first, or a NUMA node fenced or reopened, since a fenced node's devices carry
+// a taint.
+//
+// The publication runs on its own, because it must not be held under applyMu and
+// the caller's own call is over as soon as this returns. It neither blocks nor
+// uses the context for anything but logging.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) republishStaleSlices(ctx context.Context) {
+	if !cp.publishedSlicesAreStale() {
+		return
+	}
+	go cp.PublishResources(context.WithoutCancel(ctx))
+}
+
+// prepareClaim checks what a claim says about its own placement and then places
+// it. The check comes first because the answer does not depend on the device
+// mode, and a claim that contradicts itself is the template's error rather than
+// the node's.
+func (cp *CPUDriver) prepareClaim(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+	placement, err := cp.claimConfig(claim)
+	if err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+	if cp.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
+		return cp.prepareGroupedResourceClaim(ctx, logger, claim, placement)
+	}
+	return cp.prepareResourceClaim(ctx, logger, claim, placement)
+}
+
+// claimConfig is what a claim says about its own placement, folded from the
+// configurations its requests carry. Mobility and alignment describe the claim
+// and not one of its requests, so configurations that disagree about them are
+// refused rather than reconciled.
+//
+// Every configuration this driver is named in has to be readable, wherever it
+// came from, or the claim is refused. Only the claim's own are then read for
+// what they say: one attached to a DeviceClass is the cluster administrator's,
+// and whether a workload survives having its CPUs changed is for whoever writes
+// its template to state.
+func (cp *CPUDriver) claimConfig(claim *resourceapi.ResourceClaim) (opaqueapi.ClaimPlacement, error) {
+	placement := opaqueapi.ClaimPlacement{Alignment: v1alpha1.AlignmentBestEffort}
+	if claim.Status.Allocation == nil {
+		return placement, nil
+	}
+
+	folded := false
+	for _, entry := range claim.Status.Allocation.Devices.Config {
+		if entry.Opaque == nil || entry.Opaque.Driver != cp.driverName || len(entry.Opaque.Parameters.Raw) == 0 {
+			continue
+		}
+		parsed, err := opaqueapi.ParseOpaqueConfig(entry.Opaque.Parameters.Raw)
+		if err != nil {
+			return opaqueapi.ClaimPlacement{}, err
+		}
+		if entry.Source != resourceapi.AllocationConfigSourceClaim {
+			continue
+		}
+		if folded && (parsed.Relocatable != placement.Relocatable || parsed.Alignment != placement.Alignment) {
+			return opaqueapi.ClaimPlacement{}, fmt.Errorf("claim %s/%s carries configurations that disagree about cpuConfig.relocatable or cpuConfig.alignment, which describe the claim rather than one of its requests",
+				claim.Namespace, claim.Name)
+		}
+		placement.Relocatable = parsed.Relocatable
+		placement.Alignment = parsed.Alignment
+		placement.AlignmentSet = placement.AlignmentSet || parsed.AlignmentSet
+		folded = true
+	}
+
+	if placement.AlignmentSet && !claimOffersSplitAlternatives(claim) {
+		return opaqueapi.ClaimPlacement{}, fmt.Errorf("claim %s/%s sets cpuConfig.alignment, but none of its requests offers the allocator alternatives, so it can only be placed whole",
+			claim.Namespace, claim.Name)
+	}
+	return placement, nil
+}
+
+// claimOffersSplitAlternatives reports whether any request of a claim leaves the
+// allocator a choice between placements of different shapes, which is what
+// cpuConfig.alignment answers.
+func claimOffersSplitAlternatives(claim *resourceapi.ResourceClaim) bool {
+	for _, request := range claim.Spec.Devices.Requests {
+		if len(request.FirstAvailable) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// reservedForPodUIDs returns the pod UIDs claim.Status.ReservedFor names,
+// ignoring any non-pod consumer reference: this driver only ever compares
+// against a requesting pod's own UID.
+func reservedForPodUIDs(claim *resourceapi.ResourceClaim) []types.UID {
+	var podUIDs []types.UID
+	for _, consumer := range claim.Status.ReservedFor {
+		if consumer.Resource != "pods" {
+			continue
+		}
+		podUIDs = append(podUIDs, consumer.UID)
+	}
+	return podUIDs
 }
 
 func getCDIDeviceName(uid types.UID) string {
 	return fmt.Sprintf("claim-%s", uid)
 }
 
+// claimUIDFromDeviceName reverses getCDIDeviceName, and reports whether name
+// has the shape this driver generates at all.
+func claimUIDFromDeviceName(name string) (types.UID, bool) {
+	uid, ok := strings.CutPrefix(name, "claim-")
+	return types.UID(uid), ok
+}
+
 // reserveResourceClaimAllocation records a new claim allocation while applying
 // the shared-pool guard for currently running shared containers. A shared
 // container from the same pod may not have been created yet when this DRA hook
 // runs, so that case is detected later by the NRI CreateContainer check.
-func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet) error {
+//
+// CCX-FORK: upstream passes one cpuset for the whole claim.
+func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, record store.ClaimRecord) error {
 	hasSharedContainers := len(cp.podConfigStore.GetContainersWithSharedCPUs()) > 0
-	return cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, cpus, hasSharedContainers)
+	return cp.cpuAllocationStore.ReserveResourceClaimAllocation(logger, claimUID, record, hasSharedContainers)
 }
 
-func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+// requestAllocations orders what each request of a claim was given by request
+// name, so the store and the records it writes never depend on map order.
+func requestAllocations(byRequest map[string]store.RequestAllocation) []store.RequestAllocation {
+	names := make([]string, 0, len(byRequest))
+	for name := range byRequest {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	requests := make([]store.RequestAllocation, 0, len(names))
+	for _, name := range names {
+		requests = append(requests, byRequest[name])
+	}
+	return requests
+}
+
+// recordedDevices is how many CPUs a claim's allocation charged each device it
+// takes CPUs of its own from, which is what a scheduler subtracts from those
+// devices' capacities. A pool is left out, for the reason deviceIsPool gives.
+func (cp *CPUDriver) recordedDevices(claim *resourceapi.ResourceClaim) map[string]int {
+	if claim.Status.Allocation == nil {
+		return nil
+	}
+	charged := map[string]int{}
+	for _, alloc := range claim.Status.Allocation.Devices.Results {
+		if alloc.Driver != cp.driverName || cp.topology.deviceIsPool(alloc.Device) {
+			continue
+		}
+		quantity, ok := alloc.ConsumedCapacity[device.CPUResourceQualifiedName]
+		if !ok {
+			continue
+		}
+		charged[alloc.Device] += int(quantity.Value())
+	}
+	if len(charged) == 0 {
+		return nil
+	}
+	return charged
+}
+
+// addRequestCPUs merges one allocation result into the request it belongs to. A
+// request satisfied by several devices holds their union, and every device of
+// one request has the same role, since a device class selects one partition.
+func addRequestCPUs(byRequest map[string]store.RequestAllocation, name string, cpus cpuset.CPUSet, role store.Role) {
+	existing := byRequest[name]
+	byRequest[name] = store.RequestAllocation{
+		Request: name,
+		CPUs:    existing.CPUs.Union(cpus),
+		Role:    role,
+	}
+}
+
+// CCX-FORK: upstream takes the logger and the claim alone. Whether the claim's
+// CPUs may later change is the claim's own answer, read once above.
+func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
 	logger.V(4).Info("preparing grouped resource claim")
 
 	if claim.Status.Allocation == nil {
@@ -127,21 +363,53 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		}
 	}
 
-	if existingCPUs, ok := cp.cpuAllocationStore.GetResourceClaimAllocation(claim.UID); ok {
-		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", existingCPUs.String())
+	if existing, ok := cp.cpuAllocationStore.GetClaimRecord(claim.UID); ok {
+		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", store.UnionOf(existing.Requests).String())
 		// Even if the claim is already allocated in our in-memory store (which happens when a duplicate prepare
 		// call is invoked without an intermediate unprepare), we must call prepareDevices and return the result back to Kubelet.
 		// If the CDI file is already created on disk, the CDI manager will safely overwrite it with the same configuration.
 		// This ensures that the CDI specification file is written/recreated on disk (for example, if the driver
 		// pod restarted and synchronized its memory store from the runtime but did not recreate the CDI files on disk).
-		return cp.prepareDevices(logger, claim, existingCPUs)
+		//
+		// CCX-FORK: a record recovered from a spec written before the driver kept
+		// the charged devices names none, and this claim object is where that
+		// answer comes back from -- the allocation is immutable, so what it charges
+		// now is what it charged when the claim was first prepared. The kubelet
+		// replays Prepare for every claim after a driver restart, which is what
+		// makes the published capacity right again one restart after an upgrade
+		// rather than once the node's pods have turned over.
+		if len(existing.Recorded) == 0 {
+			if charged := cp.recordedDevices(claim); len(charged) > 0 {
+				if err := cp.cpuAllocationStore.SetRecordedDevices(logger, claim.UID, charged); err != nil {
+					logger.Error(err, "cannot record which devices this claim's allocation charged, leaving their capacities uncorrected")
+				} else {
+					existing.Recorded = charged
+				}
+			}
+		}
+		return cp.prepareDevices(logger, claim, existing, placement)
 	}
 
 	var assignedCPUs cpuset.CPUSet
-	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+	byRequest := map[string]store.RequestAllocation{}
+	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs().Difference(cp.cpuAllocationStore.ReservedClosures())
 
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != cp.driverName {
+			continue
+		}
+		// CCX-FORK: upstream takes every result's CPUs out of the device's
+		// capacity, since each of its devices is held by one claim. A pool
+		// device is claimed, not carved up: the claim is given its whole CPU
+		// set, and the amount the allocator charged bounds how much work lands
+		// there rather than naming a number of CPUs to take.
+		if cp.topology.deviceIsPool(alloc.Device) {
+			poolCPUs, published := cp.topology.deviceNameToCPUs[alloc.Device]
+			if !published {
+				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
+			}
+			addRequestCPUs(byRequest, alloc.Request, poolCPUs, store.RoleShared)
+			logger.V(2).Info("claimed a CPU pool", "device", alloc.Device, "cpus", poolCPUs.String())
 			continue
 		}
 		quantity, ok := alloc.ConsumedCapacity[device.CPUResourceQualifiedName]
@@ -157,6 +425,17 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		}
 
 		claimCPUCount := int(count)
+		// The device's requestPolicy makes the scheduler round a request up to
+		// whole cores, so an amount that is not a multiple means the policy was
+		// not applied -- most likely DRAConsumableCapacity is enabled on the
+		// apiserver but not on kube-scheduler. Say so, because the alternative
+		// is an obscure allocation failure below. Read per device: another
+		// device's non-uniform cores must not excuse this one's mismatch.
+		threadsPerCore := cp.topology.deviceThreadsPerCore[alloc.Device]
+		if threadsPerCore > 1 && claimCPUCount%threadsPerCore != 0 {
+			return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q consumed %d CPUs, which is not a multiple of the %d-CPU core size: the scheduler did not honour the capacity requestPolicy, check that the DRAConsumableCapacity feature gate is enabled on kube-scheduler",
+				alloc.Device, claimCPUCount, threadsPerCore)}
+		}
 		logger.V(4).Info("found CPU request", "numCPUs", claimCPUCount, "device", alloc.Device)
 
 		topo := cp.topology.cpuTopology
@@ -170,63 +449,363 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		}
 
 		var cur cpuset.CPUSet
+		// CCX-FORK: upstream takes the CPUs of the socket or NUMA node the device
+		// groups. A device answers for its partition's share of that group, so
+		// its own published CPUs are the set a claim on it may take from, and
+		// that holds however small the group is -- a whole cache included.
+		deviceCPUs, published := cp.topology.deviceNameToCPUs[alloc.Device]
+
+		// CCX-FORK: a device reaching into a NUMA node the driver has stopped
+		// vouching for hands out nothing. The CPUs it would offer are computed
+		// from a record that may be wrong about which claim holds which, so the
+		// claim waits bound rather than starting on CPUs another may be running
+		// on.
+		if fenced := cp.poisonedNUMANodesOf(deviceCPUs); len(fenced) > 0 {
+			return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q reaches into NUMA node(s) %v this driver cannot vouch for: an exchange of CPUs there could not be settled, and it hands out none until a read-back agrees with its records",
+				alloc.Device, fenced)}
+		}
+
+		// CCX-FORK: hoisted out of the case below so the shared error check can say
+		// how much of the device was free. Every way the selector fails means the
+		// device its allocation names cannot hold this claim -- too few of its CPUs,
+		// or too few of them in whole cores -- and that is a scheduler acting on
+		// capacity that has stopped being true, which is worth counting rather than
+		// reporting as an ordinary allocation failure.
+		var availableCPUsForDevice cpuset.CPUSet
+
 		switch cp.cpuDeviceGroupBy {
-		case device.GROUP_BY_SOCKET:
-			socketID, ok := cp.topology.deviceNameToSocketID[alloc.Device]
-			if !ok {
-				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no valid socket ID found for device %s", alloc.Device)}
+		case device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
+			if !published {
+				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
 			}
-			socketCPUs := topo.CPUDetails.CPUsInSockets(socketID)
-			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(socketCPUs)
-			logger.V(4).Info("socket CPU availability", "socketID", socketID, "socketCPUs", socketCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.cpuAllocator.Allocate(logger, availableCPUsForDevice, preferredCPUs, claimCPUCount)
-		case device.GROUP_BY_NUMA_NODE:
-			numaNodeID, ok := cp.topology.deviceNameToNUMANodeID[alloc.Device]
-			if !ok {
-				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no valid NUMA node ID found for device %s", alloc.Device)}
+			availableCPUsForDevice = allocatableCPUs.Difference(assignedCPUs).Intersection(deviceCPUs)
+			logger.V(4).Info("device CPU availability", "device", alloc.Device, "deviceCPUs", deviceCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
+			cur, err = cp.takeCPUsForDevice(logger, topo, availableCPUsForDevice, preferredCPUs, claimCPUCount, threadsPerCore)
+			if err != nil && cp.cpuDeviceGroupBy == device.GROUP_BY_UNCORE_CACHE && claimOffersSplitAlternatives(claim) {
+				rehomedCPUs, targetDev, rehomeErr := cp.rehomeShare(logger, topo, allocatableCPUs.Difference(assignedCPUs), alloc.Device, claimCPUCount)
+				if rehomeErr == nil {
+					cur = rehomedCPUs
+					err = nil
+					logger.Info("re-homed a flexible claim share to another cache", "originalDevice", alloc.Device, "targetDevice", targetDev, "cpus", cur.String())
+				}
 			}
-			numaCPUs := topo.CPUDetails.CPUsInNUMANodes(numaNodeID)
-			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(numaCPUs)
-			logger.V(4).Info("NUMA node CPU availability", "numaNodeID", numaNodeID, "numaCPUs", numaCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.cpuAllocator.Allocate(logger, availableCPUsForDevice, preferredCPUs, claimCPUCount)
 		case device.GROUP_BY_MACHINE:
-			// no mapping needed in machine mode - just one device = the whole machine
-			availableCPUs := topo.CPUDetails.CPUs().Difference(cp.topology.reservedCPUs)
-			logger.V(4).Info("Machine CPU availability", "availableCPUs", availableCPUs.String())
-			cur, err = cp.cpuAllocator.Allocate(logger, availableCPUs, preferredCPUs, claimCPUCount)
+			if !published {
+				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
+			}
+			// CCX-FORK: upstream allocates from the whole machine minus the
+			// reservation. The machine device is published per partition, so the
+			// device's own CPUs are that partition's share of it, and confining
+			// the allocator to them is what keeps a claim that names its own
+			// CPUs inside the partition it was allocated on.
+			logger.V(4).Info("machine CPU availability", "device", alloc.Device, "availableCPUs", deviceCPUs.String())
+			cur, err = cp.cpuAllocator.Allocate(logger, deviceCPUs, preferredCPUs, claimCPUCount)
 			logger.V(2).Info("using opaque config CPU assignment", "device", alloc.Device, "assigned", cur.String())
 		}
 
 		if err != nil {
-			return kubeletplugin.PrepareResult{Err: err}
+			return kubeletplugin.PrepareResult{Err: cp.recordedDeviceFull(ctx, logger, claim, alloc.Device,
+				availableCPUsForDevice.Size(), int(claimCPUCount), err)}
 		}
 		if err := cp.cpuAllocator.Validate(cur, assignedCPUs, cp.cpuAllocationStore.GetPreparedCPUs()); err != nil {
 			return kubeletplugin.PrepareResult{Err: err}
 		}
 		assignedCPUs = assignedCPUs.Union(cur)
+		addRequestCPUs(byRequest, alloc.Request, cur, store.RoleExclusive)
 		logger.V(2).Info("CPU assignment for device", "device", alloc.Device, "assigned", cur.String(), "allAssigned", assignedCPUs.String())
 	}
 
-	if assignedCPUs.Size() == 0 {
+	if len(byRequest) == 0 {
 		logger.V(6).Info("claim has no CPU allocations for this driver")
 		return kubeletplugin.PrepareResult{}
 	}
 
+	record := store.ClaimRecord{
+		Requests:    requestAllocations(byRequest),
+		Relocatable: placement.Relocatable,
+		Alignment:   placement.Alignment,
+		Recorded:    cp.recordedDevices(claim),
+	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
-	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, assignedCPUs); err != nil {
+	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, assignedCPUs)
+
+	plan, err := cp.secureRepairWitness(ctx, logger, claim, assignedCPUs, placement)
+	if err != nil {
+		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+	corr := cp.buildClaimCorrelation(claim, assignedCPUs, plan)
+	record.Correlation = corr
+	cp.cpuAllocationStore.SetClaimCorrelation(claim.UID, corr)
+
+	result := cp.prepareDevices(logger, claim, record, placement)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
+		cp.releaseActiveExactPlanAndClosure(assignedCPUs)
 		return result
+	}
+	logger.Info("claim admitted",
+		"claimUID", claim.UID,
+		"numaNode", corr.NUMANode,
+		"partition", corr.Partition,
+		"frontierSnapshot", corr.FrontierSnapshot,
+		"witnessRounds", corr.WitnessRounds,
+		"witnessPlan", corr.WitnessPlan,
+		"initialCPUSet", corr.InitialCPUSet,
+		"runtimeOutcome", corr.RuntimeOutcome,
+	)
+	cp.recordClaimEvent(ctx, claim, "ClaimAdmitted", fmt.Sprintf("admitted on NUMA %v partition %s with cpuset %s frontier %s witness %s",
+		corr.NUMANode, corr.Partition, corr.InitialCPUSet, corr.FrontierSnapshot, corr.WitnessPlan))
+	if placement.Alignment == v1alpha1.AlignmentRepairable && (corr.FrontierSnapshot == "1" || corr.FrontierSnapshot == "2" || corr.FrontierSnapshot == "3") {
+		if corr.RuntimeOutcome == "started_split" {
+			if (cp.makeRoomTargets != nil && cp.makeRoomTargets[claim.UID] != nil) || plan != nil {
+				cp.metrics.RecordFrontierAdmissionOutcome("waited_prepare")
+			}
+			cp.metrics.RecordFrontierAdmissionOutcome("started_split")
+			if cp.promiseObligations == nil {
+				cp.promiseObligations = make(map[types.UID]*promiseObligation)
+			}
+			cp.promiseObligations[claim.UID] = &promiseObligation{
+				claimUID:         claim.UID,
+				prepareTime:      time.Now(),
+				advertisedRounds: corr.FrontierSnapshot,
+			}
+			cp.refreshObligationMetrics()
+		}
+	}
+	if cp.makeRoomTargets != nil {
+		if target, ok := cp.makeRoomTargets[claim.UID]; ok {
+			for numaNodeID, plan := range cp.activeExactPlans {
+				if plan != nil {
+					if targetCache, ok := plan.Goal.TargetCache(); ok && targetCache == target.cacheID {
+						cp.clearActiveExactPlan(numaNodeID)
+						cp.cpuAllocationStore.ReleaseClosure(numaNodeID)
+					}
+				}
+			}
+			delete(cp.makeRoomTargets, claim.UID)
+		}
 	}
 	cp.metrics.RecordClaimAllocatedCPUs(assignedCPUs.Size())
 	cp.refreshAllocationMetrics()
 	return result
 }
 
-func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+// recordedDeviceFull reports a claim whose allocation names a device that cannot
+// hold what it was charged for, and returns the error that refuses the Prepare.
+// cause is why the device's own CPUs would not do: too few of them free, or too
+// few of them in the whole cores this device hands out.
+//
+// A scheduler subtracted this claim's CPUs from that device's published
+// capacity, so it saw room there. Two windows can leave that view stale for a
+// hop: its own, between the driver storing a capacity and the scheduler
+// observing it, and the one where a claim's allocation is cleared before its
+// CPUs are physically free, so the device it left is credited a departure the
+// allocator has already refunded. Either shows up here, where the pod waits
+// bound and the kubelet retries -- which is the safe end of it. The counter says
+// how often it happens and to which shape of claim, since a claim the allocator
+// may not split has nowhere else to go.
+func (cp *CPUDriver) recordedDeviceFull(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, deviceName string, room, charged int, cause error) error {
+	shape := opaqueapi.ShapeFlexible
+	if !claimOffersSplitAlternatives(claim) {
+		shape = opaqueapi.ShapeNeverSplit
+		if cp.cpuDeviceGroupBy == device.GROUP_BY_UNCORE_CACHE {
+			cp.ensureMakeRoomTarget(claim, deviceName)
+			cp.requestReconcile()
+		}
+	}
+	err := fmt.Errorf("device %q cannot hold the %d CPUs claim %s/%s was charged for there, with %d of its own free: %w",
+		deviceName, charged, claim.Namespace, claim.Name, room, cause)
+	logger.Error(err, "refusing a claim whose recorded device has no room", "device", deviceName, "shape", shape)
+	cp.metrics.RecordPrepareNoRoom(shape)
+	cp.recordClaimEvent(ctx, claim, "RecordedDeviceFull", err.Error())
+	return err
+}
+
+func (cp *CPUDriver) ensureMakeRoomTarget(claim *resourceapi.ResourceClaim, deviceName string) {
+	if cp.makeRoomTargets == nil {
+		cp.makeRoomTargets = make(map[types.UID]*makeRoomTarget)
+	}
+	if _, ok := cp.makeRoomTargets[claim.UID]; ok {
+		return
+	}
+	cacheID := cp.topology.deviceNameToUncoreCacheID[deviceName]
+	numaNodeID := cp.topology.deviceNameToNUMANodeID[deviceName]
+	partition := cp.devicePartition(deviceName)
+	if partition == "" {
+		partition = device.DefaultPartitionName
+	}
+	cp.makeRoomTargets[claim.UID] = &makeRoomTarget{
+		claimUID:   claim.UID,
+		namespace:  claim.Namespace,
+		name:       claim.Name,
+		cacheID:    cacheID,
+		numaNodeID: numaNodeID,
+		partition:  partition,
+		device:     deviceName,
+	}
+}
+
+// recordClaimEvent puts a message about one claim on that claim's own event
+// stream, where whoever is looking at a pod stuck starting will find it.
+//
+// Written on its own goroutine, and on a context the caller's cannot cancel:
+// the kubelet must not wait on an API call for it, and the hook asking for it
+// holds applyMu, which may not be held across a call that blocks.
+func (cp *CPUDriver) recordClaimEventRef(ctx context.Context, ns, name string, uid types.UID, reason, message string) {
+	if cp.kubeClient == nil {
+		return
+	}
+	event := &v1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: name + ".",
+			Namespace:    ns,
+		},
+		InvolvedObject: v1.ObjectReference{
+			APIVersion: resourceapi.SchemeGroupVersion.String(),
+			Kind:       "ResourceClaim",
+			Namespace:  ns,
+			Name:       name,
+			UID:        uid,
+		},
+		Reason:         reason,
+		Message:        message,
+		Type:           v1.EventTypeWarning,
+		Source:         v1.EventSource{Component: cp.driverName, Host: cp.nodeName},
+		FirstTimestamp: metav1.Now(),
+		LastTimestamp:  metav1.Now(),
+		Count:          1,
+	}
+	ctx = context.WithoutCancel(ctx)
+	go func() {
+		if _, err := cp.kubeClient.CoreV1().Events(ns).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+			ctxlog.FromContext(ctx).Error(err, "cannot report a claim event", "reason", reason, "claimUID", uid)
+		}
+	}()
+}
+
+func (cp *CPUDriver) recordClaimEvent(ctx context.Context, claim *resourceapi.ResourceClaim, reason, message string) {
+	cp.recordClaimEventRef(ctx, claim.Namespace, claim.Name, claim.UID, reason, message)
+}
+
+// takeCPUsForDevice picks the CPUs backing one device's share of a claim.
+// threadsPerCore is this specific device's own effective allocation step (0
+// when whole-core allocation is off or this device has no single thread
+// count), not a node-wide answer: a different device's non-uniform cores must
+// not change what this call does.
+//
+// With whole-core allocation in effect it takes complete physical cores, which
+// also keeps the claim inside as few uncore caches as possible. Otherwise it uses
+// the CPU-granular allocator, so behaviour is unchanged when the option is off.
+// placedCPUs applies the configured cache placement policy, and reports whether
+// the policy decided the placement at all. It does not when whole cores are not
+// in play and the policy is the packing default, which is what both callers'
+// last resorts already do -- and those last resorts differ, which is why this
+// stops short of choosing one. A claim falls through to the configured
+// allocator, so an external one can honour the claim's own hint; a
+// defragmentation move falls through to the built-in packed selection, because a
+// move carries no hint and an external allocator refuses an empty one.
+func (cp *CPUDriver) placedCPUs(topo *cpuinfo.CPUTopology, available cpuset.CPUSet, numCPUs, threadsPerCore int) (cpuset.CPUSet, bool, error) {
+	if threadsPerCore > 1 {
+		got, err := coreselect.TakeWholeCoresPolicy(topo, available, numCPUs, cp.placementPolicy, cp.topology.reservedCPUs)
+		return got, true, err
+	}
+	if cp.placementPolicy == coreselect.Spread {
+		got, err := coreselect.TakeSpreadCPUs(topo, available, numCPUs, cp.topology.reservedCPUs)
+		return got, true, err
+	}
+	return cpuset.New(), false, nil
+}
+
+func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, topo *cpuinfo.CPUTopology, available, preferred cpuset.CPUSet, numCPUs int, threadsPerCore int) (cpuset.CPUSet, error) {
+	if got, ok, err := cp.placedCPUs(topo, available, numCPUs, threadsPerCore); ok {
+		return got, err
+	}
+	return cp.cpuAllocator.Allocate(logger, available, preferred, numCPUs)
+}
+
+type rehomeCandidate struct {
+	device  string
+	cacheID int
+	free    int
+	tenants int
+	curCPUs cpuset.CPUSet
+}
+
+func (cp *CPUDriver) rehomeShare(logger logr.Logger, topo *cpuinfo.CPUTopology, availableAllocatable cpuset.CPUSet, recordedDevice string, numCPUs int) (cpuset.CPUSet, string, error) {
+	targetNUMA, hasNUMA := cp.topology.deviceNameToNUMANodeID[recordedDevice]
+	if !hasNUMA {
+		return cpuset.New(), "", fmt.Errorf("recorded device %q has no NUMA node mapping", recordedDevice)
+	}
+	targetPartition := cp.devicePartition(recordedDevice)
+
+	var candidates []rehomeCandidate
+	for candDev, candCPUs := range cp.topology.deviceNameToCPUs {
+		if candDev == recordedDevice || cp.topology.deviceIsPool(candDev) {
+			continue
+		}
+		if cp.topology.deviceNameToNUMANodeID[candDev] != targetNUMA {
+			continue
+		}
+		if cp.devicePartition(candDev) != targetPartition {
+			continue
+		}
+		if fenced := cp.poisonedNUMANodesOf(candCPUs); len(fenced) > 0 {
+			continue
+		}
+		candAvailable := availableAllocatable.Intersection(candCPUs)
+		if candAvailable.Size() < numCPUs {
+			continue
+		}
+		threadsPerCore := cp.topology.deviceThreadsPerCore[candDev]
+		// A re-home carries no hint by construction -- the claim named CPUs on the
+		// device it is being moved off -- so it takes the same hint-free selection a
+		// defragmentation move does rather than the allocator interface.
+		cur, err := cp.selectMoveCPUs(logger, topo, candAvailable, numCPUs, threadsPerCore)
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, rehomeCandidate{
+			device:  candDev,
+			cacheID: cp.topology.deviceNameToUncoreCacheID[candDev],
+			free:    candAvailable.Size(),
+			tenants: candCPUs.Difference(candAvailable).Size(),
+			curCPUs: cur,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return cpuset.New(), "", fmt.Errorf("no candidate cache with room in NUMA node %d and partition %q", targetNUMA, targetPartition)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		if cp.placementPolicy == coreselect.Spread {
+			if a.tenants != b.tenants {
+				return a.tenants < b.tenants
+			}
+			if a.free != b.free {
+				return a.free > b.free
+			}
+		} else {
+			if a.free != b.free {
+				return a.free < b.free
+			}
+		}
+		if a.cacheID != b.cacheID {
+			return a.cacheID < b.cacheID
+		}
+		return a.device < b.device
+	})
+
+	best := candidates[0]
+	return best.curCPUs, best.device, nil
+}
+
+// CCX-FORK: upstream takes the logger and the claim alone, as above.
+func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
 	logger.V(4).Info("preparing individual resource claim")
 
 	if claim.Status.Allocation == nil {
@@ -236,6 +815,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	}
 
 	claimCPUIDs := []int{}
+	byRequest := map[string]store.RequestAllocation{}
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != cp.driverName {
 			continue
@@ -247,6 +827,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 			}
 		}
 		claimCPUIDs = append(claimCPUIDs, cpuID)
+		addRequestCPUs(byRequest, alloc.Request, cpuset.New(cpuID), store.RoleExclusive)
 	}
 
 	if len(claimCPUIDs) == 0 {
@@ -255,7 +836,8 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	}
 
 	claimCPUSet := cpuset.New(claimCPUIDs...)
-	if existingCPUs, ok := cp.cpuAllocationStore.GetResourceClaimAllocation(claim.UID); ok {
+	if existing, ok := cp.cpuAllocationStore.GetClaimRecord(claim.UID); ok {
+		existingCPUs := store.UnionOf(existing.Requests)
 		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", existingCPUs.String())
 		if !existingCPUs.Equals(claimCPUSet) {
 			// This should realistically never happen as the claim is immutable.
@@ -263,35 +845,253 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 				Err: fmt.Errorf("claim %s/%s is already prepared with different CPUs %s (requested %s)", claim.Namespace, claim.Name, existingCPUs.String(), claimCPUSet.String()),
 			}
 		}
-		return cp.prepareDevices(logger, claim, existingCPUs)
+		return cp.prepareDevices(logger, claim, existing, placement)
 	}
 
 	// All the CPUs allocated to a claim must not be prepared for another claim.
-	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs()
+	allocatableCPUs := cp.cpuAllocationStore.GetSharedCPUs().Difference(cp.cpuAllocationStore.ReservedClosures())
 	if !claimCPUSet.IsSubsetOf(allocatableCPUs) {
 		return kubeletplugin.PrepareResult{
 			Err: fmt.Errorf("claim %s/%s has overlapping device assignment with other claims", claim.Namespace, claim.Name),
 		}
 	}
 
+	record := store.ClaimRecord{
+		Requests:    requestAllocations(byRequest),
+		Relocatable: placement.Relocatable,
+		Alignment:   placement.Alignment,
+	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
-	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, claimCPUSet); err != nil {
+	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, claimCPUSet)
+	plan, err := cp.secureRepairWitness(ctx, logger, claim, claimCPUSet, placement)
+	if err != nil {
+		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+	corr := cp.buildClaimCorrelation(claim, claimCPUSet, plan)
+	record.Correlation = corr
+	cp.cpuAllocationStore.SetClaimCorrelation(claim.UID, corr)
+
+	result := cp.prepareDevices(logger, claim, record, placement)
 	if result.Err != nil {
 		cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
+		cp.releaseActiveExactPlanAndClosure(claimCPUSet)
 		return result
+	}
+	logger.Info("claim admitted",
+		"claimUID", claim.UID,
+		"numaNode", corr.NUMANode,
+		"partition", corr.Partition,
+		"frontierSnapshot", corr.FrontierSnapshot,
+		"witnessRounds", corr.WitnessRounds,
+		"witnessPlan", corr.WitnessPlan,
+		"initialCPUSet", corr.InitialCPUSet,
+		"runtimeOutcome", corr.RuntimeOutcome,
+	)
+	cp.recordClaimEvent(ctx, claim, "ClaimAdmitted", fmt.Sprintf("admitted on NUMA %v partition %s with cpuset %s frontier %s witness %s",
+		corr.NUMANode, corr.Partition, corr.InitialCPUSet, corr.FrontierSnapshot, corr.WitnessPlan))
+	if placement.Alignment == v1alpha1.AlignmentRepairable && (corr.FrontierSnapshot == "1" || corr.FrontierSnapshot == "2" || corr.FrontierSnapshot == "3") {
+		if corr.RuntimeOutcome == "started_split" {
+			if plan != nil {
+				cp.metrics.RecordFrontierAdmissionOutcome("waited_prepare")
+			}
+			cp.metrics.RecordFrontierAdmissionOutcome("started_split")
+			if cp.promiseObligations == nil {
+				cp.promiseObligations = make(map[types.UID]*promiseObligation)
+			}
+			cp.promiseObligations[claim.UID] = &promiseObligation{
+				claimUID:         claim.UID,
+				prepareTime:      time.Now(),
+				advertisedRounds: corr.FrontierSnapshot,
+			}
+			cp.refreshObligationMetrics()
+		}
 	}
 	cp.metrics.RecordClaimAllocatedCPUs(claimCPUSet.Size())
 	cp.refreshAllocationMetrics()
 	return result
 }
 
-func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, claimCPUSet cpuset.CPUSet) kubeletplugin.PrepareResult {
+func (cp *CPUDriver) secureRepairWitness(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, cpuAssignment cpuset.CPUSet, placement opaqueapi.ClaimPlacement) (*defrag.ExactPlan, error) {
+	if placement.Alignment != v1alpha1.AlignmentRepairable {
+		return nil, nil
+	}
+	topo := cp.topology.cpuTopology
+	if topo == nil {
+		return nil, nil
+	}
+	nodeIDs := topo.CPUDetails.KeepOnly(cpuAssignment).NUMANodes().List()
+	if len(nodeIDs) != 1 {
+		return nil, nil
+	}
+	numaNodeID := nodeIDs[0]
+	online := topo.CPUDetails.CPUs()
+	var matchingScope *defragScope
+	for _, s := range cp.defragScopes(online) {
+		if s.numaNodeID == numaNodeID {
+			allocatable := cp.defragAllocatable(online)
+			if part, ok := cp.defragPartition(s.partition, allocatable); ok {
+				if cpuAssignment.IsSubsetOf(part.CPUs) {
+					sCopy := s
+					matchingScope = &sCopy
+					break
+				}
+			}
+		}
+	}
+	if matchingScope == nil {
+		return nil, nil
+	}
+	view, ok := cp.defragView(logger, *matchingScope, online)
+	if !ok || view.topology.ExcessSpread(cpuAssignment) <= 0 {
+		return nil, nil
+	}
+	goal := defrag.GoalMakeClaimWhole{ClaimUID: claim.UID}
+	sel := cp.defragSelector(logger, view.threadsPerCore)
+	opts := defrag.ExactOptions{
+		Eligible:   cp.claimMovableForExact,
+		AllowSwaps: cp.defrag.allowTransientOverlap,
+	}
+	inFlight := cp.allocatedUnpreparedCPUs(numaNodeID)
+	plan, err := defrag.ExactSearch(view.topology, view.placements, view.free, inFlight, goal, sel, opts)
+	if err != nil || !plan.Status.Feasible() || len(plan.Moves) == 0 {
+		cp.recordClaimEvent(ctx, claim, "NoRepairWitness", "no repair witness within budget for split repairable claim")
+		cp.metrics.RecordPrepareNoWitness()
+		return nil, fmt.Errorf("no repair witness within budget for repairable claim %s/%s on NUMA node %d", claim.Namespace, claim.Name, numaNodeID)
+	}
+	closure := plan.ComputeClosure()
+	cp.cpuAllocationStore.ReserveClosure(numaNodeID, closure)
+	cp.setActiveExactPlan(numaNodeID, &plan)
+	return &plan, nil
+}
+
+func (cp *CPUDriver) releaseActiveExactPlanAndClosure(cpuAssignment cpuset.CPUSet) {
+	topo := cp.topology.cpuTopology
+	if topo == nil {
+		return
+	}
+	for _, nodeID := range topo.CPUDetails.KeepOnly(cpuAssignment).NUMANodes().List() {
+		cp.clearActiveExactPlan(nodeID)
+		cp.cpuAllocationStore.ReleaseClosure(nodeID)
+	}
+}
+
+func (cp *CPUDriver) buildClaimCorrelation(claim *resourceapi.ResourceClaim, cpus cpuset.CPUSet, plan *defrag.ExactPlan) store.ClaimCorrelation {
+	var numaNode *int
+	if cp.topology.cpuTopology != nil {
+		nodeIDs := cp.topology.cpuTopology.CPUDetails.KeepOnly(cpus).NUMANodes().List()
+		if len(nodeIDs) == 1 {
+			n := nodeIDs[0]
+			numaNode = &n
+		}
+	}
+	var partition string
+	if claim.Status.Allocation != nil {
+		for _, alloc := range claim.Status.Allocation.Devices.Results {
+			if alloc.Driver == cp.driverName {
+				p := cp.devicePartition(alloc.Device)
+				if p != "" {
+					partition = p
+					break
+				}
+			}
+		}
+	}
+	if partition == "" {
+		partition = device.DefaultPartitionName
+	}
+	var frontierSnapshot string
+	if numaNode != nil && partition != "" {
+		key := scopeFrontierKey(partition, *numaNode)
+		if cp.publishedFrontier != nil {
+			frontierSnapshot = cp.publishedFrontier[key]
+		}
+		if frontierSnapshot == "" {
+			f, _ := cp.frontier()
+			if f != nil {
+				frontierSnapshot = f[key]
+			}
+		}
+	}
+	var witnessRounds *int
+	var witnessPlan string
+	if plan != nil {
+		r := len(plan.Moves)
+		witnessRounds = &r
+		var descs []string
+		for _, m := range plan.Moves {
+			descs = append(descs, fmt.Sprintf("%s:%s->%s", m.ClaimUID, m.From.String(), m.To.String()))
+		}
+		witnessPlan = strings.Join(descs, "; ")
+	}
+
+	runtimeOutcome := "aligned"
+	if cp.topology.cpuTopology != nil && cp.cpuDeviceGroupBy == device.GROUP_BY_UNCORE_CACHE && numaNode != nil {
+		online := cp.topology.cpuTopology.CPUDetails.CPUs()
+		allocatable := cp.defragAllocatable(online)
+		if part, ok := cp.defragPartition(partition, allocatable); ok {
+			if nodeTopo, err := defrag.NewTopology(cp.topology.cpuTopology, *numaNode, part.CPUs.Intersection(allocatable)); err == nil {
+				if nodeTopo.ExcessSpread(cpus) > 0 {
+					runtimeOutcome = "started_split"
+				}
+			}
+		}
+	}
+
+	return store.ClaimCorrelation{
+		NUMANode:         numaNode,
+		Partition:        partition,
+		FrontierSnapshot: frontierSnapshot,
+		WitnessRounds:    witnessRounds,
+		WitnessPlan:      witnessPlan,
+		InitialCPUSet:    cpus.String(),
+		RuntimeOutcome:   runtimeOutcome,
+	}
+}
+
+func (cp *CPUDriver) claimNameAndNamespace(uid types.UID) (string, string) {
+	if cp.claimReader != nil {
+		if claims, err := cp.claimReader.AllocatedClaims(); err == nil {
+			for _, c := range claims {
+				if c.UID == uid {
+					return c.Namespace, c.Name
+				}
+			}
+		}
+	}
+	return "", ""
+}
+
+// cdiEnvValue is what the injected variable says about a claim's placement: the
+// cpuset when the claim's CPUs are fixed for the life of its containers, and
+// cdiEnvDynamicValue when the claim permits them to change.
+//
+// Keyed on the claim rather than on whether defragmentation is enabled now,
+// because the variable cannot be rewritten once the container exists: a claim
+// that permits moves would be handed a cpuset that becomes a lie the moment the
+// feature is switched on, and an immobile claim would be denied a cpuset that
+// is true for its whole life.
+//
+// CCX-FORK: upstream always writes the cpuset.
+func (cp *CPUDriver) cdiEnvValue(record store.ClaimRecord) string {
+	if record.Relocatable {
+		return cdiEnvDynamicValue
+	}
+	return store.UnionOf(record.Requests).String()
+}
+
+// CCX-FORK: upstream is handed the claim's cpuset and nothing else about the
+// claim.
+func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, record store.ClaimRecord, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
 	deviceName := getCDIDeviceName(claim.UID)
-	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, claimCPUSet.String())
-	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar); err != nil {
+	byRequest := make(map[string]store.RequestAllocation, len(record.Requests))
+	for _, request := range record.Requests {
+		byRequest[request.Request] = request
+	}
+	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, cp.cdiEnvValue(record))
+	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
 
@@ -321,6 +1121,25 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 					IntValue: &allocatedCount,
 				}
 			}
+			// CCX-FORK: upstream's metadata file carries the device attributes
+			// and the allocated count alone. The fork adds what the claim itself
+			// said about its placement, so a workload can read its own contract
+			// rather than being told it out of band.
+			metadataAttrs[string(device.AttributeRelocatable)] = resourceapi.DeviceAttribute{
+				BoolValue: new(record.Relocatable),
+			}
+			metadataAttrs[string(device.AttributeAlignment)] = resourceapi.DeviceAttribute{
+				StringValue: new(string(placement.Alignment)),
+			}
+			// The file is written before the container starts and cannot be
+			// rewritten afterwards, so it may name CPUs only where they are
+			// settled for the container's life. A claim whose CPUs may change
+			// reads them from the kernel instead.
+			if request, ok := byRequest[allocResult.Request]; ok && requestCPUsAreFixed(record, request) {
+				metadataAttrs[string(device.AttributeCPUSet)] = resourceapi.DeviceAttribute{
+					StringValue: new(request.CPUs.String()),
+				}
+			}
 			preparedDevice.Metadata = &kubeletplugin.DeviceMetadata{
 				Attributes: metadataAttrs,
 			}
@@ -335,6 +1154,12 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 	}
 }
 
+// requestCPUsAreFixed reports whether a request's CPUs are settled for the life
+// of its container.
+func requestCPUsAreFixed(record store.ClaimRecord, request store.RequestAllocation) bool {
+	return request.Role == store.RoleShared || !record.Relocatable
+}
+
 // UnprepareResourceClaims is called by the kubelet to unprepare the resources for a claim.
 func (cp *CPUDriver) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {
 	_, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen))
@@ -347,6 +1172,9 @@ func (cp *CPUDriver) UnprepareResourceClaims(ctx context.Context, claims []kubel
 	if len(claims) == 0 {
 		return result, nil
 	}
+
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
 
 	for _, claim := range claims {
 		// note kubeletplugin.NamespacedObject doesn't implement KMetadata
@@ -363,10 +1191,94 @@ func (cp *CPUDriver) UnprepareResourceClaims(ctx context.Context, claims []kubel
 			cp.refreshAllocationMetrics()
 		}
 	}
+	// CCX-FORK: a released claim can leave a cache empty, which the published
+	// order depends on; upstream's order depends on nothing.
+	cp.republishStaleSlices(ctx)
 	return result, nil
 }
 
+func (cp *CPUDriver) refreshObligationMetrics() {
+	if len(cp.promiseObligations) == 0 {
+		cp.metrics.SetFrontierOldestObligationSeconds(0)
+		return
+	}
+	var oldest time.Time
+	for _, ob := range cp.promiseObligations {
+		if oldest.IsZero() || ob.prepareTime.Before(oldest) {
+			oldest = ob.prepareTime
+		}
+	}
+	cp.metrics.SetFrontierOldestObligationSeconds(time.Since(oldest).Seconds())
+}
+
+func (cp *CPUDriver) refreshMirrorMetrics() {
+	devices := cp.mirroredDevices()
+	if len(devices) == 0 {
+		cp.metrics.SetClaimsOffRecordedCache(0)
+		cp.metrics.SetMaxAbsCacheError(0)
+		return
+	}
+	holdings := cp.cpuAllocationStore.ClaimHoldings()
+
+	claimsOffRecorded := 0
+	for _, holding := range holdings {
+		if len(holding.Recorded) == 0 {
+			continue
+		}
+		off := false
+		for name, cpus := range devices {
+			charged := holding.Recorded[name]
+			occupied := cpus.Intersection(holding.Held).Size()
+			if charged != occupied {
+				off = true
+				break
+			}
+		}
+		if off {
+			claimsOffRecorded++
+		}
+	}
+	cp.metrics.SetClaimsOffRecordedCache(claimsOffRecorded)
+
+	maxAbsError := 0
+	for name, cpus := range devices {
+		size := cpus.Size()
+		correction := cp.publishedCorrection[name]
+		val := size + correction
+		consumed := 0
+		occupied := 0
+		for _, holding := range holdings {
+			consumed += holding.Recorded[name]
+			occupied += cpus.Intersection(holding.Held).Size()
+		}
+		freePhys := size - occupied
+		diff := (val - consumed) - freePhys
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > maxAbsError {
+			maxAbsError = diff
+		}
+	}
+	cp.metrics.SetMaxAbsCacheError(maxAbsError)
+}
+
 func (cp *CPUDriver) unprepareResourceClaim(logger logr.Logger, claim kubeletplugin.NamespacedObject) error {
+	if _, ok := cp.promiseObligations[claim.UID]; ok {
+		cp.metrics.RecordFrontierAdmissionOutcome("remained_unrepaired")
+		delete(cp.promiseObligations, claim.UID)
+		cp.refreshObligationMetrics()
+	}
+	if existing, ok := cp.cpuAllocationStore.GetClaimRecord(claim.UID); ok {
+		if existing.Correlation.RuntimeOutcome != "aligned" && existing.Correlation.RuntimeOutcome != "" {
+			logger.Info("claim unrepaired",
+				"claimUID", claim.UID,
+				"initialCPUSet", existing.Correlation.InitialCPUSet,
+				"finalCPUSet", store.UnionOf(existing.Requests).String(),
+			)
+			cp.recordClaimEventRef(context.Background(), claim.Namespace, claim.Name, claim.UID, "ClaimUnrepaired", "claim deallocated while still split")
+		}
+	}
 	// Remove the CDI spec first. If that fails, keep the allocation recorded so
 	// the driver does not make those CPUs available while stale CDI state remains.
 	if err := cp.cdiMgr.RemoveDevice(logger, getCDIDeviceName(claim.UID)); err != nil {
@@ -374,9 +1286,33 @@ func (cp *CPUDriver) unprepareResourceClaim(logger logr.Logger, claim kubeletplu
 	}
 	cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
 	cp.claimTracker.Cleanup(claim.UID)
-	// TODO(#279): Update existing shared containers here once all supported runtimes can
-	// safely process unsolicited NRI UpdateContainers calls. Until then, each container
-	// picks up the expanded cpuset on its next CreateContainer or Synchronize.
+	for numaNodeID, plan := range cp.activeExactPlans {
+		if plan != nil {
+			if targetClaim, ok := plan.Goal.TargetClaim(); ok && targetClaim == claim.UID {
+				cp.clearActiveExactPlan(numaNodeID)
+				cp.cpuAllocationStore.ReleaseClosure(numaNodeID)
+			}
+		}
+	}
+	if cp.makeRoomTargets != nil {
+		if target, ok := cp.makeRoomTargets[claim.UID]; ok {
+			for numaNodeID, plan := range cp.activeExactPlans {
+				if plan != nil {
+					if targetCache, ok := plan.Goal.TargetCache(); ok && targetCache == target.cacheID {
+						cp.clearActiveExactPlan(numaNodeID)
+						cp.cpuAllocationStore.ReleaseClosure(numaNodeID)
+					}
+				}
+			}
+			delete(cp.makeRoomTargets, claim.UID)
+		}
+	}
+	// The released CPUs are back in the shared pool now, but the containers
+	// entitled to them still hold the narrower cpuset. Hand that off to the
+	// worker rather than doing it here: kubelet must not wait on an NRI round
+	// trip, and an unsolicited update issued from inside a hook is what
+	// deadlocks a runtime with a pre-nri#301 Adaptation.
+	cp.requestReconcile()
 	return nil
 }
 

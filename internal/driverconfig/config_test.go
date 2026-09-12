@@ -19,6 +19,7 @@ limitations under the License.
 package driverconfig_test
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"os"
@@ -479,6 +480,37 @@ groupBy: garbage
 	assert.Contains(t, err.Error(), "garbage")
 }
 
+// TestResolve_GroupByUncoreCache: a config file may ask for one device per
+// uncore cache, and the generated schema accepts exactly what the validator
+// does.
+func TestResolve_GroupByUncoreCache(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+groupBy: uncorecache
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, device.GROUP_BY_UNCORE_CACHE, result.GroupBy)
+
+	raw, err := driverconfig.GenerateDriverConfigSchema()
+	require.NoError(t, err)
+	var schema struct {
+		Properties struct {
+			GroupBy struct {
+				Enum []string `json:"enum"`
+			} `json:"groupBy"`
+		} `json:"properties"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &schema))
+	assert.Contains(t, schema.Properties.GroupBy.Enum, device.GROUP_BY_UNCORE_CACHE,
+		"a value the driver accepts that the schema does not is a config file the chart rejects")
+}
+
 // TestResolve_ExcludedFieldInFileIsError: excluded and removed fields aren't
 // configurable via the config file.
 func TestResolve_ExcludedFieldInFileIsError(t *testing.T) {
@@ -704,4 +736,581 @@ reservedCPUs: "0-3"
 	require.NoError(t, err)
 	assert.True(t, result.ExposePCIeRoots)
 	assert.Equal(t, "0-3", result.ReservedCPUs)
+}
+
+// TestResolve_FullPhysicalCPUsOnlyDefaultsOff: the option is opt-in, so an
+// untouched config keeps upstream's single-thread allocation behaviour.
+func TestResolve_FullPhysicalCPUsOnlyDefaultsOff(t *testing.T) {
+	assert.False(t, driverconfig.Default().FullPhysicalCPUsOnly)
+}
+
+// TestValidate_FullPhysicalCPUsOnlyRequiresGroupedMode: in individual mode the
+// scheduler picks exact per-CPU devices, so the driver cannot hold a core's
+// siblings together and the option must be refused rather than ignored.
+func TestValidate_FullPhysicalCPUsOnlyRequiresGroupedMode(t *testing.T) {
+	cfg := driverconfig.Default()
+	cfg.FullPhysicalCPUsOnly = true
+
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_GROUPED
+	assert.NoError(t, cfg.Validate())
+
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fullPhysicalCPUsOnly")
+	assert.Contains(t, err.Error(), "requires cpuDeviceMode")
+}
+
+// TestResolve_UnsolicitedUpdateDefaults: pushing updates the runtime did not ask
+// for is opt-in, because it deadlocks runtimes with a pre-#301 NRI. The reconcile
+// that depends on it defaults on, so one option is enough to enable it.
+func TestResolve_UnsolicitedUpdateDefaults(t *testing.T) {
+	d := driverconfig.Default()
+	assert.False(t, d.AssumeUnsolicitedUpdatesSafe, "must be an explicit operator assertion")
+	assert.True(t, d.ReconcileSharedOnUnprepare, "inert until the assertion is made")
+}
+
+// TestResolve_UnsolicitedUpdateOptionsFromFile: both options are settable from a
+// config file, including turning the reconcile off against its default.
+func TestResolve_UnsolicitedUpdateOptionsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+assumeUnsolicitedUpdatesSafe: true
+reconcileSharedOnUnprepare: false
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.NoError(t, err)
+	assert.True(t, result.AssumeUnsolicitedUpdatesSafe)
+	assert.False(t, result.ReconcileSharedOnUnprepare)
+}
+
+// TestResolve_DefragDefaults: defragmentation is off, and the instant of
+// overlap an exchange needs is permitted, so enabling the one option gets the
+// repair a full node depends on.
+func TestResolve_DefragDefaults(t *testing.T) {
+	d := driverconfig.Default()
+	assert.False(t, d.DefragEnabled)
+	assert.True(t, d.DefragAllowTransientOverlap)
+	assert.NoError(t, d.Validate())
+}
+
+// TestValidate_DefragRequirements: the modes where the driver does not choose a
+// claim's CPUs, and the runtime assertion a move depends on.
+func TestValidate_DefragRequirements(t *testing.T) {
+	testCases := []struct {
+		name          string
+		mutate        func(*driverconfig.Config)
+		expectedError string
+	}{
+		{
+			name:   "grouped by NUMA node with unsolicited updates permitted",
+			mutate: func(*driverconfig.Config) {},
+		},
+		{
+			name:   "grouped by socket",
+			mutate: func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_SOCKET },
+		},
+		{
+			// The scheduler picked the exact CPU devices, so their placement is
+			// not the driver's to change.
+			name:          "individual mode",
+			mutate:        func(c *driverconfig.Config) { c.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL },
+			expectedError: "requires cpuDeviceMode",
+		},
+		{
+			// The cpuset came from the claim's own opaque config. Machine
+			// grouping also requires the external allocator, which is set here
+			// so that this case fails on defragEnabled rather than on that.
+			name: "grouped by machine",
+			mutate: func(c *driverconfig.Config) {
+				c.GroupBy = device.GROUP_BY_MACHINE
+				c.Allocator = driverconfig.AllocatorExternal
+			},
+			expectedError: "requires groupBy",
+		},
+		{
+			// A move does take the claim off the device it was allocated on here,
+			// and the capacity published for both devices carries the difference.
+			name:   "grouped by uncore cache",
+			mutate: func(c *driverconfig.Config) { c.GroupBy = device.GROUP_BY_UNCORE_CACHE },
+		},
+		{
+			name:          "without the unsolicited update assertion",
+			mutate:        func(c *driverconfig.Config) { c.AssumeUnsolicitedUpdatesSafe = false },
+			expectedError: "requires assumeUnsolicitedUpdatesSafe",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			cfg.DefragEnabled = true
+			cfg.AssumeUnsolicitedUpdatesSafe = true
+			tc.mutate(&cfg)
+
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "defragEnabled")
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestValidate_DefragRequirementsAreInertWhenDisabled: an unusable combination
+// must not stop a driver that is not going to defragment anything.
+func TestValidate_DefragRequirementsAreInertWhenDisabled(t *testing.T) {
+	cfg := driverconfig.Default()
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+	assert.NoError(t, cfg.Validate())
+}
+
+// TestResolve_DefragOptionsFromFile: both options are settable from a config
+// file, including forbidding the instant of overlap against its default.
+func TestResolve_DefragOptionsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+assumeUnsolicitedUpdatesSafe: true
+defragEnabled: true
+defragAllowTransientOverlap: false
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.NoError(t, err)
+	assert.True(t, result.DefragEnabled)
+	assert.False(t, result.DefragAllowTransientOverlap)
+}
+
+// TestValidate_DefragOverlapIsInertWhenDefragIsOff: forbidding the overlap on a
+// node that never defragments describes nothing, so it is not an error. The
+// option defaults on, so refusing the combination would refuse every default
+// configuration that leaves defragmentation off.
+func TestValidate_DefragOverlapIsInertWhenDefragIsOff(t *testing.T) {
+	cfg := driverconfig.Default()
+	cfg.DefragAllowTransientOverlap = false
+	assert.NoError(t, cfg.Validate())
+}
+
+// TestValidate_CachePlacementStrategy: only the two named policies exist, and
+// the policy governs which CPUs the driver picks, so it is rejected where the
+// driver does not pick.
+func TestValidate_CachePlacementStrategy(t *testing.T) {
+	cfg := driverconfig.Default()
+	assert.Equal(t, "pack", cfg.CachePlacementStrategy, "the default must be upstream's behaviour")
+	assert.NoError(t, cfg.Validate())
+
+	cfg.CachePlacementStrategy = "spread"
+	assert.NoError(t, cfg.Validate(), "spread must not demand whole-core allocation")
+
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires cpuDeviceMode")
+	cfg.CPUDeviceMode = device.CPU_DEVICE_MODE_GROUPED
+
+	cfg.CachePlacementStrategy = "sprinkle"
+	err = cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"sprinkle"`)
+}
+
+// TestValidate_CPUPartitions covers the checks that need no topology, which are
+// the ones every node runs for every profile.
+func TestValidate_CPUPartitions(t *testing.T) {
+	valid := []driverconfig.CPUPartition{
+		{Name: "system", Role: "reserved", CPUs: "0,16"},
+		{Name: "dataplane", Role: "exclusive", CPUs: "8-11", SMT: &driverconfig.SMT{Threads: 1}},
+	}
+	testCases := []struct {
+		name          string
+		mutate        func(*driverconfig.Config)
+		expectedError string
+	}{
+		{
+			name:   "a valid list",
+			mutate: func(c *driverconfig.Config) { c.CPUPartitions = valid },
+		},
+		{
+			name: "individual mode",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = valid
+				c.CPUDeviceMode = device.CPU_DEVICE_MODE_INDIVIDUAL
+			},
+			expectedError: "requires cpuDeviceMode",
+		},
+		{
+			name: "beside reservedCPUs",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = valid
+				c.ReservedCPUs = "0"
+			},
+			expectedError: "names CPUs in the same scope",
+		},
+		{
+			name: "an unknown role",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "vm", Role: "burst", CPUs: "1"}}
+			},
+			expectedError: `invalid role "burst" of partition "vm"`,
+		},
+		{
+			name: "the implicit partition's name",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "default", Role: "exclusive", CPUs: "1"}}
+			},
+			expectedError: "never declared",
+		},
+		{
+			name: "a name that is not a DNS label",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "Data Plane", Role: "exclusive", CPUs: "1"}}
+			},
+			expectedError: `invalid partition name "Data Plane"`,
+		},
+		{
+			name: "a name too long for a device name",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: strings.Repeat("a", 47), Role: "exclusive", CPUs: "1"}}
+			},
+			expectedError: "at most 46 characters",
+		},
+		{
+			name: "a duplicate name",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{
+					{Name: "vm", Role: "exclusive", CPUs: "1"},
+					{Name: "vm", Role: "exclusive", CPUs: "2"},
+				}
+			},
+			expectedError: `partition "vm" is declared twice`,
+		},
+		{
+			name: "unparseable cpus",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "a-b"}}
+			},
+			expectedError: `invalid cpus "a-b" of partition "vm"`,
+		},
+		{
+			name: "no cpus",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: ""}}
+			},
+			expectedError: "names no CPUs",
+		},
+		{
+			name: "overlapping partitions",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = []driverconfig.CPUPartition{
+					{Name: "vm", Role: "exclusive", CPUs: "4-7"},
+					{Name: "dataplane", Role: "exclusive", CPUs: "6-9"},
+				}
+			},
+			expectedError: `partitions "vm" and "dataplane" both claim 6-7`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestResolve_CPUPartitionsFromFile: the three spellings of the thread-arity
+// expectation all parse, and the dump reads back as the operator wrote it.
+func TestResolve_CPUPartitionsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+cpuPartitions:
+  - name: system
+    role: reserved
+    cpus: "0,16"
+  - name: helpers
+    role: shared
+    cpus: "1-3"
+    smt: true
+  - name: dataplane
+    role: exclusive
+    cpus: "8-11"
+    smt: false
+  - name: vm
+    role: exclusive
+    cpus: "4-7"
+    smt: 2
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.CPUPartitions, 4)
+	assert.Equal(t, 0, result.CPUPartitions[0].ThreadsPerCore(), "an absent smt means the platform's own arity")
+	assert.Equal(t, 0, result.CPUPartitions[1].ThreadsPerCore())
+	assert.Equal(t, 1, result.CPUPartitions[2].ThreadsPerCore())
+	assert.Equal(t, 2, result.CPUPartitions[3].ThreadsPerCore())
+
+	dump := result.Dump()
+	assert.Contains(t, dump, "smt: true")
+	assert.Contains(t, dump, "smt: false")
+	assert.Contains(t, dump, "smt: 2")
+}
+
+// TestResolve_CPUPartitionsRejectUnknownFields: a misspelled partition field is
+// a typo the operator must see, not a silently ignored key.
+func TestResolve_CPUPartitionsRejectUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+cpuPartitions:
+  - name: vm
+    role: exclusive
+    cpuset: "4-7"
+`)
+
+	_, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cpuset")
+}
+
+// TestResolve_CPUPartitionsRejectBadSMT: smt takes true, false or a thread
+// count, and anything else fails the file rather than defaulting.
+func TestResolve_CPUPartitionsRejectBadSMT(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+cpuPartitions:
+  - name: vm
+    role: exclusive
+    cpus: "4-7"
+    smt: "off"
+`)
+
+	_, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be true, false or a thread count")
+}
+
+// TestWithProfile: the label value picks the node type's description of its
+// own cores; the implicit profile leaves the whole node in one default
+// partition; a name the config does not declare is an error, never a fallback
+// onto another node type's cores, and an unlabelled node does not start at all.
+func TestWithProfile(t *testing.T) {
+	r7625 := []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "8-15"}}
+	base := driverconfig.Default()
+	base.Profiles = map[string]driverconfig.Profile{
+		"r7625": {CPUPartitions: r7625},
+		"x3d":   {CPUPartitions: []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "4-7"}}},
+	}
+
+	t.Run("a profile becomes the node's partitions", func(t *testing.T) {
+		cfg, err := base.WithProfile("r7625")
+		require.NoError(t, err)
+		assert.Equal(t, r7625, cfg.CPUPartitions)
+		assert.Empty(t, cfg.Profiles, "the profile a node did not select is not its business")
+	})
+
+	t.Run("the implicit profile declares nothing", func(t *testing.T) {
+		cfg, err := base.WithProfile(driverconfig.DefaultProfileName)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.CPUPartitions)
+	})
+
+	t.Run("an unlabelled node does not start", func(t *testing.T) {
+		_, err := base.WithProfile("")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), driverconfig.ProfileLabel)
+		assert.Contains(t, err.Error(), "r7625")
+		assert.Contains(t, err.Error(), "x3d")
+	})
+
+	t.Run("an unknown profile is an error", func(t *testing.T) {
+		_, err := base.WithProfile("tpyo")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"tpyo"`)
+		assert.Contains(t, err.Error(), driverconfig.ProfileLabel)
+		assert.Contains(t, err.Error(), "r7625")
+	})
+
+	t.Run("without profiles the fleet-wide fields stand", func(t *testing.T) {
+		fleet := driverconfig.Default()
+		fleet.ReservedCPUs = "0-1"
+		for _, name := range []string{"", driverconfig.DefaultProfileName} {
+			cfg, err := fleet.WithProfile(name)
+			require.NoError(t, err)
+			assert.Equal(t, "0-1", cfg.ReservedCPUs)
+		}
+		_, err := fleet.WithProfile("r7625")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "declares no profiles")
+	})
+}
+
+// TestValidate_Profiles covers the scope rule around profiles and the checks
+// on the profiles themselves, all of which every node runs.
+func TestValidate_Profiles(t *testing.T) {
+	vm := []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "8-15"}}
+	testCases := []struct {
+		name          string
+		mutate        func(*driverconfig.Config)
+		expectedError string
+	}{
+		{
+			name: "a valid profile",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {CPUPartitions: vm}}
+			},
+		},
+		{
+			name: "reservedCPUs beside profiles",
+			mutate: func(c *driverconfig.Config) {
+				c.ReservedCPUs = "0"
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {CPUPartitions: vm}}
+			},
+			expectedError: "with profiles declared",
+		},
+		{
+			name: "cpuPartitions beside profiles",
+			mutate: func(c *driverconfig.Config) {
+				c.CPUPartitions = vm
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {CPUPartitions: vm}}
+			},
+			expectedError: "the partitions belong to the profiles",
+		},
+		{
+			name: "the implicit profile's name",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{"default": {CPUPartitions: vm}}
+			},
+			expectedError: "never declared",
+		},
+		{
+			name: "a profile describing no cores",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {}}
+			},
+			expectedError: "describes no cores",
+		},
+		{
+			name: "a profile the node under test does not select",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{
+					"r7625": {CPUPartitions: vm},
+					"x3d":   {CPUPartitions: []driverconfig.CPUPartition{{Name: "vm", Role: "burst", CPUs: "1"}}},
+				}
+			},
+			expectedError: `config profile "x3d" does not validate`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.expectedError)
+		})
+	}
+}
+
+// TestResolve_ProfileRejectsReservedCPUs: a profile carries partitions and
+// nothing else, so upstream's fleet-wide cpuset inside one is a typo the
+// operator has to see rather than a key that decodes into nothing.
+func TestResolve_ProfileRejectsReservedCPUs(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+profiles:
+  r7625:
+    reservedCPUs: "0,128"
+`)
+
+	_, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reservedCPUs")
+}
+
+// TestWarnDeprecatedCPUFields: a node's cores described outside a profile
+// still work and say so; described inside one, there is nothing to warn about.
+func TestWarnDeprecatedCPUFields(t *testing.T) {
+	partitions := []driverconfig.CPUPartition{{Name: "vm", Role: "exclusive", CPUs: "8-15"}}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*driverconfig.Config)
+		want   []string
+		absent bool
+	}{
+		{
+			name:   "a fleet-wide reservation",
+			mutate: func(c *driverconfig.Config) { c.ReservedCPUs = "0-1" },
+			want:   []string{"deprecated", "reservedCPUs", driverconfig.ProfileLabel},
+		},
+		{
+			name:   "a fleet-wide partition list",
+			mutate: func(c *driverconfig.Config) { c.CPUPartitions = partitions },
+			want:   []string{"deprecated", "cpuPartitions"},
+		},
+		{
+			name: "the same list inside a profile",
+			mutate: func(c *driverconfig.Config) {
+				c.Profiles = map[string]driverconfig.Profile{"r7625": {CPUPartitions: partitions}}
+			},
+			absent: true,
+		},
+		{
+			name:   "nothing named at all",
+			mutate: func(c *driverconfig.Config) {},
+			absent: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := driverconfig.Default()
+			tc.mutate(&cfg)
+
+			var logs strings.Builder
+			logger := funcr.New(func(prefix, args string) {
+				logs.WriteString(prefix + " " + args + "\n")
+			}, funcr.Options{})
+
+			cfg.WarnDeprecatedCPUFields(logger)
+
+			if tc.absent {
+				assert.NotContains(t, logs.String(), "deprecated")
+				return
+			}
+			for _, want := range tc.want {
+				assert.Contains(t, logs.String(), want)
+			}
+		})
+	}
 }

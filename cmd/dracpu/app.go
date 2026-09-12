@@ -33,12 +33,14 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/subcommands"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/driver"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -139,11 +141,6 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	printVersion(logger)
 	logger.Info("configuration successfully loaded", "configuration", cfg.Dump())
 
-	reservedCPUSet, err := cpuset.Parse(cfg.ReservedCPUs)
-	if err != nil {
-		return fmt.Errorf("failed to parse reserved CPUs: %w", err)
-	}
-
 	sfs, err := newSysFS(logger, cfg.SysFSOverlay)
 	if err != nil {
 		return err
@@ -160,6 +157,19 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	})
 	// Add metrics handler
 	mux.Handle("/metrics", promhttp.Handler())
+	// CCX-FORK: which CPUs back each claim is the driver's own answer and is
+	// published nowhere else, so it is served on request. Registered before the
+	// driver exists, because the server comes up first so that healthz can answer
+	// while the driver initializes.
+	var placements atomic.Pointer[driver.CPUDriver]
+	mux.HandleFunc("/placements", func(w http.ResponseWriter, r *http.Request) {
+		dracpu := placements.Load()
+		if dracpu == nil {
+			http.Error(w, "driver has not started yet", http.StatusServiceUnavailable)
+			return
+		}
+		dracpu.ServePlacements(w, r.WithContext(ctxlog.NewContext(r.Context(), logger)))
+	})
 	server := &http.Server{
 		Addr:              cfg.BindAddress,
 		Handler:           mux,
@@ -169,9 +179,12 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		WriteTimeout:      10 * time.Second,
 	}
 
+	// A bind/serve failure here must be fatal, not merely logged, or the
+	// process silently serves nothing on this port until the next restart.
+	httpErr := make(chan error, 1)
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error(err, "HTTP server failed")
+			httpErr <- err
 		}
 	}()
 
@@ -208,14 +221,54 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	ctx, stop := signal.NotifyContext(ctx, unix.SIGINT, unix.SIGTERM)
 	defer stop()
 
+	// CCX-FORK: per-node config profiles. Upstream reads one config for every
+	// node; the fork folds in the profile the node's own label names, before
+	// anything reads the CPU carve-outs.
+	cfg.WarnDeprecatedCPUFields(logger)
+	profiled := len(cfg.Profiles) > 0
+	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("can not read node %q to resolve its config profile: %w", nodeName, err)
+	}
+	profile := node.Labels[driverconfig.ProfileLabel]
+	cfg, err = cfg.WithProfile(profile)
+	if err != nil {
+		return err
+	}
+	if profiled {
+		logger.Info("applied config profile from the node label", "label", driverconfig.ProfileLabel, "profile", profile,
+			"cpuPartitions", cfg.CPUPartitions)
+	}
+
+	reservedCPUSet, err := cpuset.Parse(cfg.ReservedCPUs)
+	if err != nil {
+		return fmt.Errorf("failed to parse reserved CPUs: %w", err)
+	}
+	cpuPartitions, err := cfg.Partitions()
+	if err != nil {
+		return err
+	}
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		namespace = metav1.NamespaceDefault
+	}
+
 	driverConfig := driver.Config{
 		DriverName:                            driverName,
 		NodeName:                              nodeName,
+		Namespace:                             namespace,
 		ReservedCPUs:                          reservedCPUSet,
 		CPUDeviceMode:                         cfg.CPUDeviceMode,
 		CPUDeviceGroupBy:                      cfg.GroupBy,
 		ExposePCIeRoots:                       cfg.ExposePCIeRoots,
 		PublishNodeAllocatableResourceMapping: cfg.PublishNodeAllocatableResourceMapping,
+		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
+		CachePlacementStrategy:                coreselect.Policy(cfg.CachePlacementStrategy),
+		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
+		ReconcileSharedOnUnprepare:            cfg.ReconcileSharedOnUnprepare,
+		DefragEnabled:                         cfg.DefragEnabled,
+		DefragAllowTransientOverlap:           cfg.DefragAllowTransientOverlap,
+		CPUPartitions:                         cpuPartitions,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 		Allocator:                             cfg.Allocator,
@@ -228,6 +281,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	if err != nil {
 		return fmt.Errorf("driver failed to initialize: %w", err)
 	}
+	placements.Store(dracpu)
 	asyncErr, err := dracpu.Start(ctx)
 	if err != nil {
 		return fmt.Errorf("driver failed to start: %w", err)
@@ -236,6 +290,10 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	ready.Store(true)
 	logger.Info("driver started")
 
+	return waitForShutdown(ctx, stop, logger, server, asyncErr, httpErr)
+}
+
+func waitForShutdown(ctx context.Context, stop context.CancelFunc, logger logr.Logger, server *http.Server, asyncErr, httpErr <-chan error) error {
 	var fatalErr error
 
 	select {
@@ -247,6 +305,9 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	case err := <-asyncErr:
 		stop()
 		fatalErr = fmt.Errorf("NRI driver error: %w", err)
+	case err := <-httpErr:
+		stop()
+		fatalErr = fmt.Errorf("HTTP server error: %w", err)
 	}
 
 	// Gracefully shutdown HTTP server

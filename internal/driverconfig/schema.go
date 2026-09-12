@@ -22,6 +22,7 @@ import (
 	"slices"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 )
 
@@ -37,9 +38,46 @@ var schemaExcludedFields = map[string]string{
 // schemaEnums are the allowed values for fields whose Go type (string) can't
 // express them on its own.
 var schemaEnums = map[string][]any{
-	"cpuDeviceMode": {device.CPU_DEVICE_MODE_GROUPED, device.CPU_DEVICE_MODE_INDIVIDUAL},
-	"groupBy":       {device.GROUP_BY_NUMA_NODE, device.GROUP_BY_SOCKET, device.GROUP_BY_MACHINE},
-	"allocator":     {AllocatorCPUManager, AllocatorExternal},
+	"cachePlacementStrategy": {string(coreselect.Pack), string(coreselect.Spread)},
+	"cpuDeviceMode":          {device.CPU_DEVICE_MODE_GROUPED, device.CPU_DEVICE_MODE_INDIVIDUAL},
+	"groupBy":                groupingEnum(),
+	"allocator":              {AllocatorCPUManager, AllocatorExternal},
+}
+
+// groupingEnum is groupings as an enum, so that the config files the driver
+// accepts and the ones the chart accepts cannot drift apart.
+func groupingEnum() []any {
+	enum := make([]any, 0, len(groupings))
+	for _, grouping := range groupings {
+		enum = append(enum, grouping)
+	}
+	return enum
+}
+
+// schemaListEnums are the allowed values for a field of a list field's item,
+// which schemaEnums cannot express: it keys on the name of the list.
+var schemaListEnums = map[string]map[string][]any{
+	"cpuPartitions": {
+		"role": {
+			device.PARTITION_ROLE_RESERVED,
+			device.PARTITION_ROLE_DEFAULT,
+			device.PARTITION_ROLE_SHARED,
+			device.PARTITION_ROLE_EXCLUSIVE,
+		},
+	},
+}
+
+// schemaListFields replace the inferred schema of a list item's field outright,
+// for a field whose Go type describes less than the file accepts.
+var schemaListFields = map[string]map[string]*jsonschema.Schema{
+	"cpuPartitions": {
+		"smt": {
+			OneOf: []*jsonschema.Schema{
+				{Type: "boolean"},
+				{Type: "integer", Minimum: new(float64(1))},
+			},
+		},
+	},
 }
 
 // driverConfigSchemaComment is the generated schema's top-level "$comment".
@@ -69,6 +107,37 @@ func GenerateDriverConfigSchema() ([]byte, error) {
 		prop.Enum = enum
 	}
 
+	for jsonKey, enums := range schemaListEnums {
+		items, err := listItemSchemas(schema, jsonKey)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range items {
+			for field, enum := range enums {
+				prop, ok := item.Properties[field]
+				if !ok {
+					return nil, fmt.Errorf("schemaListEnums has entry %q.%q but the list item has no matching field", jsonKey, field)
+				}
+				prop.Enum = enum
+			}
+		}
+	}
+
+	for jsonKey, fields := range schemaListFields {
+		items, err := listItemSchemas(schema, jsonKey)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range items {
+			for field, replacement := range fields {
+				if _, ok := item.Properties[field]; !ok {
+					return nil, fmt.Errorf("schemaListFields has entry %q.%q but the list item has no matching field", jsonKey, field)
+				}
+				item.Properties[field] = replacement
+			}
+		}
+	}
+
 	schema.Properties["apiVersion"] = &jsonschema.Schema{
 		Type: "string",
 		Enum: []any{ConfigAPIVersion},
@@ -84,4 +153,39 @@ func GenerateDriverConfigSchema() ([]byte, error) {
 		return nil, fmt.Errorf("marshaling schema: %w", err)
 	}
 	return append(out, '\n'), nil
+}
+
+// listItemSchemas returns the item schema of every list named jsonKey anywhere
+// under schema, not only the one on Config itself: the same list is declared
+// again inside a profile, and a constraint applied to one copy and not the
+// other would accept in a profile what it rejects fleet-wide.
+func listItemSchemas(schema *jsonschema.Schema, jsonKey string) ([]*jsonschema.Schema, error) {
+	var items []*jsonschema.Schema
+	var walk func(*jsonschema.Schema) error
+	visited := map[*jsonschema.Schema]bool{}
+	walk = func(s *jsonschema.Schema) error {
+		if s == nil || visited[s] {
+			return nil
+		}
+		visited[s] = true
+		if prop, ok := s.Properties[jsonKey]; ok {
+			if prop.Items == nil {
+				return fmt.Errorf("field %q is not a list", jsonKey)
+			}
+			items = append(items, prop.Items)
+		}
+		for _, prop := range s.Properties {
+			if err := walk(prop); err != nil {
+				return err
+			}
+		}
+		return walk(s.AdditionalProperties)
+	}
+	if err := walk(schema); err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("Config has no field %q", jsonKey)
+	}
+	return items, nil
 }

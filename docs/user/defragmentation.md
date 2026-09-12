@@ -1,0 +1,253 @@
+# CPU Defragmentation
+
+> [!IMPORTANT]
+> This is a feature of [this fork](../../FORK.md), not of upstream `dra-driver-cpu`.
+
+As claims come and go, the CPUs backing the surviving ones scatter. A claim that started inside one
+uncore cache (an AMD CCX, or one slice of a split L3) ends up straddling two, and the node's free CPUs
+end up one per cache, so no cache can be handed to a future claim whole. Neither recovers on its own:
+placement is chosen once, when the claim is prepared.
+
+Defragmentation moves a **running** claim onto different CPUs to recover that alignment, without
+restarting its container. The claim keeps its CPU count, its NUMA node and the CPU partition it was
+allocated from; only which CPUs back it change.
+
+```yaml
+# values.yaml
+driverConfig:
+  cpuDeviceMode: grouped
+  groupBy: numanode
+  assumeUnsolicitedUpdatesSafe: true # see Runtime support
+  defragEnabled: true
+```
+
+## Which claims are moved
+
+Only a claim that asks to be. Enabling the feature is the operator's half of the decision; the other
+half is the tenant's, because a move changes the CPUs under a running workload and only that workload
+knows whether it survives one. A launcher that re-reads its affinity when `cpuset.cpus` changes loses
+nothing; one that pinned its threads once at start keeps running with that pinning silently gone.
+
+```yaml
+# In the claim's opaque configuration, see opaque-cpuset-overrides.md
+cpuConfig:
+  relocatable: true
+```
+
+The default is `false`, so a claim that says nothing is never moved. Such a claim is not merely left
+out of a pass: the better placement a pass aims at is built around it, so it stands as a fixed
+obstacle rather than a move the driver keeps wanting and can never make. A node full of claims that
+never opted in therefore reports the spread it cannot repair and moves nothing, which is the correct
+outcome and is visible in `dra_cpu_defrag_excess_uncore_caches`.
+
+## Repairing a node with no free CPUs
+
+A move needs somewhere free to move to, and a node that packing has deliberately filled has nowhere.
+The repair left there is an **exchange**: two claims are re-cut over the CPUs they already hold
+between them, each keeping its own count, so a claim straddling two caches ends up whole on the one a
+smaller tenant was sitting in, and that tenant takes the CPUs the first one leaves behind.
+
+Both containers are updated in one batch, and the runtime applies the two cpuset writes in order, so
+for the instant between them the two claims sit on the same CPUs. That instant is what
+`defragAllowTransientOverlap` permits, and it is on by default: forbidding it forbids repairing a
+full node at all, which is the case the feature exists for. cgroup v2 allows two sibling containers
+to share a cpuset — only `cpuset.cpus.partition` makes a set exclusive, and neither the kubelet nor
+containerd uses partitions for pods — so what the two claims lose for those milliseconds is speed,
+not correctness.
+
+Set it to `false` on a node where even that is unacceptable. Every claim then moves only into CPUs
+nothing holds, a full node keeps the placement it has, and the refusal is visible rather than silent:
+those moves are counted in `dra_cpu_defrag_blocked_moves_total`, and `/placements?dryrun=1` reports
+that an exchange would have helped. A single workload that cannot afford the instant is better served
+by not permitting moves at all, with `cpuConfig.relocatable: false`.
+
+The hazard an exchange has and a move does not is a batch the runtime applies only in part: the two
+claims would then share CPUs for good, silently, because cgroup v2 does not object. The driver does
+not leave it there. Both claims hold both cpusets for the whole batch, so nothing else can be given
+those CPUs meanwhile; a refused half is sent again; and if the runtime refuses it a second time, the
+half it did move is put back. Each attempt has a deadline of its own, so a runtime that never answers
+is an unsettled round rather than a wait without end.
+
+### When an exchange cannot be settled either way
+
+If the runtime will neither finish an exchange nor undo it, the driver has lost track of which of the
+two claims is on which CPUs, and it says so rather than guessing. The NUMA node is **fenced**:
+
+- `PrepareResourceClaims` fails for every device reaching into it, so a bound pod waits rather than
+  starting on CPUs another workload may be running on;
+- nothing further is planned there;
+- its devices carry a `NoSchedule` taint under `dra.cpu/poisoned`, so the scheduler stops sending
+  claims to a node that would refuse them. It is its own taint key, distinct from the one a named
+  [CPU partition](cpu-partitions.md) carries, and nothing is meant to tolerate it;
+- both claims keep holding both cpusets, so nothing else is offered what they might be using.
+
+The fence lifts on evidence, not on time. The driver reads the two containers' `cpuset.cpus.effective`
+back from the host's cgroup tree and rebuilds its records from what it finds: if both containers took
+their new CPUs the exchange is recorded as done, if neither did it is recorded as never having
+happened, and anything else leaves the fence up and is counted in
+`dra_cpu_defrag_readback_mismatches_total`. Neither the forward state nor the rolled-back one may be
+assumed — a call that failed may have applied work before its reply was lost.
+
+The read-back needs the host's cgroup2 tree mounted read-only at `/sys/fs/cgroup`, which the chart
+does. A container's own `/sys/fs/cgroup` is its cgroup namespace's view and says nothing about anyone
+else, so without that mount a fenced node cannot reopen.
+
+`dra_cpu_defrag_numa_node_poisoned` is the gauge to alert on, and
+`dra_cpu_defrag_poisoned_duration_seconds` says how long the fences have lasted. A node that stays
+fenced is a runtime that is refusing container updates it should be accepting; the driver has already
+stopped making things worse there, and the containers involved keep running.
+
+## What it does not do
+
+- **It does not change a claim's size.** A claim allocated 4 CPUs always has 4.
+- **It does not move a claim between NUMA nodes.** The driver never sets `cpuset.mems`, so a claim's
+  memory locality is exactly its CPUs' NUMA footprint, and a move preserves it.
+- **It does not move a claim between [CPU partitions](cpu-partitions.md).** A repair may only use the
+  CPUs of the partition the claim already sits in, so the cores set aside for a dataplane and the
+  cores the virtual machines run on are never mixed by a pass. This is by construction rather than by
+  policy: the free CPUs a round may take and the claims it may shuffle are both cut to one partition
+  of one NUMA node before planning starts. A partition whose claims all decline to move therefore has
+  nothing to plan, and the spread it keeps is reported rather than repaired.
+- **It coexists with in-place pod resize (KEP-1287).** A resize reaches the runtime as the same CRI
+  call a move uses, and applies against the container's current state: a claim's cpuset survives a
+  resize, including a resize issued after the claim has been moved. Verified on containerd
+  v2.4.0-beta.0, and pinned by an e2e spec.
+- **A move leaves a claim's `consumedCapacity` alone, and changes what its devices publish.** A
+  claim's allocation cannot be rewritten, so a claim moved off the device it was allocated from is
+  still charged there. Under `groupBy: numanode` and `socket` a move stays inside one device and
+  nothing changes; under `groupBy: uncorecache` a device is one cache, and the capacity published for
+  the two caches involved carries the difference, so that a scheduler subtracting what it charged
+  arrives at the CPUs really free. That publication reaches the API server: the destination is
+  shrunk before the containers are touched, and the origin grows once the runtime confirms. Fencing
+  a NUMA node reaches it too — the taint has to, or the scheduler would keep sending claims to a
+  node that refuses them. See [The Capacity Mirror](capacity-mirror.md).
+- **A round waits for its own shrink to be stored.** Publication is asynchronous and nothing reports
+  when a write landed, so the driver reads its node's own `ResourceSlice`s back and starts a batch
+  only once they show the destination short of the CPUs the move is about to take. A shrink that is
+  not stored in time abandons the round — the claim stays where it is, the reservation is released,
+  and the scope is tried again — so while the API server is unreachable nothing on the node moves.
+  Those rounds are counted in `dra_cpu_defrag_unpublished_rounds_total`.
+- **It cannot fix a bad node choice.** The scheduler sees only how many CPUs are free on a node, never
+  their shape, so it can bind a large claim to a node that genuinely cannot free a cache while a
+  neighbour could. A bound claim cannot move to another node.
+- **It is a no-op on nodes with one uncore cache per NUMA node**, where there is no spread to recover.
+  A NUMA node whose CPUs report no uncore cache ID cannot be reasoned about at all; `/placements`
+  lists it under `unmeasurableNUMANodes` rather than failing.
+
+## Requirements
+
+`defragEnabled` is refused at startup unless all of the following hold.
+
+- **`cpuDeviceMode: grouped` with `groupBy: numanode`, `socket` or `uncorecache`.** These are the
+  modes where the driver chooses a claim's CPUs in the first place. In `individual` mode the scheduler
+  picks exact per-CPU devices, and with `groupBy: machine` the cpuset comes from the claim's own opaque
+  config, so in both cases the placement is not the driver's to change.
+- **`assumeUnsolicitedUpdatesSafe: true`.** See below.
+
+### Runtime support
+
+A move is a container update the runtime did not ask for. On a runtime whose vendored NRI predates
+[containerd/nri#301](https://github.com/containerd/nri/pull/301), such an update can deadlock the
+runtime: it takes an internal lock before dispatching to the plugin and needs the same one to serve
+the update.
+
+The driver cannot detect this. The NRI `Configure` handshake reports the runtime's name and version
+but not its vendored NRI version, and a version table would mis-classify backported builds in both
+directions. So it is an operator assertion:
+
+- **containerd** carries the fix from NRI v0.12.1 onwards, first released in containerd
+  v2.4.0-beta.0. Earlier releases do not: containerd v2.3.4, which `kindest/node:v1.37.0` ships,
+  still vendors NRI v0.12.0, so a stock kind cluster does **not** meet this floor. Verify a runtime
+  rather than trusting its version string: `go version -m $(which containerd) | grep containerd/nri`.
+- **CRI-O v1.36** still vendors NRI v0.12.0 and is **not** supported. It also never populates
+  `Container.CDIDevices`, which this driver uses to verify that a claim a container names really was
+  injected into it.
+
+## What a workload must not do
+
+A container's environment cannot be rewritten once it exists, so the injected `DRA_CPUSET_*` variable
+cannot track a claim that moves. For a claim that permits moves its value is the literal string `dynamic` rather
+than a cpuset, so a workload that parses it fails loudly instead of quietly pinning itself to CPUs its
+claim has left.
+
+Whether a claim may be moved at all is in its own
+[device metadata file](device-metadata.md), as `dra.cpu/relocatable`, so a launcher can decide what to
+do without being configured separately. Where it may, read the current CPUs from the kernel:
+
+- `sched_getaffinity(2)`, which the kernel keeps current through a move; or
+- the container's own `/sys/fs/cgroup/cpuset.cpus.effective`.
+
+A workload that self-pins is re-homed by the kernel with no signal of its own. To be told when its
+CPUs change, watch its own `cpuset.cpus` with inotify: that file is written by `runc`/`crun` on every
+update and so generates `IN_MODIFY`, unlike the derived `cpuset.cpus.effective`, which is produced on
+read. Read `.effective` (or call `sched_getaffinity`) once the event arrives, since that is the value
+that survived intersection with the parent cgroup. Two changes inotify cannot see are CPU hotplug and
+a parent cgroup's cpuset changing; a lazy backstop poll covers both.
+
+## When a pass runs
+
+There is nothing to tune. A pass runs when something changed: after every prepare, after every
+release, and after the driver synchronizes with the runtime, which is what repairs a node the driver
+was not running on. A round that committed anything asks for the next pass itself, because the CPUs
+it freed are what the following move needs, so a repair that needs several rounds runs them back to
+back rather than waiting between them.
+
+A pass plans and applies one round per NUMA node and CPU partition, which is what bounds how much of
+a machine one batch disturbs; a claim is never moved across either boundary anyway. A region whose
+round the runtime refused or never confirmed is tried again on its own, after a delay that grows
+while it keeps failing and resets when it succeeds, and it holds up no other region meanwhile. A
+quiet node runs no passes at all.
+
+A pass is one read of the online CPU set and then pure computation over the claims the node already
+holds, and it stops as soon as it finds a region as well packed as its claims allow, so an arrival
+that lands aligned — the normal case on a node with free caches — costs about a millisecond and moves
+nothing.
+
+**Who pays.** A pass repacks largest claim first, so a large misplaced claim is repaired by moving the
+small claims standing in its way. That is what best-effort placement means for the smaller claims, and
+it belongs in their expectations. With no misplaced claim, nothing moves at all: small claims keep
+their private caches while there is slack.
+
+## Observing it
+
+The metrics are in [Metrics](metrics.md#defragmentation);
+`dra_cpu_defrag_largest_alignable_free_cpus` is the one that says whether the *next* large claim will
+land aligned.
+
+When a claim stays split and the metrics do not say why, ask the node directly. `/placements` serves
+the current placement of every claim, and `?dryrun=1` adds the moves a pass would make right now
+along with the gate that stopped it. A dry run reserves nothing, writes nothing and sends nothing.
+
+```bash
+# On the node
+curl -s localhost:8080/placements?dryrun=1
+
+# Or centrally, through the API server's pod proxy (needs pods/proxy)
+kubectl get --raw \
+  "/api/v1/namespaces/kube-system/pods/$(kubectl -n kube-system get pod \
+     -l app.kubernetes.io/name=dra-driver-cpu \
+     --field-selector spec.nodeName=<node> -o jsonpath='{.items[0].metadata.name}'):8080/proxy/placements?dryrun=1"
+```
+
+Each NUMA node carries one entry under `plans` per partition, which is one round, with the CPUs that
+partition holds and what is free in them. A `reason` of `all N moves towards the ideal are blocked`
+means the claims in the way never asked to be moved, or there is no slack inside that partition to
+move them through. A `movingFrom` is a move still in flight: the claim holds both sets of CPUs until
+the runtime confirms it.
+
+## Worked example
+
+[`hack/examples/qemu-ccx-vm/`](../../hack/examples/qemu-ccx-vm/) carries a complete pair of QEMU VM
+classes against this driver -- a whole-cache VM selected onto capable nodes via
+`largestUncoreCacheCPUs`, and a flexible small VM the defragmenter may re-home -- together with the
+in-pod launcher that implements the workload contract above: live CPUs from the cgroup, per-vCPU
+pinning over QMP, and inotify-driven re-pinning on every move.
+
+## Rolling out
+
+Passes are node-local and write nothing to the API, so 100 nodes are 100 independent instances with no
+coordination between them and no cluster-scale load. The flip side is that a planner bug reaches every
+node of a given topology at once: **stage a rollout by node type, not at random.**
+
+Rolling *back* to a driver without this feature needs the node drained first. See
+[Migration](../../FORK.md#migration-between-upstream-and-this-fork).
