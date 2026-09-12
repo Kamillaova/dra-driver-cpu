@@ -78,7 +78,7 @@ type workload struct {
 var minimalWorkloads = []workload{
 	{
 		claims: []*resourceapi.ResourceClaim{
-			individualMetricsClaim(types.UID("app-0"), "cpudev1"),
+			metricsClaimReservedFor(individualMetricsClaim(types.UID("app-0"), "cpudev1"), "pod-uid-0"),
 		},
 		pod: &api.PodSandbox{Id: "sandbox-0", Uid: "pod-uid-0", Name: "pod-0"},
 		ctrs: []*api.Container{
@@ -90,7 +90,7 @@ var minimalWorkloads = []workload{
 	},
 	{
 		claims: []*resourceapi.ResourceClaim{
-			individualMetricsClaim(types.UID("app-1"), "cpudev2", "cpudev3"),
+			metricsClaimReservedFor(individualMetricsClaim(types.UID("app-1"), "cpudev2", "cpudev3"), "pod-uid-1"),
 		},
 		pod: &api.PodSandbox{Id: "sandbox-1", Uid: "pod-uid-1", Name: "pod-1"},
 		ctrs: []*api.Container{
@@ -103,6 +103,18 @@ var minimalWorkloads = []workload{
 			},
 		},
 	},
+}
+
+// metricsClaimReservedFor names podUID as a reserved consumer of claim. Prepare
+// records that reservation, and CreateContainer refuses a container whose claim
+// has none whenever the runtime reports no CDI devices to authenticate it with.
+func metricsClaimReservedFor(claim *resourceapi.ResourceClaim, podUID types.UID) *resourceapi.ResourceClaim {
+	claim.Status.ReservedFor = append(claim.Status.ReservedFor, resourceapi.ResourceClaimConsumerReference{
+		Resource: "pods",
+		Name:     string(podUID),
+		UID:      podUID,
+	})
+	return claim
 }
 
 func individualMetricsClaim(uid types.UID, devices ...string) *resourceapi.ResourceClaim {
