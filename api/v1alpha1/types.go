@@ -65,3 +65,18 @@ const (
 	// Relocatable.
 	AlignmentRepairable Alignment = "Repairable"
 )
+
+// ClaimPlacementStatus is the versioned status schema for v1alpha1.
+//
+// This struct is placed in the claim's status at: claim.Status.Devices[*].Data
+// to publish the actual CPUs a claim occupies on one device.
+type ClaimPlacementStatus struct {
+	// APIVersion specifies the schema version. Should be "v1alpha1".
+	APIVersion string `json:"apiVersion"`
+	// Kind is "ClaimPlacementStatus".
+	Kind string `json:"kind"`
+	// CPUSet specifies the cpus allocated to this claim on this device.
+	CPUSet string `json:"cpuset"`
+	// CPUCount is the number of CPUs allocated on this device.
+	CPUCount int `json:"cpuCount"`
+}
