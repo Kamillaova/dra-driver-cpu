@@ -39,6 +39,7 @@ type Recorder interface {
 	RecordDefragPass(result cpumetrics.Result, duration time.Duration)
 	RecordDefragMoves(result cpumetrics.Result, count int)
 	RecordDefragBlockedMoves(count int)
+	SetPartitionState(verified map[string]bool)
 }
 
 func (cp *CPUDriver) refreshAllocationMetrics() {
