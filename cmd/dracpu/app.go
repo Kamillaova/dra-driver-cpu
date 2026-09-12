@@ -253,9 +253,17 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		return err
 	}
 
+	// The projected claim ConfigMap lives in this driver's own namespace, which
+	// only the pod can tell it.
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		namespace = metav1.NamespaceDefault
+	}
+
 	driverConfig := driver.Config{
 		DriverName:                            driverName,
 		NodeName:                              nodeName,
+		Namespace:                             namespace,
 		ReservedCPUs:                          reservedCPUSet,
 		CPUDeviceMode:                         cfg.CPUDeviceMode,
 		CPUDeviceGroupBy:                      cfg.GroupBy,
