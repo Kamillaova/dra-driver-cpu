@@ -70,6 +70,10 @@ const (
 	// ResourceSlice) that indicates how many CPUs were allocated to a specific
 	// claim from a grouped device's capacity.
 	AttributeAllocatedNumCPUs resourceapi.QualifiedName = "dra.cpu/allocatedNumCPUs"
+	// AttributeCPUSet is a metadata-only attribute naming the CPUs a request was
+	// given, published for a request whose CPUs cannot change while its
+	// container runs.
+	AttributeCPUSet resourceapi.QualifiedName = "dra.cpu/cpuset"
 )
 
 // addPartitionAttributes names the partition a device's CPUs come from and what
