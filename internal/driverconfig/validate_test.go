@@ -16,7 +16,11 @@ limitations under the License.
 
 package driverconfig
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
+)
 
 func TestValidate(t *testing.T) {
 	for _, tc := range []struct {
@@ -26,46 +30,51 @@ func TestValidate(t *testing.T) {
 	}{{
 		name: "error: unknown allocator",
 		conf: Config{
-			KubeletRootDir: "/var/lib/kubelet",
-			CPUDeviceMode:  "grouped",
-			GroupBy:        "numanode",
-			Allocator:      "other-allocator",
+			KubeletRootDir:         "/var/lib/kubelet",
+			CachePlacementStrategy: string(coreselect.Pack),
+			CPUDeviceMode:          "grouped",
+			GroupBy:                "numanode",
+			Allocator:              "other-allocator",
 		},
 		expectedErr: true,
 	}, {
 		name: "error: non-external allocator in machine mode",
 		conf: Config{
-			KubeletRootDir: "/var/lib/kubelet",
-			CPUDeviceMode:  "grouped",
-			GroupBy:        "machine",
-			Allocator:      "cpumanager",
+			KubeletRootDir:         "/var/lib/kubelet",
+			CachePlacementStrategy: string(coreselect.Pack),
+			CPUDeviceMode:          "grouped",
+			GroupBy:                "machine",
+			Allocator:              "cpumanager",
 		},
 		expectedErr: true,
 	}, {
 		name: "valid: external allocator in machine mode",
 		conf: Config{
-			KubeletRootDir: "/var/lib/kubelet",
-			CPUDeviceMode:  "grouped",
-			GroupBy:        "machine",
-			Allocator:      "external",
+			KubeletRootDir:         "/var/lib/kubelet",
+			CachePlacementStrategy: string(coreselect.Pack),
+			CPUDeviceMode:          "grouped",
+			GroupBy:                "machine",
+			Allocator:              "external",
 		},
 		expectedErr: false,
 	}, {
 		name: "valid: allocator: cpumanager",
 		conf: Config{
-			KubeletRootDir: "/var/lib/kubelet",
-			CPUDeviceMode:  "grouped",
-			GroupBy:        "numanode",
-			Allocator:      "cpumanager",
+			KubeletRootDir:         "/var/lib/kubelet",
+			CachePlacementStrategy: string(coreselect.Pack),
+			CPUDeviceMode:          "grouped",
+			GroupBy:                "numanode",
+			Allocator:              "cpumanager",
 		},
 		expectedErr: false,
 	}, {
 		name: "valid: allocator: external",
 		conf: Config{
-			KubeletRootDir: "/var/lib/kubelet",
-			CPUDeviceMode:  "grouped",
-			GroupBy:        "numanode",
-			Allocator:      "external",
+			KubeletRootDir:         "/var/lib/kubelet",
+			CachePlacementStrategy: string(coreselect.Pack),
+			CPUDeviceMode:          "grouped",
+			GroupBy:                "numanode",
+			Allocator:              "external",
 		},
 		expectedErr: false,
 	}} {
