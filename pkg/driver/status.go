@@ -93,10 +93,17 @@ func (cp *CPUDriver) doPublishClaimPlacementStatus(ctx context.Context, logger l
 			intersection := assignedCPUs.Intersection(devCPUs)
 
 			placement := v1alpha1.ClaimPlacementStatus{
-				APIVersion: v1alpha1.APIVersion,
-				Kind:       "ClaimPlacementStatus",
-				CPUSet:     intersection.String(),
-				CPUCount:   intersection.Size(),
+				APIVersion:       v1alpha1.APIVersion,
+				Kind:             "ClaimPlacementStatus",
+				CPUSet:           intersection.String(),
+				CPUCount:         intersection.Size(),
+				NUMANode:         record.Correlation.NUMANode,
+				Partition:        record.Correlation.Partition,
+				FrontierSnapshot: record.Correlation.FrontierSnapshot,
+				WitnessRounds:    record.Correlation.WitnessRounds,
+				WitnessPlan:      record.Correlation.WitnessPlan,
+				InitialCPUSet:    record.Correlation.InitialCPUSet,
+				RuntimeOutcome:   record.Correlation.RuntimeOutcome,
 			}
 
 			data, err := json.Marshal(placement)
