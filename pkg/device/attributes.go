@@ -36,6 +36,8 @@ const (
 	GROUP_BY_NUMA_NODE = "numanode"
 	// GROUP_BY_MACHINE groups CPUs by the entire machine.
 	GROUP_BY_MACHINE = "machine"
+	// GROUP_BY_UNCORE_CACHE groups CPUs by the uncore cache they share.
+	GROUP_BY_UNCORE_CACHE = "uncorecache"
 )
 
 const (
