@@ -158,6 +158,11 @@ type CPUDriver struct {
 	// ResourceClaims itself, so between the scheduler allocating a claim and the
 	// kubelet preparing it, this is the only view it has.
 	claimReader claimReader
+	// storedSlices reads back the ResourceSlices the API server holds for this
+	// node, which is how a defragmentation round finds out that the capacity its
+	// move depends on has been stored. Nil until Start fills its cache, and left
+	// nil when nothing moves a claim.
+	storedSlices storedSliceReader
 	// reconcileTrigger carries coalesced reconcile requests to the worker
 	// goroutine. Nil when no feature needs it.
 	reconcileTrigger chan struct{}
@@ -513,6 +518,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 			enabled:               config.DefragEnabled,
 			allowTransientOverlap: config.DefragAllowTransientOverlap,
 			batchTimeout:          defaultDefragBatchTimeout,
+			publishTimeout:        defaultDefragPublishTimeout,
 		}
 		if plugin.defrag.enabled {
 			plugin.cgroupfs = providers.EnsureCgroupFS()
@@ -833,6 +839,17 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	// node knows that yet.
 	if err := watchAllocatedClaims(ctx, cp); err != nil {
 		return asyncErr, fmt.Errorf("failed to watch the projected claim ConfigMap: %w", err)
+	}
+	// CCX-FORK: a move publishes a capacity the scheduler has to have stored
+	// before any container is told about it, and publication is asynchronous, so
+	// the driver reads its own node's slices back. Only a driver that moves
+	// claims needs it, and only one with a client can have it.
+	if cp.defrag.enabled && cp.kubeClient != nil {
+		reader, err := watchStoredSlices(ctx, cp)
+		if err != nil {
+			return asyncErr, fmt.Errorf("failed to watch this node's ResourceSlices: %w", err)
+		}
+		cp.storedSlices = reader
 	}
 	// CCX-FORK: upstream starts no worker here and never pushes an update the
 	// runtime did not ask for, so it hands the stub to nothing.
