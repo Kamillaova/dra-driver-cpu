@@ -79,15 +79,16 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RequestAllocation`, `UnionOf`,
   `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
-  `GetRebindOrigin`, `GetResourceClaimRequests`, `GetResourceClaimAllocationUnion`,
-  `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
+  `GetRebindOrigin`, `GetResourceClaimRequests`, `GetResourceClaimAllocationUnion`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`
 
 - `internal/driverconfig`: `DefragEnabled` and `validateDefrag`; `CachePlacementStrategy` and
-  `validateCachePlacementStrategy`
+  `validateCachePlacementStrategy`; the `Profiles`
+  map, `Profile`, `ProfileLabel`, `DefaultProfileName`, `WithProfile`, `asProfile`,
+  `validateProfiles` and `WarnDeprecatedCPUFields`
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
   behind them
