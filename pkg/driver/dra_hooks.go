@@ -289,9 +289,29 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 // With whole-core allocation in effect it takes complete physical cores, which
 // also keeps the claim inside as few uncore caches as possible. Otherwise it uses
 // the CPU-granular allocator, so behaviour is unchanged when the option is off.
-func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, topo *cpuinfo.CPUTopology, available, preferred cpuset.CPUSet, numCPUs int, threadsPerCore int) (cpuset.CPUSet, error) {
+// placedCPUs applies the configured cache placement policy, and reports whether
+// the policy decided the placement at all. It does not when whole cores are not
+// in play and the policy is the packing default, which is what both callers'
+// last resorts already do -- and those last resorts differ, which is why this
+// stops short of choosing one. A claim falls through to the configured
+// allocator, so an external one can honour the claim's own hint; a
+// defragmentation move falls through to the built-in packed selection, because a
+// move carries no hint and an external allocator refuses an empty one.
+func (cp *CPUDriver) placedCPUs(topo *cpuinfo.CPUTopology, available cpuset.CPUSet, numCPUs, threadsPerCore int) (cpuset.CPUSet, bool, error) {
 	if threadsPerCore > 1 {
-		return coreselect.TakeWholeCores(topo, available, numCPUs)
+		got, err := coreselect.TakeWholeCoresPolicy(topo, available, numCPUs, cp.placementPolicy, cp.topology.reservedCPUs)
+		return got, true, err
+	}
+	if cp.placementPolicy == coreselect.Spread {
+		got, err := coreselect.TakeSpreadCPUs(topo, available, numCPUs, cp.topology.reservedCPUs)
+		return got, true, err
+	}
+	return cpuset.New(), false, nil
+}
+
+func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, topo *cpuinfo.CPUTopology, available, preferred cpuset.CPUSet, numCPUs int, threadsPerCore int) (cpuset.CPUSet, error) {
+	if got, ok, err := cp.placedCPUs(topo, available, numCPUs, threadsPerCore); ok {
+		return got, err
 	}
 	return cp.cpuAllocator.Allocate(logger, available, preferred, numCPUs)
 }
