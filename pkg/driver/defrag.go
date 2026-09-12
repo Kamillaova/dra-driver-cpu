@@ -221,8 +221,13 @@ func (cp *CPUDriver) defragOnlineCPUs(logger logr.Logger) (cpuset.CPUSet, bool) 
 // containers with it released, then confirm or undo under it again.
 func (cp *CPUDriver) runDefragRound(ctx context.Context, scope defragScope, online cpuset.CPUSet) cpumetrics.Result {
 	logger := ctxlog.FromContext(ctx).WithValues(scope.logValues()...)
+	// A fenced node is asked first whether it can be reopened: the read-back is
+	// what settles the exchange that fenced it, and until it does there is
+	// nothing to plan there.
+	cp.liftPoison(logger, scope.numaNodeID)
 	round := cp.beginDefragRound(logger, scope, online)
 	if round == nil {
+		cp.republishStaleSlicesLocking(ctx)
 		return cpumetrics.ResultSuccess
 	}
 
@@ -243,7 +248,21 @@ func (cp *CPUDriver) runDefragRound(ctx context.Context, scope defragScope, onli
 		}
 		cp.settleExchanges(logger, round, failed)
 	}
-	return cp.finishDefragRound(logger, round, failed, updateErr)
+	result := cp.finishDefragRound(logger, round, failed, updateErr)
+	// The published devices carry which NUMA nodes are fenced, and this round may
+	// have fenced one or reopened one.
+	cp.republishStaleSlicesLocking(ctx)
+	return result
+}
+
+// republishStaleSlicesLocking is republishStaleSlices for a caller that holds no
+// lock. What it reads -- the fenced nodes, and what the last publication carried
+// -- is guarded by applyMu, and a pass runs on its own goroutine beside the
+// kubelet hooks that write them.
+func (cp *CPUDriver) republishStaleSlicesLocking(ctx context.Context) {
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+	cp.republishStaleSlices(ctx)
 }
 
 // sendDefragBatch pushes one batch of container updates and gives the runtime a
@@ -428,12 +447,15 @@ func (cp *CPUDriver) rollbackUpdates(round *defragRound, exchange int, notApplie
 	return updates, nil
 }
 
-// observeNodeShape republishes how well placed the node's claims are and how
-// large a claim each NUMA node could still take unsplit.
+// observeNodeShape republishes how well placed the node's claims are, how large
+// a claim each NUMA node could still take unsplit, and which NUMA nodes the
+// driver has stopped vouching for.
 //
 // It measures rather than plans, so every scope is reported on every pass,
-// including one whose round is still unsettled. The gauges are replaced
-// wholesale, which is why they are taken together and not one round at a time.
+// including one whose round is still unsettled. The two fragmentation gauges are
+// replaced wholesale, which is why they are taken together and not one round at
+// a time; the fence gauge is per node, because a fence is raised and lifted
+// between passes and must not wait for one.
 //
 // Both keep the shape they had before the node's cores could be divided, so the
 // per-partition rounds are folded back into one number per node: the avoidable
@@ -456,6 +478,7 @@ func (cp *CPUDriver) observeNodeShape(logger logr.Logger, online cpuset.CPUSet) 
 	allocatable := cp.defragAllocatable(online)
 	state := cpumetrics.DefragState{LargestAlignableFreeCPUs: map[int]int{}}
 	for _, numaNodeID := range topo.CPUDetails.NUMANodes().List() {
+		cp.metrics.SetDefragNodePoisoned(numaNodeID, cp.nodeIsPoisoned(numaNodeID))
 		nodeTopo, err := defrag.NewTopology(topo, numaNodeID, allocatable)
 		if err != nil {
 			logger.V(2).Info("node cannot be measured", "numaNode", numaNodeID, "reason", err.Error())
@@ -484,6 +507,12 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, onl
 
 	if round := cp.takePendingRound(logger, scope); round != nil {
 		return round
+	}
+	if cp.nodeIsPoisoned(scope.numaNodeID) {
+		// The record a plan would be built from may be wrong about which claim
+		// holds which CPUs, which is the one thing a plan may not be wrong about.
+		logger.V(2).Info("not planning on a fenced NUMA node")
+		return nil
 	}
 
 	moves := cp.planScopeMoves(logger, scope, online)
@@ -989,29 +1018,21 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 			continue
 		}
 
-		exchange := step[0].Exchange
-		switch round.outcomes[exchange] {
-		case exchangeApplied:
-			if err := cp.cpuAllocationStore.CommitSwap(sLogger, stepClaims(step)...); err != nil {
-				sLogger.Error(err, "cannot complete the exchange")
-				round.outcomes[exchange] = exchangeUnsettled
-				unsettled += len(step)
-				continue
-			}
-			committed += len(step)
-		case exchangeUndone:
-			if !cp.abortStep(sLogger, step) {
-				round.outcomes[exchange] = exchangeUnsettled
-				unsettled += len(step)
-				continue
-			}
-			reverted += len(step)
-		default:
-			// Neither applied nor undone: the claims still hold both cpusets and
-			// the round is sent again rather than settled on a guess.
+		wanted := round.outcomes[step[0].Exchange]
+		if !cp.settleExchangeStep(sLogger, round, step) {
+			// Neither applied nor undone: the claims still hold both cpusets, the
+			// round is sent again rather than settled on a guess, and the NUMA
+			// node is fenced until a read-back says where they are.
 			sLogger.Info("an exchange is unsettled, keeping both cpusets reserved")
 			unsettled += len(step)
+			cp.poisonNode(sLogger, round.scope)
+			continue
 		}
+		if wanted == exchangeApplied {
+			committed += len(step)
+			continue
+		}
+		reverted += len(step)
 	}
 	cp.metrics.RecordDefragMoves(cpumetrics.ResultSuccess, committed)
 	cp.metrics.RecordDefragMoves(cpumetrics.ResultError, reverted)
@@ -1081,6 +1102,32 @@ func (cp *CPUDriver) moveWasRefused(move defrag.Move, refused map[types.UID]stru
 func (cp *CPUDriver) abortMoves(logger logr.Logger, moves []defrag.Move) {
 	for _, step := range defragSteps(moves) {
 		cp.abortStep(logger.WithValues("claimUIDs", stepClaims(step)), step)
+	}
+}
+
+// settleExchangeStep applies one exchange's recorded outcome to the store and
+// the specs on disk, and reports whether it is settled. An outcome nobody could
+// determine, and one the store refuses, both leave it unsettled.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) settleExchangeStep(logger logr.Logger, round *defragRound, step []defrag.Move) bool {
+	exchange := step[0].Exchange
+	switch round.outcomes[exchange] {
+	case exchangeApplied:
+		if err := cp.cpuAllocationStore.CommitSwap(logger, stepClaims(step)...); err != nil {
+			logger.Error(err, "cannot complete the exchange")
+			round.outcomes[exchange] = exchangeUnsettled
+			return false
+		}
+		return true
+	case exchangeUndone:
+		if !cp.abortStep(logger, step) {
+			round.outcomes[exchange] = exchangeUnsettled
+			return false
+		}
+		return true
+	default:
+		return false
 	}
 }
 
