@@ -155,7 +155,7 @@
       ],
       "properties": {
         "create": {
-          "description": "Create RBAC resources (ClusterRole and ClusterRoleBinding)",
+          "description": "Create RBAC resources (ClusterRole, ClusterRoleBinding, Role, and RoleBinding)",
           "type": "boolean"
         }
       },
