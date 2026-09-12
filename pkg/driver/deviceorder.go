@@ -33,7 +33,7 @@ import (
 // a named partition's taints stay in its own slices.
 //
 // Called with applyMu held.
-func (cp *CPUDriver) chunkDevices(occupied map[string]bool, poisoned map[int]bool, mirror capacityMirror, frontier map[string]string) ([][]resourceapi.Device, int) {
+func (cp *CPUDriver) chunkDevices(occupied map[string]bool, poisoned map[int]bool, mirror capacityMirror, frontier map[string]string, frontierInput map[string]string) ([][]resourceapi.Device, int) {
 	var chunks [][]resourceapi.Device
 	floored := 0
 	for _, partitionDevices := range cp.topology.devicesByPartition {
@@ -43,7 +43,7 @@ func (cp *CPUDriver) chunkDevices(occupied map[string]bool, poisoned map[int]boo
 		mirrored, atFloor := applyCapacityMirror(cp.orderCacheDevices(partitionDevices, occupied), mirror)
 		floored += atFloor
 		ordered := cp.fenceDevices(mirrored, poisoned)
-		withFrontier := cp.attachFrontierAttributes(ordered, frontier)
+		withFrontier := cp.attachFrontierAttributes(ordered, frontier, frontierInput)
 		chunks = append(chunks, slices.Collect(slices.Chunk(withFrontier, cp.devicesPerResourceSlice))...)
 	}
 	return chunks, floored
@@ -128,10 +128,10 @@ func (cp *CPUDriver) occupiedDevices() map[string]bool {
 	return occupied
 }
 
-// refreshDeviceOrder returns the chunks to publish. The order and the three
-// inputs it was computed from are recorded together, because a later hook
-// decides whether to publish again by comparing them; recording one without the
-// others is what would make that comparison lie.
+// refreshDeviceOrder returns the chunks to publish. The order and the inputs
+// it was computed from are recorded together, because a later hook decides
+// whether to publish again by comparing them; recording one without the others
+// is what would make that comparison lie.
 //
 // Called with applyMu held.
 func (cp *CPUDriver) refreshDeviceOrder() [][]resourceapi.Device {
@@ -139,9 +139,10 @@ func (cp *CPUDriver) refreshDeviceOrder() [][]resourceapi.Device {
 		return nil
 	}
 	occupied, poisoned, mirror := cp.occupiedDevices(), cp.poisonedNUMANodes(), cp.capacityMirror()
-	frontier := cp.frontier()
-	cp.publishedOccupancy, cp.publishedPoison, cp.publishedCorrection, cp.publishedFrontier = occupied, poisoned, mirror.corrections(), frontier
-	chunks, floored := cp.chunkDevices(occupied, poisoned, mirror, frontier)
+	frontier, frontierInput := cp.frontier()
+	cp.publishedOccupancy, cp.publishedPoison, cp.publishedCorrection = occupied, poisoned, mirror.corrections()
+	cp.publishedFrontier, cp.publishedFrontierInput = frontier, frontierInput
+	chunks, floored := cp.chunkDevices(occupied, poisoned, mirror, frontier, frontierInput)
 	cp.topology.deviceSlices = chunks
 	cp.metrics.SetFlooredCapacityDevices(floored)
 	return cp.topology.deviceSlices
@@ -149,9 +150,9 @@ func (cp *CPUDriver) refreshDeviceOrder() [][]resourceapi.Device {
 
 // publishedSlicesAreStale reports whether what the slices carry has stopped
 // describing the node: a NUMA node fenced or reopened since they went out, a
-// capacity whose correction has changed, or a cache that has changed between
-// holding a claim and holding none, which is what the published device order is
-// a function of.
+// capacity whose correction has changed, a cache that has changed between
+// holding a claim and holding none, or a frontier whose rounds or input digest
+// differ from what was published.
 //
 // Called with applyMu held.
 func (cp *CPUDriver) publishedSlicesAreStale() bool {
@@ -173,5 +174,6 @@ func (cp *CPUDriver) publishedSlicesAreStale() bool {
 	if !maps.Equal(cp.occupiedDevices(), cp.publishedOccupancy) {
 		return true
 	}
-	return !maps.Equal(cp.frontier(), cp.publishedFrontier)
+	rounds, input := cp.frontier()
+	return !maps.Equal(rounds, cp.publishedFrontier) || !maps.Equal(input, cp.publishedFrontierInput)
 }
