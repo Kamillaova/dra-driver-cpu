@@ -40,6 +40,10 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	defer logger.Info("end: synchronize state with the runtime", "numPods", len(pods), "numContainers", len(containers))
 
 	defer func() { cp.metrics.RecordNRISynchronize(rerr, time.Since(startTime)) }()
+	// Synchronize rebuilds all three stores and swaps them in, so nothing that
+	// reads or writes a placement may run while it does.
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
 
 	cpuAllocationStore := store.NewCPUAllocation(cp.topology.cpuTopology, cp.topology.reservedCPUs)
 	podConfigStore := store.NewPodConfig()
@@ -271,6 +275,9 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	logger.V(2).Info("begin: CreateContainer")
 	defer logger.V(2).Info("end: CreateContainer")
 
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
 	adjust := &api.ContainerAdjustment{}
 	var updates []*api.ContainerUpdate
 
@@ -369,6 +376,9 @@ func (cp *CPUDriver) StopContainer(ctx context.Context, pod *api.PodSandbox, ctr
 	logger.V(2).Info("begin: StopContainer")
 	defer logger.V(2).Info("end: StopContainer")
 
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
 	updates := []*api.ContainerUpdate{}
 	claimUIDs, removed := cp.podConfigStore.RemoveContainerState(types.UID(pod.GetUid()), ctr.GetName(), types.UID(ctr.GetId()))
 	if !removed {
@@ -388,6 +398,9 @@ func (cp *CPUDriver) RemoveContainer(ctx context.Context, pod *api.PodSandbox, c
 	_, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen), "pod", ctxlog.KObj(pod), "podUID", pod.Uid, "container", ctr.Name, "containerID", ctr.Id)
 	logger.V(2).Info("begin: RemoveContainer")
 	defer logger.V(2).Info("end: RemoveContainer")
+
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
 
 	claimUIDs, removed := cp.podConfigStore.RemoveContainerState(types.UID(pod.GetUid()), ctr.GetName(), types.UID(ctr.GetId()))
 	if !removed {
