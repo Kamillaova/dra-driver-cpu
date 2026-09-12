@@ -32,6 +32,7 @@ type Recorder interface {
 	RecordNRIStopContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRIRemoveContainer(err error, claimCount int, elapsed time.Duration)
 	RecordSynchronizeSkippedClaim()
+	RecordSynchronizeForeignCPUs()
 	RecordMisplacedClaim()
 	// CCX-FORK: RecordPrepareNoRoom is the fork's, and belongs with the prepare
 	// counters above rather than with the defragmentation block below: it counts
