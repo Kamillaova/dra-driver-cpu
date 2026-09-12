@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -49,6 +50,21 @@ func TestE2E(t *testing.T) {
 	klog.SetLoggerWithOptions(ginkgo.GinkgoLogr, klog.ContextualLogger(true))
 	gomega.RegisterFailHandler(ginkgo.Fail)
 	ginkgo.RunSpecs(t, "DRA CPU Driver E2E Suite")
+}
+
+func isReleaseGate() bool {
+	return os.Getenv("DRACPU_E2E_RELEASE_GATE") != ""
+}
+
+func assertScenarioRan(ran bool, msg string) {
+	ginkgo.GinkgoHelper()
+	if !ran {
+		if isReleaseGate() {
+			ginkgo.Fail("release gate requires scenario to run: " + msg)
+		} else {
+			ginkgo.Skip(msg)
+		}
+	}
 }
 
 // shared code which is not ready yet to be moved into a test/pkg/... package
@@ -694,7 +710,7 @@ func repairableClaimSpecWithSelector(cpus int, cel string) resourcev1.ResourceCl
 // publishes the attribute per device, so other modes get no selector and the
 // scenario spans the machine as it always did.
 func numaCEL(cfg driverConfigValues, numaID int) string {
-	if cfg.GroupBy != "numanode" {
+	if cfg.GroupBy != "numanode" && cfg.GroupBy != "uncorecache" {
 		return ""
 	}
 	return fmt.Sprintf(`device.attributes["dra.cpu"].numaNodeID == %d`, numaID)
