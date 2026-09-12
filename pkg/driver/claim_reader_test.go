@@ -31,6 +31,7 @@ import (
 	"k8s.io/utils/cpuset"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 )
 
@@ -91,6 +92,7 @@ func TestClaimConfigMapReaderAllocatedClaims(t *testing.T) {
 		driverName: driverName,
 		namespace:  namespace,
 		kubeClient: client,
+		metrics:    cpumetrics.Noop(),
 	}
 
 	reader, err := watchAllocatedClaims(context.Background(), d)
@@ -124,6 +126,7 @@ func TestClaimConfigMapReaderMissingOrCorrupt(t *testing.T) {
 		driverName: driverName,
 		namespace:  namespace,
 		kubeClient: client,
+		metrics:    cpumetrics.Noop(),
 	}
 
 	reader, err := watchAllocatedClaims(context.Background(), d)
@@ -201,6 +204,7 @@ func TestClaimConfigMapReaderStaleGeneration(t *testing.T) {
 		driverName: driverName,
 		namespace:  namespace,
 		kubeClient: client,
+		metrics:    cpumetrics.Noop(),
 	}
 
 	reader, err := watchAllocatedClaims(context.Background(), d)

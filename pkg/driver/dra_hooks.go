@@ -462,6 +462,14 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 			availableCPUsForDevice = allocatableCPUs.Difference(assignedCPUs).Intersection(deviceCPUs)
 			logger.V(4).Info("device CPU availability", "device", alloc.Device, "deviceCPUs", deviceCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
 			cur, err = cp.takeCPUsForDevice(logger, topo, availableCPUsForDevice, preferredCPUs, claimCPUCount, threadsPerCore)
+			if err != nil && cp.cpuDeviceGroupBy == device.GROUP_BY_UNCORE_CACHE && claimOffersSplitAlternatives(claim) {
+				rehomedCPUs, targetDev, rehomeErr := cp.rehomeShare(logger, topo, allocatableCPUs.Difference(assignedCPUs), alloc.Device, claimCPUCount)
+				if rehomeErr == nil {
+					cur = rehomedCPUs
+					err = nil
+					logger.Info("re-homed a flexible claim share to another cache", "originalDevice", alloc.Device, "targetDevice", targetDev, "cpus", cur.String())
+				}
+			}
 		case device.GROUP_BY_MACHINE:
 			if !published {
 				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
@@ -619,6 +627,84 @@ func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, topo *cpuinfo.CPUTopo
 		return got, err
 	}
 	return cp.cpuAllocator.Allocate(logger, available, preferred, numCPUs)
+}
+
+type rehomeCandidate struct {
+	device  string
+	cacheID int
+	free    int
+	tenants int
+	curCPUs cpuset.CPUSet
+}
+
+func (cp *CPUDriver) rehomeShare(logger logr.Logger, topo *cpuinfo.CPUTopology, availableAllocatable cpuset.CPUSet, recordedDevice string, numCPUs int) (cpuset.CPUSet, string, error) {
+	targetNUMA, hasNUMA := cp.topology.deviceNameToNUMANodeID[recordedDevice]
+	if !hasNUMA {
+		return cpuset.New(), "", fmt.Errorf("recorded device %q has no NUMA node mapping", recordedDevice)
+	}
+	targetPartition := cp.devicePartition(recordedDevice)
+
+	var candidates []rehomeCandidate
+	for candDev, candCPUs := range cp.topology.deviceNameToCPUs {
+		if candDev == recordedDevice || cp.topology.deviceIsPool(candDev) {
+			continue
+		}
+		if cp.topology.deviceNameToNUMANodeID[candDev] != targetNUMA {
+			continue
+		}
+		if cp.devicePartition(candDev) != targetPartition {
+			continue
+		}
+		if fenced := cp.poisonedNUMANodesOf(candCPUs); len(fenced) > 0 {
+			continue
+		}
+		candAvailable := availableAllocatable.Intersection(candCPUs)
+		if candAvailable.Size() < numCPUs {
+			continue
+		}
+		threadsPerCore := cp.topology.deviceThreadsPerCore[candDev]
+		// A re-home carries no hint by construction -- the claim named CPUs on the
+		// device it is being moved off -- so it takes the same hint-free selection a
+		// defragmentation move does rather than the allocator interface.
+		cur, err := cp.selectMoveCPUs(logger, topo, candAvailable, numCPUs, threadsPerCore)
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, rehomeCandidate{
+			device:  candDev,
+			cacheID: cp.topology.deviceNameToUncoreCacheID[candDev],
+			free:    candAvailable.Size(),
+			tenants: candCPUs.Difference(candAvailable).Size(),
+			curCPUs: cur,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return cpuset.New(), "", fmt.Errorf("no candidate cache with room in NUMA node %d and partition %q", targetNUMA, targetPartition)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		if cp.placementPolicy == coreselect.Spread {
+			if a.tenants != b.tenants {
+				return a.tenants < b.tenants
+			}
+			if a.free != b.free {
+				return a.free > b.free
+			}
+		} else {
+			if a.free != b.free {
+				return a.free < b.free
+			}
+		}
+		if a.cacheID != b.cacheID {
+			return a.cacheID < b.cacheID
+		}
+		return a.device < b.device
+	})
+
+	best := candidates[0]
+	return best.curCPUs, best.device, nil
 }
 
 // CCX-FORK: upstream takes the logger and the claim alone, as above.
