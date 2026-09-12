@@ -29,6 +29,7 @@ The command prints JSON metadata for custom `dra_cpu_*` metrics only. It does no
 | `dra_cpu_nri_stop_container_duration_seconds`   | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `StopContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`.   |
 | `dra_cpu_nri_remove_container_duration_seconds` | Histogram | `result`, `cpu_allocation_mode` | Duration of the NRI `RemoveContainer` callback in seconds. `result` is `success` or `error`; `cpu_allocation_mode` is `shared` or `exclusive`. |
 | `dra_cpu_synchronize_skipped_claims_total`      | Counter   | none                            | Claims or containers `Synchronize` could not adopt from the runtime's reported state, skipped rather than aborting the whole call.             |
+| `dra_cpu_misplaced_claims_total`                | Counter   | none                            | Restored claims whose CPUs no single CPU partition holds, which is what a partition list edited under a running node looks like.               |
 
 Note about `dra_cpu_nri_remove_container_duration_seconds`: due to how the driver is implemented and how it uses the NRI APIs, this metric reports
 cases on which the hook recovered an internal faulty state. The cleanup action should be carried at the `StopContainer` stage and the real work

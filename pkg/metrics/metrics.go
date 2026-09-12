@@ -116,6 +116,7 @@ type Metrics struct {
 	nriStopContainerDuration   *prometheus.HistogramVec
 	nriRemoveContainerDuration *prometheus.HistogramVec
 	synchronizeSkippedClaims   prometheus.Counter
+	misplacedClaims            prometheus.Counter
 
 	// CCX-FORK: upstream's collectors end above; the defragmentation ones and
 	// everything serving them in this file are the fork's.
@@ -235,6 +236,11 @@ var (
 		kind: metricCounter,
 		help: "Total number of claims or containers Synchronize could not adopt from the runtime's reported state, skipped rather than aborting the whole call.",
 	}
+	misplacedClaimsSpec = metricSpec{
+		name: "dra_cpu_misplaced_claims_total",
+		kind: metricCounter,
+		help: "Total number of restored claims whose CPUs no single CPU partition holds, which is what a partition list edited under a running node looks like.",
+	}
 	defragExcessUncoreCachesSpec = metricSpec{
 		name: "dra_cpu_defrag_excess_uncore_caches",
 		kind: metricGauge,
@@ -286,6 +292,7 @@ var metricSpecs = []metricSpec{
 	nriStopContainerDurationSpec,
 	nriRemoveContainerDurationSpec,
 	synchronizeSkippedClaimsSpec,
+	misplacedClaimsSpec,
 	defragExcessUncoreCachesSpec,
 	defragAlignableFreeCPUsSpec,
 	defragPassesSpec,
@@ -337,6 +344,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		nriStopContainerDuration:   newHistogramVec(nriStopContainerDurationSpec),
 		nriRemoveContainerDuration: newHistogramVec(nriRemoveContainerDurationSpec),
 		synchronizeSkippedClaims:   newCounter(synchronizeSkippedClaimsSpec),
+		misplacedClaims:            newCounter(misplacedClaimsSpec),
 
 		defragExcessUncoreCaches:      newGauge(defragExcessUncoreCachesSpec),
 		defragAlignableFreeCPUs:       newGaugeVec(defragAlignableFreeCPUsSpec),
@@ -361,6 +369,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriStopContainerDuration,
 		m.nriRemoveContainerDuration,
 		m.synchronizeSkippedClaims,
+		m.misplacedClaims,
 		m.defragExcessUncoreCaches,
 		m.defragAlignableFreeCPUs,
 		m.defragPasses,
@@ -494,6 +503,10 @@ func (m *Metrics) RecordSynchronizeSkippedClaim() {
 	m.synchronizeSkippedClaims.Inc()
 }
 
+func (m *Metrics) RecordMisplacedClaim() {
+	m.misplacedClaims.Inc()
+}
+
 // SetDefragState replaces the per-NUMA-node series wholesale, so a node a pass
 // could not measure this time reports nothing rather than its last value.
 func (m *Metrics) SetDefragState(state DefragState) {
@@ -539,6 +552,7 @@ func (noopRecorder) RecordNRICreateContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()                     {}
+func (noopRecorder) RecordMisplacedClaim()                              {}
 func (noopRecorder) SetDefragState(DefragState)                         {}
 func (noopRecorder) RecordDefragPass(Result, time.Duration)             {}
 func (noopRecorder) RecordDefragMoves(Result, int)                      {}
