@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/prometheus/client_golang/prometheus"
@@ -55,7 +56,6 @@ func newDefragTestDriver(t *testing.T, caches, cpusPerCache int) *defragTestDriv
 // newDefragTestDriverTopo spreads the caches over numaNodes NUMA nodes.
 func newDefragTestDriverTopo(t *testing.T, numaNodes, cachesPerNode, cpusPerCache int) *defragTestDriver {
 	t.Helper()
-	logger := testr.New(t)
 
 	cpusPerNode := cachesPerNode * cpusPerCache
 	var infos []cpuinfo.CPUInfo
@@ -65,7 +65,14 @@ func newDefragTestDriverTopo(t *testing.T, numaNodes, cachesPerNode, cpusPerCach
 			UncoreCacheID: cpu / cpusPerCache,
 		})
 	}
-	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	return newDefragTestDriverWith(t, infos)
+}
+
+// newDefragTestDriverWith builds the same driver over an explicit topology, for
+// a test whose point is a shape the two constructors above cannot describe.
+func newDefragTestDriverWith(t *testing.T, infos []cpuinfo.CPUInfo) *defragTestDriver {
+	t.Helper()
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(testr.New(t))
 	require.NoError(t, err)
 
 	allCPUs := topo.CPUDetails.CPUs()
@@ -81,9 +88,9 @@ func newDefragTestDriverTopo(t *testing.T, numaNodes, cachesPerNode, cpusPerCach
 		cdiMgr:             cdi,
 		containerUpdater:   updater,
 		reconcileTrigger:   make(chan struct{}, 1),
-		pendingRounds:      make(map[int]*defragRound),
-		defragRetries:      workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[int]()),
-		defragRetryDue:     make(chan int),
+		pendingRounds:      make(map[defragScope]*defragRound),
+		defragRetries:      workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[defragScope]()),
+		defragRetryDue:     make(chan defragScope),
 		sysfs: fstest.MapFS{
 			"devices/system/cpu/online": &fstest.MapFile{Data: []byte(allCPUs.String() + "\n")},
 		},
@@ -91,6 +98,46 @@ func newDefragTestDriverTopo(t *testing.T, numaNodes, cachesPerNode, cpusPerCach
 	}
 	t.Cleanup(d.defragRetries.ShutDown)
 	return &defragTestDriver{CPUDriver: d, updater: updater, cdi: cdi, metrics: reg, allCPUs: allCPUs}
+}
+
+// describe resolves the driver's cores into the given partitions plus the
+// implicit remainder, as New does, so that a test can name the region a round
+// covers. Exclusive partitions only: a reserved or shared one would also have to
+// be folded into the reservation the allocation store was built with.
+func (d *defragTestDriver) describe(t *testing.T, partitions ...devattr.Partition) {
+	t.Helper()
+	for _, partition := range partitions {
+		require.True(t, partition.PublishesExclusiveDevices(),
+			"describe takes exclusive partitions; %q has role %q", partition.Name, partition.Role)
+	}
+	d.partitions = devattr.WithImplicitDefault(partitions, d.allCPUs)
+	d.defaultPartitionCPUs = cpuset.New()
+	for _, partition := range d.partitions {
+		if partition.Role == devattr.PARTITION_ROLE_DEFAULT {
+			d.defaultPartitionCPUs = d.defaultPartitionCPUs.Union(partition.CPUs)
+		}
+	}
+}
+
+// defaultScope is the region a pass covers on a node whose cores nobody
+// described: the whole of one NUMA node.
+func defaultScope(numaNodeID int) defragScope {
+	return defragScope{numaNodeID: numaNodeID, partition: devattr.DefaultPartitionName}
+}
+
+// smtCacheInfos is one NUMA node of four SMT2 cores, core c being CPUs
+// {c, c+4}: cores 0-1 share cache 0 and cores 2-3 cache 1.
+func smtCacheInfos() []cpuinfo.CPUInfo {
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 8 {
+		core := cpu % 4
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID: cpu, CoreID: core, SocketID: 0, NUMANodeID: 0,
+			UncoreCacheID: core / 2, SiblingCPUID: (cpu + 4) % 8,
+			SiblingCPUSet: cpuset.New(core, core+4),
+		})
+	}
+	return infos
 }
 
 // errUpdateFailed stands in for a runtime that could not be reached.
@@ -266,7 +313,7 @@ func TestDefragPassDropsARoundWhoseStoresWereRebuilt(t *testing.T) {
 
 	d.updater.err = errUpdateFailed
 	d.defragPass(context.Background())
-	require.Contains(t, d.pendingRounds, 0)
+	require.Contains(t, d.pendingRounds, defaultScope(0))
 
 	// A driver restart or an NRI reconnect rebuilds the stores from the specs on
 	// disk, which already name the targets. The pending round belongs to a store
@@ -276,7 +323,7 @@ func TestDefragPassDropsARoundWhoseStoresWereRebuilt(t *testing.T) {
 	d.updater.err = nil
 
 	d.defragPass(context.Background())
-	require.NotContains(t, d.pendingRounds, 0, "the stale round must be dropped, not replayed")
+	require.NotContains(t, d.pendingRounds, defaultScope(0), "the stale round must be dropped, not replayed")
 	require.Len(t, d.updater.allCalls(), 1, "and nothing further sent for an already packed node")
 }
 
@@ -621,7 +668,7 @@ func TestDefragPassKeepsGoingPastANodeItCannotSettle(t *testing.T) {
 
 	d.updater.err = errUpdateFailed
 	d.defragPass(context.Background())
-	require.Contains(t, d.pendingRounds, 0, "node 0's round is unconfirmed")
+	require.Contains(t, d.pendingRounds, defaultScope(0), "node 0's round is unconfirmed")
 
 	// Node 1 only now needs a move, and node 0 is still stuck.
 	d.updater.err = nil
@@ -632,55 +679,18 @@ func TestDefragPassKeepsGoingPastANodeItCannotSettle(t *testing.T) {
 
 	moved, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-n1")
 	require.Equal(t, 1, cpuinfoSpread(d.CPUDriver, moved), "node 1 was held up by node 0")
-	require.NotContains(t, d.pendingRounds, 1)
-	require.NotContains(t, d.pendingRounds, 0, "node 0's own round was re-sent and settled")
+	require.NotContains(t, d.pendingRounds, defaultScope(1))
+	require.NotContains(t, d.pendingRounds, defaultScope(0), "node 0's own round was re-sent and settled")
 }
 
 func TestDefragPassMovesWholeCores(t *testing.T) {
 	// SMT topology: core c is CPUs {c, c+4}; cores 0-1 share cache 0, cores 2-3
 	// cache 1. With whole-core allocation on, a move may never split a core, and
-	// only whole free cores count as free.
-	logger := testr.New(t)
-	var infos []cpuinfo.CPUInfo
-	for cpu := range 8 {
-		core := cpu % 4
-		infos = append(infos, cpuinfo.CPUInfo{
-			CpuID: cpu, CoreID: core, SocketID: 0, NUMANodeID: 0,
-			UncoreCacheID: core / 2, SiblingCPUID: (cpu + 4) % 8,
-		})
-	}
-	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
-	require.NoError(t, err)
-
-	updater := &fakeContainerUpdater{}
-	cdi := newMockCdiMgr()
-	d := &defragTestDriver{
-		CPUDriver: &CPUDriver{
-			topology: deviceTopology{
-				cpuTopology: topo, reservedCPUs: cpuset.New(),
-				numaNodeThreadsPerCore: map[int]int{0: 2},
-			},
-			cpuAllocationStore:   store.NewCPUAllocation(topo, cpuset.New()),
-			podConfigStore:       store.NewPodConfig(),
-			claimTracker:         store.NewClaimTracker(),
-			cdiMgr:               cdi,
-			containerUpdater:     updater,
-			reconcileTrigger:     make(chan struct{}, 1),
-			pendingRounds:        make(map[int]*defragRound),
-			defragRetries:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[int]()),
-			defragRetryDue:       make(chan int),
-			fullPhysicalCPUsOnly: true,
-			sysfs: fstest.MapFS{
-				"devices/system/cpu/online": &fstest.MapFile{Data: []byte("0-7\n")},
-			},
-			defrag:  defragOptions{enabled: true},
-			metrics: cpumetrics.Noop(),
-		},
-		updater: updater,
-		cdi:     cdi,
-		allCPUs: topo.CPUDetails.CPUs(),
-	}
-	t.Cleanup(d.defragRetries.ShutDown)
+	// only whole free cores count as free. The step it must respect is derived
+	// from the scope's own cores, so this also pins that derivation end to end.
+	d := newDefragTestDriverWith(t, smtCacheInfos())
+	d.fullPhysicalCPUsOnly = true
+	topo := d.topology.cpuTopology
 	// Cores 0 and 2, one per cache; cores 1 and 3 are free.
 	d.placeClaim(t, "claim-1", cpuset.New(0, 4, 2, 6))
 	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
@@ -736,11 +746,11 @@ func TestDefragNodeForgetsANodesBackoffOnceItSettles(t *testing.T) {
 
 	d.updater.err = errUpdateFailed
 	d.defragPass(context.Background())
-	require.Positive(t, d.defragRetries.NumRequeues(0), "an unconfirmed round must arm the retry")
+	require.Positive(t, d.defragRetries.NumRequeues(defaultScope(0)), "an unconfirmed round must arm the retry")
 
 	d.updater.err = nil
 	d.defragPass(context.Background())
-	require.Zero(t, d.defragRetries.NumRequeues(0), "a settled round must clear the backoff")
+	require.Zero(t, d.defragRetries.NumRequeues(defaultScope(0)), "a settled round must clear the backoff")
 }
 
 func TestDefragPassReleasesApplyMuDuringTheRuntimeCall(t *testing.T) {
@@ -888,4 +898,259 @@ func TestDefragPassStillMovesAClaimAfterARestart(t *testing.T) {
 	moved, ok := after.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
 	require.True(t, ok)
 	require.Equal(t, cpuset.New(0, 1), moved, "the claim was not consolidated after the restart")
+}
+
+// mixedSMTInfos is one NUMA node whose two caches disagree about thread arity:
+// cache 0 holds two SMT2 cores (CPUs 0-3), cache 1 two cores whose siblings the
+// platform took offline and which the kernel therefore reports as one thread
+// each (CPUs 4 and 5).
+func mixedSMTInfos() []cpuinfo.CPUInfo {
+	var infos []cpuinfo.CPUInfo
+	for _, cpu := range []int{0, 1, 2, 3} {
+		core := cpu % 2
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID: cpu, CoreID: core, SocketID: 0, NUMANodeID: 0, UncoreCacheID: 0,
+			SiblingCPUID: (cpu + 2) % 4, SiblingCPUSet: cpuset.New(core, core+2),
+		})
+	}
+	for _, cpu := range []int{4, 5} {
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID: cpu, CoreID: cpu - 2, SocketID: 0, NUMANodeID: 0, UncoreCacheID: 1,
+			SiblingCPUID: -1, SiblingCPUSet: cpuset.New(cpu),
+		})
+	}
+	return infos
+}
+
+// partitionedDefragDriver is four caches of four CPUs on one NUMA node, with
+// caches 0 and 1 (CPUs 0-7) declared as a dataplane partition and caches 2 and 3
+// (CPUs 8-15) left as the implicit default one.
+func partitionedDefragDriver(t *testing.T) *defragTestDriver {
+	t.Helper()
+	d := newDefragTestDriverTopo(t, 1, 4, 4)
+	d.describe(t, devattr.Partition{
+		Name: "dataplane",
+		Role: devattr.PARTITION_ROLE_EXCLUSIVE,
+		CPUs: cpuset.New(0, 1, 2, 3, 4, 5, 6, 7),
+	})
+	return d
+}
+
+func TestDefragPassNeverMovesAClaimOutOfItsPartition(t *testing.T) {
+	// A repair may only use the CPUs of the partition the claim already sits in,
+	// so a pass never mixes the dataplane's cores with the virtual machines'.
+	//
+	// The claim below is split across both caches of its own partition and has
+	// nowhere left to go inside it, while the whole of the other partition is
+	// free. The second half of the test is what proves the partition is doing the
+	// work rather than the arithmetic happening to agree: the same node with its
+	// cores undescribed moves the same claim onto the very CPUs the dataplane
+	// would have held.
+	place := func(d *defragTestDriver) {
+		d.placeClaim(t, "claim-vm", cpuset.New(8, 12))
+		d.placeFixedClaim(t, "claim-a", cpuset.New(9, 10, 11))
+		d.placeFixedClaim(t, "claim-b", cpuset.New(13, 14, 15))
+		d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-vm")
+	}
+
+	described := partitionedDefragDriver(t)
+	place(described)
+
+	described.defragPass(context.Background())
+
+	require.Empty(t, described.updater.allCalls(),
+		"the only repair on offer crosses a partition, so there is no repair")
+	cpus, ok := described.cpuAllocationStore.GetResourceClaimAllocation("claim-vm")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(8, 12), cpus, "the claim left its partition")
+
+	undescribed := newDefragTestDriverTopo(t, 1, 4, 4)
+	place(undescribed)
+
+	undescribed.defragPass(context.Background())
+
+	moved, ok := undescribed.cpuAllocationStore.GetResourceClaimAllocation("claim-vm")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(0, 1), moved,
+		"with no partitions the planner takes the free cache, which is what confinement has to prevent")
+}
+
+func TestDefragPassRunsARoundPerPartition(t *testing.T) {
+	// One topology per NUMA node and partition means one round each: two claims
+	// on one NUMA node, one per partition, are two batches, and each is repaired
+	// inside the partition that granted it.
+	d := partitionedDefragDriver(t)
+	d.placeClaim(t, "claim-dp", cpuset.New(0, 4))
+	d.runContainer(t, "pod-dp", "ctr-dp", "ctr-uid-dp", "claim-dp")
+	d.placeClaim(t, "claim-vm", cpuset.New(8, 12))
+	d.runContainer(t, "pod-vm", "ctr-vm", "ctr-uid-vm", "claim-vm")
+
+	d.defragPass(context.Background())
+
+	calls := d.updater.allCalls()
+	require.Len(t, calls, 2, "one round per partition, not one spanning both")
+	require.Equal(t, "0-1", updateFor(t, calls[0], "ctr-uid-dp"), "the declared partition is planned first")
+	require.Equal(t, "8-9", updateFor(t, calls[1], "ctr-uid-vm"))
+
+	dataplane, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-dp")
+	require.Equal(t, cpuset.New(0, 1), dataplane)
+	vm, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-vm")
+	require.Equal(t, cpuset.New(8, 9), vm)
+}
+
+func TestDefragPassSkipsAPartitionWithNothingMobile(t *testing.T) {
+	// A partition whose claims all decline to move has nothing to plan, and
+	// nothing had to tell the planner so: the better placement is built around
+	// such a claim, so the partition reports itself as well packed as its claims
+	// allow. It is still measured, which is how an operator sees the spread that
+	// will not be repaired.
+	d := partitionedDefragDriver(t)
+	d.placeFixedClaim(t, "claim-spdk", cpuset.New(0, 4))
+	d.runContainer(t, "pod-dp", "ctr-dp", "ctr-uid-dp", "claim-spdk")
+	d.placeClaim(t, "claim-vm", cpuset.New(8, 12))
+	d.runContainer(t, "pod-vm", "ctr-vm", "ctr-uid-vm", "claim-vm")
+
+	d.defragPass(context.Background())
+
+	calls := d.updater.allCalls()
+	require.Len(t, calls, 1, "only the partition holding a mobile claim runs a round")
+	require.Equal(t, "8-9", updateFor(t, calls[0], "ctr-uid-vm"))
+	spdk, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-spdk")
+	require.Equal(t, cpuset.New(0, 4), spdk, "an immobile claim must not be moved")
+	require.InDelta(t, 2, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01,
+		"both partitions were measured before the pass, and both were split")
+
+	d.defragPass(context.Background())
+
+	require.Len(t, d.updater.allCalls(), 1, "and nothing further is attempted")
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01,
+		"what is left is the spread the immobile claim keeps")
+}
+
+func TestDefragPassLeavesACPUInThePoolOnlyWhereThePoolIs(t *testing.T) {
+	// While a move is in flight its claim holds both its old and its new CPUs, so
+	// a round has to leave one CPU behind for the containers holding no claim.
+	// Those run on the default partition alone, so that is the only partition
+	// where the rule bites: elsewhere none of the CPUs a round takes were ever
+	// theirs to run on, and holding one back would refuse a repair for nothing.
+	//
+	// Both halves use the same shape: a three-CPU partition, a claim split across
+	// its two caches, and exactly one free CPU, which the repair needs.
+	split := func(d *defragTestDriver) {
+		d.placeClaim(t, "claim-1", cpuset.New(0, 2))
+		d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+		d.runContainer(t, "pod-2", "shared-ctr", "shared-uid")
+	}
+
+	t.Run("an exclusive partition may take its last free CPU", func(t *testing.T) {
+		d := newDefragTestDriverTopo(t, 1, 2, 2)
+		// CPU 3 is the whole of the implicit default partition, so the claimless
+		// container runs there and nothing the vm partition does can empty it.
+		d.describe(t, devattr.Partition{
+			Name: "vm", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(0, 1, 2),
+		})
+		split(d)
+
+		d.defragPass(context.Background())
+
+		calls := d.updater.allCalls()
+		require.Len(t, calls, 1)
+		require.Equal(t, "0-1", updateFor(t, calls[0], "ctr-uid-1"))
+		require.Equal(t, "3", updateFor(t, calls[0], "shared-uid"),
+			"the pool is untouched, which is why the round was free to take everything else")
+	})
+
+	t.Run("the default partition may not", func(t *testing.T) {
+		d := newDefragTestDriverTopo(t, 1, 2, 2)
+		// The same three CPUs, now the default partition: the claimless container
+		// runs on them, so the last free CPU is the pool.
+		d.describe(t, devattr.Partition{
+			Name: "other", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(3),
+		})
+		split(d)
+
+		d.defragPass(context.Background())
+
+		require.Empty(t, d.updater.allCalls(), "the repair would have left the pool empty")
+		cpus, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+		require.Equal(t, cpuset.New(0, 2), cpus)
+		// Held back while planning, which is the whole of the difference: a round
+		// built and then abandoned for want of a pool would leave this at zero and
+		// an error in the log.
+		require.Positive(t, metricValue(t, d.metrics, "dra_cpu_defrag_blocked_moves_total", nil))
+	})
+}
+
+func TestDefragScopeThreadsPerCoreIsThePartitionsOwn(t *testing.T) {
+	// A NUMA node holding an SMT partition beside one whose siblings are offline
+	// has no single whole-core step, and neither partition may be handed the
+	// other's: each scope is asked for its own, computed from its own cores.
+	d := newDefragTestDriverWith(t, mixedSMTInfos())
+	d.fullPhysicalCPUsOnly = true
+	d.describe(t,
+		devattr.Partition{Name: "vm", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(0, 1, 2, 3)},
+		devattr.Partition{Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(4, 5)},
+	)
+	logger := testr.New(t)
+	online, ok := d.defragOnlineCPUs(logger)
+	require.True(t, ok)
+
+	vm, ok := d.defragView(logger, defragScope{numaNodeID: 0, partition: "vm"}, online)
+	require.True(t, ok)
+	require.Equal(t, 2, vm.threadsPerCore, "the SMT partition keeps its whole-core step")
+
+	dataplane, ok := d.defragView(logger, defragScope{numaNodeID: 0, partition: "dataplane"}, online)
+	require.True(t, ok)
+	require.Equal(t, 0, dataplane.threadsPerCore,
+		"a core with one thread has nothing to keep together, so there is no step to respect")
+
+	// Whether the promise applies at all is still the operator's option.
+	d.fullPhysicalCPUsOnly = false
+	vm, ok = d.defragView(logger, defragScope{numaNodeID: 0, partition: "vm"}, online)
+	require.True(t, ok)
+	require.Zero(t, vm.threadsPerCore)
+}
+
+func TestDefragPassReportsSpreadNoPartitionCanRepair(t *testing.T) {
+	// A claim whose CPUs straddle two partitions is what a partition list edited
+	// under a running node looks like. No pass can repair it -- a rebind replaces
+	// a claim's whole exclusive set, so it belongs to no region -- but its spread
+	// is real, and the guide promises that spread a pass cannot repair is reported
+	// rather than hidden. A claim that never asked to move is reported on exactly
+	// that ground, so this one has to be too.
+	d := partitionedDefragDriver(t)
+	// CPU 0 is the dataplane's cache 0, CPU 8 the default partition's cache 2.
+	d.placeClaim(t, "claim-straddling", cpuset.New(0, 8))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-straddling")
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls(), "no region holds it, so no region can move it")
+	cpus, ok := d.cpuAllocationStore.GetResourceClaimAllocation("claim-straddling")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(0, 8), cpus)
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01,
+		"the node spans two caches where one would do, whoever can repair it")
+}
+
+func TestDefragPassMeasuresANodeWithNoPlannablePartition(t *testing.T) {
+	// Every partition of this node is one the machine contradicts, so it publishes
+	// no device and a pass has nowhere to plan. The node still has a shape, and a
+	// gauge that vanishes cannot be alerted on -- least of all in the state where
+	// an operator most needs to see it.
+	d := newDefragTestDriverTopo(t, 1, 2, 4)
+	d.describe(t, devattr.Partition{
+		Name: "dataplane", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: d.allCPUs,
+	})
+	d.degradedPartitions = map[string]string{
+		"dataplane": `partition "dataplane" expects at most 1 online thread(s) per core`,
+	}
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls())
+	require.InDelta(t, 0, metricValue(t, d.metrics, "dra_cpu_defrag_largest_alignable_free_cpus",
+		map[string]string{"numa_node": "0"}), 0.01,
+		"no partition can take a claim, and the series has to say so rather than disappear")
+	require.InDelta(t, 0, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil), 0.01)
 }
