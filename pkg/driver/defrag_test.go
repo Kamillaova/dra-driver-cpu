@@ -1438,3 +1438,43 @@ func TestDefragPassTreatsAReplacedContainerAsMoved(t *testing.T) {
 	require.Empty(t, d.pendingRounds)
 	require.Zero(t, metricValue(t, d.metrics, "dra_cpu_defrag_partial_batches_total", nil))
 }
+
+func TestExactPlanArbitration(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+
+	logger := testr.New(t)
+	scope := defaultScope(0)
+	online := d.allCPUs
+
+	d.applyMu.Lock()
+	moves := d.planScopeMoves(logger, scope, online)
+	require.NotEmpty(t, moves, "expected greedy planner to produce moves")
+
+	exactPlan := &defrag.ExactPlan{
+		NUMANodeID: 0,
+		Status:     defrag.SearchReachable,
+		Moves: []defrag.Move{
+			{ClaimUID: "claim-1", From: cpuset.New(0, 4), To: cpuset.New(0, 1)},
+		},
+	}
+	d.setActiveExactPlan(0, exactPlan)
+	require.True(t, d.hasActiveExactPlan(0))
+
+	skippedMoves := d.planScopeMoves(logger, scope, online)
+	require.Nil(t, skippedMoves, "expected greedy planner to skip NUMA node with active exact plan")
+	d.applyMu.Unlock()
+
+	// Cause ledger mismatch by unpreparing/rebinding claim-1
+	d.applyMu.Lock()
+	err := d.cpuAllocationStore.BeginRebind(logger, "claim-1", cpuset.New(2, 3))
+	require.NoError(t, err)
+	d.applyMu.Unlock()
+
+	// beginDefragRound detects ledger mismatch and clears the active exact plan
+	_ = d.beginDefragRound(logger, scope, online)
+
+	d.applyMu.Lock()
+	require.False(t, d.hasActiveExactPlan(0), "expected active exact plan to be cleared after ledger mismatch")
+	d.applyMu.Unlock()
+}

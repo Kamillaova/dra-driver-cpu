@@ -574,6 +574,14 @@ func (cp *CPUDriver) beginDefragRound(logger logr.Logger, scope defragScope, onl
 		return nil
 	}
 
+	if plan := cp.getActiveExactPlan(scope.numaNodeID); plan != nil {
+		view, ok := cp.defragView(logger, scope, online)
+		if ok && !plan.MatchesLedger(view.placements) {
+			logger.Info("active exact plan no longer matches ledger; aborting and clearing exact plan", "numaNode", scope.numaNodeID)
+			cp.clearActiveExactPlan(scope.numaNodeID)
+		}
+	}
+
 	moves := cp.planScopeMoves(logger, scope, online)
 	if len(moves) == 0 {
 		return nil
@@ -882,6 +890,11 @@ func (cp *CPUDriver) scopeThreadsPerCore(cpus cpuset.CPUSet) int {
 
 // planScopeMoves plans one scope. Called with applyMu held.
 func (cp *CPUDriver) planScopeMoves(logger logr.Logger, scope defragScope, online cpuset.CPUSet) []defrag.Move {
+	if cp.hasActiveExactPlan(scope.numaNodeID) {
+		logger.V(4).Info("skipping greedy pass on NUMA node with active exact plan", "numaNode", scope.numaNodeID)
+		return nil
+	}
+
 	view, ok := cp.defragView(logger, scope, online)
 	if !ok {
 		return nil
@@ -903,6 +916,41 @@ func (cp *CPUDriver) planScopeMoves(logger logr.Logger, scope defragScope, onlin
 		"currentCost", plan.CurrentCost, "idealCost", plan.IdealCost, "reason", plan.Reason)
 	cp.metrics.RecordDefragBlockedMoves(plan.Blocked)
 	return plan.Moves
+}
+
+// hasActiveExactPlan reports whether the NUMA node has an active exact plan.
+// Called with applyMu held.
+func (cp *CPUDriver) hasActiveExactPlan(numaNodeID int) bool {
+	if cp.activeExactPlans == nil {
+		return false
+	}
+	return cp.activeExactPlans[numaNodeID] != nil
+}
+
+// setActiveExactPlan stores an active exact plan for the NUMA node.
+// Called with applyMu held.
+func (cp *CPUDriver) setActiveExactPlan(numaNodeID int, plan *defrag.ExactPlan) {
+	if cp.activeExactPlans == nil {
+		cp.activeExactPlans = make(map[int]*defrag.ExactPlan)
+	}
+	cp.activeExactPlans[numaNodeID] = plan
+}
+
+// clearActiveExactPlan removes the active exact plan for the NUMA node.
+// Called with applyMu held.
+func (cp *CPUDriver) clearActiveExactPlan(numaNodeID int) {
+	if cp.activeExactPlans != nil {
+		delete(cp.activeExactPlans, numaNodeID)
+	}
+}
+
+// getActiveExactPlan returns the active exact plan for the NUMA node.
+// Called with applyMu held.
+func (cp *CPUDriver) getActiveExactPlan(numaNodeID int) *defrag.ExactPlan {
+	if cp.activeExactPlans == nil {
+		return nil
+	}
+	return cp.activeExactPlans[numaNodeID]
 }
 
 // largestAlignableFreeCPUs is the most CPUs still free inside a single uncore

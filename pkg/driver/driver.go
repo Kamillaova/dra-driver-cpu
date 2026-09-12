@@ -37,6 +37,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuallocator"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -191,6 +192,9 @@ type CPUDriver struct {
 	// held so the next attempt at that scope can send it again. Guarded by
 	// applyMu.
 	pendingRounds map[defragScope]*defragRound
+	// activeExactPlans holds, per NUMA node, an in-progress exact plan whose
+	// moves take precedence over greedy planning. Guarded by applyMu.
+	activeExactPlans map[int]*defrag.ExactPlan
 	// defragRetries holds the scopes whose last round the runtime left
 	// unsettled, each released again once its own backoff has elapsed.
 	defragRetries workqueue.TypedRateLimitingInterface[defragScope]
@@ -499,6 +503,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 			plugin.cgroupfs = providers.EnsureCgroupFS()
 			plugin.poisonedNodes = make(map[int]*poisonedNode)
 			plugin.pendingRounds = make(map[defragScope]*defragRound)
+			plugin.activeExactPlans = make(map[int]*defrag.ExactPlan)
 			plugin.defragRetries = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[defragScope]())
 			plugin.defragRetryDue = make(chan defragScope)
 		}
