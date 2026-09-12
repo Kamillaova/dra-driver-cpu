@@ -120,7 +120,7 @@ stopped making things worse there, and the containers involved keep running.
   arrives at the CPUs really free. That publication reaches the API server: the destination is
   shrunk before the containers are touched, and the origin grows once the runtime confirms. Fencing
   a NUMA node reaches it too — the taint has to, or the scheduler would keep sending claims to a
-  node that refuses them.
+  node that refuses them. See [The Capacity Mirror](capacity-mirror.md).
 - **A round waits for its own shrink to be stored.** Publication is asynchronous and nothing reports
   when a write landed, so the driver reads its node's own `ResourceSlice`s back and starts a batch
   only once they show the destination short of the CPUs the move is about to take. A shrink that is
