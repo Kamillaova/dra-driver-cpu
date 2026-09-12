@@ -37,6 +37,7 @@ import (
 type claimReader interface {
 	AllocatedClaims() ([]*resourceapi.ResourceClaim, error)
 	IsProjectedDeallocated(claimUID types.UID) bool
+	GetProjectedClaims() (*v1alpha1.ProjectedClaims, error)
 }
 
 type claimConfigMapReader struct {
@@ -132,6 +133,14 @@ func (r *claimConfigMapReader) IsProjectedDeallocated(claimUID types.UID) bool {
 	return false
 }
 
+func (r *claimConfigMapReader) GetProjectedClaims() (*v1alpha1.ProjectedClaims, error) {
+	projected, ok, err := r.getProjected()
+	if err != nil || !ok {
+		return nil, err
+	}
+	return &projected, nil
+}
+
 // watchAllocatedClaims gives the driver its reader and keeps it fed from the
 // ConfigMap the scheduler projects for this node.
 //
@@ -167,12 +176,15 @@ func watchAllocatedClaims(ctx context.Context, cp *CPUDriver) error {
 	if _, err := cmInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			cp.republishStaleSlicesLocking(context.Background())
+			cp.reconcileMakeRoomTargets(context.Background())
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			cp.republishStaleSlicesLocking(context.Background())
+			cp.reconcileMakeRoomTargets(context.Background())
 		},
 		DeleteFunc: func(obj interface{}) {
 			cp.republishStaleSlicesLocking(context.Background())
+			cp.reconcileMakeRoomTargets(context.Background())
 		},
 	}); err != nil {
 		return fmt.Errorf("cannot watch the projected claim ConfigMap of node %q: %w", cp.nodeName, err)
