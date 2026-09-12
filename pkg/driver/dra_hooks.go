@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -37,6 +38,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -94,7 +96,24 @@ func (cp *CPUDriver) publishResources(ctx context.Context) error {
 		},
 	}
 
-	return cp.draPlugin.PublishResources(ctx, resources)
+	rawBytes, _ := json.Marshal(resources)
+	cp.metrics.RecordSliceUpdate(len(rawBytes))
+	cp.metrics.RecordSliceUpdateRetryDepth(0)
+
+	err := cp.draPlugin.PublishResources(ctx, resources)
+	if err != nil {
+		if apierrors.IsConflict(err) {
+			cp.metrics.RecordSliceUpdateConflict()
+		}
+		if apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) {
+			cp.metrics.RecordSliceUpdateValidationError()
+		}
+		if apierrors.IsTooManyRequests(err) {
+			cp.metrics.RecordSliceUpdateRateLimit()
+		}
+		return err
+	}
+	return nil
 }
 
 // PrepareResourceClaims is called by the kubelet to prepare a resource claim.
@@ -539,6 +558,23 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 	)
 	cp.recordClaimEvent(ctx, claim, "ClaimAdmitted", fmt.Sprintf("admitted on NUMA %v partition %s with cpuset %s frontier %s witness %s",
 		corr.NUMANode, corr.Partition, corr.InitialCPUSet, corr.FrontierSnapshot, corr.WitnessPlan))
+	if placement.Alignment == v1alpha1.AlignmentRepairable && (corr.FrontierSnapshot == "1" || corr.FrontierSnapshot == "2" || corr.FrontierSnapshot == "3") {
+		if corr.RuntimeOutcome == "started_split" {
+			if (cp.makeRoomTargets != nil && cp.makeRoomTargets[claim.UID] != nil) || plan != nil {
+				cp.metrics.RecordFrontierAdmissionOutcome("waited_prepare")
+			}
+			cp.metrics.RecordFrontierAdmissionOutcome("started_split")
+			if cp.promiseObligations == nil {
+				cp.promiseObligations = make(map[types.UID]*promiseObligation)
+			}
+			cp.promiseObligations[claim.UID] = &promiseObligation{
+				claimUID:         claim.UID,
+				prepareTime:      time.Now(),
+				advertisedRounds: corr.FrontierSnapshot,
+			}
+			cp.refreshObligationMetrics()
+		}
+	}
 	if cp.makeRoomTargets != nil {
 		if target, ok := cp.makeRoomTargets[claim.UID]; ok {
 			for numaNodeID, plan := range cp.activeExactPlans {
@@ -856,6 +892,23 @@ func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logge
 	)
 	cp.recordClaimEvent(ctx, claim, "ClaimAdmitted", fmt.Sprintf("admitted on NUMA %v partition %s with cpuset %s frontier %s witness %s",
 		corr.NUMANode, corr.Partition, corr.InitialCPUSet, corr.FrontierSnapshot, corr.WitnessPlan))
+	if placement.Alignment == v1alpha1.AlignmentRepairable && (corr.FrontierSnapshot == "1" || corr.FrontierSnapshot == "2" || corr.FrontierSnapshot == "3") {
+		if corr.RuntimeOutcome == "started_split" {
+			if plan != nil {
+				cp.metrics.RecordFrontierAdmissionOutcome("waited_prepare")
+			}
+			cp.metrics.RecordFrontierAdmissionOutcome("started_split")
+			if cp.promiseObligations == nil {
+				cp.promiseObligations = make(map[types.UID]*promiseObligation)
+			}
+			cp.promiseObligations[claim.UID] = &promiseObligation{
+				claimUID:         claim.UID,
+				prepareTime:      time.Now(),
+				advertisedRounds: corr.FrontierSnapshot,
+			}
+			cp.refreshObligationMetrics()
+		}
+	}
 	cp.metrics.RecordClaimAllocatedCPUs(claimCPUSet.Size())
 	cp.refreshAllocationMetrics()
 	return result
@@ -1144,7 +1197,78 @@ func (cp *CPUDriver) UnprepareResourceClaims(ctx context.Context, claims []kubel
 	return result, nil
 }
 
+func (cp *CPUDriver) refreshObligationMetrics() {
+	if len(cp.promiseObligations) == 0 {
+		cp.metrics.SetFrontierOldestObligationSeconds(0)
+		return
+	}
+	var oldest time.Time
+	for _, ob := range cp.promiseObligations {
+		if oldest.IsZero() || ob.prepareTime.Before(oldest) {
+			oldest = ob.prepareTime
+		}
+	}
+	cp.metrics.SetFrontierOldestObligationSeconds(time.Since(oldest).Seconds())
+}
+
+func (cp *CPUDriver) refreshMirrorMetrics() {
+	devices := cp.mirroredDevices()
+	if len(devices) == 0 {
+		cp.metrics.SetClaimsOffRecordedCache(0)
+		cp.metrics.SetMaxAbsCacheError(0)
+		return
+	}
+	holdings := cp.cpuAllocationStore.ClaimHoldings()
+
+	claimsOffRecorded := 0
+	for _, holding := range holdings {
+		if len(holding.Recorded) == 0 {
+			continue
+		}
+		off := false
+		for name, cpus := range devices {
+			charged := holding.Recorded[name]
+			occupied := cpus.Intersection(holding.Held).Size()
+			if charged != occupied {
+				off = true
+				break
+			}
+		}
+		if off {
+			claimsOffRecorded++
+		}
+	}
+	cp.metrics.SetClaimsOffRecordedCache(claimsOffRecorded)
+
+	maxAbsError := 0
+	for name, cpus := range devices {
+		size := cpus.Size()
+		correction := cp.publishedCorrection[name]
+		val := size + correction
+		consumed := 0
+		occupied := 0
+		for _, holding := range holdings {
+			consumed += holding.Recorded[name]
+			occupied += cpus.Intersection(holding.Held).Size()
+		}
+		freePhys := size - occupied
+		diff := (val - consumed) - freePhys
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > maxAbsError {
+			maxAbsError = diff
+		}
+	}
+	cp.metrics.SetMaxAbsCacheError(maxAbsError)
+}
+
 func (cp *CPUDriver) unprepareResourceClaim(logger logr.Logger, claim kubeletplugin.NamespacedObject) error {
+	if _, ok := cp.promiseObligations[claim.UID]; ok {
+		cp.metrics.RecordFrontierAdmissionOutcome("remained_unrepaired")
+		delete(cp.promiseObligations, claim.UID)
+		cp.refreshObligationMetrics()
+	}
 	if existing, ok := cp.cpuAllocationStore.GetClaimRecord(claim.UID); ok {
 		if existing.Correlation.RuntimeOutcome != "aligned" && existing.Correlation.RuntimeOutcome != "" {
 			logger.Info("claim unrepaired",
