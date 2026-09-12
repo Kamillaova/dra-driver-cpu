@@ -327,6 +327,19 @@ type driverConfigValues struct {
 	GroupBy                               string `json:"groupBy,omitempty"`
 	ReservedCPUs                          string `json:"reservedCPUs,omitempty"`
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
+	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+	// ReconcileSharedOnUnprepare defaults to true in the driver, so a config
+	// file that does not mention it leaves it on: absent must read as true,
+	// which a plain bool cannot express.
+	ReconcileSharedOnUnprepare *bool `json:"reconcileSharedOnUnprepare,omitempty"`
+}
+
+// reconcilesSharedOnUnprepare reports whether the driver widens shared
+// containers as soon as a claim is released, rather than at their next
+// lifecycle event.
+func (v driverConfigValues) reconcilesSharedOnUnprepare() bool {
+	return v.AssumeUnsolicitedUpdatesSafe &&
+		(v.ReconcileSharedOnUnprepare == nil || *v.ReconcileSharedOnUnprepare)
 }
 
 // getDriverConfigValues reads the ConfigMap if the daemonset uses --config=, else falls back to
