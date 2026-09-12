@@ -523,6 +523,11 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 // to co-locate workloads on hyperthreads of the same core.
 func createCPUDeviceSlices(deviceInfos []cpuDeviceInfo, pcieRootMapper *store.PCIeRootMapper, smtEnabled bool, nodeAllocatableResources bool) []resourceapi.Device {
 	var allDevices []resourceapi.Device
+	// CCX-FORK: individual mode never has declared partitions -- cpuPartitions
+	// requires grouped mode -- but its devices still answer the partition
+	// question, because a class selecting on that attribute fails with a CEL
+	// evaluation error, not a non-match, against a device that lacks it.
+	partition := Partition{Name: DefaultPartitionName, Role: PARTITION_ROLE_DEFAULT}
 	for _, deviceInfo := range deviceInfos {
 		cpu := deviceInfo.cpu
 		deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
@@ -537,6 +542,7 @@ func createCPUDeviceSlices(deviceInfos []cpuDeviceInfo, pcieRootMapper *store.PC
 			AttributeCPUID:      {IntValue: new(int64(cpu.CpuID))},
 		}
 		addCompatibilityAttributes(deviceAttrs, int64(cpu.NUMANodeID))
+		addPartitionAttributes(deviceAttrs, partition)
 		addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, cpu.CpuID)
 
 		cpuDevice := resourceapi.Device{

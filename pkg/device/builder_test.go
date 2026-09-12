@@ -239,6 +239,20 @@ func TestIndividualDevicesHaveNoGroupCacheAttributes(t *testing.T) {
 	}
 }
 
+// TestIndividualDevicesAnswerThePartitionQuestion: the shipped device class
+// selects on the partition attribute, and a device without it fails that
+// selector with an evaluation error rather than simply not matching. Individual
+// mode has no declared partitions, so every device is in the implicit one.
+func TestIndividualDevicesAnswerThePartitionQuestion(t *testing.T) {
+	devices, _ := device.Build(fakeCacheTopology(), cpuset.New(), store.NewPCIeRootMapper(), false)
+	require.NotEmpty(t, devices)
+	for _, dev := range devices {
+		require.Equal(t, device.DefaultPartitionName, *dev.Attributes[device.AttributePartition].StringValue, dev.Name)
+		require.Equal(t, device.PARTITION_ROLE_DEFAULT, *dev.Attributes[device.AttributeRole].StringValue, dev.Name)
+		require.Empty(t, dev.Taints, "device %q: the implicit partition is untainted", dev.Name)
+	}
+}
+
 // fakeSMTCacheTopology returns 16 CPUs on one socket and one NUMA node: 8 cores
 // of 2 threads across 2 uncore caches, i.e. the smallest shape with more than one
 // cache per NUMA node. Cores are 0-7, thread 1 of core c is CPU c+8.
