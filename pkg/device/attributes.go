@@ -62,6 +62,7 @@ const (
 	AttributeCPUSet                 resourceapi.QualifiedName = api.AttributeCPUSet
 	AttributeRelocatable            resourceapi.QualifiedName = api.AttributeRelocatable
 	AttributeAlignment              resourceapi.QualifiedName = api.AttributeAlignment
+	AttributeRepairRounds           resourceapi.QualifiedName = api.AttributeRepairRounds
 )
 
 // addPartitionAttributes names the partition a device's CPUs come from and what
