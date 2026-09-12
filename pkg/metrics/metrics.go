@@ -101,6 +101,7 @@ type Metrics struct {
 	nriCreateContainerDuration *prometheus.HistogramVec
 	nriStopContainerDuration   *prometheus.HistogramVec
 	nriRemoveContainerDuration *prometheus.HistogramVec
+	synchronizeSkippedClaims   prometheus.Counter
 }
 
 type metricKind string
@@ -206,6 +207,11 @@ var (
 		labels:  []string{"result", "cpu_allocation_mode"},
 		buckets: nriBuckets,
 	}
+	synchronizeSkippedClaimsSpec = metricSpec{
+		name: "dra_cpu_synchronize_skipped_claims_total",
+		kind: metricCounter,
+		help: "Total number of claims or containers Synchronize could not adopt from the runtime's reported state, skipped rather than aborting the whole call.",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -222,6 +228,7 @@ var metricSpecs = []metricSpec{
 	nriCreateContainerDurationSpec,
 	nriStopContainerDurationSpec,
 	nriRemoveContainerDurationSpec,
+	synchronizeSkippedClaimsSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -266,6 +273,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		nriCreateContainerDuration: newHistogramVec(nriCreateContainerDurationSpec),
 		nriStopContainerDuration:   newHistogramVec(nriStopContainerDurationSpec),
 		nriRemoveContainerDuration: newHistogramVec(nriRemoveContainerDurationSpec),
+		synchronizeSkippedClaims:   newCounter(synchronizeSkippedClaimsSpec),
 	}
 
 	reg.MustRegister(
@@ -282,6 +290,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriCreateContainerDuration,
 		m.nriStopContainerDuration,
 		m.nriRemoveContainerDuration,
+		m.synchronizeSkippedClaims,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -326,6 +335,13 @@ func newHistogramVec(spec metricSpec) *prometheus.HistogramVec {
 		Help:    spec.help,
 		Buckets: spec.buckets,
 	}, spec.labels)
+}
+
+func newCounter(spec metricSpec) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{
+		Name: spec.name,
+		Help: spec.help,
+	})
 }
 
 func (m *Metrics) SetAllocationState(state AllocationState) {
@@ -389,6 +405,10 @@ func determineAllocation(claimCount int) CPUAllocation {
 	return CPUAllocationExclusive
 }
 
+func (m *Metrics) RecordSynchronizeSkippedClaim() {
+	m.synchronizeSkippedClaims.Inc()
+}
+
 type noopRecorder struct{}
 
 // Noop returns a recorder that discards all metric observations.
@@ -404,3 +424,4 @@ func (noopRecorder) RecordNRISynchronize(error, time.Duration)          {}
 func (noopRecorder) RecordNRICreateContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
+func (noopRecorder) RecordSynchronizeSkippedClaim()                     {}

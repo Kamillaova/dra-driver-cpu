@@ -31,6 +31,10 @@ type Recorder interface {
 	RecordNRICreateContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRIStopContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRIRemoveContainer(err error, claimCount int, elapsed time.Duration)
+	// CCX-FORK: upstream's Recorder ends above. Synchronize here skips a claim
+	// it cannot adopt rather than failing the whole call, so it has something to
+	// count that upstream does not.
+	RecordSynchronizeSkippedClaim()
 }
 
 func (cp *CPUDriver) refreshAllocationMetrics() {
