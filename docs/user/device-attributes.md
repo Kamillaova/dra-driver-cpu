@@ -24,6 +24,8 @@ CPU group, `individual` one device per CPU.
 | `resource.kubernetes.io/numaNode` | int     | Standard NUMA node of the group (published when grouping by NUMA node)                                         |
 | `dra.cpu/socketID`                | int     | CPU socket of the group (published when grouping by NUMA node or socket)                                       |
 | `dra.cpu/numCPUs`                 | int     | CPUs available in the group                                                                                    |
+| `dra.cpu/partition`               | string  | The CPU partition the group's CPUs belong to, `default` on a node with no `cpuPartitions`                      |
+| `dra.cpu/role`                    | string  | That partition's role: `default` or `exclusive` for a group that publishes devices                             |
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled for this group's own cores                                              |
 | `dra.cpu/threadsPerCore`          | int     | This group's own uniform thread count per core (0 when its cores do not all agree); `smtEnabled` is `threadsPerCore > 1` |
 | `dra.cpu/largestUncoreCacheCPUs`  | int     | Allocatable CPUs in the group's largest uncore (L3/CCX) cache — the biggest claim it can align to one cache    |
@@ -57,8 +59,15 @@ These compatibility attributes will be removed in a future version:
 
 Grouped devices also expose the consumable capacity `dra.cpu/cpu` — the number of CPUs
 claimable from the group. With `groupBy: machine`, only `numCPUs`, `smtEnabled`,
-`threadsPerCore`, the uncore cache attributes, and — when `--expose-pcie-roots` is enabled —
-`resource.kubernetes.io/pcieRoot` are published.
+`threadsPerCore`, `partition`, `role`, the uncore cache attributes, and — when
+`--expose-pcie-roots` is enabled — `resource.kubernetes.io/pcieRoot` are published.
+
+A group is published per partition, so a NUMA node or socket split between partitions yields one
+device per partition with disjoint CPUs, named `<group device>-<partition>`. Every device of a
+declared partition carries the `NoSchedule` device taint `dra.cpu/partition=<name>`, so reaching it
+takes a request that tolerates that partition by name; the implicit `default` partition is
+untainted, which is where a claim that names no partition is allocated. See
+[Configuration](configuration.md) for the partition list itself.
 
 ### Individual mode
 
