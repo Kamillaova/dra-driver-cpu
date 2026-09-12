@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -43,18 +44,40 @@ type fakeContainerUpdater struct {
 	// onUpdate runs during the call, outside the driver's applyMu, which is when
 	// a container lifecycle event can really interleave with a round.
 	onUpdate func([]*api.ContainerUpdate)
+	// reply answers each call in turn when set, which is what a test about a
+	// partly applied batch needs: the first call refuses a container and a later
+	// one does not. call counts from one.
+	reply func(call int, updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error)
 }
 
 func (f *fakeContainerUpdater) UpdateContainers(updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, updates)
+	call := len(f.calls)
 	failed, err := f.failed, f.err
-	hook := f.onUpdate
+	hook, reply := f.onUpdate, f.reply
 	f.mu.Unlock()
 	if hook != nil {
 		hook(updates)
 	}
+	if reply != nil {
+		return reply(call, updates)
+	}
 	return failed, err
+}
+
+// refusing answers every call by refusing the updates for the named containers,
+// which is how a runtime reports a batch it applied only in part.
+func refusing(containerIDs ...string) func(int, []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
+	return func(_ int, updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
+		var failed []*api.ContainerUpdate
+		for _, update := range updates {
+			if slices.Contains(containerIDs, update.GetContainerId()) {
+				failed = append(failed, update)
+			}
+		}
+		return failed, nil
+	}
 }
 
 func (f *fakeContainerUpdater) allCalls() [][]*api.ContainerUpdate {
