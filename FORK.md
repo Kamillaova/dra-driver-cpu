@@ -92,10 +92,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `encodePlacements`, `decodePlacements`, `decodeRecordedDevices`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries`,
-  `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes`, `claimReader`, `namespace`
-  and `placementPolicy` fields, `deviceTopology.deviceIsPool`, `Providers.CgroupFS` and
-  `EnsureCgroupFS`, and `Config.DefragEnabled`, `Config.DefragAllowTransientOverlap` and
-  `Config.Namespace`
+  `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes`, `publishedCorrection`,
+  `claimReader`, `namespace` and `placementPolicy` fields, `deviceTopology.deviceIsPool`,
+  `Providers.CgroupFS` and `EnsureCgroupFS`, and `Config.DefragEnabled`,
+  `Config.DefragAllowTransientOverlap` and `Config.Namespace`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
   and the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields
@@ -114,7 +114,7 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
   `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
   `GetClaimRecord`, `SetRecordedDevices`, `IsRelocatable`, `HoldsExclusiveCPUs`,
-  `ExclusiveClaimAllocations`
+  `ExclusiveClaimAllocations`, `ClaimHolding` and `ClaimHoldings`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 
@@ -129,8 +129,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `Profile`, `ProfileLabel`, `DefaultProfileName`, `WithProfile`, `asProfile`, `validateProfiles` and
   `WarnDeprecatedCPUFields`
 
-- `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods and the collectors
-  behind them
+- `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods,
+  `SetFlooredCapacityDevices`, and the collectors behind them
 
 - `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
   `e2e_suite_test.go`, and the `defragEnabled`/`defragAllowTransientOverlap`/`fullPhysicalCPUsOnly`
@@ -143,10 +143,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   they pin, rather than kept apart
 
 Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/cgroupfs`, `pkg/driver/defrag.go`,
-`reconcile.go`, `placements.go`, `deviceorder.go`, `poison.go`, `claim_reader.go`,
-`pkg/cpuinfo/coretopology.go`, `api/attributes.go`, `api/v1alpha1/projection.go`,
-`deployment/helm/dra-driver-cpu/templates/role.yaml`, `rolebinding.yaml`) are visible to
-`git diff --stat` on their own and are not repeated here.
+`reconcile.go`, `placements.go`, `deviceorder.go`, `poison.go`, `mirror.go`, `claim_reader.go`,
+`pkg/cpuinfo/coretopology.go`, `pkg/device/partition.go`, `api/attributes.go`,
+`api/v1alpha1/projection.go`, `deployment/helm/dra-driver-cpu/templates/role.yaml`,
+`rolebinding.yaml`) are visible to `git diff --stat` on their own and are not repeated here.
 
 `api/` is a nested module here (`api/go.mod`), because the scheduler plugin that reads the driver's
 device attributes pins it independently and importing it must not drag in the whole driver. Upstream
