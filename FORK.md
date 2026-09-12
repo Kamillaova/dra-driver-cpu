@@ -116,6 +116,8 @@ These carry no fork-only code and are intended to be offered upstream as separat
 - uncore cache geometry device attributes
 - claim-ownership authentication against `Container.CDIDevices` (as an *additive* check)
 - `fullPhysicalCPUsOnly` — upstream issue #45
+- CPU partitions: the `cpuPartitions` list, the devices and taints it publishes, and its
+  verification against the node's own thread arity
 - shared-pool reconcile after unprepare — upstream issue #279
 
 The defragmenter itself is not upstreamable in the near term: it needs a runtime opt-in, and moving a
