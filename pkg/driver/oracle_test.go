@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -39,6 +40,7 @@ import (
 	"k8s.io/utils/cpuset"
 
 	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuallocator"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
@@ -55,17 +57,18 @@ type oracleTopologyConfig struct {
 }
 
 type oracleClaim struct {
-	uid           types.UID
-	namespace     string
-	name          string
-	size          int
-	relocatable   bool
-	alignment     v1alpha1.Alignment
-	flexible      bool
-	podUID        types.UID
-	containerName string
-	containerUID  types.UID
-	chargedCache  string
+	uid                 types.UID
+	namespace           string
+	name                string
+	size                int
+	relocatable         bool
+	alignment           v1alpha1.Alignment
+	flexible            bool
+	podUID              types.UID
+	containerName       string
+	containerUID        types.UID
+	sharedContainerUIDs []types.UID
+	chargedCache        string
 
 	isAllocated   bool
 	isPrepared    bool
@@ -75,6 +78,11 @@ type oracleClaim struct {
 
 	initialCPUs cpuset.CPUSet
 	currentCPUs cpuset.CPUSet
+}
+
+func (c *oracleClaim) allContainers() []types.UID {
+	res := []types.UID{c.containerUID}
+	return append(res, c.sharedContainerUIDs...)
 }
 
 type oracleClaimReader struct {
@@ -310,6 +318,53 @@ func (h *oracleHarness) createClaim(uid string, size int, chargedCacheID int, re
 	return c
 }
 
+func (h *oracleHarness) createJointClaim(uid string, podUID, containerUID types.UID, containerName string, size int, chargedCacheID int, relocatable bool, alignment v1alpha1.Alignment, flexible bool) *oracleClaim {
+	c := &oracleClaim{
+		uid:           types.UID(uid),
+		namespace:     "default",
+		name:          "pod-" + string(podUID),
+		size:          size,
+		relocatable:   relocatable,
+		alignment:     alignment,
+		flexible:      flexible,
+		podUID:        podUID,
+		containerName: containerName,
+		containerUID:  containerUID,
+		chargedCache:  cacheDevice(chargedCacheID),
+	}
+	h.claims[c.uid] = c
+	return c
+}
+
+func getContainerLiveCPUs(cgroups fstest.MapFS, containerUID types.UID) cpuset.CPUSet {
+	dir, err := cgroupfs.Dir("/kubepods/" + string(containerUID))
+	if err != nil {
+		return cpuset.New()
+	}
+	f, ok := cgroups[dir+"/cpuset.cpus.effective"]
+	if !ok || f == nil {
+		return cpuset.New()
+	}
+	parsed, err := cpuset.Parse(strings.TrimSpace(string(f.Data)))
+	if err != nil {
+		return cpuset.New()
+	}
+	return parsed
+}
+
+func (h *oracleHarness) syncContainerLiveCPUs(ctrUID types.UID) {
+	ctrCPUs := cpuset.New()
+	for _, c := range h.claims {
+		if !c.isPrepared {
+			continue
+		}
+		if c.containerUID == ctrUID || slices.Contains(c.sharedContainerUIDs, ctrUID) {
+			ctrCPUs = ctrCPUs.Union(c.currentCPUs)
+		}
+	}
+	setContainerLiveCPUs(h.cgroups, ctrUID, ctrCPUs)
+}
+
 func (h *oracleHarness) buildResourceClaim(c *oracleClaim) *resourceapi.ResourceClaim {
 	opaqueCfg := v1alpha1.OpaqueConfig{
 		APIVersion: v1alpha1.APIVersion,
@@ -458,10 +513,20 @@ func (h *oracleHarness) Prepare(claim *oracleClaim) {
 
 	h.driver.applyMu.Lock()
 	_, _ = h.driver.claimTracker.SetOwner(testr.New(h.t), claim.podUID, claim.containerName, claim.uid)
-	h.driver.podConfigStore.SetContainerState(claim.podUID,
-		store.NewContainerState(claim.containerName, claim.containerUID, claim.uid).WithCgroup(cgroupOf(claim.containerUID)))
+	existingState := h.driver.podConfigStore.GetContainerState(claim.podUID, claim.containerName)
+	if existingState != nil {
+		allClaims := append(existingState.ClaimUIDs(), claim.uid)
+		h.driver.podConfigStore.SetContainerState(claim.podUID,
+			store.NewContainerState(claim.containerName, claim.containerUID, allClaims...).WithCgroup(cgroupOf(claim.containerUID)))
+	} else {
+		h.driver.podConfigStore.SetContainerState(claim.podUID,
+			store.NewContainerState(claim.containerName, claim.containerUID, claim.uid).WithCgroup(cgroupOf(claim.containerUID)))
+	}
 	h.driver.applyMu.Unlock()
-	setContainerLiveCPUs(h.cgroups, claim.containerUID, placed)
+
+	for _, ctrUID := range claim.allContainers() {
+		h.syncContainerLiveCPUs(ctrUID)
+	}
 
 	h.AssertInvariants()
 }
@@ -490,7 +555,10 @@ func (h *oracleHarness) BeginMove(claim *oracleClaim, target cpuset.CPUSet) {
 func (h *oracleHarness) CommitMove(claim *oracleClaim, target cpuset.CPUSet) {
 	h.t.Helper()
 	logger := testr.New(h.t)
-	setContainerLiveCPUs(h.cgroups, claim.containerUID, target)
+	claim.currentCPUs = target
+	for _, ctrUID := range claim.allContainers() {
+		h.syncContainerLiveCPUs(ctrUID)
+	}
 
 	require.NoError(h.t, h.driver.cpuAllocationStore.CommitRebind(logger, claim.uid))
 
@@ -498,7 +566,6 @@ func (h *oracleHarness) CommitMove(claim *oracleClaim, target cpuset.CPUSet) {
 	require.NoError(h.t, h.driver.writeClaimPlacement(logger, claim.uid))
 	h.driver.applyMu.Unlock()
 
-	claim.currentCPUs = target
 	delete(h.activeTransitClaims, claim.uid)
 	h.inTransit = len(h.activeTransitClaims) > 0
 
@@ -558,8 +625,14 @@ func (h *oracleHarness) CommitSwap(claimA, claimB *oracleClaim) {
 
 	targetA := claimB.currentCPUs
 	targetB := claimA.currentCPUs
-	setContainerLiveCPUs(h.cgroups, claimA.containerUID, targetA)
-	setContainerLiveCPUs(h.cgroups, claimB.containerUID, targetB)
+	claimA.currentCPUs = targetA
+	claimB.currentCPUs = targetB
+
+	for _, c := range []*oracleClaim{claimA, claimB} {
+		for _, ctrUID := range c.allContainers() {
+			h.syncContainerLiveCPUs(ctrUID)
+		}
+	}
 
 	require.NoError(h.t, h.driver.cpuAllocationStore.CommitSwap(logger, claimA.uid, claimB.uid))
 
@@ -568,8 +641,6 @@ func (h *oracleHarness) CommitSwap(claimA, claimB *oracleClaim) {
 	require.NoError(h.t, h.driver.writeClaimPlacement(logger, claimB.uid))
 	h.driver.applyMu.Unlock()
 
-	claimA.currentCPUs = targetA
-	claimB.currentCPUs = targetB
 	delete(h.activeTransitClaims, claimA.uid)
 	delete(h.activeTransitClaims, claimB.uid)
 	h.inTransit = len(h.activeTransitClaims) > 0
@@ -605,6 +676,10 @@ func (h *oracleHarness) Unprepare(claim *oracleClaim) {
 	claim.isPrepared = false
 	claim.isUnprepared = true
 	claim.currentCPUs = cpuset.New()
+
+	for _, ctrUID := range claim.allContainers() {
+		h.syncContainerLiveCPUs(ctrUID)
+	}
 
 	h.AssertInvariants()
 }
@@ -729,6 +804,9 @@ func (h *oracleHarness) CrashAndRestart() {
 			if ok {
 				claim.currentCPUs = current
 			}
+			for _, ctrUID := range claim.allContainers() {
+				h.syncContainerLiveCPUs(ctrUID)
+			}
 		}
 	}
 
@@ -817,6 +895,46 @@ func (h *oracleHarness) AssertInvariants() {
 			require.True(h.t, ok, "immobile claim %s missing from store", claim.uid)
 			require.True(h.t, current.Equals(claim.initialCPUs),
 				"immobile claim %s cpuset shifted: initial=%s, current=%s", claim.uid, claim.initialCPUs.String(), current.String())
+		}
+	}
+
+	h.assertThreeWayInvariant()
+}
+
+func (h *oracleHarness) assertThreeWayInvariant() {
+	h.t.Helper()
+	if h.inTransit {
+		return
+	}
+
+	containerClaims := make(map[types.UID]cpuset.CPUSet)
+	for _, claim := range h.claims {
+		if claim.isPrepared {
+			record, ok := h.driver.cpuAllocationStore.GetClaimRecord(claim.uid)
+			require.True(h.t, ok, "prepared claim %s must have record in store", claim.uid)
+			claimCPUs, ok := h.driver.cpuAllocationStore.GetResourceClaimAllocation(claim.uid)
+			require.True(h.t, ok, "prepared claim %s must have allocation in store", claim.uid)
+			require.False(h.t, claimCPUs.IsEmpty(), "prepared claim %s must have non-empty CPUs in store", claim.uid)
+			require.True(h.t, claimCPUs.Equals(claim.currentCPUs), "store CPUs %s != claim current CPUs %s", claimCPUs.String(), claim.currentCPUs.String())
+			require.True(h.t, claimCPUs.Equals(store.UnionOf(record.Requests)), "store allocation %s != record requests %s", claimCPUs.String(), store.UnionOf(record.Requests).String())
+
+			devName := getCDIDeviceName(claim.uid)
+			cdiRecord, err := h.mockCDI.GetDeviceAllocations(devName)
+			require.NoError(h.t, err, "CDI device %s must exist", devName)
+			require.True(h.t, store.UnionOf(cdiRecord.Requests).Equals(claimCPUs), "CDI allocated CPUs %s != store CPUs %s", store.UnionOf(cdiRecord.Requests).String(), claimCPUs.String())
+
+			for _, ctrUID := range claim.allContainers() {
+				containerClaims[ctrUID] = containerClaims[ctrUID].Union(claimCPUs)
+			}
+		}
+	}
+
+	if !h.inTransit {
+		for ctrUID, expectedCPUs := range containerClaims {
+			liveCPUs := getContainerLiveCPUs(h.cgroups, ctrUID)
+			require.True(h.t, liveCPUs.Equals(expectedCPUs),
+				"kernel cgroup cpuset %s for container %s does not match expected claim union %s",
+				liveCPUs.String(), ctrUID, expectedCPUs.String())
 		}
 	}
 }
@@ -1252,4 +1370,129 @@ func TestInvariantOracle_ReplacementPodPrepareBeforeEvictedUnprepare(t *testing.
 		}
 	}
 	h.driver.applyMu.Unlock()
+}
+
+func TestInvariantOracle_JointClaimLifecycle(t *testing.T) {
+	h := newOracleHarness(t, oracleTopologyConfig{
+		numaNodes:     2,
+		cachesPerNUMA: 2,
+		cpusPerCache:  []int{4},
+	})
+
+	podUID := types.UID("joint-pod")
+	ctrUID := types.UID("joint-ctr")
+	ctrName := "joint-container"
+
+	c1 := h.createJointClaim("claim-joint-1", podUID, ctrUID, ctrName, 2, 0, true, v1alpha1.AlignmentBestEffort, true)
+	c2 := h.createJointClaim("claim-joint-2", podUID, ctrUID, ctrName, 2, 0, true, v1alpha1.AlignmentBestEffort, true)
+
+	h.Allocate(c1)
+	h.Allocate(c2)
+
+	h.Prepare(c1)
+	require.Equal(t, c1.currentCPUs, getContainerLiveCPUs(h.cgroups, ctrUID))
+
+	h.Prepare(c2)
+	expectedUnion := c1.currentCPUs.Union(c2.currentCPUs)
+	require.Equal(t, 4, expectedUnion.Size())
+	require.Equal(t, expectedUnion, getContainerLiveCPUs(h.cgroups, ctrUID))
+
+	target := cpuset.New(4, 5)
+	h.BeginMove(c1, target)
+	h.CommitMove(c1, target)
+	expectedAfterMove := c1.currentCPUs.Union(c2.currentCPUs)
+	require.Equal(t, expectedAfterMove, getContainerLiveCPUs(h.cgroups, ctrUID))
+
+	h.Unprepare(c1)
+	require.Equal(t, c2.currentCPUs, getContainerLiveCPUs(h.cgroups, ctrUID))
+
+	h.Unprepare(c2)
+	require.True(t, getContainerLiveCPUs(h.cgroups, ctrUID).IsEmpty())
+
+	h.Deallocate(c1)
+	h.Deallocate(c2)
+	h.Delete(c1)
+	h.Delete(c2)
+}
+
+func TestInvariantOracle_SharedClaimLifecycle(t *testing.T) {
+	h := newOracleHarness(t, oracleTopologyConfig{
+		numaNodes:     2,
+		cachesPerNUMA: 2,
+		cpusPerCache:  []int{4},
+	})
+
+	podUID := types.UID("shared-claim-pod")
+	ctr1UID := types.UID("shared-ctr-1")
+	ctr2UID := types.UID("shared-ctr-2")
+
+	c1 := h.createJointClaim("claim-shared-1", podUID, ctr1UID, "ctr-1", 2, 0, true, v1alpha1.AlignmentBestEffort, true)
+	c1.sharedContainerUIDs = append(c1.sharedContainerUIDs, ctr2UID)
+
+	h.Allocate(c1)
+	h.Prepare(c1)
+
+	h.driver.applyMu.Lock()
+	h.driver.podConfigStore.SetContainerState(podUID,
+		store.NewContainerState("ctr-2", ctr2UID, c1.uid).WithCgroup(cgroupOf(ctr2UID)))
+	h.driver.applyMu.Unlock()
+	h.syncContainerLiveCPUs(ctr2UID)
+
+	h.AssertInvariants()
+	require.Equal(t, c1.currentCPUs, getContainerLiveCPUs(h.cgroups, ctr1UID))
+	require.Equal(t, c1.currentCPUs, getContainerLiveCPUs(h.cgroups, ctr2UID))
+
+	target := cpuset.New(4, 5)
+	h.BeginMove(c1, target)
+	h.CommitMove(c1, target)
+
+	require.Equal(t, target, getContainerLiveCPUs(h.cgroups, ctr1UID))
+	require.Equal(t, target, getContainerLiveCPUs(h.cgroups, ctr2UID))
+
+	h.Unprepare(c1)
+	h.AssertInvariants()
+	require.True(t, getContainerLiveCPUs(h.cgroups, ctr1UID).IsEmpty())
+	require.True(t, getContainerLiveCPUs(h.cgroups, ctr2UID).IsEmpty())
+
+	h.Deallocate(c1)
+	h.Delete(c1)
+}
+
+func TestInvariantOracle_RequeueLifecycle(t *testing.T) {
+	h := newOracleHarness(t, oracleTopologyConfig{
+		numaNodes:     2,
+		cachesPerNUMA: 2,
+		cpusPerCache:  []int{4},
+	})
+
+	c1 := h.createClaim("claim-requeue", 2, 0, true, v1alpha1.AlignmentBestEffort, true)
+	h.Allocate(c1)
+	h.Prepare(c1)
+
+	h.driver.applyMu.Lock()
+	holdings := h.driver.cpuAllocationStore.ClaimHoldings()
+	require.Equal(t, 2, holdings[c1.uid].Recorded[cacheDevice(0)])
+	h.driver.applyMu.Unlock()
+
+	h.Unprepare(c1)
+	h.Deallocate(c1)
+	h.AssertInvariants()
+
+	c1.chargedCache = cacheDevice(1)
+	h.Allocate(c1)
+	h.Prepare(c1)
+
+	h.driver.applyMu.Lock()
+	holdingsAfter := h.driver.cpuAllocationStore.ClaimHoldings()
+	require.Equal(t, 2, holdingsAfter[c1.uid].Recorded[cacheDevice(1)])
+	require.Equal(t, 0, holdingsAfter[c1.uid].Recorded[cacheDevice(0)])
+	h.driver.applyMu.Unlock()
+
+	require.Equal(t, 2, c1.currentCPUs.Size())
+	require.True(t, c1.currentCPUs.IsSubsetOf(h.cacheIDToCPUs[1]))
+
+	h.Unprepare(c1)
+	h.Deallocate(c1)
+	h.Delete(c1)
+	h.AssertInvariants()
 }
