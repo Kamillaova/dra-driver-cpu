@@ -30,6 +30,7 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 )
 
 func TestClaimConfigMapReaderAllocatedClaims(t *testing.T) {
@@ -89,6 +90,7 @@ func TestClaimConfigMapReaderAllocatedClaims(t *testing.T) {
 		driverName: driverName,
 		namespace:  namespace,
 		kubeClient: client,
+		metrics:    cpumetrics.Noop(),
 	}
 
 	require.NoError(t, watchAllocatedClaims(context.Background(), d))
@@ -122,6 +124,7 @@ func TestClaimConfigMapReaderMissingOrCorrupt(t *testing.T) {
 		driverName: driverName,
 		namespace:  namespace,
 		kubeClient: client,
+		metrics:    cpumetrics.Noop(),
 	}
 
 	require.NoError(t, watchAllocatedClaims(context.Background(), d))
@@ -203,6 +206,7 @@ func TestClaimConfigMapReaderAcceptsARestartedProjector(t *testing.T) {
 		driverName: driverName,
 		namespace:  namespace,
 		kubeClient: client,
+		metrics:    cpumetrics.Noop(),
 	}
 
 	require.NoError(t, watchAllocatedClaims(context.Background(), d))
