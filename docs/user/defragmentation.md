@@ -112,10 +112,15 @@ stopped making things worse there, and the containers involved keep running.
   call a move uses, and applies against the container's current state: a claim's cpuset survives a
   resize, including a resize issued after the claim has been moved. Verified on containerd
   v2.4.0-beta.0, and pinned by an e2e spec.
-- **A move is invisible to the scheduler.** It changes neither a device's `capacity` nor any claim's
-  `consumedCapacity`, so no `ResourceSlice` is republished, no scheduler cache is invalidated, and no
-  write reaches the API server. Fencing a NUMA node is the one thing here that does reach the API
-  server: the taint has to, or the scheduler would keep sending claims to a node that refuses them.
+- **A move leaves a claim's `consumedCapacity` alone, and changes what its devices publish.** A
+  claim's allocation cannot be rewritten, so a claim moved off the device it was allocated from is
+  still charged there. Under `groupBy: numanode` and `socket` a move stays inside one device and
+  nothing changes; under `groupBy: uncorecache` a device is one cache, and the capacity published for
+  the two caches involved carries the difference, so that a scheduler subtracting what it charged
+  arrives at the CPUs really free. That publication reaches the API server: the destination is
+  shrunk before the containers are touched, and the origin grows once the runtime confirms. Fencing
+  a NUMA node reaches it too — the taint has to, or the scheduler would keep sending claims to a
+  node that refuses them.
 - **It cannot fix a bad node choice.** The scheduler sees only how many CPUs are free on a node, never
   their shape, so it can bind a large claim to a node that genuinely cannot free a cache while a
   neighbour could. A bound claim cannot move to another node.
@@ -127,10 +132,10 @@ stopped making things worse there, and the containers involved keep running.
 
 `defragEnabled` is refused at startup unless all of the following hold.
 
-- **`cpuDeviceMode: grouped` with `groupBy: numanode` or `socket`.** These are the modes where the
-  driver chooses a claim's CPUs in the first place. In `individual` mode the scheduler picks exact
-  per-CPU devices, and with `groupBy: machine` the cpuset comes from the claim's own opaque config, so
-  in both cases the placement is not the driver's to change.
+- **`cpuDeviceMode: grouped` with `groupBy: numanode`, `socket` or `uncorecache`.** These are the
+  modes where the driver chooses a claim's CPUs in the first place. In `individual` mode the scheduler
+  picks exact per-CPU devices, and with `groupBy: machine` the cpuset comes from the claim's own opaque
+  config, so in both cases the placement is not the driver's to change.
 - **`assumeUnsolicitedUpdatesSafe: true`.** See below.
 
 ### Runtime support
