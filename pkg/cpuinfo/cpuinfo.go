@@ -39,6 +39,24 @@ func ProcfsRoot() string {
 	return path.Join(os.Getenv("HOST_ROOT"), procfsRoot)
 }
 
+// OnlineCPUs reports the kernel's online CPU set as it stands now.
+//
+// CCX-FORK: upstream unexported its reader, on the ground that callers should
+// consume the topology-validated subset instead. That holds for everything
+// derived once at start-up, and this fork follows it there. The defragmenter is
+// the exception it does not cover: a pass must notice that a CPU went offline
+// after the driver started, which a start-time set cannot express by
+// construction. Callers intersect what they get back with the scope they are
+// planning, so a CPU that came online later is not mistaken for free space.
+func OnlineCPUs(logger logr.Logger, sysfs fs.ReadLinkFS) (cpuset.CPUSet, error) {
+	online, err := readOnlineCPUs(sysfs)
+	if err != nil {
+		return cpuset.New(), err
+	}
+	logger.V(4).Info("read online CPUs", "cpus", online.String())
+	return online, nil
+}
+
 // readOnlineCPUs returns the kernel's raw online CPU set. Callers that need
 // CPUs usable by the driver should use CPUTopology.CPUDetails instead.
 func readOnlineCPUs(sysfs fs.ReadLinkFS) (cpuset.CPUSet, error) {
