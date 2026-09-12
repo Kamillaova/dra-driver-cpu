@@ -184,3 +184,56 @@ func TestCompleteCoresIsIdempotent(t *testing.T) {
 	once := repeatingCoreIDs.CompleteCores(cpuset.New(0, 1, 5))
 	assert.Equal(t, once, repeatingCoreIDs.CompleteCores(once))
 }
+
+func TestUniformThreadsPerCore(t *testing.T) {
+	tests := []struct {
+		name    string
+		details CPUDetails
+		cpus    cpuset.CPUSet
+		want    int
+	}{
+		{
+			name:    "all cores two-way",
+			details: repeatingCoreIDs,
+			cpus:    repeatingCoreIDs.CPUs(),
+			want:    2,
+		},
+		{
+			// A core only partly present still has both threads, so the
+			// count stays 2 rather than becoming mixed.
+			name:    "partially present core still counts its siblings",
+			details: repeatingCoreIDs,
+			cpus:    cpuset.New(0, 1),
+			want:    2,
+		},
+		{
+			name:    "mixed thread counts are not uniform",
+			details: hybridCores,
+			cpus:    hybridCores.CPUs(),
+			want:    0,
+		},
+		{
+			name:    "single-threaded cores only",
+			details: hybridCores,
+			cpus:    cpuset.New(2, 3),
+			want:    1,
+		},
+		{
+			name:    "empty",
+			details: repeatingCoreIDs,
+			cpus:    cpuset.New(),
+			want:    0,
+		},
+		{
+			name:    "cpus outside the topology are ignored",
+			details: repeatingCoreIDs,
+			cpus:    cpuset.New(0, 99),
+			want:    2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.details.UniformThreadsPerCore(tt.cpus))
+		})
+	}
+}

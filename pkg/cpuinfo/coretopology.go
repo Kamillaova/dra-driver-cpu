@@ -116,3 +116,44 @@ func (d CPUDetails) CompleteCores(cpus cpuset.CPUSet) cpuset.CPUSet {
 	}
 	return cpuset.New(complete...)
 }
+
+// UniformThreadsPerCore returns how many threads each physical core in cpus has,
+// when every one of them has the same count. It returns 0 when the counts differ
+// or cpus is empty, so callers that can only act on a uniform core size — such as
+// expressing it as a single allocation step — can detect that up front.
+//
+// Counts are taken from the receiver, which must be the full topology: a core
+// only partly present in cpus still has all of its threads.
+func (d CPUDetails) UniformThreadsPerCore(cpus cpuset.CPUSet) int {
+	threads := 0
+	for _, loc := range d.coreLocationsOf(cpus) {
+		n := d.CPUsInCoreLocations(loc).Size()
+		if threads == 0 {
+			threads = n
+			continue
+		}
+		if n != threads {
+			return 0
+		}
+	}
+	return threads
+}
+
+// coreLocationsOf returns the distinct physical cores the CPUs in cpus occupy,
+// skipping CPUs absent from this CPUDetails.
+func (d CPUDetails) coreLocationsOf(cpus cpuset.CPUSet) []CoreLocation {
+	seen := make(map[CoreLocation]struct{})
+	var locs []CoreLocation
+	for _, cpuID := range cpus.List() {
+		loc, ok := d.CoreOf(cpuID)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[loc]; dup {
+			continue
+		}
+		seen[loc] = struct{}{}
+		locs = append(locs, loc)
+	}
+	return locs
+}

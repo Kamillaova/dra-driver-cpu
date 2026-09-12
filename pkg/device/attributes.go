@@ -46,6 +46,10 @@ const (
 	AttributeCoreID     resourceapi.QualifiedName = "dra.cpu/coreID"
 	AttributeCPUID      resourceapi.QualifiedName = "dra.cpu/cpuID"
 	AttributeNumCPUs    resourceapi.QualifiedName = "dra.cpu/numCPUs"
+	// AttributeThreadsPerCore is a grouped device's own uniform thread-per-core
+	// count (0 when its cores do not all agree), independent of node-wide SMT:
+	// AttributeSMTEnabled is true exactly when this is greater than one.
+	AttributeThreadsPerCore resourceapi.QualifiedName = "dra.cpu/threadsPerCore"
 	// AttributeLargestUncoreCacheCPUs is the largest number of allocatable CPUs
 	// sharing one uncore cache within a grouped device, i.e. the biggest claim
 	// the group could satisfy from a single cache. It is not a per-cache size:
