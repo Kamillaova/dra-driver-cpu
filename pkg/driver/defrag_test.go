@@ -27,6 +27,7 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
+	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/defrag"
@@ -35,6 +36,8 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/cpuset"
@@ -172,6 +175,13 @@ func (d *defragTestDriver) placeClaim(t *testing.T, claimUID types.UID, cpus cpu
 func (d *defragTestDriver) placeFixedClaim(t *testing.T, claimUID types.UID, cpus cpuset.CPUSet) {
 	t.Helper()
 	d.place(t, claimUID, exclusiveOn(cpus))
+}
+
+func (d *defragTestDriver) placeRepairableClaim(t *testing.T, claimUID types.UID, cpus cpuset.CPUSet) {
+	t.Helper()
+	rec := relocatableOn(cpus)
+	rec.Alignment = v1alpha1.AlignmentRepairable
+	d.place(t, claimUID, rec)
 }
 
 func (d *defragTestDriver) place(t *testing.T, claimUID types.UID, record store.ClaimRecord) {
@@ -1476,5 +1486,104 @@ func TestExactPlanArbitration(t *testing.T) {
 
 	d.applyMu.Lock()
 	require.False(t, d.hasActiveExactPlan(0), "expected active exact plan to be cleared after ledger mismatch")
+	d.applyMu.Unlock()
+}
+
+func TestClaimMovableExcludesRepairable(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-permissive", cpuset.New(0, 1))
+	d.placeRepairableClaim(t, "claim-repairable", cpuset.New(2, 3))
+
+	d.applyMu.Lock()
+	defer d.applyMu.Unlock()
+
+	require.True(t, d.claimMovable("claim-permissive"))
+	require.False(t, d.claimMovable("claim-repairable"))
+	require.True(t, d.claimMovableForExact("claim-repairable"))
+}
+
+func TestDefragPassRepairsRepairableClaimWithExactSearch(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeRepairableClaim(t, "claim-split", cpuset.New(0, 4))
+	d.runContainer(t, "pod-1", "cont-1", "container-1", "claim-split")
+
+	logger := testr.New(t)
+	scope := defaultScope(0)
+	online := d.allCPUs
+
+	d.applyMu.Lock()
+	greedyMoves := d.planScopeMoves(logger, scope, online)
+	require.Empty(t, greedyMoves)
+	d.applyMu.Unlock()
+
+	round := d.beginDefragRound(logger, scope, online)
+	require.NotNil(t, round)
+	require.Len(t, round.moves, 1)
+	require.Equal(t, types.UID("claim-split"), round.moves[0].ClaimUID)
+	require.True(t, round.moves[0].To.IsSubsetOf(cpuset.New(0, 1, 2, 3)) || round.moves[0].To.IsSubsetOf(cpuset.New(4, 5, 6, 7)))
+
+	d.applyMu.Lock()
+	require.True(t, d.hasActiveExactPlan(0))
+	require.False(t, d.cpuAllocationStore.ReservedClosure(0).IsEmpty())
+	d.applyMu.Unlock()
+
+	res := d.finishDefragRound(logger, round, nil, nil)
+	require.Equal(t, cpumetrics.ResultSuccess, res)
+
+	d.applyMu.Lock()
+	require.False(t, d.hasActiveExactPlan(0))
+	require.True(t, d.cpuAllocationStore.ReservedClosure(0).IsEmpty())
+	record, ok := d.cpuAllocationStore.GetClaimRecord("claim-split")
+	require.True(t, ok)
+	nodeTopo, err := defrag.NewTopology(d.topology.cpuTopology, 0, d.allCPUs)
+	require.NoError(t, err)
+	require.Equal(t, 0, nodeTopo.ExcessSpread(store.UnionOf(record.Requests)))
+	d.applyMu.Unlock()
+}
+
+type fakeClaimReader struct {
+	claims []*resourceapi.ResourceClaim
+}
+
+func (f fakeClaimReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, error) {
+	return f.claims, nil
+}
+
+func TestAllocatedUnpreparedCPUsTreatedAsConsumed(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	d.topology.deviceNameToCPUs = map[string]cpuset.CPUSet{
+		"dev-0": cpuset.New(0, 1),
+	}
+
+	d.claimReader = fakeClaimReader{
+		claims: []*resourceapi.ResourceClaim{
+			{
+				ObjectMeta: metav1.ObjectMeta{UID: "unprepared-claim"},
+				Status: resourceapi.ResourceClaimStatus{
+					Allocation: &resourceapi.AllocationResult{
+						Devices: resourceapi.DeviceAllocationResult{
+							Results: []resourceapi.DeviceRequestAllocationResult{
+								{
+									Driver: d.driverName,
+									Device: "dev-0",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	unprepared := d.allocatedUnpreparedCPUs(0)
+	require.True(t, unprepared.Equals(cpuset.New(0, 1)))
+
+	logger := testr.New(t)
+	scope := defaultScope(0)
+	d.applyMu.Lock()
+	view, ok := d.defragView(logger, scope, d.allCPUs)
+	require.True(t, ok)
+	require.False(t, view.free.Contains(0))
+	require.False(t, view.free.Contains(1))
 	d.applyMu.Unlock()
 }

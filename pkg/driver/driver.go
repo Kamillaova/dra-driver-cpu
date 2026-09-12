@@ -157,6 +157,7 @@ type CPUDriver struct {
 	// move depends on has been stored. Nil until Start fills its cache, and left
 	// nil when nothing moves a claim.
 	storedSlices storedSliceReader
+	claimReader  claimReader
 	// reconcileTrigger carries coalesced reconcile requests to the worker
 	// goroutine. Nil when no feature needs it.
 	reconcileTrigger chan struct{}
@@ -824,6 +825,12 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 			return asyncErr, fmt.Errorf("failed to watch this node's ResourceSlices: %w", err)
 		}
 		cp.storedSlices = reader
+
+		claimReader, err := watchAllocatedClaims(ctx, cp)
+		if err != nil {
+			return asyncErr, fmt.Errorf("failed to watch ResourceClaims: %w", err)
+		}
+		cp.claimReader = claimReader
 	}
 	// CCX-FORK: upstream starts no worker here and never pushes an update the
 	// runtime did not ask for, so it hands the stub to nothing.

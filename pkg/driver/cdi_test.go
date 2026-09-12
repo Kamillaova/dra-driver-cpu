@@ -24,6 +24,7 @@ import (
 
 	"github.com/go-logr/logr/testr"
 	"github.com/google/go-cmp/cmp"
+	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
@@ -47,7 +48,10 @@ func getSpecFromCache(mgr *CdiManager, targetSpecName string) *cdiSpec.Spec {
 // exclusiveOn is the allocation shape of every claim this driver prepares
 // today: one request granting CPUs the claim holds alone.
 func exclusiveOn(cpus cpuset.CPUSet) store.ClaimRecord {
-	return store.ClaimRecord{Requests: []store.RequestAllocation{{Request: "cpus", CPUs: cpus, Role: store.RoleExclusive}}}
+	return store.ClaimRecord{
+		Requests:  []store.RequestAllocation{{Request: "cpus", CPUs: cpus, Role: store.RoleExclusive}},
+		Alignment: v1alpha1.AlignmentBestEffort,
+	}
 }
 
 // relocatableOn is a claim that permits its CPUs to change, which is what a
@@ -124,6 +128,7 @@ func TestAddDevice(t *testing.T) {
 						Annotations: map[string]string{
 							cdiPlacementsAnnotation:  `[{"request":"cpus","cpus":"0-1","role":"exclusive"}]`,
 							cdiRelocatableAnnotation: "false",
+							cdiAlignmentAnnotation:   "BestEffort",
 						},
 						ContainerEdits: cdiSpec.ContainerEdits{
 							Env: []string{tc.envVar},
@@ -341,7 +346,8 @@ func TestGetDeviceAllocationsFallsBackToEnv(t *testing.T) {
 	got, err := mgr.GetDeviceAllocations(deviceName)
 	require.NoError(t, err)
 	require.Equal(t, store.ClaimRecord{
-		Requests: []store.RequestAllocation{{CPUs: cpuset.New(4, 5), Role: store.RoleExclusive}},
+		Requests:  []store.RequestAllocation{{CPUs: cpuset.New(4, 5), Role: store.RoleExclusive}},
+		Alignment: v1alpha1.AlignmentBestEffort,
 	}, got)
 }
 
@@ -582,4 +588,22 @@ func TestGetDeviceAllocationsMalformedChargedAnnotation(t *testing.T) {
 	_, err = mgr.GetDeviceAllocations(deviceName)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), cdiRecordedAnnotation)
+}
+
+func TestGetDeviceAllocationsRecoversAlignment(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	rec := exclusiveOn(cpuset.New(0, 1))
+	rec.Relocatable = true
+	rec.Alignment = v1alpha1.AlignmentRepairable
+
+	require.NoError(t, mgr.AddDevice(logger, "claim-repairable", "DRA_CPUSET_claim-repairable=0-1", rec))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations("claim-repairable")
+	require.NoError(t, err)
+	require.Equal(t, v1alpha1.AlignmentRepairable, got.Alignment)
+	require.True(t, got.Relocatable)
 }
