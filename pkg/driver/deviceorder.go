@@ -33,7 +33,7 @@ import (
 // a named partition's taints stay in its own slices.
 //
 // Called with applyMu held.
-func (cp *CPUDriver) chunkDevices(occupied map[string]bool, poisoned map[int]bool, mirror capacityMirror) ([][]resourceapi.Device, int) {
+func (cp *CPUDriver) chunkDevices(occupied map[string]bool, poisoned map[int]bool, mirror capacityMirror, frontier map[string]string) ([][]resourceapi.Device, int) {
 	var chunks [][]resourceapi.Device
 	floored := 0
 	for _, partitionDevices := range cp.topology.devicesByPartition {
@@ -43,7 +43,8 @@ func (cp *CPUDriver) chunkDevices(occupied map[string]bool, poisoned map[int]boo
 		mirrored, atFloor := applyCapacityMirror(cp.orderCacheDevices(partitionDevices, occupied), mirror)
 		floored += atFloor
 		ordered := cp.fenceDevices(mirrored, poisoned)
-		chunks = append(chunks, slices.Collect(slices.Chunk(ordered, cp.devicesPerResourceSlice))...)
+		withFrontier := cp.attachFrontierAttributes(ordered, frontier)
+		chunks = append(chunks, slices.Collect(slices.Chunk(withFrontier, cp.devicesPerResourceSlice))...)
 	}
 	return chunks, floored
 }
@@ -138,8 +139,9 @@ func (cp *CPUDriver) refreshDeviceOrder() [][]resourceapi.Device {
 		return nil
 	}
 	occupied, poisoned, mirror := cp.occupiedDevices(), cp.poisonedNUMANodes(), cp.capacityMirror()
-	cp.publishedOccupancy, cp.publishedPoison, cp.publishedCorrection = occupied, poisoned, mirror.corrections()
-	chunks, floored := cp.chunkDevices(occupied, poisoned, mirror)
+	frontier := cp.frontier()
+	cp.publishedOccupancy, cp.publishedPoison, cp.publishedCorrection, cp.publishedFrontier = occupied, poisoned, mirror.corrections(), frontier
+	chunks, floored := cp.chunkDevices(occupied, poisoned, mirror, frontier)
 	cp.topology.deviceSlices = chunks
 	cp.metrics.SetFlooredCapacityDevices(floored)
 	return cp.topology.deviceSlices
@@ -168,5 +170,8 @@ func (cp *CPUDriver) publishedSlicesAreStale() bool {
 	if cp.cpuDeviceGroupBy != device.GROUP_BY_UNCORE_CACHE {
 		return false
 	}
-	return !maps.Equal(cp.occupiedDevices(), cp.publishedOccupancy)
+	if !maps.Equal(cp.occupiedDevices(), cp.publishedOccupancy) {
+		return true
+	}
+	return !maps.Equal(cp.frontier(), cp.publishedFrontier)
 }
