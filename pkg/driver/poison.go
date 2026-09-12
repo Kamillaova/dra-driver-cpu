@@ -60,6 +60,27 @@ func (cp *CPUDriver) poisonNode(logger logr.Logger, scope defragScope) {
 	fence.scopes[scope] = struct{}{}
 }
 
+func (cp *CPUDriver) poisonNUMANodeForCPUs(logger logr.Logger, cpus cpuset.CPUSet) {
+	if cp.topology.cpuTopology == nil {
+		return
+	}
+	numaNodes := cp.topology.cpuTopology.CPUDetails.NUMANodes().List()
+	allocatable := cp.defragAllocatable(cp.topology.cpuTopology.CPUDetails.CPUs())
+	for _, numaNodeID := range numaNodes {
+		inNode := cp.topology.cpuTopology.CPUDetails.CPUsInNUMANodes(numaNodeID)
+		if !inNode.Intersection(cpus).IsEmpty() {
+			scope := defragScope{numaNodeID: numaNodeID, partition: "default"}
+			for _, partition := range cp.defragPartitions(allocatable) {
+				if !partition.CPUs.Intersection(inNode).Intersection(cpus).IsEmpty() {
+					scope.partition = partition.Name
+					break
+				}
+			}
+			cp.poisonNode(logger, scope)
+		}
+	}
+}
+
 // nodeIsPoisoned reports whether a NUMA node is fenced. Called with applyMu
 // held.
 func (cp *CPUDriver) nodeIsPoisoned(numaNodeID int) bool {
