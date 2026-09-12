@@ -105,7 +105,9 @@ func newDefragTestDriverWith(t *testing.T, infos []cpuinfo.CPUInfo) *defragTestD
 		sysfs: fstest.MapFS{
 			"devices/system/cpu/online": &fstest.MapFile{Data: []byte(allCPUs.String() + "\n")},
 		},
-		defrag: defragOptions{enabled: true, allowTransientOverlap: true, batchTimeout: defaultDefragBatchTimeout},
+		defrag:           defragOptions{enabled: true, allowTransientOverlap: true, batchTimeout: defaultDefragBatchTimeout},
+		cpuDeviceGroupBy: devattr.GROUP_BY_UNCORE_CACHE,
+		makeRoomTargets:  make(map[types.UID]*makeRoomTarget),
 	}
 	t.Cleanup(d.defragRetries.ShutDown)
 	return &defragTestDriver{CPUDriver: d, updater: updater, cdi: cdi, metrics: reg, allCPUs: allCPUs, cgroups: cgroups}
@@ -1482,7 +1484,7 @@ func TestExactPlanArbitration(t *testing.T) {
 	d.applyMu.Unlock()
 
 	// beginDefragRound detects ledger mismatch and clears the active exact plan
-	_ = d.beginDefragRound(logger, scope, online)
+	_ = d.beginDefragRound(context.Background(), logger, scope, online)
 
 	d.applyMu.Lock()
 	require.False(t, d.hasActiveExactPlan(0), "expected active exact plan to be cleared after ledger mismatch")
@@ -1516,7 +1518,7 @@ func TestDefragPassRepairsRepairableClaimWithExactSearch(t *testing.T) {
 	require.Empty(t, greedyMoves)
 	d.applyMu.Unlock()
 
-	round := d.beginDefragRound(logger, scope, online)
+	round := d.beginDefragRound(context.Background(), logger, scope, online)
 	require.NotNil(t, round)
 	require.Len(t, round.moves, 1)
 	require.Equal(t, types.UID("claim-split"), round.moves[0].ClaimUID)
@@ -1544,6 +1546,7 @@ func TestDefragPassRepairsRepairableClaimWithExactSearch(t *testing.T) {
 type fakeClaimReader struct {
 	claims      []*resourceapi.ResourceClaim
 	deallocated map[types.UID]bool
+	projected   *v1alpha1.ProjectedClaims
 }
 
 func (f fakeClaimReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, error) {
@@ -1552,6 +1555,10 @@ func (f fakeClaimReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, error)
 
 func (f fakeClaimReader) IsProjectedDeallocated(claimUID types.UID) bool {
 	return f.deallocated != nil && f.deallocated[claimUID]
+}
+
+func (f fakeClaimReader) GetProjectedClaims() (*v1alpha1.ProjectedClaims, error) {
+	return f.projected, nil
 }
 
 func TestAllocatedUnpreparedCPUsTreatedAsConsumed(t *testing.T) {

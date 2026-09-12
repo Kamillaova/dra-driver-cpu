@@ -157,8 +157,9 @@ type CPUDriver struct {
 	// node, which is how a defragmentation round finds out that the capacity its
 	// move depends on has been stored. Nil until Start fills its cache, and left
 	// nil when nothing moves a claim.
-	storedSlices storedSliceReader
-	claimReader  claimReader
+	storedSlices    storedSliceReader
+	claimReader     claimReader
+	makeRoomTargets map[types.UID]*makeRoomTarget
 	// reconcileTrigger carries coalesced reconcile requests to the worker
 	// goroutine. Nil when no feature needs it.
 	reconcileTrigger chan struct{}
@@ -245,6 +246,16 @@ type CPUDriver struct {
 type deviceHealthEntry struct {
 	status  kubeletplugin.HealthStatus
 	message string
+}
+
+type makeRoomTarget struct {
+	claimUID   types.UID
+	namespace  string
+	name       string
+	cacheID    int
+	numaNodeID int
+	partition  string
+	device     string
 }
 
 // deviceTopology holds the CPU topology and device-to-CPU/socket/NUMA
@@ -417,6 +428,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		devicesPerResourceSlice: config.DevicesPerResourceSlice(),
 		metrics:                 metricsRecorder,
 		health:                  newHealthTracker(),
+		makeRoomTargets:         make(map[types.UID]*makeRoomTarget),
 		kubeletRootDir:          config.KubeletRootDir,
 	}
 	sfs := providers.EnsureSysFS()
