@@ -32,6 +32,12 @@ type Recorder interface {
 	RecordNRIStopContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRIRemoveContainer(err error, claimCount int, elapsed time.Duration)
 	RecordSynchronizeSkippedClaim()
+	// CCX-FORK: upstream's Recorder ends above; the defragmentation methods are
+	// the fork's.
+	SetDefragState(cpumetrics.DefragState)
+	RecordDefragPass(result cpumetrics.Result, duration time.Duration)
+	RecordDefragMoves(result cpumetrics.Result, count int)
+	RecordDefragBlockedMoves(count int)
 }
 
 func (cp *CPUDriver) refreshAllocationMetrics() {
