@@ -131,6 +131,7 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 			// way a DRA_CPUSET_* env var can; CreateContainer falls back to
 			// this when the runtime reports no CDI devices at all.
 			cp.claimTracker.SetReservedFor(claim.UID, reservedForPodUIDs(claim))
+			cp.publishClaimPlacementStatus(ctx, cLogger, claim.UID)
 		}
 		cp.metrics.RecordPrepare(prepareResult, time.Since(start))
 		// CCX-FORK: a claim that just landed split across caches is exactly what a
