@@ -34,7 +34,9 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -96,7 +98,7 @@ func (cp *CPUDriver) publishResources(ctx context.Context) error {
 
 // PrepareResourceClaims is called by the kubelet to prepare a resource claim.
 func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
-	_, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen))
+	ctx, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen))
 
 	logger.V(4).Info("begin: preparing resource claims", "numClaims", len(claims))
 	defer logger.V(4).Info("end: preparing resource claims", "numClaims", len(claims))
@@ -119,7 +121,7 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 		cLogger := logger.WithValues("claim", ctxlog.KObj(claim), "claimUID", claim.UID)
 		// CCX-FORK: upstream dispatches on the device mode here, having nothing
 		// to check before it.
-		result[claim.UID] = cp.prepareClaim(cLogger, claim)
+		result[claim.UID] = cp.prepareClaim(ctx, cLogger, claim)
 		prepareResult := cpumetrics.ResultSuccess
 		if result[claim.UID].Err != nil {
 			prepareResult = cpumetrics.ResultError
@@ -166,13 +168,13 @@ func (cp *CPUDriver) republishStaleSlices(ctx context.Context) {
 // it. The check comes first because the answer does not depend on the device
 // mode, and a claim that contradicts itself is the template's error rather than
 // the node's.
-func (cp *CPUDriver) prepareClaim(logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+func (cp *CPUDriver) prepareClaim(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	placement, err := cp.claimConfig(claim)
 	if err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
 	if cp.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-		return cp.prepareGroupedResourceClaim(logger, claim, placement)
+		return cp.prepareGroupedResourceClaim(ctx, logger, claim, placement)
 	}
 	return cp.prepareResourceClaim(logger, claim, placement)
 }
@@ -323,7 +325,7 @@ func addRequestCPUs(byRequest map[string]store.RequestAllocation, name string, c
 
 // CCX-FORK: upstream takes the logger and the claim alone. Whether the claim's
 // CPUs may later change is the claim's own answer, read once above.
-func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *resourceapi.ResourceClaim, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
+func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
 	logger.V(4).Info("preparing grouped resource claim")
 
 	if claim.Status.Allocation == nil {
@@ -442,12 +444,20 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 				alloc.Device, fenced)}
 		}
 
+		// CCX-FORK: hoisted out of the case below so the shared error check can say
+		// how much of the device was free. Every way the selector fails means the
+		// device its allocation names cannot hold this claim -- too few of its CPUs,
+		// or too few of them in whole cores -- and that is a scheduler acting on
+		// capacity that has stopped being true, which is worth counting rather than
+		// reporting as an ordinary allocation failure.
+		var availableCPUsForDevice cpuset.CPUSet
+
 		switch cp.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
 			if !published {
 				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
 			}
-			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(deviceCPUs)
+			availableCPUsForDevice = allocatableCPUs.Difference(assignedCPUs).Intersection(deviceCPUs)
 			logger.V(4).Info("device CPU availability", "device", alloc.Device, "deviceCPUs", deviceCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
 			cur, err = cp.takeCPUsForDevice(logger, topo, availableCPUsForDevice, preferredCPUs, claimCPUCount, threadsPerCore)
 		case device.GROUP_BY_MACHINE:
@@ -465,7 +475,8 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		}
 
 		if err != nil {
-			return kubeletplugin.PrepareResult{Err: err}
+			return kubeletplugin.PrepareResult{Err: cp.recordedDeviceFull(ctx, logger, claim, alloc.Device,
+				availableCPUsForDevice.Size(), int(claimCPUCount), err)}
 		}
 		if err := cp.cpuAllocator.Validate(cur, assignedCPUs, cp.cpuAllocationStore.GetPreparedCPUs()); err != nil {
 			return kubeletplugin.PrepareResult{Err: err}
@@ -497,6 +508,71 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 	cp.metrics.RecordClaimAllocatedCPUs(assignedCPUs.Size())
 	cp.refreshAllocationMetrics()
 	return result
+}
+
+// recordedDeviceFull reports a claim whose allocation names a device that cannot
+// hold what it was charged for, and returns the error that refuses the Prepare.
+// cause is why the device's own CPUs would not do: too few of them free, or too
+// few of them in the whole cores this device hands out.
+//
+// A scheduler subtracted this claim's CPUs from that device's published
+// capacity, so it saw room there. Two windows can leave that view stale for a
+// hop: its own, between the driver storing a capacity and the scheduler
+// observing it, and the one where a claim's allocation is cleared before its
+// CPUs are physically free, so the device it left is credited a departure the
+// allocator has already refunded. Either shows up here, where the pod waits
+// bound and the kubelet retries -- which is the safe end of it. The counter says
+// how often it happens and to which shape of claim, since a claim the allocator
+// may not split has nowhere else to go.
+func (cp *CPUDriver) recordedDeviceFull(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim, deviceName string, room, charged int, cause error) error {
+	shape := opaqueapi.ShapeFlexible
+	if !claimOffersSplitAlternatives(claim) {
+		shape = opaqueapi.ShapeNeverSplit
+	}
+	err := fmt.Errorf("device %q cannot hold the %d CPUs claim %s/%s was charged for there, with %d of its own free: %w",
+		deviceName, charged, claim.Namespace, claim.Name, room, cause)
+	logger.Error(err, "refusing a claim whose recorded device has no room", "device", deviceName, "shape", shape)
+	cp.metrics.RecordPrepareNoRoom(shape)
+	cp.recordClaimEvent(ctx, claim, "RecordedDeviceFull", err.Error())
+	return err
+}
+
+// recordClaimEvent puts a message about one claim on that claim's own event
+// stream, where whoever is looking at a pod stuck starting will find it.
+//
+// Written on its own goroutine, and on a context the caller's cannot cancel:
+// the kubelet must not wait on an API call for it, and the hook asking for it
+// holds applyMu, which may not be held across a call that blocks.
+func (cp *CPUDriver) recordClaimEvent(ctx context.Context, claim *resourceapi.ResourceClaim, reason, message string) {
+	if cp.kubeClient == nil {
+		return
+	}
+	event := &v1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: claim.Name + ".",
+			Namespace:    claim.Namespace,
+		},
+		InvolvedObject: v1.ObjectReference{
+			APIVersion: resourceapi.SchemeGroupVersion.String(),
+			Kind:       "ResourceClaim",
+			Namespace:  claim.Namespace,
+			Name:       claim.Name,
+			UID:        claim.UID,
+		},
+		Reason:         reason,
+		Message:        message,
+		Type:           v1.EventTypeWarning,
+		Source:         v1.EventSource{Component: cp.driverName, Host: cp.nodeName},
+		FirstTimestamp: metav1.Now(),
+		LastTimestamp:  metav1.Now(),
+		Count:          1,
+	}
+	ctx = context.WithoutCancel(ctx)
+	go func() {
+		if _, err := cp.kubeClient.CoreV1().Events(claim.Namespace).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+			ctxlog.FromContext(ctx).Error(err, "cannot report a claim event", "reason", reason, "claim", ctxlog.KObj(claim))
+		}
+	}()
 }
 
 // takeCPUsForDevice picks the CPUs backing one device's share of a claim.
