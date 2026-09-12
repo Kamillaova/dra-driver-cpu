@@ -246,30 +246,30 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		}
 
 		var cur cpuset.CPUSet
+		// CCX-FORK: upstream takes the CPUs of the socket or NUMA node the device
+		// groups. A device answers for its partition's share of that group, so
+		// its own published CPUs are the set a claim on it may take from.
+		deviceCPUs, published := cp.topology.deviceNameToCPUs[alloc.Device]
+
 		switch cp.cpuDeviceGroupBy {
-		case device.GROUP_BY_SOCKET:
-			socketID, ok := cp.topology.deviceNameToSocketID[alloc.Device]
-			if !ok {
-				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no valid socket ID found for device %s", alloc.Device)}
+		case device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE:
+			if !published {
+				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
 			}
-			socketCPUs := topo.CPUDetails.CPUsInSockets(socketID)
-			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(socketCPUs)
-			logger.V(4).Info("socket CPU availability", "socketID", socketID, "socketCPUs", socketCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.takeCPUsForDevice(logger, topo, availableCPUsForDevice, preferredCPUs, claimCPUCount, threadsPerCore)
-		case device.GROUP_BY_NUMA_NODE:
-			numaNodeID, ok := cp.topology.deviceNameToNUMANodeID[alloc.Device]
-			if !ok {
-				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no valid NUMA node ID found for device %s", alloc.Device)}
-			}
-			numaCPUs := topo.CPUDetails.CPUsInNUMANodes(numaNodeID)
-			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(numaCPUs)
-			logger.V(4).Info("NUMA node CPU availability", "numaNodeID", numaNodeID, "numaCPUs", numaCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
+			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(deviceCPUs)
+			logger.V(4).Info("device CPU availability", "device", alloc.Device, "deviceCPUs", deviceCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
 			cur, err = cp.takeCPUsForDevice(logger, topo, availableCPUsForDevice, preferredCPUs, claimCPUCount, threadsPerCore)
 		case device.GROUP_BY_MACHINE:
-			// no mapping needed in machine mode - just one device = the whole machine
-			availableCPUs := topo.CPUDetails.CPUs().Difference(cp.topology.reservedCPUs)
-			logger.V(4).Info("Machine CPU availability", "availableCPUs", availableCPUs.String())
-			cur, err = cp.cpuAllocator.Allocate(logger, availableCPUs, preferredCPUs, claimCPUCount)
+			if !published {
+				return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q was not published by this driver", alloc.Device)}
+			}
+			// CCX-FORK: upstream allocates from the whole machine minus the
+			// reservation. The machine device is published per partition, so the
+			// device's own CPUs are that partition's share of it, and confining
+			// the allocator to them is what keeps a claim that names its own
+			// CPUs inside the partition it was allocated on.
+			logger.V(4).Info("machine CPU availability", "device", alloc.Device, "availableCPUs", deviceCPUs.String())
+			cur, err = cp.cpuAllocator.Allocate(logger, deviceCPUs, preferredCPUs, claimCPUCount)
 			logger.V(2).Info("using opaque config CPU assignment", "device", alloc.Device, "assigned", cur.String())
 		}
 
