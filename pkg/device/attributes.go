@@ -60,11 +60,40 @@ const (
 	// allocatable CPUs to a grouped device. One means cache alignment within the
 	// group is trivially satisfied.
 	AttributeUncoreCachesInGroup resourceapi.QualifiedName = "dra.cpu/uncoreCachesInGroup"
+	// AttributePartition is the partition a device's CPUs belong to, which is
+	// "default" on a node whose cores nobody has described.
+	AttributePartition resourceapi.QualifiedName = "dra.cpu/partition"
+	// AttributeRole is that partition's role, so a claim can select on what the
+	// cores are for rather than on the name a fleet happened to give them.
+	AttributeRole resourceapi.QualifiedName = "dra.cpu/role"
 	// AttributeAllocatedNumCPUs is a metadata-only attribute (not published in
 	// ResourceSlice) that indicates how many CPUs were allocated to a specific
 	// claim from a grouped device's capacity.
 	AttributeAllocatedNumCPUs resourceapi.QualifiedName = "dra.cpu/allocatedNumCPUs"
 )
+
+// addPartitionAttributes names the partition a device's CPUs come from and what
+// that partition is for. Published on every grouped device, including the
+// implicit partition of an unpartitioned node, so that a device class selecting
+// a partition means the same thing on every node in the fleet.
+func addPartitionAttributes(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, partition Partition) {
+	attrs[AttributePartition] = resourceapi.DeviceAttribute{StringValue: new(partition.Name)}
+	attrs[AttributeRole] = resourceapi.DeviceAttribute{StringValue: new(partition.Role)}
+}
+
+// partitionTaints keeps a named partition's devices away from every claim that
+// does not tolerate that partition by name. The implicit partition is untainted,
+// so a claim that names no partition is allocated there and nowhere else.
+func partitionTaints(partition Partition) []resourceapi.DeviceTaint {
+	if !partition.Named() {
+		return nil
+	}
+	return []resourceapi.DeviceTaint{{
+		Key:    PartitionTaintKey,
+		Value:  partition.Name,
+		Effect: resourceapi.DeviceTaintEffectNoSchedule,
+	}}
+}
 
 // addCompatibilityAttributes add attributes to enable compatibility (e.g. alignment) with other
 // DRA resource drivers leveraging attributes which are not kubernetes standard.

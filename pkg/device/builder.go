@@ -48,32 +48,72 @@ func Build(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet, pcieRootMapp
 	return createCPUDeviceSlices(deviceInfos, pcieRootMapper, topo.SMTEnabled, nodeAllocatableResources), nameToID
 }
 
-// BuildGrouped publishes one device per CPU group. Each device's own
-// thread-per-core count decides whether whole-core allocation applies to it,
-// so one device's non-uniform cores never disable the feature for a different,
-// uniform device on the same node; fullPhysicalCPUsOnly is only the operator's
-// request for the feature, not a per-device guarantee.
+// GroupedDevices is what grouped mode publishes, together with what a caller
+// needs to resolve an allocation on one of those devices back to CPUs.
+type GroupedDevices struct {
+	// ByPartition holds each publishing partition's devices, in the order the
+	// partitions were given.
+	ByPartition [][]resourceapi.Device
+	// NameToID maps a device name to the socket or NUMA node it groups, and is
+	// empty under the other groupings.
+	NameToID map[string]int
+	// ThreadsPerCore is each device's effective whole-core allocation step, and
+	// holds no entry for a device where whole-core allocation is off or has no
+	// single thread count to work with.
+	ThreadsPerCore map[string]int
+}
+
+// BuildGrouped publishes one device per CPU group of every partition that
+// claims may take CPUs from. Each device's own thread-per-core count decides
+// whether whole-core allocation applies to it, so one device's non-uniform
+// cores never disable the feature for a different, uniform device on the same
+// node; fullPhysicalCPUsOnly is only the operator's request for the feature,
+// not a per-device guarantee.
 //
-// The returned deviceThreadsPerCore map is each device's effective allocation
-// step (0 when the feature is off or that device has no single thread count),
-// so a caller allocating a claim onto one of these devices decides consistently
-// with what was just published for it.
-func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet, pcieRootMapper *store.PCIeRootMapper, nodeAllocatableResources bool, fullPhysicalCPUsOnly bool) ([]resourceapi.Device, map[string]int, map[string]int) {
-	deviceInfos := groupedCPUDeviceInfos(logger, groupBy, topo, reservedCPUSet, fullPhysicalCPUsOnly)
-	nameToID := make(map[string]int)
-	deviceThreadsPerCore := make(map[string]int)
-	for _, dev := range deviceInfos {
-		switch groupBy {
-		case GROUP_BY_SOCKET:
-			nameToID[dev.name] = dev.socketID
-		case GROUP_BY_NUMA_NODE:
-			nameToID[dev.name] = dev.numaNodeID
+// Devices are returned one group per partition, in the order partitions were
+// given, so that a partition's taints never travel in another partition's
+// ResourceSlice.
+//
+// CCX-FORK: upstream publishes one device per group over the whole node, with
+// no partitions and no taints, and returns a flat device list.
+func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet, pcieRootMapper *store.PCIeRootMapper, nodeAllocatableResources bool, fullPhysicalCPUsOnly bool, partitions []Partition) GroupedDevices {
+	built := GroupedDevices{
+		NameToID:       make(map[string]int),
+		ThreadsPerCore: make(map[string]int),
+	}
+	for _, partition := range partitions {
+		if !partition.PublishesDevices() {
+			continue
 		}
-		if fullPhysicalCPUsOnly && dev.threadsPerCore > 1 {
-			deviceThreadsPerCore[dev.name] = dev.threadsPerCore
+		deviceInfos := groupedCPUDeviceInfos(logger, groupBy, topo, reservedCPUSet, fullPhysicalCPUsOnly, partition, len(partitions) > 1)
+		for _, dev := range deviceInfos {
+			switch groupBy {
+			case GROUP_BY_SOCKET:
+				built.NameToID[dev.name] = dev.socketID
+			case GROUP_BY_NUMA_NODE:
+				built.NameToID[dev.name] = dev.numaNodeID
+			}
+			if fullPhysicalCPUsOnly && dev.threadsPerCore > 1 {
+				built.ThreadsPerCore[dev.name] = dev.threadsPerCore
+			}
+		}
+		devices := createGroupedCPUDeviceSlices(logger, groupBy, deviceInfos, pcieRootMapper, topo, nodeAllocatableResources, fullPhysicalCPUsOnly, partition)
+		if len(devices) > 0 {
+			built.ByPartition = append(built.ByPartition, devices)
 		}
 	}
-	return createGroupedCPUDeviceSlices(logger, groupBy, deviceInfos, pcieRootMapper, topo, nodeAllocatableResources, fullPhysicalCPUsOnly), nameToID, deviceThreadsPerCore
+	return built
+}
+
+// partitionDeviceName suffixes a group's device name with the partition it
+// belongs to, so that a group split between partitions yields one device per
+// partition with disjoint CPUs. The implicit partition keeps the plain name an
+// unpartitioned node publishes.
+func partitionDeviceName(name string, partition Partition) string {
+	if !partition.Named() {
+		return name
+	}
+	return name + "-" + partition.Name
 }
 
 func groupedCPUNodeAllocatable(enabled bool) map[v1.ResourceName]resourceapi.NodeAllocatableResource {
@@ -120,7 +160,9 @@ type cpuDeviceInfo struct {
 	cpu  cpuinfo.CPUInfo
 }
 
-func groupedCPUDeviceInfos(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology, reservedCPUs cpuset.CPUSet, fullPhysicalCPUsOnly bool) []groupedCPUDeviceInfo {
+// CCX-FORK: upstream describes every group of the node in one call; here each
+// call describes one partition's share of those groups.
+func groupedCPUDeviceInfos(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology, reservedCPUs cpuset.CPUSet, fullPhysicalCPUsOnly bool, partition Partition, nodeDescribed bool) []groupedCPUDeviceInfo {
 	var devices []groupedCPUDeviceInfo
 	// build reports a device's own thread-per-core count and, under whole-core
 	// allocation, drops any core the reservation split rather than publishing it
@@ -128,6 +170,11 @@ func groupedCPUDeviceInfos(logger logr.Logger, groupBy string, topo *cpuinfo.CPU
 	// from this device's own CPUs alone, so another device's non-uniform cores
 	// never disable whole-core allocation here, and it is reported even when
 	// fullPhysicalCPUsOnly is off, since it is a hardware fact.
+	// What a group leaves this partition: the group's CPUs, without the
+	// reservation and without whatever another partition claims.
+	allocatableIn := func(groupCPUs cpuset.CPUSet) cpuset.CPUSet {
+		return groupCPUs.Difference(reservedCPUs).Intersection(partition.CPUs)
+	}
 	build := func(name string, rawCPUs cpuset.CPUSet) (cpuset.CPUSet, int) {
 		threadsPerCore := topo.CPUDetails.UniformThreadsPerCore(rawCPUs)
 		if !fullPhysicalCPUsOnly {
@@ -151,8 +198,8 @@ func groupedCPUDeviceInfos(logger logr.Logger, groupBy string, topo *cpuinfo.CPU
 	case GROUP_BY_SOCKET:
 		socketIDs := topo.CPUDetails.Sockets().List()
 		for _, socketID := range socketIDs {
-			name := fmt.Sprintf("%s%03d", CPUDeviceSocketGroupedPrefix, socketID)
-			rawCPUs := topo.CPUDetails.CPUsInSockets(socketID).Difference(reservedCPUs)
+			name := partitionDeviceName(fmt.Sprintf("%s%03d", CPUDeviceSocketGroupedPrefix, socketID), partition)
+			rawCPUs := allocatableIn(topo.CPUDetails.CPUsInSockets(socketID))
 			allocatableCPUs, threadsPerCore := build(name, rawCPUs)
 			if allocatableCPUs.Size() == 0 {
 				continue
@@ -167,8 +214,8 @@ func groupedCPUDeviceInfos(logger logr.Logger, groupBy string, topo *cpuinfo.CPU
 	case GROUP_BY_NUMA_NODE:
 		numaNodeIDs := topo.CPUDetails.NUMANodes().List()
 		for _, numaID := range numaNodeIDs {
-			name := fmt.Sprintf("%s%03d", CPUDeviceNUMAGroupedPrefix, numaID)
-			rawCPUs := topo.CPUDetails.CPUsInNUMANodes(numaID).Difference(reservedCPUs)
+			name := partitionDeviceName(fmt.Sprintf("%s%03d", CPUDeviceNUMAGroupedPrefix, numaID), partition)
+			rawCPUs := allocatableIn(topo.CPUDetails.CPUsInNUMANodes(numaID))
 			allocatableCPUs, threadsPerCore := build(name, rawCPUs)
 			if allocatableCPUs.Size() == 0 {
 				continue
@@ -185,13 +232,21 @@ func groupedCPUDeviceInfos(logger logr.Logger, groupBy string, topo *cpuinfo.CPU
 			})
 		}
 	case GROUP_BY_MACHINE:
+		name := partitionDeviceName(CPUDeviceMachineGrouped, partition)
 		// Use the topology-validated CPU set. GetCPUInfos filters online CPUs
 		// whose topology is incomplete, and the allocation store is built from
 		// the same CPUDetails map.
-		rawCPUs := topo.CPUDetails.CPUs().Difference(reservedCPUs)
-		allocatableCPUs, threadsPerCore := build(CPUDeviceMachineGrouped, rawCPUs)
+		rawCPUs := allocatableIn(topo.CPUDetails.CPUs())
+		allocatableCPUs, threadsPerCore := build(name, rawCPUs)
+		// A node with one partition publishes the machine device whatever the
+		// reservation leaves in it, which is what an unpartitioned node has
+		// always done; once the cores are described, an empty partition is a
+		// description of nothing and publishes nothing.
+		if allocatableCPUs.IsEmpty() && nodeDescribed {
+			break
+		}
 		devices = append(devices, groupedCPUDeviceInfo{
-			name:           CPUDeviceMachineGrouped,
+			name:           name,
 			cpus:           allocatableCPUs,
 			threadsPerCore: threadsPerCore,
 		})
@@ -271,7 +326,9 @@ func cpuDeviceInfos(topo *cpuinfo.CPUTopology, reservedCPUSet cpuset.CPUSet) []c
 // device must not advertise the same answer as a full-SMT one. The request
 // policy stays gated by fullPhysicalCPUsOnly, since it is a promise about
 // allocation, not a description of the hardware.
-func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfos []groupedCPUDeviceInfo, pcieRootMapper *store.PCIeRootMapper, topo *cpuinfo.CPUTopology, nodeAllocatableResources bool, fullPhysicalCPUsOnly bool) []resourceapi.Device {
+//
+// CCX-FORK: upstream publishes neither the partition attributes nor the taint.
+func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfos []groupedCPUDeviceInfo, pcieRootMapper *store.PCIeRootMapper, topo *cpuinfo.CPUTopology, nodeAllocatableResources bool, fullPhysicalCPUsOnly bool, partition Partition) []resourceapi.Device {
 	logger.V(4).Info("creating grouped CPU devices")
 	var devices []resourceapi.Device
 
@@ -297,6 +354,7 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 				AttributeSMTEnabled:     {BoolValue: new(smtEnabled)},
 				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
+			addPartitionAttributes(deviceAttrs, partition)
 			addUncoreCacheAttributes(topo, deviceAttrs, deviceInfo.cpus)
 			addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...)
 
@@ -306,6 +364,7 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 				Capacity:                 deviceCapacity,
 				AllowMultipleAllocations: new(true),
 				NodeAllocatableResources: groupedCPUNodeAllocatable(nodeAllocatableResources),
+				Taints:                   partitionTaints(partition),
 			})
 		case GROUP_BY_NUMA_NODE:
 			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
@@ -318,6 +377,7 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
 			addCompatibilityAttributes(deviceAttrs, int64(deviceInfo.numaNodeID))
+			addPartitionAttributes(deviceAttrs, partition)
 			addUncoreCacheAttributes(topo, deviceAttrs, deviceInfo.cpus)
 			addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...)
 
@@ -327,6 +387,7 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 				Capacity:                 deviceCapacity,
 				AllowMultipleAllocations: new(true),
 				NodeAllocatableResources: groupedCPUNodeAllocatable(nodeAllocatableResources),
+				Taints:                   partitionTaints(partition),
 			})
 		case GROUP_BY_MACHINE:
 			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
@@ -334,6 +395,7 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
 				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
+			addPartitionAttributes(deviceAttrs, partition)
 			addUncoreCacheAttributes(topo, deviceAttrs, deviceInfo.cpus)
 			addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...)
 			devices = append(devices, resourceapi.Device{
@@ -342,6 +404,7 @@ func createGroupedCPUDeviceSlices(logger logr.Logger, groupBy string, deviceInfo
 				Capacity:                 deviceCapacity,
 				AllowMultipleAllocations: new(true),
 				NodeAllocatableResources: groupedCPUNodeAllocatable(nodeAllocatableResources),
+				Taints:                   partitionTaints(partition),
 			})
 		}
 	}
