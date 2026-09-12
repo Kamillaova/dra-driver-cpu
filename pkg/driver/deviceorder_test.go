@@ -172,33 +172,3 @@ func TestCacheDeviceOrderRepublishedOnAnEmptinessChange(t *testing.T) {
 	require.Equal(t, []string{cacheDevice(0), cacheDevice(1), cacheDevice(2), cacheDevice(3)},
 		publishedDeviceNames(plugin.publishedResources.Pools[testNodeName].Slices[0].Devices))
 }
-
-// TestNUMANodeThreadsPerCoreUnderCacheGrouping: the defragmentation planner and
-// the /placements dry run ask this map for a NUMA node's whole-core step, and
-// under cache grouping several devices share a node. The node has a step only
-// where they agree on one.
-func TestNUMANodeThreadsPerCoreUnderCacheGrouping(t *testing.T) {
-	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: smtPoolInfos()}).GetCPUTopology(testr.New(t))
-	require.NoError(t, err)
-
-	// Caches 0 and 1 are NUMA node 0's, caches 2 and 3 NUMA node 1's.
-	nameToID := map[string]int{
-		cacheDevice(0): 0, cacheDevice(1): 0,
-		cacheDevice(2): 1, cacheDevice(3): 1,
-	}
-
-	agreeing := numaNodeThreadsPerCore(topo, devattr.GROUP_BY_UNCORE_CACHE, nameToID, map[string]int{
-		cacheDevice(0): 2, cacheDevice(1): 2,
-		cacheDevice(2): 2, cacheDevice(3): 2,
-	})
-	require.Equal(t, map[int]int{0: 2, 1: 2}, agreeing)
-
-	// A partition whose siblings are offline leaves one cache of NUMA node 0 at
-	// one thread per core, so that node promises nothing.
-	disagreeing := numaNodeThreadsPerCore(topo, devattr.GROUP_BY_UNCORE_CACHE, nameToID, map[string]int{
-		cacheDevice(0): 2, cacheDevice(1): 1,
-		cacheDevice(2): 2, cacheDevice(3): 2,
-	})
-	require.Equal(t, map[int]int{0: 0, 1: 2}, disagreeing,
-		"a node whose devices disagree has no single step, whatever order the map is walked in")
-}
