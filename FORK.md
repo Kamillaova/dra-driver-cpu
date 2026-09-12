@@ -86,8 +86,10 @@ Fork-only symbols added to upstream files, which carry no marker of their own. A
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
 - `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiRecordedAnnotation`,
-  `cdiRelocatableAnnotation`, `cdiEnvDynamicValue`, `GetDeviceAllocations`, `cdiRequestPlacement`,
-  `encodePlacements`, `decodePlacements`, `decodeRecordedDevices`
+  `cdiRelocatableAnnotation`, `cdiRoundIDAnnotation`, `cdiRoundOriginAnnotation`,
+  `cdiRoundTargetAnnotation`, `cdiRoundPartnersAnnotation`, `cdiEnvDynamicValue`,
+  `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`, `decodePlacements`,
+  `decodeRecordedDevices`, `decodeRoundPartners`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `activeExactPlans`,
   `defragRetries` and `defragRetryDue`, `cgroupfs`, `poisonedNodes`, `publishedCorrection`,
@@ -103,10 +105,13 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 
-- `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`, `sharedContainerCPUs`
+- `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
+  `containerClassification`, `classifyContainer`, `reconcileActiveRounds`
+
+- `pkg/driver/poison.go`: `poisonNUMANodeForCPUs`
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
-  `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
+  `RoundProvenance`, `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
   `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
   `GetClaimRecord`, `SetRecordedDevices`, `IsRelocatable`, `HoldsExclusiveCPUs`,
