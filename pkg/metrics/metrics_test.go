@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 30)
+	require.Len(t, descriptors, 31)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -71,6 +71,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_poisoned_duration_seconds",
 		"dra_cpu_defrag_readback_mismatches_total",
 		"dra_cpu_capacity_mirror_floored_devices",
+		"dra_cpu_defrag_unpublished_rounds_total",
 	}, names)
 	require.Empty(t, descriptors[13].Labels)
 	require.Empty(t, descriptors[14].Labels)
@@ -89,6 +90,7 @@ func TestDescriptors(t *testing.T) {
 	require.Empty(t, descriptors[27].Labels)
 	require.Empty(t, descriptors[28].Labels)
 	require.Empty(t, descriptors[29].Labels)
+	require.Empty(t, descriptors[30].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -133,6 +135,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_defrag_readback_mismatches_total",
 		"dra_cpu_defrag_rollbacks_total",
 		"dra_cpu_defrag_swap_overlap_seconds",
+		"dra_cpu_defrag_unpublished_rounds_total",
 		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_nri_create_container_duration_seconds",
 		"dra_cpu_nri_remove_container_duration_seconds",
@@ -200,6 +203,7 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordDefragNodeReopened(time.Second)
 	m.RecordDefragReadbackMismatch()
 	m.SetFlooredCapacityDevices(0)
+	m.RecordDefragUnpublishedRound()
 	m.RecordSynchronizeSkippedClaim()
 	m.RecordMisplacedClaim()
 	m.SetPartitionState(map[string]bool{"dataplane": true})
