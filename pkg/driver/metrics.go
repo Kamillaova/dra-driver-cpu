@@ -32,6 +32,7 @@ type Recorder interface {
 	RecordNRIStopContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRIRemoveContainer(err error, claimCount int, elapsed time.Duration)
 	RecordSynchronizeSkippedClaim()
+	RecordMisplacedClaim()
 	// CCX-FORK: upstream's Recorder ends above; the defragmentation methods are
 	// the fork's.
 	SetDefragState(cpumetrics.DefragState)
