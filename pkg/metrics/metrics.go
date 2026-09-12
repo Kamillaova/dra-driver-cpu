@@ -37,6 +37,14 @@ const (
 	ResultUnknown Result = "unknown"
 )
 
+// The outcomes a ResourceSlice handoff can have. The publishing controller
+// writes in the background, so these say whether it took the inventory, not
+// whether the API server stored it.
+const (
+	HandoffAccepted = "accepted"
+	HandoffRefused  = "refused"
+)
+
 func (r Result) String() string {
 	switch r {
 	case ResultSuccess:
@@ -128,21 +136,34 @@ type Metrics struct {
 
 	// CCX-FORK: upstream's collectors end above; the defragmentation ones and
 	// everything serving them in this file are the fork's.
-	defragExcessUncoreCaches      prometheus.Gauge
-	defragAlignableFreeCPUs       *prometheus.GaugeVec
-	defragPasses                  *prometheus.CounterVec
-	defragMoves                   *prometheus.CounterVec
-	defragBlockedMoves            prometheus.Counter
-	defragPassDurationSecondsHist prometheus.Histogram
-	defragSwapOverlapSecondsHist  prometheus.Histogram
-	defragPartialBatches          prometheus.Counter
-	defragRollbacks               *prometheus.CounterVec
-	defragNodePoisoned            *prometheus.GaugeVec
-	defragPoisonedNodes           prometheus.Counter
-	defragPoisonDurationSecsHist  prometheus.Histogram
-	defragReadbackMismatches      prometheus.Counter
-	flooredCapacityDevices        prometheus.Gauge
-	defragUnpublishedRounds       prometheus.Counter
+	defragExcessUncoreCaches        prometheus.Gauge
+	defragAlignableFreeCPUs         *prometheus.GaugeVec
+	defragPasses                    *prometheus.CounterVec
+	defragMoves                     *prometheus.CounterVec
+	defragBlockedMoves              prometheus.Counter
+	defragPassDurationSecondsHist   prometheus.Histogram
+	defragSwapOverlapSecondsHist    prometheus.Histogram
+	defragPartialBatches            prometheus.Counter
+	defragRollbacks                 *prometheus.CounterVec
+	defragNodePoisoned              *prometheus.GaugeVec
+	defragPoisonedNodes             prometheus.Counter
+	defragPoisonDurationSecsHist    prometheus.Histogram
+	defragReadbackMismatches        prometheus.Counter
+	flooredCapacityDevices          prometheus.Gauge
+	defragUnpublishedRounds         prometheus.Counter
+	frontierAdmissions              *prometheus.CounterVec
+	frontierOldestObligationSeconds prometheus.Gauge
+	repairRounds                    *prometheus.CounterVec
+	timeToAlignmentSeconds          prometheus.Histogram
+	sliceWritesPerRound             prometheus.Histogram
+	sliceUpdates                    prometheus.Counter
+	sliceUpdateBytes                prometheus.Counter
+	sliceHandoffs                   *prometheus.CounterVec
+	storeToDriverDelaySeconds       prometheus.Histogram
+	frontierUnusableDurationSeconds prometheus.Histogram
+	sliceZeroCommitRefreshes        prometheus.Counter
+	claimsOffRecordedCache          prometheus.Gauge
+	capacityMirrorMaxAbsCacheError  prometheus.Gauge
 }
 
 type metricKind string
@@ -363,6 +384,78 @@ var (
 		kind: metricCounter,
 		help: "Total number of defragmentation rounds abandoned because the capacity they shrink was not stored by the API server in time. While this rises no claim on the node is being moved.",
 	}
+	frontierAdmissionsSpec = metricSpec{
+		name:   "dra_cpu_frontier_admissions_total",
+		kind:   metricCounter,
+		help:   "Total number of positive-frontier admissions by outcome.",
+		labels: []string{"outcome"},
+	}
+	frontierOldestObligationSpec = metricSpec{
+		name: "dra_cpu_frontier_oldest_obligation_seconds",
+		kind: metricGauge,
+		help: "Age in seconds of the oldest active split claim admitted against a positive frontier.",
+	}
+	repairRoundsSpec = metricSpec{
+		name:   "dra_cpu_repair_rounds_total",
+		kind:   metricCounter,
+		help:   "Total number of completed claim repairs by advertised and actual rounds.",
+		labels: []string{"advertised_rounds", "actual_rounds"},
+	}
+	timeToAlignmentSpec = metricSpec{
+		name:    "dra_cpu_time_to_alignment_seconds",
+		kind:    metricHistogram,
+		help:    "Time in seconds from claim Prepare until defragmentation alignment.",
+		buckets: prometheus.DefBuckets,
+	}
+	sliceWritesPerRoundSpec = metricSpec{
+		name:    "dra_cpu_slice_writes_per_round",
+		kind:    metricHistogram,
+		help:    "Number of ResourceSlice write operations per defragmentation round.",
+		buckets: []float64{1, 2, 4, 8, 16, 32},
+	}
+	sliceUpdatesSpec = metricSpec{
+		name: "dra_cpu_slice_updates_total",
+		kind: metricCounter,
+		help: "Total number of ResourceSlice publish attempts.",
+	}
+	sliceUpdateBytesSpec = metricSpec{
+		name: "dra_cpu_slice_update_bytes_total",
+		kind: metricCounter,
+		help: "Total serialized payload bytes across all ResourceSlice publish operations.",
+	}
+	sliceHandoffsSpec = metricSpec{
+		name:   "dra_cpu_slice_handoffs_total",
+		kind:   metricCounter,
+		help:   "Total number of ResourceSlice handoffs to the publishing controller, by outcome.",
+		labels: []string{"outcome"},
+	}
+	storeToDriverDelaySpec = metricSpec{
+		name:    "dra_cpu_store_to_driver_delay_seconds",
+		kind:    metricHistogram,
+		help:    "Duration from driver slice publish until storedDevicesAgree confirms storage.",
+		buckets: prometheus.DefBuckets,
+	}
+	frontierUnusableDurationSpec = metricSpec{
+		name:    "dra_cpu_frontier_unusable_duration_seconds",
+		kind:    metricHistogram,
+		help:    "Duration in seconds during which a repair frontier was marked unusable.",
+		buckets: prometheus.DefBuckets,
+	}
+	sliceZeroCommitRefreshesSpec = metricSpec{
+		name: "dra_cpu_slice_zero_commit_refreshes_total",
+		kind: metricCounter,
+		help: "Total count of slice refresh operations triggered by zero-commit defragmentation passes.",
+	}
+	claimsOffRecordedCacheSpec = metricSpec{
+		name: "dra_cpu_claims_off_recorded_cache",
+		kind: metricGauge,
+		help: "Count of claims currently occupying CPUs on cache devices differing from their recorded allocations.",
+	}
+	capacityMirrorMaxAbsCacheErrorSpec = metricSpec{
+		name: "dra_cpu_capacity_mirror_max_abs_cache_error",
+		kind: metricGauge,
+		help: "Maximum absolute per-cache capacity error across all cache devices on the node.",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -400,6 +493,19 @@ var metricSpecs = []metricSpec{
 	defragReadbackMismatchesSpec,
 	flooredCapacityDevicesSpec,
 	defragUnpublishedRoundsSpec,
+	frontierAdmissionsSpec,
+	frontierOldestObligationSpec,
+	repairRoundsSpec,
+	timeToAlignmentSpec,
+	sliceWritesPerRoundSpec,
+	sliceUpdatesSpec,
+	sliceUpdateBytesSpec,
+	sliceHandoffsSpec,
+	storeToDriverDelaySpec,
+	frontierUnusableDurationSpec,
+	sliceZeroCommitRefreshesSpec,
+	claimsOffRecordedCacheSpec,
+	capacityMirrorMaxAbsCacheErrorSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -451,21 +557,34 @@ func New(reg prometheus.Registerer) *Metrics {
 		misplacedClaims:            newCounter(misplacedClaimsSpec),
 		partitionVerified:          newGaugeVec(partitionVerifiedSpec),
 
-		defragExcessUncoreCaches:      newGauge(defragExcessUncoreCachesSpec),
-		defragAlignableFreeCPUs:       newGaugeVec(defragAlignableFreeCPUsSpec),
-		defragPasses:                  newCounterVec(defragPassesSpec),
-		defragMoves:                   newCounterVec(defragMovesSpec),
-		defragBlockedMoves:            newCounter(defragBlockedMovesSpec),
-		defragPassDurationSecondsHist: newHistogram(defragPassDurationSpec),
-		defragSwapOverlapSecondsHist:  newHistogram(defragSwapOverlapSpec),
-		defragPartialBatches:          newCounter(defragPartialBatchesSpec),
-		defragRollbacks:               newCounterVec(defragRollbacksSpec),
-		defragNodePoisoned:            newGaugeVec(defragNodePoisonedSpec),
-		defragPoisonedNodes:           newCounter(defragPoisonedNodesSpec),
-		defragPoisonDurationSecsHist:  newHistogram(defragPoisonDurationSpec),
-		defragReadbackMismatches:      newCounter(defragReadbackMismatchesSpec),
-		flooredCapacityDevices:        newGauge(flooredCapacityDevicesSpec),
-		defragUnpublishedRounds:       newCounter(defragUnpublishedRoundsSpec),
+		defragExcessUncoreCaches:        newGauge(defragExcessUncoreCachesSpec),
+		defragAlignableFreeCPUs:         newGaugeVec(defragAlignableFreeCPUsSpec),
+		defragPasses:                    newCounterVec(defragPassesSpec),
+		defragMoves:                     newCounterVec(defragMovesSpec),
+		defragBlockedMoves:              newCounter(defragBlockedMovesSpec),
+		defragPassDurationSecondsHist:   newHistogram(defragPassDurationSpec),
+		defragSwapOverlapSecondsHist:    newHistogram(defragSwapOverlapSpec),
+		defragPartialBatches:            newCounter(defragPartialBatchesSpec),
+		defragRollbacks:                 newCounterVec(defragRollbacksSpec),
+		defragNodePoisoned:              newGaugeVec(defragNodePoisonedSpec),
+		defragPoisonedNodes:             newCounter(defragPoisonedNodesSpec),
+		defragPoisonDurationSecsHist:    newHistogram(defragPoisonDurationSpec),
+		defragReadbackMismatches:        newCounter(defragReadbackMismatchesSpec),
+		flooredCapacityDevices:          newGauge(flooredCapacityDevicesSpec),
+		defragUnpublishedRounds:         newCounter(defragUnpublishedRoundsSpec),
+		frontierAdmissions:              newCounterVec(frontierAdmissionsSpec),
+		frontierOldestObligationSeconds: newGauge(frontierOldestObligationSpec),
+		repairRounds:                    newCounterVec(repairRoundsSpec),
+		timeToAlignmentSeconds:          newHistogram(timeToAlignmentSpec),
+		sliceWritesPerRound:             newHistogram(sliceWritesPerRoundSpec),
+		sliceUpdates:                    newCounter(sliceUpdatesSpec),
+		sliceUpdateBytes:                newCounter(sliceUpdateBytesSpec),
+		sliceHandoffs:                   newCounterVec(sliceHandoffsSpec),
+		storeToDriverDelaySeconds:       newHistogram(storeToDriverDelaySpec),
+		frontierUnusableDurationSeconds: newHistogram(frontierUnusableDurationSpec),
+		sliceZeroCommitRefreshes:        newCounter(sliceZeroCommitRefreshesSpec),
+		claimsOffRecordedCache:          newGauge(claimsOffRecordedCacheSpec),
+		capacityMirrorMaxAbsCacheError:  newGauge(capacityMirrorMaxAbsCacheErrorSpec),
 	}
 
 	reg.MustRegister(
@@ -503,9 +622,25 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragReadbackMismatches,
 		m.flooredCapacityDevices,
 		m.defragUnpublishedRounds,
+		m.frontierAdmissions,
+		m.frontierOldestObligationSeconds,
+		m.repairRounds,
+		m.timeToAlignmentSeconds,
+		m.sliceWritesPerRound,
+		m.sliceUpdates,
+		m.sliceUpdateBytes,
+		m.sliceHandoffs,
+		m.storeToDriverDelaySeconds,
+		m.frontierUnusableDurationSeconds,
+		m.sliceZeroCommitRefreshes,
+		m.claimsOffRecordedCache,
+		m.capacityMirrorMaxAbsCacheError,
 	)
 	for _, shape := range []string{api.ShapeNeverSplit, api.ShapeFlexible} {
 		m.prepareNoRoom.WithLabelValues(shape)
+	}
+	for _, outcome := range []string{"waited_prepare", "started_split", "finished_aligned", "remained_unrepaired"} {
+		m.frontierAdmissions.WithLabelValues(outcome)
 	}
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -521,6 +656,9 @@ func New(reg prometheus.Registerer) *Metrics {
 			m.nriStopContainerDuration.WithLabelValues(result.String(), alloc.String())
 			m.nriRemoveContainerDuration.WithLabelValues(result.String(), alloc.String())
 		}
+	}
+	for _, outcome := range []string{HandoffAccepted, HandoffRefused} {
+		m.sliceHandoffs.WithLabelValues(outcome)
 	}
 	return m
 }
@@ -744,6 +882,95 @@ func (m *Metrics) RecordDefragBlockedMoves(count int) {
 	m.defragBlockedMoves.Add(float64(count))
 }
 
+func (m *Metrics) RecordFrontierAdmissionOutcome(outcome string) {
+	if m == nil || m.frontierAdmissions == nil {
+		return
+	}
+	m.frontierAdmissions.WithLabelValues(outcome).Inc()
+}
+
+func (m *Metrics) SetFrontierOldestObligationSeconds(seconds float64) {
+	if m == nil || m.frontierOldestObligationSeconds == nil {
+		return
+	}
+	m.frontierOldestObligationSeconds.Set(seconds)
+}
+
+func (m *Metrics) RecordRepairRounds(advertisedRounds, actualRounds string) {
+	if m == nil || m.repairRounds == nil {
+		return
+	}
+	m.repairRounds.WithLabelValues(advertisedRounds, actualRounds).Inc()
+}
+
+func (m *Metrics) RecordTimeToAlignment(seconds float64) {
+	if m == nil || m.timeToAlignmentSeconds == nil {
+		return
+	}
+	m.timeToAlignmentSeconds.Observe(seconds)
+}
+
+func (m *Metrics) RecordSliceWritesPerRound(writes int) {
+	if m == nil || m.sliceWritesPerRound == nil {
+		return
+	}
+	m.sliceWritesPerRound.Observe(float64(writes))
+}
+
+func (m *Metrics) RecordSliceUpdate(bytes int) {
+	if m == nil {
+		return
+	}
+	if m.sliceUpdates != nil {
+		m.sliceUpdates.Inc()
+	}
+	if m.sliceUpdateBytes != nil {
+		m.sliceUpdateBytes.Add(float64(bytes))
+	}
+}
+
+func (m *Metrics) RecordSliceHandoff(outcome string) {
+	if m == nil || m.sliceHandoffs == nil {
+		return
+	}
+	m.sliceHandoffs.WithLabelValues(outcome).Inc()
+}
+
+func (m *Metrics) RecordStoreToDriverDelay(seconds float64) {
+	if m == nil || m.storeToDriverDelaySeconds == nil {
+		return
+	}
+	m.storeToDriverDelaySeconds.Observe(seconds)
+}
+
+func (m *Metrics) RecordFrontierUnusableDuration(seconds float64) {
+	if m == nil || m.frontierUnusableDurationSeconds == nil {
+		return
+	}
+	m.frontierUnusableDurationSeconds.Observe(seconds)
+}
+
+func (m *Metrics) RecordSliceZeroCommitRefresh() {
+	if m == nil || m.sliceZeroCommitRefreshes == nil {
+		return
+	}
+	m.sliceZeroCommitRefreshes.Inc()
+}
+
+func (m *Metrics) SetClaimsOffRecordedCache(count int) {
+	if m == nil || m.claimsOffRecordedCache == nil {
+		return
+	}
+	m.claimsOffRecordedCache.Set(float64(count))
+}
+
+func (m *Metrics) SetMaxAbsCacheError(errorCPUs int) {
+	if m == nil || m.capacityMirrorMaxAbsCacheError == nil {
+		return
+	}
+	m.capacityMirrorMaxAbsCacheError.Set(float64(errorCPUs))
+}
+
 type noopRecorder struct{}
 
 // Noop returns a recorder that discards all metric observations.
@@ -778,3 +1005,15 @@ func (noopRecorder) RecordDefragNodeReopened(time.Duration)             {}
 func (noopRecorder) RecordDefragReadbackMismatch()                      {}
 func (noopRecorder) SetFlooredCapacityDevices(int)                      {}
 func (noopRecorder) RecordDefragUnpublishedRound()                      {}
+func (noopRecorder) RecordFrontierAdmissionOutcome(string)              {}
+func (noopRecorder) SetFrontierOldestObligationSeconds(float64)         {}
+func (noopRecorder) RecordRepairRounds(string, string)                  {}
+func (noopRecorder) RecordTimeToAlignment(float64)                      {}
+func (noopRecorder) RecordSliceWritesPerRound(int)                      {}
+func (noopRecorder) RecordSliceUpdate(int)                              {}
+func (noopRecorder) RecordSliceHandoff(string)                          {}
+func (noopRecorder) RecordStoreToDriverDelay(float64)                   {}
+func (noopRecorder) RecordFrontierUnusableDuration(float64)             {}
+func (noopRecorder) RecordSliceZeroCommitRefresh()                      {}
+func (noopRecorder) SetClaimsOffRecordedCache(int)                      {}
+func (noopRecorder) SetMaxAbsCacheError(int)                            {}
