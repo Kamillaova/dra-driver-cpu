@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 22)
+	require.Len(t, descriptors, 25)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -63,6 +63,9 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_moves_total",
 		"dra_cpu_defrag_blocked_moves_total",
 		"dra_cpu_defrag_pass_duration_seconds",
+		"dra_cpu_defrag_swap_overlap_seconds",
+		"dra_cpu_defrag_partial_batches_total",
+		"dra_cpu_defrag_rollbacks_total",
 	}, names)
 	require.Empty(t, descriptors[13].Labels)
 	require.Empty(t, descriptors[14].Labels)
@@ -73,6 +76,9 @@ func TestDescriptors(t *testing.T) {
 	require.Equal(t, []string{"result"}, descriptors[18].Labels)
 	require.Equal(t, []string{"result"}, descriptors[19].Labels)
 	require.Empty(t, descriptors[20].Labels)
+	require.Empty(t, descriptors[22].Labels)
+	require.Empty(t, descriptors[23].Labels)
+	require.Equal(t, []string{"result"}, descriptors[24].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -108,8 +114,11 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_defrag_blocked_moves_total",
 		"dra_cpu_defrag_excess_uncore_caches",
 		"dra_cpu_defrag_moves_total",
+		"dra_cpu_defrag_partial_batches_total",
 		"dra_cpu_defrag_pass_duration_seconds",
 		"dra_cpu_defrag_passes_total",
+		"dra_cpu_defrag_rollbacks_total",
+		"dra_cpu_defrag_swap_overlap_seconds",
 		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_nri_create_container_duration_seconds",
 		"dra_cpu_nri_remove_container_duration_seconds",
@@ -169,6 +178,9 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordDefragPass(ResultSuccess, time.Second)
 	m.RecordDefragMoves(ResultSuccess, 1)
 	m.RecordDefragBlockedMoves(1)
+	m.RecordDefragSwapOverlap(time.Second)
+	m.RecordDefragPartialBatch()
+	m.RecordDefragRollback(ResultSuccess)
 	m.RecordSynchronizeSkippedClaim()
 	m.RecordMisplacedClaim()
 	m.SetPartitionState(map[string]bool{"dataplane": true})
