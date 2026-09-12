@@ -39,6 +39,7 @@ import (
 type claimReader interface {
 	AllocatedClaims() ([]*resourceapi.ResourceClaim, error)
 	IsProjectedDeallocated(claimUID types.UID) bool
+	GetProjectedClaims() (*v1alpha1.ProjectedClaims, error)
 }
 
 type claimConfigMapReader struct {
@@ -130,6 +131,10 @@ func (r *claimConfigMapReader) IsProjectedDeallocated(claimUID types.UID) bool {
 	return false
 }
 
+func (r *claimConfigMapReader) GetProjectedClaims() (*v1alpha1.ProjectedClaims, error) {
+	return r.getProjected()
+}
+
 func watchAllocatedClaims(ctx context.Context, cp *CPUDriver) (claimReader, error) {
 	if cp.kubeClient == nil {
 		return nil, nil
@@ -155,12 +160,15 @@ func watchAllocatedClaims(ctx context.Context, cp *CPUDriver) (claimReader, erro
 	cmInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			cp.republishStaleSlicesLocking(context.Background())
+			cp.reconcileMakeRoomTargets(context.Background())
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			cp.republishStaleSlicesLocking(context.Background())
+			cp.reconcileMakeRoomTargets(context.Background())
 		},
 		DeleteFunc: func(obj interface{}) {
 			cp.republishStaleSlicesLocking(context.Background())
+			cp.reconcileMakeRoomTargets(context.Background())
 		},
 	})
 
