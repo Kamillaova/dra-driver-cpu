@@ -79,6 +79,12 @@ on - is configured through other Helm values, not through this file.
 - Grouping strategy used when `cpuDeviceMode` is `grouped`.
 - `numanode`: groups CPUs by NUMA node.
 - `socket`: groups CPUs by socket.
+- `uncorecache`: groups CPUs by the uncore (L3/CCX) cache they share, one device per cache. The
+  capacity a claim consumes is then the capacity of one cache, so a request for a whole cache can
+  only be satisfied by a cache that has one free, and the allocator — not the driver — decides which
+  cache a claim lands on. Every device of one NUMA node is published consecutively, so a claim
+  constraining its requests to one NUMA node stays cheap to allocate. CPUs whose cache the kernel
+  does not report are not published under this grouping.
 - `machine`: groups all allocatable node CPUs into a single machine-wide capacity device.
   NOTE: this mode requires an external scheduler to supply core assignments. See
   [Custom Opaque CPUSet Allocation Overrides](opaque-cpuset-overrides.md).
@@ -147,7 +153,10 @@ on - is configured through other Helm values, not through this file.
 - Requires `cpuDeviceMode: grouped` with `groupBy: numanode` or `socket`, because those
   are the modes where the driver chooses a claim's CPUs in the first place: `individual`
   mode has the scheduler pick exact per-CPU devices, and `groupBy: machine` takes the
-  cpuset from the claim's own opaque config.
+  cpuset from the claim's own opaque config. `groupBy: uncorecache` is refused for a
+  different reason: the driver does choose the CPUs there, but a device is one cache, so
+  moving a claim to another cache would take it off the device it was allocated on and
+  the scheduler's per-device accounting would stop describing the node.
 - Requires `assumeUnsolicitedUpdatesSafe`, since a move is pushed to the runtime
   unprompted.
 - A structural no-op on nodes with one cache per NUMA node, where there is no spread to
