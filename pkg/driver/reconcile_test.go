@@ -26,6 +26,7 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
@@ -76,6 +77,7 @@ func driverWithSharedContainer(t *testing.T, claimUID types.UID, claimCPUs cpuse
 		cdiMgr:             newMockCdiMgr(),
 		containerUpdater:   updater,
 		reconcileTrigger:   make(chan struct{}, 1),
+		metrics:            cpumetrics.Noop(),
 	}
 	requirePreparedResourceClaim(t, logger, d.cpuAllocationStore, claimUID, claimCPUs)
 	d.podConfigStore.SetContainerState("shared-pod", store.NewContainerState("shared-ctr", "shared-ctr-id"))
