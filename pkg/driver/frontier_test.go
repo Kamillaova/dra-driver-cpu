@@ -92,14 +92,18 @@ func TestFrontierAttributeFormatAndScoping(t *testing.T) {
 			require.NotNil(t, rAttr.StringValue)
 
 			val, hasFrontier := dev.Attributes[devattr.AttributeRepairRounds]
+			inputVal, hasInput := dev.Attributes[devattr.AttributeFrontierInput]
 			if *rAttr.StringValue == devattr.PARTITION_ROLE_SHARED {
 				require.False(t, hasFrontier)
+				require.False(t, hasInput)
 				poolChecked++
 				continue
 			}
 
 			require.True(t, hasFrontier)
 			require.NotNil(t, val.StringValue)
+			require.True(t, hasInput)
+			require.NotNil(t, inputVal.StringValue)
 			fields := strings.Split(*val.StringValue, ",")
 			require.Len(t, fields, api.RepairRoundsFields)
 			for _, f := range fields {
@@ -109,6 +113,7 @@ func TestFrontierAttributeFormatAndScoping(t *testing.T) {
 					t.Fatalf("unexpected repair round field: %q", f)
 				}
 			}
+			require.Len(t, *inputVal.StringValue, 64)
 			exclusiveChecked++
 		}
 	}
@@ -167,6 +172,9 @@ func TestFrontierPoisonedNode(t *testing.T) {
 			require.True(t, hasFrontier)
 			require.NotNil(t, val.StringValue)
 			require.Equal(t, "-,-,-,-", *val.StringValue)
+
+			_, hasInput := dev.Attributes[devattr.AttributeFrontierInput]
+			require.False(t, hasInput)
 		}
 	}
 }
@@ -209,4 +217,37 @@ func TestFrontierIsUnreachableWithDefragmentationOff(t *testing.T) {
 			require.Equal(t, unreachableFrontier(), *val.StringValue, dev.Name)
 		}
 	}
+}
+
+func TestFrontierInputDigestChangesWithClaims(t *testing.T) {
+	infos := fourCacheInfos()
+	cp, _ := newCustomFrontierDriver(t, infos, nil, devattr.GROUP_BY_UNCORE_CACHE)
+
+	// Clean state
+	slices1 := cp.refreshDeviceOrder()
+	var digest1 string
+	for _, slice := range slices1 {
+		if len(slice) > 0 {
+			if v, ok := slice[0].Attributes[devattr.AttributeFrontierInput]; ok {
+				digest1 = *v.StringValue
+				break
+			}
+		}
+	}
+	require.NotEmpty(t, digest1)
+
+	// Place one claim
+	placeCharged(t, cp, "claim-1", "cpudevcache000", cpuset.New(0, 1))
+	slices2 := cp.refreshDeviceOrder()
+	var digest2 string
+	for _, slice := range slices2 {
+		if len(slice) > 0 {
+			if v, ok := slice[0].Attributes[devattr.AttributeFrontierInput]; ok {
+				digest2 = *v.StringValue
+				break
+			}
+		}
+	}
+	require.NotEmpty(t, digest2)
+	require.NotEqual(t, digest1, digest2)
 }
