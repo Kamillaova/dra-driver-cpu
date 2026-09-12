@@ -91,7 +91,7 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/cdi.go`: `cdiSpecVersion`, `cdiPlacementsAnnotation`, `cdiRelocatableAnnotation`,
   `cdiAlignmentAnnotation`, `cdiRecordedAnnotation`, `cdiRoundIDAnnotation`, `cdiRoundOriginAnnotation`,
-  `cdiRoundTargetAnnotation`, `cdiRoundPartnersAnnotation`, `cdiEnvDynamicValue`,
+  `cdiRoundTargetAnnotation`, `cdiRoundPartnersAnnotation`, `cdiCorrelationAnnotation`, `cdiEnvDynamicValue`,
   `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`, `decodePlacements`,
   `decodeRecordedDevices`, `decodeRoundPartners`, `recordableRole`
 
@@ -107,6 +107,7 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
   `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `recordedDevices`,
   `recordedDeviceFull`, `recordClaimEvent`, `recordClaimEventRef`, `ensureMakeRoomTarget`, `secureRepairWitness`, `releaseActiveExactPlanAndClosure`,
+  `buildClaimCorrelation`, `claimNameAndNamespace`,
   `publishResources`, `republishStaleSlices`, `rehomeCandidate`, `rehomeShare`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses, and the
@@ -118,10 +119,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/poison.go`: `poisonNUMANodeForCPUs`
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
-  `RoundProvenance`, `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
+  `RoundProvenance`, `ClaimCorrelation`, `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
   `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
-  `GetClaimRecord`, `SetRecordedDevices`, `IsRelocatable`, `IsRepairable`, `Alignment`, `ReserveClosure`,
+  `GetClaimRecord`, `SetClaimCorrelation`, `UpdateClaimRuntimeOutcome`, `SetRecordedDevices`, `IsRelocatable`, `IsRepairable`, `Alignment`, `ReserveClosure`,
   `ReleaseClosure`, `ReservedClosures`, `ReservedClosure`, `HoldsExclusiveCPUs`,
   `ExclusiveClaimAllocations`, `ClaimHolding` and `ClaimHoldings`
 
