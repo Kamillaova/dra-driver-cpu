@@ -50,6 +50,7 @@ type Recorder interface {
 	RecordDefragNodeReopened(duration time.Duration)
 	RecordDefragReadbackMismatch()
 	SetFlooredCapacityDevices(count int)
+	RecordDefragUnpublishedRound()
 	SetPartitionState(verified map[string]bool)
 }
 
