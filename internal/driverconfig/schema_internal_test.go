@@ -20,6 +20,7 @@ package driverconfig
 import (
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -136,5 +137,65 @@ func TestGenerateDriverConfigSchema_ExcludesKubeletRootDir(t *testing.T) {
 	}
 	if want := "use the chart's top-level kubeletRootDir value, or --kubelet-root-dir when running the binary directly"; schemaExcludedFields["kubeletRootDir"] != want {
 		t.Errorf("kubeletRootDir exclusion hint = %q, want %q", schemaExcludedFields["kubeletRootDir"], want)
+	}
+}
+
+// TestGenerateDriverConfigSchema_PartitionItemConstraints: a partition's role
+// and thread-arity expectation are constrained inside the list item, where the
+// Go types say only "string" and "object".
+func TestGenerateDriverConfigSchema_PartitionItemConstraints(t *testing.T) {
+	out, err := GenerateDriverConfigSchema()
+	if err != nil {
+		t.Fatalf("GenerateDriverConfigSchema() error: %v", err)
+	}
+
+	var doc struct {
+		Properties struct {
+			CPUPartitions struct {
+				Items struct {
+					Required   []string `json:"required"`
+					Properties struct {
+						Role struct {
+							Enum []string `json:"enum"`
+						} `json:"role"`
+						SMT struct {
+							OneOf []struct {
+								Type    string   `json:"type"`
+								Minimum *float64 `json:"minimum"`
+							} `json:"oneOf"`
+						} `json:"smt"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"cpuPartitions"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshaling generated schema: %v", err)
+	}
+
+	item := doc.Properties.CPUPartitions.Items
+	wantRoles := []string{"reserved", "default", "shared", "exclusive"}
+	if !reflect.DeepEqual(item.Properties.Role.Enum, wantRoles) {
+		t.Errorf("role enum = %v, want %v", item.Properties.Role.Enum, wantRoles)
+	}
+	if len(item.Properties.SMT.OneOf) != 2 {
+		t.Fatalf("smt oneOf has %d branches, want boolean and integer", len(item.Properties.SMT.OneOf))
+	}
+	if got := item.Properties.SMT.OneOf[0].Type; got != "boolean" {
+		t.Errorf("first smt branch is %q, want boolean", got)
+	}
+	if got := item.Properties.SMT.OneOf[1].Type; got != "integer" {
+		t.Errorf("second smt branch is %q, want integer", got)
+	}
+	if item.Properties.SMT.OneOf[1].Minimum == nil || *item.Properties.SMT.OneOf[1].Minimum != 1 {
+		t.Errorf("smt integer branch minimum = %v, want 1", item.Properties.SMT.OneOf[1].Minimum)
+	}
+	for _, want := range []string{"name", "role", "cpus"} {
+		if !slices.Contains(item.Required, want) {
+			t.Errorf("partition item does not require %q, got %v", want, item.Required)
+		}
+	}
+	if slices.Contains(item.Required, "smt") {
+		t.Errorf("partition item requires smt, which is optional: %v", item.Required)
 	}
 }
