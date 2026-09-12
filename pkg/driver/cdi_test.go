@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,6 +25,7 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
 	cdiSpec "tags.cncf.io/container-device-interface/specs-go"
 )
@@ -330,6 +332,89 @@ func TestGetDeviceCPUSetMissingDevice(t *testing.T) {
 
 	_, err = mgr.GetDeviceCPUSet("claim-cpu-absent")
 	require.Error(t, err)
+}
+
+func TestPreparedClaimAllocationsRecoversRecordedPlacements(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	claimA := types.UID("claim-a")
+	claimB := types.UID("claim-b")
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimA),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimA, "0-1"), cpuset.New(0, 1)))
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimB),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimB, "dynamic"), cpuset.New(4, 5)))
+	require.NoError(t, mgr.Refresh())
+
+	got := mgr.PreparedClaimAllocations(logger)
+	require.Equal(t, map[types.UID]cpuset.CPUSet{
+		claimA: cpuset.New(0, 1),
+		claimB: cpuset.New(4, 5),
+	}, got)
+}
+
+func TestPreparedClaimAllocationsEmptyWhenNothingOnDisk(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	require.Empty(t, mgr.PreparedClaimAllocations(logger))
+}
+
+func TestPreparedClaimAllocationsIgnoresDevicesThisDriverWouldNotHaveGenerated(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	// Neither is a "claim-<uid>" name, so recovering them would not name a real
+	// claim UID -- a hand-edited or foreign spec sharing this driver's kind.
+	foreign := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name:           "not-a-claim-device",
+			Annotations:    map[string]string{cdiCPUSetAnnotation: "2-3"},
+			ContainerEdits: cdiSpec.ContainerEdits{Env: []string{"UNRELATED=1"}},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(foreign, mgr.getSpecName("not-a-claim-device")))
+
+	claimA := types.UID("claim-a")
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimA),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimA, "0-1"), cpuset.New(0, 1)))
+	require.NoError(t, mgr.Refresh())
+
+	got := mgr.PreparedClaimAllocations(logger)
+	require.Equal(t, map[types.UID]cpuset.CPUSet{claimA: cpuset.New(0, 1)}, got)
+}
+
+func TestPreparedClaimAllocationsSkipsOneUnrecoverableDeviceWithoutFailingTheRest(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	// A driver-written annotation that fails to parse: the spec was corrupted
+	// or hand-edited, and this one claim's placement is unrecoverable, but that
+	// must not cost every other claim its recovery too.
+	corrupt := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{
+			Name:           "claim-corrupt",
+			Annotations:    map[string]string{cdiCPUSetAnnotation: "not-a-cpuset"},
+			ContainerEdits: cdiSpec.ContainerEdits{Env: []string{"UNRELATED=1"}},
+		}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(corrupt, mgr.getSpecName("claim-corrupt")))
+
+	claimA := types.UID("claim-a")
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimA),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimA, "0-1"), cpuset.New(0, 1)))
+	require.NoError(t, mgr.Refresh())
+
+	got := mgr.PreparedClaimAllocations(logger)
+	require.Equal(t, map[types.UID]cpuset.CPUSet{claimA: cpuset.New(0, 1)}, got)
 }
 
 func TestGetDeviceCPUSetMalformedAnnotation(t *testing.T) {
