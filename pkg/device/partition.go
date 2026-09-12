@@ -54,6 +54,19 @@ const PartitionTaintKey = "dra.cpu/partition"
 // not also tolerate a fence, and nothing is meant to tolerate this one.
 const PoisonTaintKey = "dra.cpu/poisoned"
 
+// FloorTaintKey is the key of the NoSchedule taint a device carries while the
+// capacity published for it is being held above the amount the driver computed,
+// because publishing that amount would put the device below its own request
+// policy and have the API server reject the whole slice. The taint withdraws
+// what the number over-states, and goes when the computed amount climbs back.
+//
+// The third distinct key, for the reason the second one has: nothing tolerates
+// this one either, and a toleration written for a partition must tolerate
+// neither this nor a fence. It carries no value -- a computed amount may be
+// negative and a taint value is validated as a label value, which cannot begin
+// with a sign, so the number lives in the log and the gauge instead.
+const FloorTaintKey = "dra.cpu/floor"
+
 // Partition is a named set of whole cores on this node, resolved against the
 // node's own topology.
 type Partition struct {
