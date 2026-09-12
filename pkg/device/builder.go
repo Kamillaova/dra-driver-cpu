@@ -80,7 +80,9 @@ type GroupedDevices struct {
 	// Roles is each device's partition role, so a caller resolving an allocation
 	// knows whether the device grants CPUs the claim holds alone or a share of a
 	// pool every other claim on it holds too.
-	Roles map[string]string
+	Roles         map[string]string
+	Partitions    map[string]string
+	UncoreCacheID map[string]int
 }
 
 // BuildGrouped publishes one device per CPU group of every partition that
@@ -102,6 +104,8 @@ func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology,
 		ThreadsPerCore: make(map[string]int),
 		CPUs:           make(map[string]cpuset.CPUSet),
 		Roles:          make(map[string]string),
+		Partitions:     make(map[string]string),
+		UncoreCacheID:  make(map[string]int),
 	}
 	for _, partition := range partitions {
 		if partition.IsPool() {
@@ -109,6 +113,7 @@ func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology,
 			for _, dev := range deviceInfos {
 				built.CPUs[dev.name] = dev.cpus
 				built.Roles[dev.name] = partition.Role
+				built.Partitions[dev.name] = partition.Name
 			}
 			if devices := createPoolDeviceSlices(deviceInfos, partition); len(devices) > 0 {
 				built.ByPartition = append(built.ByPartition, devices)
@@ -121,6 +126,8 @@ func BuildGrouped(logger logr.Logger, groupBy string, topo *cpuinfo.CPUTopology,
 		deviceInfos := groupedCPUDeviceInfos(logger, groupBy, topo, reservedCPUSet, fullPhysicalCPUsOnly, partition, len(partitions) > 1)
 		for _, dev := range deviceInfos {
 			built.Roles[dev.name] = partition.Role
+			built.Partitions[dev.name] = partition.Name
+			built.UncoreCacheID[dev.name] = dev.uncoreCacheID
 			switch groupBy {
 			case GROUP_BY_SOCKET:
 				built.NameToID[dev.name] = dev.socketID
