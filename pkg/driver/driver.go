@@ -231,6 +231,10 @@ type CPUDriver struct {
 	// publishedFrontier is the repair frontier published per (partition, NUMA node).
 	// Guarded by applyMu.
 	publishedFrontier map[string]string
+	// publishedFrontierInput is the SHA-256 digest of the sorted UIDs of claims
+	// whose exclusive allocations were accounted for when computing publishedFrontier.
+	// Guarded by applyMu.
+	publishedFrontierInput map[string]string
 
 	kubeletRootDir string
 	cpuAllocator   CPUAllocator
