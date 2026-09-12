@@ -262,6 +262,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
 		ReconcileSharedOnUnprepare:            cfg.ReconcileSharedOnUnprepare,
 		DefragEnabled:                         cfg.DefragEnabled,
+		DefragAllowTransientOverlap:           cfg.DefragAllowTransientOverlap,
 		CPUPartitions:                         cpuPartitions,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,

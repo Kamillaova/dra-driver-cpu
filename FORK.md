@@ -81,7 +81,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `decodePlacements`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries` and
-  `defragRetryDue` and `placementPolicy` fields, and `Config.DefragEnabled`
+  `defragRetryDue` and `placementPolicy` fields, and `Config.DefragEnabled` and
+  `Config.DefragAllowTransientOverlap`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
   and the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields
@@ -96,8 +97,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
   `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
-  `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `ClaimRecord`, `GetClaimRecord`, `IsRelocatable`,
-  `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
+  `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
+  `GetClaimRecord`, `IsRelocatable`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 

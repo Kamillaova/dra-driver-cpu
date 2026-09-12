@@ -130,6 +130,9 @@ type Metrics struct {
 	defragMoves                   *prometheus.CounterVec
 	defragBlockedMoves            prometheus.Counter
 	defragPassDurationSecondsHist prometheus.Histogram
+	defragSwapOverlapSecondsHist  prometheus.Histogram
+	defragPartialBatches          prometheus.Counter
+	defragRollbacks               *prometheus.CounterVec
 }
 
 type metricKind string
@@ -285,6 +288,23 @@ var (
 		help:    "Duration of defragmentation passes in seconds.",
 		buckets: prometheus.DefBuckets,
 	}
+	defragSwapOverlapSpec = metricSpec{
+		name:    "dra_cpu_defrag_swap_overlap_seconds",
+		kind:    metricHistogram,
+		help:    "Duration of the container update batch carrying an exchange of two claims' CPUs, which bounds the window in which both of them hold the same CPUs.",
+		buckets: prometheus.DefBuckets,
+	}
+	defragPartialBatchesSpec = metricSpec{
+		name: "dra_cpu_defrag_partial_batches_total",
+		kind: metricCounter,
+		help: "Total number of exchanges the runtime applied for some of their containers and refused for the rest.",
+	}
+	defragRollbacksSpec = metricSpec{
+		name:   "dra_cpu_defrag_rollbacks_total",
+		kind:   metricCounter,
+		help:   "Total number of attempts to put the applied half of an exchange back, by result; an error leaves two claims sharing CPUs.",
+		labels: []string{"result"},
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -310,6 +330,9 @@ var metricSpecs = []metricSpec{
 	defragMovesSpec,
 	defragBlockedMovesSpec,
 	defragPassDurationSpec,
+	defragSwapOverlapSpec,
+	defragPartialBatchesSpec,
+	defragRollbacksSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -364,6 +387,9 @@ func New(reg prometheus.Registerer) *Metrics {
 		defragMoves:                   newCounterVec(defragMovesSpec),
 		defragBlockedMoves:            newCounter(defragBlockedMovesSpec),
 		defragPassDurationSecondsHist: newHistogram(defragPassDurationSpec),
+		defragSwapOverlapSecondsHist:  newHistogram(defragSwapOverlapSpec),
+		defragPartialBatches:          newCounter(defragPartialBatchesSpec),
+		defragRollbacks:               newCounterVec(defragRollbacksSpec),
 	}
 
 	reg.MustRegister(
@@ -389,6 +415,9 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragMoves,
 		m.defragBlockedMoves,
 		m.defragPassDurationSecondsHist,
+		m.defragSwapOverlapSecondsHist,
+		m.defragPartialBatches,
+		m.defragRollbacks,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -396,6 +425,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriSynchronizeDuration.WithLabelValues(result.String())
 		m.defragPasses.WithLabelValues(result.String())
 		m.defragMoves.WithLabelValues(result.String())
+		m.defragRollbacks.WithLabelValues(result.String())
 	}
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		for _, alloc := range []CPUAllocation{CPUAllocationShared, CPUAllocationExclusive} {
@@ -556,6 +586,22 @@ func (m *Metrics) RecordDefragMoves(result Result, count int) {
 	m.defragMoves.WithLabelValues(result.String()).Add(float64(count))
 }
 
+// RecordDefragSwapOverlap observes the batch that carried an exchange. The
+// instant the two claims share CPUs is inside the runtime, between the two
+// writes it applies in order, so the batch is the tightest bound on it a plugin
+// can measure.
+func (m *Metrics) RecordDefragSwapOverlap(duration time.Duration) {
+	m.defragSwapOverlapSecondsHist.Observe(duration.Seconds())
+}
+
+func (m *Metrics) RecordDefragPartialBatch() {
+	m.defragPartialBatches.Inc()
+}
+
+func (m *Metrics) RecordDefragRollback(result Result) {
+	m.defragRollbacks.WithLabelValues(result.String()).Inc()
+}
+
 func (m *Metrics) RecordDefragBlockedMoves(count int) {
 	if count <= 0 {
 		return
@@ -585,3 +631,6 @@ func (noopRecorder) SetDefragState(DefragState)                         {}
 func (noopRecorder) RecordDefragPass(Result, time.Duration)             {}
 func (noopRecorder) RecordDefragMoves(Result, int)                      {}
 func (noopRecorder) RecordDefragBlockedMoves(int)                       {}
+func (noopRecorder) RecordDefragSwapOverlap(time.Duration)              {}
+func (noopRecorder) RecordDefragPartialBatch()                          {}
+func (noopRecorder) RecordDefragRollback(Result)                        {}

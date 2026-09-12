@@ -50,6 +50,23 @@ uncore cache per NUMA node has no spread to recover, so its excess is permanentl
 | `dra_cpu_defrag_moves_total`                 | Counter   | `result`    | Claim moves attempted. `error` is a move the runtime refused and the driver reverted.                                              |
 | `dra_cpu_defrag_blocked_moves_total`         | Counter   | none        | Moves a better placement called for that a pass could not make, usually because another claim is in the way.                       |
 | `dra_cpu_defrag_pass_duration_seconds`       | Histogram | none        | Defragmentation pass latency in seconds.                                                                                           |
+| `dra_cpu_defrag_swap_overlap_seconds`        | Histogram | none        | Duration of a batch that carried an exchange and was answered, which bounds the window in which both claims hold the same CPUs.    |
+| `dra_cpu_defrag_partial_batches_total`       | Counter   | none        | Exchanges the runtime applied for some of their containers and refused for the rest.                                               |
+| `dra_cpu_defrag_rollbacks_total`             | Counter   | `result`    | Attempts to put the applied half of an exchange back. An `error` leaves two claims sharing CPUs.                                   |
+| `dra_cpu_defrag_numa_node_poisoned`          | Gauge     | `numa_node` | Whether the driver has stopped vouching for a NUMA node (1) because an exchange there could be neither finished nor undone.        |
+| `dra_cpu_defrag_poisoned_nodes_total`        | Counter   | none        | Times a NUMA node was fenced after such an exchange.                                                                               |
+| `dra_cpu_defrag_poisoned_duration_seconds`   | Histogram | none        | How long each fenced NUMA node stayed fenced, from the unsettled exchange to the read-back that agreed with the driver's records.  |
+| `dra_cpu_defrag_readback_mismatches_total`   | Counter   | none        | Read-backs that left a fenced node fenced, because its containers' CPUs match neither the driver's record nor what they came from. |
+
+`dra_cpu_defrag_swap_overlap_seconds` measures the batch rather than the window itself: the instant
+the two claims share CPUs is inside the runtime, between the two writes it applies in order, so the
+batch is the tightest bound a plugin can observe. A batch that ran out of time is not observed at all
+— its duration is the deadline, which says how long the driver waited and nothing about the window. `dra_cpu_defrag_rollbacks_total{result="error"}` and
+`dra_cpu_defrag_numa_node_poisoned` are the ones to alert on: the first means the driver could neither
+finish an exchange nor undo it, and the second is the fence it raised in response. A fenced node
+refuses new claims and plans no further moves until a read-back of its containers agrees with the
+driver's records, so a fence that does not lift is a runtime refusing container updates it should be
+accepting.
 
 `dra_cpu_defrag_largest_alignable_free_cpus` is the leading indicator: it says whether the *next*
 large claim will land aligned, where the excess count says whether the last ones did. A steady
