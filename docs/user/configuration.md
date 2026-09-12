@@ -161,7 +161,8 @@ on - is configured through other Helm values, not through this file.
   elsewhere. A scheduler subtracting what its own records charged then arrives at the CPUs
   really free there. The consequence to know about is that a cache device's `capacity` is
   no longer its size while any claim sits off the cache it was allocated from;
-  `dra.cpu/numCPUs` still carries the size.
+  `dra.cpu/numCPUs` still carries the size. See
+  [The Capacity Mirror](capacity-mirror.md).
 - Requires `assumeUnsolicitedUpdatesSafe`, since a move is pushed to the runtime
   unprompted.
 - A structural no-op on nodes with one cache per NUMA node, where there is no spread to
