@@ -87,6 +87,10 @@ var _ = ginkgo.When("checking metrics", ginkgo.Serial, ginkgo.Label("metrics"), 
 	var claimSpec resourcev1.ResourceClaimSpec
 	var rawMetrics string
 	var allocBaseline allocationMetricSnapshot
+	// step is the device's whole-core allocation step. A 1-CPU request is
+	// deliberate -- it is the interesting case under whole-core allocation, where
+	// the scheduler rounds it up to the step and the driver allocates that many.
+	var step int
 
 	ginkgo.BeforeEach(func(ctx context.Context) {
 		dracpuTesterImage = os.Getenv("DRACPU_E2E_TEST_IMAGE")
@@ -131,6 +135,8 @@ var _ = ginkgo.When("checking metrics", ginkgo.Serial, ginkgo.Label("metrics"), 
 			claimSpec = makeResourceClaimSpec(1, cpuDeviceMode == "grouped")
 		}
 
+		step = allocationStep(ctx, metricsFxt.K8SClientset, targetNode.Name)
+
 		rawMetrics, err = getDriverRawMetrics(ctx, metricsFxt, targetNode.Name)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot fetch raw allocation metrics")
 		allocBaseline, err = parseAllocationMetricSnapshot(rawMetrics)
@@ -167,8 +173,8 @@ var _ = ginkgo.When("checking metrics", ginkgo.Serial, ginkgo.Label("metrics"), 
 				g.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse baseline allocation metrics")
 				expectBasicMetricProperties(g, snapshot)
 				g.Expect(snapshot.TotalCPUs()).To(gomega.Equal(allocBaseline.TotalCPUs()))
-				g.Expect(snapshot.AllocatedCPUs).To(gomega.Equal(allocBaseline.AllocatedCPUs + 1))
-				g.Expect(snapshot.AvailableCPUs).To(gomega.Equal(allocBaseline.AvailableCPUs - 1))
+				g.Expect(snapshot.AllocatedCPUs).To(gomega.Equal(allocBaseline.AllocatedCPUs + step))
+				g.Expect(snapshot.AvailableCPUs).To(gomega.Equal(allocBaseline.AvailableCPUs - step))
 				g.Expect(snapshot.ReservedCPUs).To(gomega.Equal(allocBaseline.ReservedCPUs))
 				g.Expect(snapshot.ActiveResourceClaims).To(gomega.Equal(allocBaseline.ActiveResourceClaims + 1))
 			}).WithTimeout(driverPodPollTimeout).WithPolling(driverPodPollInterval).Should(gomega.Succeed())
@@ -193,8 +199,8 @@ var _ = ginkgo.When("checking metrics", ginkgo.Serial, ginkgo.Label("metrics"), 
 				g.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse baseline allocation metrics")
 				expectBasicMetricProperties(g, snapshot)
 				g.Expect(snapshot.TotalCPUs()).To(gomega.Equal(allocBaseline.TotalCPUs()))
-				g.Expect(snapshot.AllocatedCPUs).To(gomega.Equal(allocBaseline.AllocatedCPUs + 1))
-				g.Expect(snapshot.AvailableCPUs).To(gomega.Equal(allocBaseline.AvailableCPUs - 1))
+				g.Expect(snapshot.AllocatedCPUs).To(gomega.Equal(allocBaseline.AllocatedCPUs + step))
+				g.Expect(snapshot.AvailableCPUs).To(gomega.Equal(allocBaseline.AvailableCPUs - step))
 				g.Expect(snapshot.ReservedCPUs).To(gomega.Equal(allocBaseline.ReservedCPUs))
 				g.Expect(snapshot.ActiveResourceClaims).To(gomega.Equal(allocBaseline.ActiveResourceClaims + 1))
 			}).WithTimeout(driverPodPollTimeout).WithPolling(driverPodPollInterval).Should(gomega.Succeed())
