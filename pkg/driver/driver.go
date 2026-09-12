@@ -173,15 +173,15 @@ type CPUDriver struct {
 	// sysfs is kept so a defragmentation pass can re-read which CPUs are online;
 	// the set read in New is only true of startup.
 	sysfs sysfs.FS
-	// pendingRounds is, per NUMA node, a set of moves the runtime never
-	// confirmed, held so the next attempt at that node can send it again.
-	// Guarded by applyMu.
-	pendingRounds map[int]*defragRound
-	// defragRetries holds the NUMA nodes whose last round the runtime left
+	// pendingRounds is, per scope, a set of moves the runtime never confirmed,
+	// held so the next attempt at that scope can send it again. Guarded by
+	// applyMu.
+	pendingRounds map[defragScope]*defragRound
+	// defragRetries holds the scopes whose last round the runtime left
 	// unsettled, each released again once its own backoff has elapsed.
-	defragRetries workqueue.TypedRateLimitingInterface[int]
-	// defragRetryDue carries those nodes to the reconcile worker.
-	defragRetryDue chan int
+	defragRetries workqueue.TypedRateLimitingInterface[defragScope]
+	// defragRetryDue carries those scopes to the reconcile worker.
+	defragRetryDue chan defragScope
 	// applyMu serializes the work that decides which CPUs back a claim: the DRA
 	// prepare and unprepare hooks, the NRI hooks that read a placement or record
 	// container state, and the background worker's local phases. It also covers
@@ -241,13 +241,6 @@ type deviceTopology struct {
 	// thread count), from BuildGrouped. Keyed by device name, which a caller
 	// preparing a claim already has (alloc.Device).
 	deviceThreadsPerCore map[string]int
-	// numaNodeThreadsPerCore is deviceThreadsPerCore reindexed by NUMA node ID,
-	// derived once in New() from deviceThreadsPerCore plus whichever of
-	// deviceNameToSocketID/deviceNameToNUMANodeID is populated. It exists only
-	// for callers that plan by NUMA node and have no device name in hand
-	// (defragSelector's callers); a NUMA node belongs to exactly one socket, so
-	// this is well defined under either grouping.
-	numaNodeThreadsPerCore map[int]int
 }
 
 // Providers group the interfaces the CPUDriver depends on
@@ -451,9 +444,9 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		// updates.
 		plugin.defrag = defragOptions{enabled: config.DefragEnabled}
 		if plugin.defrag.enabled {
-			plugin.pendingRounds = make(map[int]*defragRound)
-			plugin.defragRetries = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[int]())
-			plugin.defragRetryDue = make(chan int)
+			plugin.pendingRounds = make(map[defragScope]*defragRound)
+			plugin.defragRetries = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[defragScope]())
+			plugin.defragRetryDue = make(chan defragScope)
 		}
 		if plugin.reconcileSharedOnUnprepare || plugin.defrag.enabled {
 			plugin.reconcileTrigger = make(chan struct{}, 1)
@@ -491,7 +484,6 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		case device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
 			plugin.topology.deviceNameToNUMANodeID = built.NameToID
 		}
-		plugin.topology.numaNodeThreadsPerCore = numaNodeThreadsPerCore(plugin.topology.cpuTopology, plugin.cpuDeviceGroupBy, built.NameToID, built.ThreadsPerCore)
 	} else {
 		devices, plugin.topology.deviceNameToCPUID = device.Build(plugin.topology.cpuTopology, plugin.topology.reservedCPUs, plugin.pcieRootMapper, config.PublishNodeAllocatableResourceMapping)
 		devicesByPartition = [][]resourceapi.Device{devices}
@@ -655,42 +647,6 @@ func validateReservedCPUsAlignment(topo *cpuinfo.CPUTopology, reservedCPUs cpuse
 			reservedCPUs.String(), split.String())
 	}
 	return nil
-}
-
-// numaNodeThreadsPerCore reindexes deviceThreadsPerCore by NUMA node ID, for
-// callers that plan by NUMA node and have no device name in hand (defrag). A
-// NUMA node belongs to exactly one socket, so the reindex is well defined
-// whether the driver groups devices by NUMA node or by socket.
-func numaNodeThreadsPerCore(topo *cpuinfo.CPUTopology, groupBy string, nameToID, deviceThreadsPerCore map[string]int) map[int]int {
-	// Several devices answer for one group once partitions describe a node, so
-	// the group has a step only where they agree on one; disagreement gives zero,
-	// which is what UniformThreadsPerCore means by "no single answer" and what a
-	// caller planning by group reads as no whole-core promise.
-	byGroup := make(map[int]int, len(nameToID))
-	seen := make(map[int]bool, len(nameToID))
-	for name, id := range nameToID {
-		threads := deviceThreadsPerCore[name]
-		if !seen[id] {
-			byGroup[id], seen[id] = threads, true
-			continue
-		}
-		if byGroup[id] != threads {
-			byGroup[id] = 0
-		}
-	}
-
-	switch groupBy {
-	case device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
-		return byGroup
-	case device.GROUP_BY_SOCKET:
-		byNUMANode := make(map[int]int, len(byGroup))
-		for _, numaID := range topo.CPUDetails.NUMANodes().List() {
-			anyCPU := topo.CPUDetails.CPUsInNUMANodes(numaID).UnsortedList()[0]
-			byNUMANode[numaID] = byGroup[topo.CPUDetails[anyCPU].SocketID]
-		}
-		return byNUMANode
-	}
-	return map[int]int{}
 }
 
 // registrarDir is the kubelet plugin registration directory, always
