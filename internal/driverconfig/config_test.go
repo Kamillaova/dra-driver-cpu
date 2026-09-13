@@ -763,6 +763,24 @@ func TestResolve_DefragDefaults(t *testing.T) {
 	assert.NoError(t, d.Validate())
 }
 
+// TestResolve_ServePlacements: the placements endpoint is off unless a config
+// file asks for it.
+func TestResolve_ServePlacements(t *testing.T) {
+	assert.False(t, driverconfig.Default().ServePlacements)
+
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+servePlacements: true
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.NoError(t, err)
+	assert.True(t, result.ServePlacements)
+}
+
 // TestValidate_DefragRequirements: the modes where the driver does not choose a
 // claim's CPUs, and the runtime assertion a move depends on.
 func TestValidate_DefragRequirements(t *testing.T) {
