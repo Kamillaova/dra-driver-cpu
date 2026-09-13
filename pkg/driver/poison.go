@@ -158,6 +158,7 @@ func (cp *CPUDriver) liftPoison(logger logr.Logger, numaNodeID int) {
 	}
 	delete(cp.poisonedNodes, numaNodeID)
 	cp.metrics.RecordDefragNodeReopened(time.Since(fence.since))
+	cp.metrics.RecordFrontierUnusableDuration(time.Since(fence.since).Seconds())
 	cp.metrics.SetDefragNodePoisoned(numaNodeID, false)
 	logger.Info("reopening a NUMA node: the CPUs its containers are running on agree with this driver's records")
 }
