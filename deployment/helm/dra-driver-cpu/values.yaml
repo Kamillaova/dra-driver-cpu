@@ -31,7 +31,7 @@ imagePullSecrets: []
 
 # @schema additionalProperties:false
 rbac:
-  # -- Create RBAC resources (ClusterRole and ClusterRoleBinding)
+  # -- Create RBAC resources (ClusterRole, ClusterRoleBinding, Role, and RoleBinding)
   create: true # @schema type:boolean;required:true
 
 serviceAccount:
