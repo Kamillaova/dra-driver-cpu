@@ -89,8 +89,8 @@ DaemonSet.
 Fork-only symbols added to upstream files, which carry no marker of their own. Additions that belong
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
-- `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiRecordedAnnotation`,
-  `cdiRelocatableAnnotation`, `cdiRoundIDAnnotation`, `cdiRoundOriginAnnotation`,
+- `pkg/driver/cdi.go`: `cdiSpecVersion`, `cdiPlacementsAnnotation`, `cdiRelocatableAnnotation`,
+  `cdiAlignmentAnnotation`, `cdiRecordedAnnotation`, `cdiRoundIDAnnotation`, `cdiRoundOriginAnnotation`,
   `cdiRoundTargetAnnotation`, `cdiRoundPartnersAnnotation`, `cdiEnvDynamicValue`,
   `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`, `decodePlacements`,
   `decodeRecordedDevices`, `decodeRoundPartners`, `recordableRole`
@@ -121,7 +121,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `RoundProvenance`, `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
   `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
-  `GetClaimRecord`, `SetRecordedDevices`, `IsRelocatable`, `HoldsExclusiveCPUs`,
+  `GetClaimRecord`, `SetRecordedDevices`, `IsRelocatable`, `IsRepairable`, `Alignment`, `ReserveClosure`,
+  `ReleaseClosure`, `ReservedClosures`, `ReservedClosure`, `HoldsExclusiveCPUs`,
   `ExclusiveClaimAllocations`, `ClaimHolding` and `ClaimHoldings`
 
 - `pkg/store/claim_tracker.go`: `Owner`
