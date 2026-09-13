@@ -74,7 +74,7 @@ func (cp *CPUDriver) publishResources(ctx context.Context) error {
 	cp.publishMu.Lock()
 	defer cp.publishMu.Unlock()
 	cp.applyMu.Lock()
-	chunks := cp.refreshDeviceOrder()
+	chunks, order := cp.refreshDeviceOrder()
 	cp.applyMu.Unlock()
 
 	if chunks == nil {
@@ -94,7 +94,13 @@ func (cp *CPUDriver) publishResources(ctx context.Context) error {
 		},
 	}
 
-	return cp.draPlugin.PublishResources(ctx, resources)
+	if err := cp.draPlugin.PublishResources(ctx, resources); err != nil {
+		return err
+	}
+	cp.applyMu.Lock()
+	cp.commitPublishedOrder(order)
+	cp.applyMu.Unlock()
+	return nil
 }
 
 // PrepareResourceClaims is called by the kubelet to prepare a resource claim.
