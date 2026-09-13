@@ -44,8 +44,8 @@ func getSpecFromCache(mgr *CdiManager, targetSpecName string) *cdiSpec.Spec {
 	return nil
 }
 
-// exclusiveOn is the allocation shape of every claim this driver prepares
-// today: one request granting CPUs the claim holds alone.
+// exclusiveOn is the simplest allocation shape: one request granting CPUs the
+// claim holds alone.
 func exclusiveOn(cpus cpuset.CPUSet) []store.RequestAllocation {
 	return []store.RequestAllocation{{Request: "cpus", CPUs: cpus, Role: store.RoleExclusive}}
 }
@@ -304,6 +304,28 @@ func TestGetDeviceAllocations(t *testing.T) {
 	require.Equal(t, exclusiveOn(cpuset.New(6, 7)), got, "the annotation, not the env var, is the record")
 }
 
+// TestGetDeviceAllocationsRoundTripsAPoolRequest: a claim holding both an
+// exclusive request and a share of a pool reads back with each request's role
+// intact, which is what keeps the pool's CPUs out of the exclusive accounting
+// after a driver restart.
+func TestGetDeviceAllocationsRoundTripsAPoolRequest(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-cpu-pool"
+	requests := []store.RequestAllocation{
+		{Request: "helpers", CPUs: cpuset.New(6, 7), Role: store.RoleShared},
+		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive},
+	}
+	require.NoError(t, mgr.AddDevice(logger, deviceName, "DRA_CPUSET_claim-cpu-pool=0-1,6-7", requests))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, requests, got)
+}
+
 func TestGetDeviceAllocationsFallsBackToEnv(t *testing.T) {
 	logger := testr.New(t)
 	tempCDIDir := t.TempDir()
@@ -472,7 +494,7 @@ func TestGetDeviceAllocationsRefusesUnusablePlacements(t *testing.T) {
 		wantError:  "no request placements recorded",
 	}, {
 		name:       "a role this driver does not record",
-		annotation: `[{"request":"cpus","cpus":"0-1","role":"shared"}]`,
+		annotation: `[{"request":"cpus","cpus":"0-1","role":"exclusiv"}]`,
 		wantError:  "unrecognised role",
 	}, {
 		name:       "no role at all",
