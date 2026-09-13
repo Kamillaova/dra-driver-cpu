@@ -92,9 +92,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `encodePlacements`, `decodePlacements`, `decodeRecordedDevices`, `recordableRole`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `defragRetries`,
-  `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes` and `placementPolicy` fields,
-  `deviceTopology.deviceIsPool`, `Providers.CgroupFS` and `EnsureCgroupFS`, and
-  `Config.DefragEnabled` and `Config.DefragAllowTransientOverlap`
+  `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes`, `claimReader`, `namespace`
+  and `placementPolicy` fields, `deviceTopology.deviceIsPool`, `Providers.CgroupFS` and
+  `EnsureCgroupFS`, and `Config.DefragEnabled`, `Config.DefragAllowTransientOverlap` and
+  `Config.Namespace`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
   and the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields
@@ -103,7 +104,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `recordedDevices`,
   `republishStaleSlices`
 
-- `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
+- `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses, and the
+  namespace lookup from POD_NAMESPACE
 
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`, `sharedContainerCPUs`
 
@@ -141,9 +143,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   they pin, rather than kept apart
 
 Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/cgroupfs`, `pkg/driver/defrag.go`,
-`reconcile.go`, `placements.go`, `deviceorder.go`, `poison.go`, `pkg/cpuinfo/coretopology.go`,
-`api/attributes.go`, `api/v1alpha1/projection.go`) are visible to `git diff --stat` on their own and
-are not repeated here.
+`reconcile.go`, `placements.go`, `deviceorder.go`, `poison.go`, `claim_reader.go`,
+`pkg/cpuinfo/coretopology.go`, `api/attributes.go`, `api/v1alpha1/projection.go`,
+`deployment/helm/dra-driver-cpu/templates/role.yaml`, `rolebinding.yaml`) are visible to
+`git diff --stat` on their own and are not repeated here.
 
 `api/` is a nested module here (`api/go.mod`), because the scheduler plugin that reads the driver's
 device attributes pins it independently and importing it must not drag in the whole driver. Upstream
