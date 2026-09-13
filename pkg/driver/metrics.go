@@ -35,6 +35,12 @@ type Recorder interface {
 	// it cannot adopt rather than failing the whole call, so it has something to
 	// count that upstream does not.
 	RecordSynchronizeSkippedClaim()
+	// CCX-FORK: the defragmentation methods, which have no upstream counterpart
+	// because upstream never moves a prepared claim.
+	SetDefragState(cpumetrics.DefragState)
+	RecordDefragPass(result cpumetrics.Result, duration time.Duration)
+	RecordDefragMoves(result cpumetrics.Result, count int)
+	RecordDefragBlockedMoves(count int)
 }
 
 func (cp *CPUDriver) refreshAllocationMetrics() {
