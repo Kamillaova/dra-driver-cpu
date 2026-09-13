@@ -80,6 +80,12 @@ type Config struct {
 	// AssumeUnsolicitedUpdatesSafe, since a move is pushed to the runtime
 	// unprompted. Defaults to false.
 	DefragEnabled bool `json:"defragEnabled,omitempty"`
+	// ServePlacements serves the /placements endpoint on the bind address. It
+	// reports which CPUs back every claim on this node, by claim, pod and
+	// container name, which is more than the metrics say and more than an
+	// unauthenticated caller on the node's network should be able to ask for.
+	// Defaults to false; turn it on to diagnose a split claim.
+	ServePlacements bool `json:"servePlacements,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -100,6 +106,7 @@ func (c Config) LogValues() []any {
 		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
 		"reconcileSharedOnUnprepare", c.ReconcileSharedOnUnprepare,
 		"defragEnabled", c.DefragEnabled,
+		"servePlacements", c.ServePlacements,
 	}
 }
 
@@ -121,6 +128,7 @@ type dumpConfig struct {
 	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe"`
 	ReconcileSharedOnUnprepare            bool   `json:"reconcileSharedOnUnprepare"`
 	DefragEnabled                         bool   `json:"defragEnabled"`
+	ServePlacements                       bool   `json:"servePlacements"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
