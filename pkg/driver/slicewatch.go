@@ -260,6 +260,8 @@ func (cp *CPUDriver) awaitStoredShrink(ctx context.Context, round *defragRound) 
 		return nil
 	}
 
+	round.sliceWrites++
+	start := time.Now()
 	if err := cp.publishResources(ctx); err != nil {
 		return fmt.Errorf("cannot publish the capacity this round shrinks: %w", err)
 	}
@@ -270,6 +272,7 @@ func (cp *CPUDriver) awaitStoredShrink(ctx context.Context, round *defragRound) 
 	defer poll.Stop()
 	for {
 		if cp.storedDevicesAgree(logger, names) {
+			cp.metrics.RecordStoreToDriverDelay(time.Since(start).Seconds())
 			return nil
 		}
 		select {
