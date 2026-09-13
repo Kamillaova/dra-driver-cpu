@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 25)
+	require.Len(t, descriptors, 29)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -66,6 +66,10 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_swap_overlap_seconds",
 		"dra_cpu_defrag_partial_batches_total",
 		"dra_cpu_defrag_rollbacks_total",
+		"dra_cpu_defrag_numa_node_poisoned",
+		"dra_cpu_defrag_poisoned_nodes_total",
+		"dra_cpu_defrag_poisoned_duration_seconds",
+		"dra_cpu_defrag_readback_mismatches_total",
 	}, names)
 	require.Empty(t, descriptors[13].Labels)
 	require.Empty(t, descriptors[14].Labels)
@@ -79,6 +83,10 @@ func TestDescriptors(t *testing.T) {
 	require.Empty(t, descriptors[22].Labels)
 	require.Empty(t, descriptors[23].Labels)
 	require.Equal(t, []string{"result"}, descriptors[24].Labels)
+	require.Equal(t, []string{"numa_node"}, descriptors[25].Labels)
+	require.Empty(t, descriptors[26].Labels)
+	require.Empty(t, descriptors[27].Labels)
+	require.Empty(t, descriptors[28].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -117,6 +125,9 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_defrag_partial_batches_total",
 		"dra_cpu_defrag_pass_duration_seconds",
 		"dra_cpu_defrag_passes_total",
+		"dra_cpu_defrag_poisoned_duration_seconds",
+		"dra_cpu_defrag_poisoned_nodes_total",
+		"dra_cpu_defrag_readback_mismatches_total",
 		"dra_cpu_defrag_rollbacks_total",
 		"dra_cpu_defrag_swap_overlap_seconds",
 		"dra_cpu_misplaced_claims_total",
@@ -181,6 +192,10 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordDefragSwapOverlap(time.Second)
 	m.RecordDefragPartialBatch()
 	m.RecordDefragRollback(ResultSuccess)
+	m.SetDefragNodePoisoned(0, false)
+	m.RecordDefragNodePoisoned()
+	m.RecordDefragNodeReopened(time.Second)
+	m.RecordDefragReadbackMismatch()
 	m.RecordSynchronizeSkippedClaim()
 	m.RecordMisplacedClaim()
 	m.SetPartitionState(map[string]bool{"dataplane": true})
