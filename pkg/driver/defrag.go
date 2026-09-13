@@ -1212,6 +1212,7 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 			if err := cp.writeClaimPlacement(sLogger, move.ClaimUID); err != nil {
 				sLogger.Error(err, "cannot clear round provenance from recorded placement", "claimUID", move.ClaimUID)
 			}
+			cp.publishClaimPlacementStatus(context.Background(), sLogger, move.ClaimUID)
 			committed++
 			continue
 		}
@@ -1323,6 +1324,7 @@ func (cp *CPUDriver) settleExchangeStep(logger logr.Logger, round *defragRound, 
 			if err := cp.writeClaimPlacement(logger, move.ClaimUID); err != nil {
 				logger.Error(err, "cannot clear round provenance from recorded placement", "claimUID", move.ClaimUID)
 			}
+			cp.publishClaimPlacementStatus(context.Background(), logger, move.ClaimUID)
 		}
 		return true
 	case exchangeUndone:
