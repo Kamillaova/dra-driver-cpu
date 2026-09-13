@@ -97,9 +97,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `activeExactPlans`,
   `defragRetries`, `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes`,
-  `publishedCorrection`, `storedSlices`, `claimReader`, `namespace` and `placementPolicy` fields,
-  `deviceTopology.deviceIsPool`, `Providers.CgroupFS` and `EnsureCgroupFS`, and
-  `Config.DefragEnabled`, `Config.DefragAllowTransientOverlap` and `Config.Namespace`
+  `publishedCorrection`, `publishedFrontier`, `publishedFrontierInput`, `storedSlices`,
+  `claimReader`, `namespace` and `placementPolicy` fields, `deviceTopology.deviceIsPool`,
+  `Providers.CgroupFS` and `EnsureCgroupFS`, and `Config.DefragEnabled`,
+  `Config.DefragAllowTransientOverlap` and `Config.Namespace`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
   and the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields
