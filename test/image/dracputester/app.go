@@ -37,6 +37,11 @@ import (
 const (
 	cgroupPath = "fs/cgroup"
 	cpusetFile = "cpuset.cpus.effective"
+	// metadataRoot is where the kubelet mounts one KEP-5304 metadata file per
+	// request of every claim the container holds, under a segment naming the
+	// object kind: resourceclaims or resourceclaimtemplates.
+	metadataRoot = "/var/run/kubernetes.io/dra-device-attributes"
+	metadataFile = "dra.cpu-metadata.json"
 	// affinityScanMax is the upper bound when scanning sched_getaffinity if topology is unavailable.
 	// Using runtime.NumCPU() would miss CPUs when the cgroup cpuset is non-contiguous (e.g. 2-5,9-13).
 	affinityScanMax = 2048
@@ -86,10 +91,76 @@ func affinityScanBoundFromTopology(topo *cpuinfo.CPUTopology) int {
 	return list[len(list)-1] + 1
 }
 
+// deviceMetadata mirrors the fields of the metadata file this test reads. It
+// is deliberately a local shape rather than the library type: the point is to
+// exercise the file as a workload sees it.
+type deviceMetadata struct {
+	Requests []struct {
+		Name    string `json:"name"`
+		Devices []struct {
+			Name       string `json:"name"`
+			Attributes map[string]struct {
+				String *string `json:"string"`
+			} `json:"attributes"`
+		} `json:"devices"`
+	} `json:"requests"`
+}
+
+// requestMetadata reports what every mounted metadata file says, one entry per
+// device of every request. The file is a stream of the same object once per
+// API version, newest first, so only the first is decoded.
+//
+// The tree is walked rather than indexed because the kind segment above the
+// claim varies with how the claim was written, and the claim and request are
+// read back from the path.
+func requestMetadata() []discovery.DRACPURequestMetadata {
+	var entries []discovery.DRACPURequestMetadata
+	_ = filepath.WalkDir(metadataRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || d.Name() != metadataFile {
+			return nil
+		}
+		raw, err := os.ReadFile(path) //nolint:gosec // path comes from WalkDir under a fixed root
+		if err != nil {
+			return err
+		}
+		var metadata deviceMetadata
+		if err := json.NewDecoder(strings.NewReader(string(raw))).Decode(&metadata); err != nil {
+			return err
+		}
+		request := filepath.Base(filepath.Dir(path))
+		claim := filepath.Base(filepath.Dir(filepath.Dir(path)))
+		for _, req := range metadata.Requests {
+			if req.Name != request {
+				continue
+			}
+			for _, dev := range req.Devices {
+				entry := discovery.DRACPURequestMetadata{Claim: claim, Request: req.Name}
+				if v, ok := dev.Attributes["dra.cpu/partition"]; ok && v.String != nil {
+					entry.Partition = *v.String
+				}
+				if v, ok := dev.Attributes["dra.cpu/role"]; ok && v.String != nil {
+					entry.Role = *v.String
+				}
+				if v, ok := dev.Attributes["dra.cpu/cpuset"]; ok && v.String != nil {
+					entry.CPUs = *v.String
+				}
+				entries = append(entries, entry)
+			}
+		}
+		return nil
+	})
+	return entries
+}
+
 func main() {
 	logger := stdr.New(log.Default())
 	// Read the container's cgroup view, intentionally ignoring HOST_ROOT.
 	containerSysfs := os.DirFS("/sys")
+	// Written when the container starts and not rewritten afterwards.
+	metadata := requestMetadata()
 	for {
 		cpus, err := cpuSet(containerSysfs)
 		if err != nil {
@@ -109,6 +180,7 @@ func main() {
 			Runtimeinfo: discovery.DRACPURuntimeinfo{
 				CPUAffinity: cpuAff.String(),
 			},
+			Metadata: metadata,
 		}
 		err = json.NewEncoder(os.Stdout).Encode(info)
 		if err != nil {
