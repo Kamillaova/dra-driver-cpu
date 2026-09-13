@@ -63,6 +63,26 @@ func WarnDeprecatedFlags(fs *flag.FlagSet, logger logr.Logger) {
 	})
 }
 
+// WarnDeprecatedCPUFields logs the CPU-naming fields set outside any profile.
+// They still apply while no profile is declared, and only until then.
+func (c Config) WarnDeprecatedCPUFields(logger logr.Logger) {
+	if len(c.Profiles) > 0 {
+		return
+	}
+	var fields []string
+	if c.ReservedCPUs != "" {
+		fields = append(fields, "reservedCPUs")
+	}
+	if len(c.CPUPartitions) > 0 {
+		fields = append(fields, "cpuPartitions")
+	}
+	if len(fields) == 0 {
+		return
+	}
+	logger.Info("fleet-wide CPU-naming fields are deprecated and will be removed in a future release; move them into a profile and label each node with the profile matching its hardware",
+		"fields", fields, "label", ProfileLabel)
+}
+
 type Source interface {
 	Name() string
 	Apply(logger logr.Logger, cfg *Config) error
