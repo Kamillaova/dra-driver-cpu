@@ -65,11 +65,17 @@ func (p Partition) Named() bool {
 	return p.Name != DefaultPartitionName
 }
 
-// PublishesDevices reports whether claims take CPUs from p. A reserved
-// partition runs nothing, and a shared one is a pool rather than a set of
-// exclusive devices.
-func (p Partition) PublishesDevices() bool {
+// PublishesExclusiveDevices reports whether claims take CPUs of their own from
+// p. A reserved partition runs nothing, and a shared one hands out CPUs other
+// claims hold too.
+func (p Partition) PublishesExclusiveDevices() bool {
 	return p.Role == PARTITION_ROLE_DEFAULT || p.Role == PARTITION_ROLE_EXCLUSIVE
+}
+
+// IsPool reports whether p is claimed as a pool: one device per NUMA node,
+// shareable, granting every claim that asks for it the same CPUs.
+func (p Partition) IsPool() bool {
+	return p.Role == PARTITION_ROLE_SHARED
 }
 
 // WithImplicitDefault returns partitions followed by the implicit partition
