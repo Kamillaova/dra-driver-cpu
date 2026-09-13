@@ -2789,6 +2789,9 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 func TestPrepareRefusesAClaimWhoseRecordedDeviceIsFull(t *testing.T) {
 	logger := testr.New(t)
 	d, built := newCacheGroupedPrepareDriver(t)
+	// The make-room target below is a defragmentation promise, so the feature is
+	// on here; TestNoMakeRoomTargetWithDefragmentationOff covers the other side.
+	d.defrag.enabled = true
 	reg := prometheus.NewRegistry()
 	d.metrics = cpumetrics.New(reg)
 	client := k8sfake.NewSimpleClientset()
@@ -2807,6 +2810,12 @@ func TestPrepareRefusesAClaimWhoseRecordedDeviceIsFull(t *testing.T) {
 		map[string]string{"shape": opaqueapi.ShapeNeverSplit}), 0.01)
 	require.InDelta(t, 0, metricValue(t, reg, "dra_cpu_prepare_no_room_total",
 		map[string]string{"shape": opaqueapi.ShapeFlexible}), 0.01)
+
+	d.applyMu.Lock()
+	target, hasTarget := d.makeRoomTargets[claim.UID]
+	require.True(t, hasTarget)
+	require.Equal(t, d.topology.deviceNameToUncoreCacheID[cache1], target.cacheID)
+	d.applyMu.Unlock()
 
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		events, err := client.CoreV1().Events(claim.Namespace).List(context.Background(), metav1.ListOptions{})
