@@ -151,7 +151,7 @@ type cdiRequestPlacement struct {
 // hold too, so a misspelling does not fail anywhere: it quietly turns a claim's
 // own CPUs into pool CPUs and hands them out again.
 func recordableRole(role store.Role) bool {
-	return role == store.RoleExclusive
+	return role == store.RoleExclusive || role == store.RoleShared
 }
 
 func encodePlacements(requests []store.RequestAllocation) (string, error) {
