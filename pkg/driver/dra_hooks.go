@@ -130,21 +130,23 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 	}
 	// CCX-FORK: upstream's slices never change after startup, so it publishes
 	// them once and nothing here republishes.
-	cp.republishOnCacheOrderChange(ctx)
+	cp.republishStaleSlices(ctx)
 	return result, nil
 }
 
-// republishOnCacheOrderChange sends the slices out again when this batch left a
-// cache holding a claim that held none, or the other way round: the published
-// order says which cache the allocator meets first, and it has just changed.
+// republishStaleSlices sends the slices out again when what they carry has
+// stopped describing the node: a cache that changed between holding a claim and
+// holding none, since the published order says which cache the allocator meets
+// first, or a NUMA node fenced or reopened, since a fenced node's devices carry
+// a taint.
 //
-// The publication runs on its own, because it must not be held under applyMu
-// and the kubelet's call is over as soon as this returns. It neither blocks nor
+// The publication runs on its own, because it must not be held under applyMu and
+// the caller's own call is over as soon as this returns. It neither blocks nor
 // uses the context for anything but logging.
 //
 // Called with applyMu held.
-func (cp *CPUDriver) republishOnCacheOrderChange(ctx context.Context) {
-	if !cp.cacheOrderIsStale() {
+func (cp *CPUDriver) republishStaleSlices(ctx context.Context) {
+	if !cp.publishedSlicesAreStale() {
 		return
 	}
 	go cp.PublishResources(context.WithoutCancel(ctx))
@@ -378,6 +380,16 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		// its own published CPUs are the set a claim on it may take from, and
 		// that holds however small the group is -- a whole cache included.
 		deviceCPUs, published := cp.topology.deviceNameToCPUs[alloc.Device]
+
+		// CCX-FORK: a device reaching into a NUMA node the driver has stopped
+		// vouching for hands out nothing. The CPUs it would offer are computed
+		// from a record that may be wrong about which claim holds which, so the
+		// claim waits bound rather than starting on CPUs another may be running
+		// on.
+		if fenced := cp.poisonedNUMANodesOf(deviceCPUs); len(fenced) > 0 {
+			return kubeletplugin.PrepareResult{Err: fmt.Errorf("device %q reaches into NUMA node(s) %v this driver cannot vouch for: an exchange of CPUs there could not be settled, and it hands out none until a read-back agrees with its records",
+				alloc.Device, fenced)}
+		}
 
 		switch cp.cpuDeviceGroupBy {
 		case device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_UNCORE_CACHE:
@@ -664,7 +676,7 @@ func (cp *CPUDriver) UnprepareResourceClaims(ctx context.Context, claims []kubel
 	}
 	// CCX-FORK: a released claim can leave a cache empty, which the published
 	// order depends on; upstream's order depends on nothing.
-	cp.republishOnCacheOrderChange(ctx)
+	cp.republishStaleSlices(ctx)
 	return result, nil
 }
 
