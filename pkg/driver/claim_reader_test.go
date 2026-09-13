@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
@@ -88,6 +89,7 @@ func TestClaimConfigMapReaderAllocatedClaims(t *testing.T) {
 		driverName: driverName,
 		namespace:  namespace,
 		kubeClient: client,
+		metrics:    cpumetrics.Noop(),
 	}
 
 	require.NoError(t, watchAllocatedClaims(context.Background(), d))
@@ -121,6 +123,7 @@ func TestClaimConfigMapReaderMissingOrCorrupt(t *testing.T) {
 		driverName: driverName,
 		namespace:  namespace,
 		kubeClient: client,
+		metrics:    cpumetrics.Noop(),
 	}
 
 	require.NoError(t, watchAllocatedClaims(context.Background(), d))
@@ -202,6 +205,7 @@ func TestClaimConfigMapReaderAcceptsARestartedProjector(t *testing.T) {
 		driverName: driverName,
 		namespace:  namespace,
 		kubeClient: client,
+		metrics:    cpumetrics.Noop(),
 	}
 
 	require.NoError(t, watchAllocatedClaims(context.Background(), d))
