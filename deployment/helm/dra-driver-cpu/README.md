@@ -37,7 +37,7 @@ helm install dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driv
 | affinity | object | `{}` | Affinity rules for scheduling the DaemonSet pods |
 | args.cpuDeviceMode | string | `""` | **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.cpuDeviceMode` instead. CPU exposure mode: `grouped` (expose NUMA nodes or sockets as devices) or `individual` (expose each CPU as a device); defaults to `grouped` when empty. |
 | args.exposePCIeRoots | bool | `false` | Discover and expose PCIe roots as device attributes. Requires the `DRAListTypeAttributes=true` feature gate in the cluster. Not configurable via `driverConfig`; use this flag instead |
-| args.groupBy | string | `""` | **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.groupBy` instead. Grouping criteria when `cpuDeviceMode=grouped`: `numanode`, `socket` or `machine`; defaults to `numanode` when empty. |
+| args.groupBy | string | `""` | **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.groupBy` instead. Grouping criteria when `cpuDeviceMode=grouped`: `numanode`, `socket`, `machine` or `uncorecache`; defaults to `numanode` when empty. |
 | args.hostnameOverride | string | `""` | **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.hostnameOverride` instead. Overrides the node name the driver registers under. |
 | args.logLevel | int | `4` | Log verbosity level passed as `--v` |
 | args.reservedCPUs | string | `""` | **Deprecated:** folded into the generated `driverConfig` ConfigMap and takes priority over it; use `driverConfig.reservedCPUs` instead. CPUs reserved for the OS and kubelet, excluded from DRA management (e.g. `"0-1"`). |
@@ -56,7 +56,7 @@ helm install dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driv
 | nodeSelector | object | `{}` | Node selector for scheduling the DaemonSet pods |
 | podAnnotations | object | `{}` | Annotations to add to pods |
 | podLabels | object | `{}` | Extra labels to add to pods |
-| rbac.create | bool | `true` | Create RBAC resources (ClusterRole and ClusterRoleBinding) |
+| rbac.create | bool | `true` | Create RBAC resources (ClusterRole, ClusterRoleBinding, Role, and RoleBinding) |
 | resources.limits | object | `{}` | Resource limits (unset by default) |
 | resources.requests.cpu | string | `"100m"` | CPU resource request |
 | resources.requests.memory | string | `"50Mi"` | Memory resource request |
