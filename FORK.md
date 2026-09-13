@@ -106,7 +106,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
   `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `recordedDevices`,
-  `recordedDeviceFull`, `recordClaimEvent`, `publishResources`, `republishStaleSlices`
+  `recordedDeviceFull`, `recordClaimEvent`, `secureRepairWitness`, `releaseActiveExactPlanAndClosure`,
+  `publishResources`, `republishStaleSlices`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses, and the
   namespace lookup from POD_NAMESPACE
@@ -140,8 +141,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `WarnDeprecatedCPUFields`
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods,
-  `SetFlooredCapacityDevices`, `RecordPrepareNoRoom` and `RecordSynchronizeForeignCPUs`, and the
-  collectors behind them
+  `SetFlooredCapacityDevices`, `RecordPrepareNoRoom`, `RecordPrepareNoWitness` and
+  `RecordSynchronizeForeignCPUs`, and the collectors behind them
 
 - `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
   `e2e_suite_test.go`, and the `defragEnabled`/`defragAllowTransientOverlap`/`fullPhysicalCPUsOnly`
