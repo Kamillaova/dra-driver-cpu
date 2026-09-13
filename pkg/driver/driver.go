@@ -127,6 +127,7 @@ type CPUAllocator interface {
 type CPUDriver struct {
 	driverName         string
 	nodeName           string
+	namespace          string
 	kubeClient         kubernetes.Interface
 	draPlugin          KubeletPlugin
 	nriPlugin          stub.Stub
@@ -152,6 +153,11 @@ type CPUDriver struct {
 	// registers the NRI plugin, and left nil when the operator has not asserted
 	// the runtime tolerates such updates.
 	containerUpdater containerUpdater
+	// claimReader is what the scheduler projected for this node: which claims it
+	// has allocated here, and which it has taken back. The driver does not watch
+	// ResourceClaims itself, so between the scheduler allocating a claim and the
+	// kubelet preparing it, this is the only view it has.
+	claimReader claimReader
 	// reconcileTrigger carries coalesced reconcile requests to the worker
 	// goroutine. Nil when no feature needs it.
 	reconcileTrigger chan struct{}
@@ -308,6 +314,7 @@ func (pr Providers) EnsureCgroupFS() cgroupfs.FS {
 type Config struct {
 	DriverName       string
 	NodeName         string
+	Namespace        string
 	ReservedCPUs     cpuset.CPUSet
 	CPUDeviceMode    string
 	CPUDeviceGroupBy string
@@ -366,9 +373,14 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	if metricsRecorder == nil {
 		metricsRecorder = cpumetrics.Noop()
 	}
+	ns := config.Namespace
+	if ns == "" {
+		ns = metav1.NamespaceDefault
+	}
 	plugin := &CPUDriver{
 		driverName: config.DriverName,
 		nodeName:   config.NodeName,
+		namespace:  ns,
 		kubeClient: providers.K8SClient,
 		topology: deviceTopology{
 			deviceNameToCPUID:      make(map[string]int),
@@ -803,6 +815,13 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, fmt.Errorf("failed to create plugin stub: %w", err)
 	}
 	cp.nriPlugin = stub
+	// CCX-FORK: upstream never looks at a claim it has not been handed. This
+	// driver has to, because the CPUs of a claim the scheduler has allocated but
+	// the kubelet has not yet prepared are spoken for, and nothing else on this
+	// node knows that yet.
+	if err := watchAllocatedClaims(ctx, cp); err != nil {
+		return asyncErr, fmt.Errorf("failed to watch the projected claim ConfigMap: %w", err)
+	}
 	// CCX-FORK: upstream starts no worker here and never pushes an update the
 	// runtime did not ask for, so it hands the stub to nothing.
 	if cp.reconcileTrigger != nil {
