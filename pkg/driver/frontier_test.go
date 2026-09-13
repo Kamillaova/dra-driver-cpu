@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -81,7 +82,7 @@ func TestFrontierAttributeFormatAndScoping(t *testing.T) {
 	}
 	cp, _ := newCustomFrontierDriver(t, infos, partitions, devattr.GROUP_BY_UNCORE_CACHE)
 
-	slices := cp.refreshDeviceOrder()
+	slices, _ := cp.refreshDeviceOrder()
 	require.NotEmpty(t, slices)
 
 	var exclusiveChecked, poolChecked int
@@ -92,14 +93,18 @@ func TestFrontierAttributeFormatAndScoping(t *testing.T) {
 			require.NotNil(t, rAttr.StringValue)
 
 			val, hasFrontier := dev.Attributes[devattr.AttributeRepairRounds]
+			inputVal, hasInput := dev.Attributes[devattr.AttributeFrontierInput]
 			if *rAttr.StringValue == devattr.PARTITION_ROLE_SHARED {
 				require.False(t, hasFrontier)
+				require.False(t, hasInput)
 				poolChecked++
 				continue
 			}
 
 			require.True(t, hasFrontier)
 			require.NotNil(t, val.StringValue)
+			require.True(t, hasInput)
+			require.NotNil(t, inputVal.StringValue)
 			fields := strings.Split(*val.StringValue, ",")
 			require.Len(t, fields, api.RepairRoundsFields)
 			for _, f := range fields {
@@ -109,6 +114,7 @@ func TestFrontierAttributeFormatAndScoping(t *testing.T) {
 					t.Fatalf("unexpected repair round field: %q", f)
 				}
 			}
+			require.Len(t, *inputVal.StringValue, 64)
 			exclusiveChecked++
 		}
 	}
@@ -116,7 +122,7 @@ func TestFrontierAttributeFormatAndScoping(t *testing.T) {
 	require.Positive(t, poolChecked)
 
 	numaCP, _ := newCustomFrontierDriver(t, infos, nil, devattr.GROUP_BY_NUMA_NODE)
-	numaSlices := numaCP.refreshDeviceOrder()
+	numaSlices, _ := numaCP.refreshDeviceOrder()
 	for _, slice := range numaSlices {
 		for _, dev := range slice {
 			_, hasFrontier := dev.Attributes[devattr.AttributeRepairRounds]
@@ -133,7 +139,7 @@ func TestFrontierOneRoundRepair(t *testing.T) {
 	placeCharged(t, cp, "c1", "cpudevcache001", cpuset.New(4, 5))
 	placeCharged(t, cp, "c3", "cpudevcache003", cpuset.New(12, 13, 14, 15))
 
-	slices := cp.refreshDeviceOrder()
+	slices, _ := cp.refreshDeviceOrder()
 	require.NotEmpty(t, slices)
 
 	for _, slice := range slices {
@@ -158,7 +164,7 @@ func TestFrontierPoisonedNode(t *testing.T) {
 		},
 	}
 
-	slices := cp.refreshDeviceOrder()
+	slices, _ := cp.refreshDeviceOrder()
 	require.NotEmpty(t, slices)
 
 	for _, slice := range slices {
@@ -167,6 +173,9 @@ func TestFrontierPoisonedNode(t *testing.T) {
 			require.True(t, hasFrontier)
 			require.NotNil(t, val.StringValue)
 			require.Equal(t, "-,-,-,-", *val.StringValue)
+
+			_, hasInput := dev.Attributes[devattr.AttributeFrontierInput]
+			require.False(t, hasInput)
 		}
 	}
 }
@@ -185,6 +194,29 @@ func TestFrontierStalenessLifecycle(t *testing.T) {
 	require.False(t, cp.publishedSlicesAreStale())
 }
 
+// TestAPublishThatFailedStillOwesOne: the staleness check asks what is
+// published, so recording the inputs before the attempt would answer for a
+// publish that never landed, and the slices the API server actually holds would
+// never be corrected.
+func TestAPublishThatFailedStillOwesOne(t *testing.T) {
+	infos := fourCacheInfos()
+	cp, plugin := newCustomFrontierDriver(t, infos, nil, devattr.GROUP_BY_UNCORE_CACHE)
+
+	require.NoError(t, cp.publishResources(context.Background()))
+	require.False(t, cp.publishedSlicesAreStale())
+
+	placeCharged(t, cp, "claim-occupy", "cpudevcache000", cpuset.New(0, 1))
+	require.True(t, cp.publishedSlicesAreStale())
+
+	plugin.publishError = errors.New("the API server refused the slices")
+	require.Error(t, cp.publishResources(context.Background()))
+	require.True(t, cp.publishedSlicesAreStale(), "the node still differs from what is out there")
+
+	plugin.publishError = nil
+	require.NoError(t, cp.publishResources(context.Background()))
+	require.False(t, cp.publishedSlicesAreStale())
+}
+
 // TestFrontierIsUnreachableWithDefragmentationOff: the frontier is a promise
 // about repairs this node will make, so with nothing to make them every field
 // reads unreachable -- on the same topology whose first field is 1 with the
@@ -198,7 +230,7 @@ func TestFrontierIsUnreachableWithDefragmentationOff(t *testing.T) {
 	placeCharged(t, cp, "c1", "cpudevcache001", cpuset.New(4, 5))
 	placeCharged(t, cp, "c3", "cpudevcache003", cpuset.New(12, 13, 14, 15))
 
-	slices := cp.refreshDeviceOrder()
+	slices, _ := cp.refreshDeviceOrder()
 	require.NotEmpty(t, slices)
 
 	for _, slice := range slices {
@@ -209,4 +241,37 @@ func TestFrontierIsUnreachableWithDefragmentationOff(t *testing.T) {
 			require.Equal(t, unreachableFrontier(), *val.StringValue, dev.Name)
 		}
 	}
+}
+
+func TestFrontierInputDigestChangesWithClaims(t *testing.T) {
+	infos := fourCacheInfos()
+	cp, _ := newCustomFrontierDriver(t, infos, nil, devattr.GROUP_BY_UNCORE_CACHE)
+
+	// Clean state
+	slices1, _ := cp.refreshDeviceOrder()
+	var digest1 string
+	for _, slice := range slices1 {
+		if len(slice) > 0 {
+			if v, ok := slice[0].Attributes[devattr.AttributeFrontierInput]; ok {
+				digest1 = *v.StringValue
+				break
+			}
+		}
+	}
+	require.NotEmpty(t, digest1)
+
+	// Place one claim
+	placeCharged(t, cp, "claim-1", "cpudevcache000", cpuset.New(0, 1))
+	slices2, _ := cp.refreshDeviceOrder()
+	var digest2 string
+	for _, slice := range slices2 {
+		if len(slice) > 0 {
+			if v, ok := slice[0].Attributes[devattr.AttributeFrontierInput]; ok {
+				digest2 = *v.StringValue
+				break
+			}
+		}
+	}
+	require.NotEmpty(t, digest2)
+	require.NotEqual(t, digest1, digest2)
 }
