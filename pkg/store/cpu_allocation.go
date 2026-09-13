@@ -31,8 +31,13 @@ import (
 // pool other claims may hold too.
 type Role string
 
-// RoleExclusive marks CPUs no other claim may be given.
-const RoleExclusive Role = "exclusive"
+const (
+	// RoleExclusive marks CPUs no other claim may be given.
+	RoleExclusive Role = "exclusive"
+	// RoleShared marks CPUs of a claimed pool, which every claim that asks for
+	// that pool holds at the same time.
+	RoleShared Role = "shared"
+)
 
 // RequestAllocation is the CPUs one request of a claim was given.
 type RequestAllocation struct {
