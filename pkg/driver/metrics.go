@@ -45,6 +45,10 @@ type Recorder interface {
 	RecordDefragSwapOverlap(duration time.Duration)
 	RecordDefragPartialBatch()
 	RecordDefragRollback(result cpumetrics.Result)
+	SetDefragNodePoisoned(numaNodeID int, poisoned bool)
+	RecordDefragNodePoisoned()
+	RecordDefragNodeReopened(duration time.Duration)
+	RecordDefragReadbackMismatch()
 	SetPartitionState(verified map[string]bool)
 }
 

@@ -48,6 +48,12 @@ const DefaultPartitionName = "default"
 // that partition.
 const PartitionTaintKey = "dra.cpu/partition"
 
+// PoisonTaintKey is the key of the NoSchedule taint a device carries while the
+// driver has stopped vouching for the NUMA node it reaches into. Its own key,
+// distinct from the partition's: a toleration written to reach a partition must
+// not also tolerate a fence, and nothing is meant to tolerate this one.
+const PoisonTaintKey = "dra.cpu/poisoned"
+
 // Partition is a named set of whole cores on this node, resolved against the
 // node's own topology.
 type Partition struct {
