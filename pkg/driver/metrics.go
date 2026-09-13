@@ -58,6 +58,21 @@ type Recorder interface {
 	SetFlooredCapacityDevices(count int)
 	RecordDefragUnpublishedRound()
 	SetPartitionState(verified map[string]bool)
+	// CCX-FORK: the promise-accounting, write-amplification and downgrade-gate
+	// metrics. Upstream's Recorder ends well above; these measure whether the
+	// frontier the scheduler reads is one the driver can still honour.
+	RecordFrontierAdmissionOutcome(outcome string)
+	SetFrontierOldestObligationSeconds(seconds float64)
+	RecordRepairRounds(advertisedRounds, actualRounds string)
+	RecordTimeToAlignment(seconds float64)
+	RecordSliceWritesPerRound(writes int)
+	RecordSliceUpdate(bytes int)
+	RecordSliceHandoff(outcome string)
+	RecordStoreToDriverDelay(seconds float64)
+	RecordFrontierUnusableDuration(seconds float64)
+	RecordSliceZeroCommitRefresh()
+	SetClaimsOffRecordedCache(count int)
+	SetMaxAbsCacheError(errorCPUs int)
 }
 
 func (cp *CPUDriver) refreshAllocationMetrics() {
@@ -71,4 +86,5 @@ func (cp *CPUDriver) refreshAllocationMetrics() {
 		ReservedCPUs:         snapshot.ReservedCPUs,
 		ActiveResourceClaims: snapshot.ActiveResourceClaims,
 	})
+	cp.refreshMirrorMetrics()
 }
