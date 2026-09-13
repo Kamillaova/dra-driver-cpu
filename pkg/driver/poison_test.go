@@ -82,7 +82,7 @@ func TestPoisonedNodeTaintsItsDevices(t *testing.T) {
 	}
 
 	d.applyMu.Lock()
-	slices := d.refreshDeviceOrder()
+	slices, _ := d.refreshDeviceOrder()
 	d.applyMu.Unlock()
 
 	require.Len(t, slices, 1)
