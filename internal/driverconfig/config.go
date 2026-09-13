@@ -91,6 +91,16 @@ type Config struct {
 	// cache offers nothing better -- whole-core allocation is what actually
 	// forbids that.
 	CachePlacementStrategy string `json:"cachePlacementStrategy,omitempty"`
+	// CPUPartitions describes the node's cores as named partitions: which CPUs
+	// each holds, whether workloads may run there and how, and how many threads
+	// per core it expects to find online. The CPUs no partition names form the
+	// implicit "default" partition, where a claim that names no partition lands.
+	//
+	// It replaces ReservedCPUs rather than joining it: two descriptions of the
+	// same CPUs in one scope have no precedence rule worth writing, so setting
+	// both is an error and a reserved partition is how CPUs are kept from
+	// workloads once the list is used.
+	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
 	// ServePlacements serves the /placements endpoint on the bind address. It
 	// reports which CPUs back every claim on this node, by claim, pod and
 	// container name, which is more than the metrics say and more than an
@@ -118,6 +128,7 @@ func (c Config) LogValues() []any {
 		"reconcileSharedOnUnprepare", c.ReconcileSharedOnUnprepare,
 		"defragEnabled", c.DefragEnabled,
 		"cachePlacementStrategy", c.CachePlacementStrategy,
+		"cpuPartitions", c.CPUPartitions,
 		"servePlacements", c.ServePlacements,
 	}
 }
@@ -125,23 +136,24 @@ func (c Config) LogValues() []any {
 // dumpConfig mirrors Config field-for-field but drops the omitempty json
 // tags, so Dump also prints zero values (e.g. exposePCIeRoots=false).
 type dumpConfig struct {
-	Kubeconfig                            string `json:"kubeconfig"`
-	HostnameOverride                      string `json:"hostnameOverride"`
-	BindAddress                           string `json:"bindAddress"`
-	ReservedCPUs                          string `json:"reservedCPUs"`
-	CPUDeviceMode                         string `json:"cpuDeviceMode"`
-	GroupBy                               string `json:"groupBy"`
-	ExposePCIeRoots                       bool   `json:"exposePCIeRoots"`
-	SysFSOverlay                          string `json:"sysfsOverlay"`
-	KubeletRootDir                        string `json:"kubeletRootDir"`
-	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping"`
-	Allocator                             string `json:"allocator"`
-	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly"`
-	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe"`
-	ReconcileSharedOnUnprepare            bool   `json:"reconcileSharedOnUnprepare"`
-	DefragEnabled                         bool   `json:"defragEnabled"`
-	CachePlacementStrategy                string `json:"cachePlacementStrategy"`
-	ServePlacements                       bool   `json:"servePlacements"`
+	Kubeconfig                            string         `json:"kubeconfig"`
+	HostnameOverride                      string         `json:"hostnameOverride"`
+	BindAddress                           string         `json:"bindAddress"`
+	ReservedCPUs                          string         `json:"reservedCPUs"`
+	CPUDeviceMode                         string         `json:"cpuDeviceMode"`
+	GroupBy                               string         `json:"groupBy"`
+	ExposePCIeRoots                       bool           `json:"exposePCIeRoots"`
+	SysFSOverlay                          string         `json:"sysfsOverlay"`
+	KubeletRootDir                        string         `json:"kubeletRootDir"`
+	PublishNodeAllocatableResourceMapping bool           `json:"publishNodeAllocatableResourceMapping"`
+	Allocator                             string         `json:"allocator"`
+	FullPhysicalCPUsOnly                  bool           `json:"fullPhysicalCPUsOnly"`
+	AssumeUnsolicitedUpdatesSafe          bool           `json:"assumeUnsolicitedUpdatesSafe"`
+	ReconcileSharedOnUnprepare            bool           `json:"reconcileSharedOnUnprepare"`
+	DefragEnabled                         bool           `json:"defragEnabled"`
+	CachePlacementStrategy                string         `json:"cachePlacementStrategy"`
+	CPUPartitions                         []CPUPartition `json:"cpuPartitions"`
+	ServePlacements                       bool           `json:"servePlacements"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
