@@ -41,6 +41,7 @@ type Recorder interface {
 	// counters above rather than with the defragmentation block below: it counts
 	// an admission the node refused, whether or not anything ever moved.
 	RecordPrepareNoRoom(shape string)
+	RecordPrepareNoWitness()
 	// CCX-FORK: the defragmentation methods, which have no upstream counterpart
 	// because upstream never moves a prepared claim.
 	SetDefragState(cpumetrics.DefragState)

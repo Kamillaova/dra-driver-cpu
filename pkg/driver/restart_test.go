@@ -46,13 +46,13 @@ func newRestartTestDriver(t *testing.T, cdi *mockCdiMgr, cgroups fstest.MapFS) *
 
 	return &CPUDriver{
 		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
-		metrics:            cpumetrics.Noop(),
 		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 		podConfigStore:     store.NewPodConfig(),
 		claimTracker:       store.NewClaimTracker(),
 		cdiMgr:             cdi,
 		cgroupfs:           cgroups,
 		poisonedNodes:      make(map[int]*poisonedNode),
+		metrics:            cpumetrics.Noop(),
 	}
 }
 
