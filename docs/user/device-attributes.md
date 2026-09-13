@@ -25,7 +25,7 @@ CPU group, `individual` one device per CPU.
 | `dra.cpu/socketID`                | int     | CPU socket of the group (published when grouping by NUMA node or socket)                                       |
 | `dra.cpu/numCPUs`                 | int     | CPUs available in the group                                                                                    |
 | `dra.cpu/partition`               | string  | The CPU partition the group's CPUs belong to, `default` on a node with no `cpuPartitions`                      |
-| `dra.cpu/role`                    | string  | That partition's role: `default` or `exclusive` for a group that publishes devices                             |
+| `dra.cpu/role`                    | string  | That partition's role: `default` or `exclusive` for a group of exclusive devices, `shared` for a pool device   |
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled for this group's own cores                                              |
 | `dra.cpu/threadsPerCore`          | int     | This group's own uniform thread count per core (0 when its cores do not all agree); `smtEnabled` is `threadsPerCore > 1` |
 | `dra.cpu/largestUncoreCacheCPUs`  | int     | Allocatable CPUs in the group's largest uncore (L3/CCX) cache — the biggest claim it can align to one cache    |
@@ -56,6 +56,14 @@ These compatibility attributes will be removed in a future version:
 | -------------------- | ---- | ----------------------------------------------------- |
 | `dra.cpu/numaNodeID` | int  | Driver-specific NUMA node attribute (NUMA grouping)   |
 | `dra.net/numaNode`   | int  | Cross-driver NUMA alignment attribute (NUMA grouping) |
+
+A **pool device** is the other shape grouped mode publishes: one device per NUMA node of a partition
+whose role is `shared`, named `cpudevpool<node>-<partition>`. It carries the partition attributes,
+`resource.kubernetes.io/numaNode`, `dra.cpu/socketID` and `dra.cpu/numCPUs`, and nothing about cores
+or caches — `smtEnabled`, `threadsPerCore` and the uncore cache attributes are all absent, because a
+pool grants a share of CPU time rather than CPUs a claim holds alone, and none of those questions has
+an answer for it. Its `dra.cpu/cpu` capacity is requested in milli-CPUs, and every claim that asks
+for the pool holds it at the same time.
 
 Grouped devices also expose the consumable capacity `dra.cpu/cpu` — the number of CPUs
 claimable from the group. With `groupBy: machine`, only `numCPUs`, `smtEnabled`,
