@@ -99,9 +99,10 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `defragRetries`, `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes`,
   `publishedCorrection`, `publishedFrontier`, `publishedFrontierInput`, `storedSlices`,
   `claimReader`, `namespace`, `placementWriters`, `placementWritersMu` and `placementPolicy` fields,
-  `deviceTopology.deviceIsPool`,
-  `Providers.CgroupFS` and `EnsureCgroupFS`, and `Config.DefragEnabled`,
-  `Config.DefragAllowTransientOverlap` and `Config.Namespace`
+  `deviceTopology.deviceIsPool`, `deviceTopology.deviceNameToPartition`,
+  `deviceTopology.deviceNameToUncoreCacheID`, `devicePartition`, `Providers.CgroupFS` and
+  `EnsureCgroupFS`, and `Config.DefragEnabled`, `Config.DefragAllowTransientOverlap` and
+  `Config.Namespace`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values
   and the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields
@@ -109,7 +110,7 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
   `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `recordedDevices`,
   `recordedDeviceFull`, `recordClaimEvent`, `secureRepairWitness`, `releaseActiveExactPlanAndClosure`,
-  `publishResources`, `republishStaleSlices`
+  `publishResources`, `republishStaleSlices`, `rehomeCandidate`, `rehomeShare`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses, and the
   namespace lookup from POD_NAMESPACE
