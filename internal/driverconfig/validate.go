@@ -76,6 +76,9 @@ func (c Config) Validate() error {
 	if err := c.validateCachePlacementStrategy(); err != nil {
 		return err
 	}
+	if err := c.validateCPUPartitions(); err != nil {
+		return err
+	}
 	return nil
 }
 
