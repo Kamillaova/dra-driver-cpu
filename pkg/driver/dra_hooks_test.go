@@ -2435,6 +2435,8 @@ func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool) *kubeletplugin.De
 		string(devattr.AttributeCacheL3ID):  {IntValue: new(int64(cpu.UncoreCacheID))},
 		string(devattr.AttributeCoreType):   {StringValue: new(cpu.CoreType.String())},
 		string(devattr.AttributeSMTEnabled): {BoolValue: new(smtEnabled)},
+		string(devattr.AttributePartition):  {StringValue: new(devattr.DefaultPartitionName)},
+		string(devattr.AttributeRole):       {StringValue: new(devattr.PARTITION_ROLE_DEFAULT)},
 		"dra.net/numaNode":                  {IntValue: new(int64(cpu.NUMANodeID))},
 		"dra.cpu/numaNodeID":                {IntValue: new(int64(cpu.NUMANodeID))},
 	}
