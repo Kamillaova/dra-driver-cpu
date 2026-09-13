@@ -20,6 +20,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
@@ -31,16 +32,43 @@ import (
 // another's, so a named partition's taints stay in its own slices.
 //
 // Called with applyMu held.
-func (cp *CPUDriver) chunkDevices(occupied map[string]bool) [][]resourceapi.Device {
+func (cp *CPUDriver) chunkDevices(occupied map[string]bool, poisoned map[int]bool) [][]resourceapi.Device {
 	var chunks [][]resourceapi.Device
 	for _, partitionDevices := range cp.topology.devicesByPartition {
 		if len(partitionDevices) == 0 {
 			continue
 		}
-		ordered := cp.orderCacheDevices(partitionDevices, occupied)
+		ordered := cp.fenceDevices(cp.orderCacheDevices(partitionDevices, occupied), poisoned)
 		chunks = append(chunks, slices.Collect(slices.Chunk(ordered, cp.devicesPerResourceSlice))...)
 	}
 	return chunks
+}
+
+// fenceDevices taints every device reaching into a NUMA node the driver has
+// stopped vouching for, so the scheduler stops sending claims to CPUs whose
+// owner it cannot name. The taint goes when the node reopens.
+//
+// Its own key, distinct from the partition taint: a toleration written for a
+// partition must not also tolerate a fence, and nothing is expected to tolerate
+// this one at all.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) fenceDevices(devices []resourceapi.Device, poisoned map[int]bool) []resourceapi.Device {
+	if len(poisoned) == 0 {
+		return devices
+	}
+	fenced := slices.Clone(devices)
+	for i, dev := range fenced {
+		for _, numaNodeID := range cp.poisonedNUMANodesOf(cp.topology.deviceNameToCPUs[dev.Name]) {
+			dev.Taints = append(slices.Clone(dev.Taints), resourceapi.DeviceTaint{
+				Key:    device.PoisonTaintKey,
+				Value:  strconv.Itoa(numaNodeID),
+				Effect: resourceapi.DeviceTaintEffectNoSchedule,
+			})
+		}
+		fenced[i] = dev
+	}
+	return fenced
 }
 
 // orderCacheDevices puts the caches that hold a claim before the ones that hold
@@ -95,9 +123,9 @@ func (cp *CPUDriver) occupiedDevices() map[string]bool {
 	return occupied
 }
 
-// refreshDeviceOrder returns the chunks to publish. The order and the occupancy
+// refreshDeviceOrder returns the chunks to publish. The order and the two inputs
 // it was computed from are recorded together, because a later hook decides
-// whether to publish again by comparing the two; recording one without the other
+// whether to publish again by comparing them; recording one without the others
 // is what would make that comparison lie.
 //
 // Called with applyMu held.
@@ -105,19 +133,26 @@ func (cp *CPUDriver) refreshDeviceOrder() [][]resourceapi.Device {
 	if cp.topology.devicesByPartition == nil {
 		return nil
 	}
-	occupied := cp.occupiedDevices()
-	cp.publishedOccupancy = occupied
-	cp.topology.deviceSlices = cp.chunkDevices(occupied)
+	occupied, poisoned := cp.occupiedDevices(), cp.poisonedNUMANodes()
+	cp.publishedOccupancy, cp.publishedPoison = occupied, poisoned
+	cp.topology.deviceSlices = cp.chunkDevices(occupied, poisoned)
 	return cp.topology.deviceSlices
 }
 
-// cacheOrderIsStale reports whether a cache has changed between holding a claim
-// and holding none since the slices were last published, which is when the
-// order they carry stops matching the node.
+// publishedSlicesAreStale reports whether what the slices carry has stopped
+// describing the node: a NUMA node fenced or reopened since they went out, or a
+// cache that has changed between holding a claim and holding none, which is what
+// the published device order is a function of.
 //
 // Called with applyMu held.
-func (cp *CPUDriver) cacheOrderIsStale() bool {
-	if cp.cpuDeviceGroupBy != device.GROUP_BY_UNCORE_CACHE || cp.draPlugin == nil {
+func (cp *CPUDriver) publishedSlicesAreStale() bool {
+	if cp.draPlugin == nil {
+		return false
+	}
+	if !maps.Equal(cp.poisonedNUMANodes(), cp.publishedPoison) {
+		return true
+	}
+	if cp.cpuDeviceGroupBy != device.GROUP_BY_UNCORE_CACHE {
 		return false
 	}
 	return !maps.Equal(cp.occupiedDevices(), cp.publishedOccupancy)
