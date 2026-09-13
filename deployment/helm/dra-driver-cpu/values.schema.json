@@ -278,6 +278,9 @@
         "reservedCPUs": {
           "type": "string"
         },
+        "servePlacements": {
+          "type": "boolean"
+        },
         "sysfsOverlay": {
           "type": "string"
         }
