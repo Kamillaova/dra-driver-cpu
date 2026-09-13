@@ -251,7 +251,7 @@ func taintsAgree(want, got []resourceapi.DeviceTaint) bool {
 // intendedDevices is every device the driver would publish now, by name. Called
 // with applyMu held.
 func (cp *CPUDriver) intendedDevices() map[string]resourceapi.Device {
-	chunks, _ := cp.chunkDevices(cp.occupiedDevices(), cp.poisonedNUMANodes(), cp.capacityMirror())
+	chunks, _ := cp.chunkDevices(cp.occupiedDevices(), cp.poisonedNUMANodes(), cp.capacityMirror(), cp.frontier())
 	devices := map[string]resourceapi.Device{}
 	for _, chunk := range chunks {
 		for _, dev := range chunk {
