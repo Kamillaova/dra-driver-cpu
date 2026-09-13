@@ -108,6 +108,17 @@ on - is configured through other Helm values, not through this file.
 - Requires the `DRANodeAllocatableResources` feature gate (alpha, 1.37+). See
   [Workload Configuration Requirements](workload-requirements.md).
 
+`fullPhysicalCPUsOnly` (bool, default: `false`)
+
+- Allocate whole physical cores, so a core's SMT siblings are never split between two
+  claims, nor between a claim and the shared pool. This is the driver equivalent of the
+  kubelet CPU Manager's
+  [`full-pcpus-only`](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/#static-policy-options)
+  policy option, and it matters where CPU siblings must not be shared between tenants.
+- Requires `cpuDeviceMode: grouped`: in `individual` mode the scheduler picks exact
+  per-CPU devices, so the driver cannot keep a core's siblings together.
+- A no-op where SMT is disabled, since every core has one thread.
+
 #### Example
 
 ```yaml
