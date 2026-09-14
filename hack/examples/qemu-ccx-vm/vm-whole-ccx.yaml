@@ -12,7 +12,11 @@
 #
 # The CEL selector keeps the pod off nodes whose caches are too small to ever
 # hold the vCPU set aligned. On a 7950X3D one CCX is 8 cores / 16 CPUs --
-# adjust the capacity and the selector to your parts.
+# adjust the capacity and the selector to your parts. It answers what a node
+# could do, not what is free right now: a cache big enough may already be half
+# taken when this claim is scheduled, and the claim then lands split across two.
+# relocatable is what lets a later pass repair that, so a class defined by its
+# alignment is exactly the kind that should permit moves.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -48,6 +52,19 @@ spec:
             operator: Equal
             value: helpers
             effect: NoSchedule
+      config:
+      - requests:
+        - vcpus
+        opaque:
+          driver: dra.cpu
+          parameters:
+            apiVersion: v1alpha1
+            cpuConfig:
+              # The vCPUs may be moved to recover the alignment this class is
+              # named for. Only the vcpus request needs it: the helpers share a
+              # pool, which never moves. Mobility defaults to off, so a claim
+              # that omits this is never touched.
+              relocatable: true
 ---
 apiVersion: v1
 kind: Pod
@@ -62,9 +79,9 @@ spec:
     command: ["/scripts/launch-qemu.sh"]
     env:
     # NOTE: DRA_CPUSET_<claimUID> is injected automatically. Do NOT parse it:
-    # with defragmentation enabled its value is the literal string "dynamic",
-    # and with it disabled it is only where the claim was when this container
-    # started. The launcher reads the live set from the cgroup instead.
+    # this claim is relocatable, so its value is the literal string "dynamic",
+    # and for a claim that is not it is only where that claim was when its
+    # container started. The launcher reads the live set from the cgroup instead.
     - name: VM_MEMORY_MB
       value: "16384"
     # Zero because the helpers request above holds the control threads. Without
