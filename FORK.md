@@ -99,9 +99,9 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
   `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
-  `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `ClaimRecord`, `GetClaimRecord`,
-  `IsRelocatable`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`, `SetClaimlessCPUs` and
-  `claimlessPoolLocked`
+  `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
+  `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `ClaimRecord`, `GetClaimRecord`, `IsRelocatable`,
+  `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`, `SetClaimlessCPUs` and `claimlessPoolLocked`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 
