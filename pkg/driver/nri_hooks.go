@@ -161,6 +161,10 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 		}
 	}
 
+	// CCX-FORK: the loop above rebuilt the store from what is running, which
+	// cannot account for a claim whose container never started.
+	cp.restoreUnstartedClaims(logger, cpuAllocationStore)
+
 	cp.podConfigStore = podConfigStore
 	cp.cpuAllocationStore = cpuAllocationStore
 	cp.claimTracker = claimTracker
@@ -185,6 +189,51 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 		cp.requestReconcile()
 	}
 	return containerUpdates, nil
+}
+
+// restoreUnstartedClaims reserves the claims this node holds that no running
+// container can account for.
+//
+// Synchronize rebuilds the store by walking the containers the runtime reports,
+// and a container holding a claim cannot start until that claim is prepared. A
+// driver that was down when the kubelet asked therefore leaves a deadlock behind
+// it: the claim stays allocated and unprepared, every CreateContainer for it is
+// refused, and nothing on either side can break the cycle -- the observed
+// recovery was deleting the pod.
+//
+// The two halves that close it are already here. The projected claims say which
+// claims this node is holding, and the CDI spec written at Prepare says where
+// each one was put; a claim with both and no container is exactly the stuck
+// case. Claims the projector does not name are left alone, so a spec left behind
+// by an Unprepare this driver missed cannot resurrect itself.
+func (cp *CPUDriver) restoreUnstartedClaims(logger logr.Logger, allocations *store.CPUAllocation) {
+	if cp.claimReader == nil {
+		return
+	}
+
+	claims, err := cp.claimReader.AllocatedClaims()
+	if err != nil {
+		logger.Error(err, "cannot read the projected claims, so claims without a container stay unprepared")
+		return
+	}
+
+	for _, claim := range claims {
+		if _, held := allocations.GetResourceClaimAllocation(claim.UID); held {
+			continue
+		}
+		record, err := cp.cdiMgr.GetDeviceAllocations(getCDIDeviceName(claim.UID))
+		if err != nil {
+			// Never prepared, rather than prepared and forgotten. The kubelet
+			// asks again for this one, and there is nothing to restore.
+			continue
+		}
+		if err := allocations.ReserveResourceClaimAllocation(logger, claim.UID, record, false); err != nil {
+			logger.Error(err, "cannot restore a claim no container holds", "claimUID", claim.UID)
+			continue
+		}
+		logger.Info("restored a prepared claim no running container holds",
+			"claimUID", claim.UID, "cpus", store.UnionOf(record.Requests).String())
+	}
 }
 
 // checkClaimPartition reports a restored claim whose CPUs no single partition
