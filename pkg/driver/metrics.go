@@ -35,6 +35,7 @@ type Recorder interface {
 	// it cannot adopt rather than failing the whole call, so it has something to
 	// count that upstream does not.
 	RecordSynchronizeSkippedClaim()
+	RecordSynchronizeForeignCPUs()
 	RecordMisplacedClaim()
 	// CCX-FORK: RecordPrepareNoRoom is the fork's, and belongs with the prepare
 	// counters above rather than with the defragmentation block below: it counts
