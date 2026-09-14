@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/cpuset"
 )
 
 // placementWriter is one claim's turn at its own status.
@@ -145,12 +146,20 @@ func (cp *CPUDriver) doPublishClaimPlacementStatus(ctx context.Context, logger l
 			}
 
 			intersection := assignedCPUs.Intersection(devCPUs)
+			correlation := cp.correlationForDevice(record.Correlation, result.Device, devCPUs)
 
 			placement := v1alpha1.ClaimPlacementStatus{
-				APIVersion: v1alpha1.APIVersion,
-				Kind:       "ClaimPlacementStatus",
-				CPUSet:     intersection.String(),
-				CPUCount:   intersection.Size(),
+				APIVersion:       v1alpha1.APIVersion,
+				Kind:             "ClaimPlacementStatus",
+				CPUSet:           intersection.String(),
+				CPUCount:         intersection.Size(),
+				NUMANode:         correlation.NUMANode,
+				Partition:        correlation.Partition,
+				FrontierSnapshot: correlation.FrontierSnapshot,
+				WitnessRounds:    correlation.WitnessRounds,
+				WitnessPlan:      correlation.WitnessPlan,
+				InitialCPUSet:    correlation.InitialCPUSet,
+				RuntimeOutcome:   correlation.RuntimeOutcome,
 			}
 
 			data, err := json.Marshal(placement)
@@ -193,4 +202,39 @@ func shareIDOf(result resourceapi.DeviceRequestAllocationResult) *string {
 	share := string(*result.ShareID)
 
 	return &share
+}
+
+// correlationForDevice narrows a claim's correlation to one of its devices.
+//
+// The correlation is recorded once per claim, and a claim may hold devices in
+// more than one partition: its partition, NUMA node and initial cpuset are then
+// the first device's, and publishing them on every entry tells a reader that a
+// ctrl device sits in the spdk partition. Since each entry names a device, the
+// three are recomputed from the device itself.
+//
+// The frontier and the runtime outcome were computed for one partition rather
+// than for the claim, so they are published only on the devices of that
+// partition and omitted elsewhere: an absent field reads as unknown, where a
+// wrong one reads as an answer. The witness describes the claim's own admission
+// and rides on every entry unchanged.
+func (cp *CPUDriver) correlationForDevice(correlation store.ClaimCorrelation, deviceName string, devCPUs cpuset.CPUSet) store.ClaimCorrelation {
+	partition := cp.devicePartition(deviceName)
+	if partition == "" {
+		partition = correlation.Partition
+	}
+	if partition != correlation.Partition {
+		correlation.FrontierSnapshot = ""
+		correlation.RuntimeOutcome = ""
+	}
+	correlation.Partition = partition
+
+	if nodeID, ok := cp.topology.deviceNameToNUMANodeID[deviceName]; ok {
+		correlation.NUMANode = &nodeID
+	}
+
+	if initial, err := cpuset.Parse(correlation.InitialCPUSet); err == nil {
+		correlation.InitialCPUSet = initial.Intersection(devCPUs).String()
+	}
+
+	return correlation
 }
