@@ -38,4 +38,59 @@ type OpaqueConfig struct {
 type CPUConfig struct {
 	// CPUSet specifies the cpus to allocate in standard cpuset syntax (e.g., "0-3,5").
 	CPUSet string `json:"cpuset,omitempty"`
+	// Relocatable permits the driver to change which CPUs back this claim while
+	// its containers run. Only the workload knows whether it survives that: a
+	// launcher that re-reads its affinity when the cpuset changes loses nothing,
+	// one that pinned its threads once at start keeps running with that pinning
+	// silently gone. Defaults to false, so a claim that says nothing is never
+	// moved.
+	Relocatable bool `json:"relocatable,omitempty"`
+	// Alignment is what the claim asks about being placed across more caches
+	// than its size requires. It is meaningful only where the claim's requests
+	// offer the allocator alternatives of different shapes; a claim whose only
+	// alternative is the aligned one cannot be split whatever it says here.
+	// Defaults to AlignmentBestEffort.
+	Alignment Alignment `json:"alignment,omitempty"`
+}
+
+// Alignment is a claim's answer to landing split.
+type Alignment string
+
+const (
+	// AlignmentBestEffort runs the claim where the allocator placed it, split or
+	// not, and leaves it there. This is the plain exclusive request.
+	AlignmentBestEffort Alignment = "BestEffort"
+	// AlignmentRepairable runs the claim split and has the driver make it whole,
+	// which means moving other claims out of the way, so it requires
+	// Relocatable.
+	AlignmentRepairable Alignment = "Repairable"
+)
+
+// ClaimPlacementStatus is the versioned status schema for v1alpha1.
+//
+// This struct is placed in the claim's status at: claim.Status.Devices[*].Data
+// to publish the actual CPUs a claim occupies on one device.
+type ClaimPlacementStatus struct {
+	// APIVersion specifies the schema version. Should be "v1alpha1".
+	APIVersion string `json:"apiVersion"`
+	// Kind is "ClaimPlacementStatus".
+	Kind string `json:"kind"`
+	// CPUSet specifies the cpus allocated to this claim on this device.
+	CPUSet string `json:"cpuset"`
+	// CPUCount is the number of CPUs allocated on this device.
+	CPUCount int `json:"cpuCount"`
+	// NUMANode is the NUMA node ID chosen for this claim.
+	NUMANode *int `json:"numaNode,omitempty"`
+	// Partition is the CPU partition name chosen for this claim.
+	Partition string `json:"partition,omitempty"`
+	// FrontierSnapshot is the repair frontier advertised when this claim was prepared.
+	FrontierSnapshot string `json:"frontierSnapshot,omitempty"`
+	// WitnessRounds is the repair rounds proven by the repair witness plan.
+	WitnessRounds *int `json:"witnessRounds,omitempty"`
+	// WitnessPlan is a summary of the repair witness moves.
+	WitnessPlan string `json:"witnessPlan,omitempty"`
+	// InitialCPUSet is the initial cpuset granted at Prepare.
+	InitialCPUSet string `json:"initialCPUSet,omitempty"`
+	// RuntimeOutcome is the latest runtime container update status.
+	RuntimeOutcome string `json:"runtimeOutcome,omitempty"`
 }

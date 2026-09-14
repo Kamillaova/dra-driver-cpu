@@ -72,6 +72,7 @@ clean: ## clean
 
 test-unit: ## run tests
 	CGO_ENABLED=1 GOTOOLCHAIN=${TOOOLCHAIN_MODE} go test -v -race -count 1 -coverprofile=coverage.out ./pkg/... ./internal/...
+	cd api && CGO_ENABLED=1 GOTOOLCHAIN=${TOOOLCHAIN_MODE} go test -v -race -count 1 ./...
 
 test-e2e-local: ## run e2e local tests (binary must be pre-built)
 	go test -v -count 1 ./test/e2e_local/...
@@ -122,6 +123,25 @@ endif
 # DRANodeAllocatableResources feature gate enabled.
 DRACPU_E2E_NODE_ALLOCATABLE_MAPPING ?= false
 DRACPU_E2E_ALLOCATOR ?= cpumanager
+# Set to "true" to have ci-kind-setup deploy the driver with defragmentation of
+# running claims enabled. Implies assumeUnsolicitedUpdatesSafe, which the option
+# requires; only do this on containerd, whose vendored NRI carries the fix from
+# containerd/nri#301 (see docs/user/defragmentation.md).
+DRACPU_E2E_DEFRAG ?= false
+# Set to "true" to have ci-kind-setup deploy the driver with whole physical core
+# allocation. Has observable effects only where the nodes have SMT enabled.
+DRACPU_E2E_FULL_PCPUS_ONLY ?= false
+# Set to a cpuset to have ci-kind-setup deploy the driver with a CPU partition
+# of one online thread per core on those CPUs. Their SMT siblings must already
+# be offline: the suite verifies that state, it never creates it.
+DRACPU_E2E_NOSMT_PARTITION_CPUS ?=
+# Set to a cpuset to have ci-kind-setup deploy the driver with a CPU pool on
+# those CPUs, which claims reach by asking for its device class.
+DRACPU_E2E_POOL_PARTITION_CPUS ?=
+# helm --set fills the gap before an index with null, which the values schema
+# rejects, so the pool takes the first free index rather than always the second.
+DRACPU_E2E_POOL_PARTITION_INDEX := $(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),1,0)
+comma := ,
 # Extra arguments passed to golangci-lint in the lint target.
 # For example, set GOLANGCI_LINT_EXTRA_ARGS=--fix to auto-fix issues.
 GOLANGCI_LINT_EXTRA_ARGS ?=
@@ -219,7 +239,12 @@ endif
 		--set-string args.reservedCPUs=${DRACPU_E2E_RESERVED_CPUS} \
 		--set args.exposePCIeRoots=true \
 		--set driverConfig.publishNodeAllocatableResourceMapping=$(DRACPU_E2E_NODE_ALLOCATABLE_MAPPING) \
-		--set driverConfig.allocator=$(DRACPU_E2E_ALLOCATOR)
+		--set driverConfig.allocator=$(DRACPU_E2E_ALLOCATOR) \
+		--set driverConfig.fullPhysicalCPUsOnly=$(DRACPU_E2E_FULL_PCPUS_ONLY) \
+		--set driverConfig.defragEnabled=$(DRACPU_E2E_DEFRAG) \
+		--set driverConfig.assumeUnsolicitedUpdatesSafe=$(DRACPU_E2E_DEFRAG) \
+		$(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),--set-string 'driverConfig.cpuPartitions[0].name=nosmt' --set-string 'driverConfig.cpuPartitions[0].role=exclusive' --set 'driverConfig.cpuPartitions[0].smt=false' --set-string 'driverConfig.cpuPartitions[0].cpus=$(subst $(comma),\$(comma),$(DRACPU_E2E_NOSMT_PARTITION_CPUS))') \
+		$(if $(DRACPU_E2E_POOL_PARTITION_CPUS),--set-string 'driverConfig.cpuPartitions[$(DRACPU_E2E_POOL_PARTITION_INDEX)].name=helpers' --set-string 'driverConfig.cpuPartitions[$(DRACPU_E2E_POOL_PARTITION_INDEX)].role=shared' --set-string 'driverConfig.cpuPartitions[$(DRACPU_E2E_POOL_PARTITION_INDEX)].cpus=$(subst $(comma),\$(comma),$(DRACPU_E2E_POOL_PARTITION_CPUS))')
 	hack/ci/wait-resourcelices.sh
 
 build-test-image: ## build tests image
@@ -242,12 +267,15 @@ test-e2e-kind: ci-kind-setup test-e2e ## run e2e test against a purpose-built ki
 
 lint:  ## run the linter against the codebase
 	$(GOLANGCI_LINT) run ./... $(GOLANGCI_LINT_EXTRA_ARGS)
+	cd api && $(GOLANGCI_LINT) run ./... $(GOLANGCI_LINT_EXTRA_ARGS)
 
 modernize: ## run modernize to report suggested code modernizations
 	go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(GOPLS_VERSION) -diff ./...
+	cd api && go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(GOPLS_VERSION) -diff ./...
 
 modernize-fix: ## apply modernize suggestions
 	go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(GOPLS_VERSION) -fix ./...
+	cd api && go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@$(GOPLS_VERSION) -fix ./...
 
 # dependencies
 .PHONY: install-yq

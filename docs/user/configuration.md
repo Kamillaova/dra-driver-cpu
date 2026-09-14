@@ -79,6 +79,12 @@ on - is configured through other Helm values, not through this file.
 - Grouping strategy used when `cpuDeviceMode` is `grouped`.
 - `numanode`: groups CPUs by NUMA node.
 - `socket`: groups CPUs by socket.
+- `uncorecache`: groups CPUs by the uncore (L3/CCX) cache they share, one device per cache. The
+  capacity a claim consumes is then the capacity of one cache, so a request for a whole cache can
+  only be satisfied by a cache that has one free, and the allocator — not the driver — decides which
+  cache a claim lands on. Every device of one NUMA node is published consecutively, so a claim
+  constraining its requests to one NUMA node stays cheap to allocate. CPUs whose cache the kernel
+  does not report are not published under this grouping.
 - `machine`: groups all allocatable node CPUs into a single machine-wide capacity device.
   NOTE: this mode requires an external scheduler to supply core assignments. See
   [Custom Opaque CPUSet Allocation Overrides](opaque-cpuset-overrides.md).
@@ -107,6 +113,200 @@ on - is configured through other Helm values, not through this file.
   and kubelet account claimed CPUs as node allocatable `cpu`.
 - Requires the `DRANodeAllocatableResources` feature gate (alpha, 1.37+). See
   [Workload Configuration Requirements](workload-requirements.md).
+
+`fullPhysicalCPUsOnly` (bool, default: `false`)
+
+- Allocate whole physical cores, so a core's SMT siblings are never split between two
+  claims, nor between a claim and the shared pool. This is the driver equivalent of the
+  kubelet CPU Manager's
+  [`full-pcpus-only`](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/#static-policy-options)
+  policy option, and it matters where CPU siblings must not be shared between tenants.
+- Requires `cpuDeviceMode: grouped`: in `individual` mode the scheduler picks exact
+  per-CPU devices, so the driver cannot keep a core's siblings together.
+- A no-op where SMT is disabled, since every core has one thread.
+
+`assumeUnsolicitedUpdatesSafe` (bool, default: `false`)
+
+- Permit the driver to push container cpuset updates the runtime did not ask for. Every
+  feature that reacts to a change without waiting for a container lifecycle event needs
+  this, including `reconcileSharedOnUnprepare`.
+- It is an operator assertion, not something the driver can detect. Unsolicited updates
+  deadlock runtimes whose vendored NRI predates
+  [containerd/nri#301](https://github.com/containerd/nri/pull/301), and the NRI `Configure`
+  handshake reports the runtime version but not its NRI version, so there is no reliable
+  check. containerd carries the fix from NRI v0.12.1 onwards, first released in containerd
+  v2.4.0-beta.0; containerd v2.3.4 and CRI-O v1.36 do not.
+
+`reconcileSharedOnUnprepare` (bool, default: `true`)
+
+- Widen shared containers onto the CPUs a claim released as soon as it is unprepared,
+  rather than leaving them on the narrower cpuset until their next `CreateContainer` or
+  driver restart.
+- Requires `assumeUnsolicitedUpdatesSafe` and is inert without it, so enabling that one
+  option is enough.
+
+`defragEnabled` (bool, default: `false`)
+
+- Let the driver move a running claim onto different CPUs to recover uncore cache (CCX/L3)
+  alignment lost to claim churn, without restarting its container. A claim keeps its CPU
+  count and its NUMA footprint; only which CPUs back it change.
+- Requires `cpuDeviceMode: grouped` with `groupBy: numanode`, `socket` or `uncorecache`,
+  because those are the modes where the driver chooses a claim's CPUs in the first place:
+  `individual` mode has the scheduler pick exact per-CPU devices, and `groupBy: machine`
+  takes the cpuset from the claim's own opaque config.
+- Under `groupBy: uncorecache` a device is one cache, so a move takes the claim off the
+  device its allocation named. A claim's allocation cannot be rewritten, so the capacity
+  published for each cache carries the difference instead: its own size, plus the CPUs
+  charged to it by claims that have left, minus the CPUs occupied on it by claims charged
+  elsewhere. A scheduler subtracting what its own records charged then arrives at the CPUs
+  really free there. The consequence to know about is that a cache device's `capacity` is
+  no longer its size while any claim sits off the cache it was allocated from;
+  `dra.cpu/numCPUs` still carries the size. See
+  [The Capacity Mirror](capacity-mirror.md).
+- Requires `assumeUnsolicitedUpdatesSafe`, since a move is pushed to the runtime
+  unprompted.
+- A structural no-op on nodes with one cache per NUMA node, where there is no spread to
+  recover. See [CPU Defragmentation](defragmentation.md).
+- Workloads must not read their CPUs from the `DRA_CPUSET_*` environment variable, whose
+  value is fixed when the container starts. With this option on, the variable's value is
+  the literal string `dynamic` instead of a cpuset, so a workload that parses it fails
+  loudly rather than pinning itself to CPUs its claim has left. Read
+  `sched_getaffinity(2)` or the container's own `cpuset.cpus.effective` instead. See
+  [How it Works](how-it-works.md).
+
+`defragAllowTransientOverlap` (bool, default: `true`)
+
+- Permit the instant during an exchange in which two claims hold the same CPUs. Exchanging the CPUs
+  of two claims is the only repair a node with no free CPUs has, and the runtime applies the two
+  cpuset writes of one batch in order, so between them both claims sit on the CPUs one of them is
+  leaving. cgroup v2 allows that: only `cpuset.cpus.partition` makes a set exclusive, and neither
+  the kubelet nor containerd uses partitions for pods.
+- Set it to `false` to forbid that instant, which also forbids every exchange: a claim then moves
+  only into CPUs nothing holds, and a node packing has filled keeps the placement it has. The
+  refusal is visible — those moves are counted in `dra_cpu_defrag_blocked_moves_total`, and
+  `/placements?dryrun=1` says an exchange would have helped.
+- Inert without `defragEnabled`. The window is two sequential cgroup writes inside one batch, during
+  which the two claims share CPUs at roughly half speed; a workload that cannot afford even that
+  opts out of moves entirely with `cpuConfig.relocatable: false`, which is the default.
+
+`cachePlacementStrategy` (string, `pack` | `spread`, default: `pack`)
+
+- How a claim that fits inside one uncore cache chooses among the caches that can hold it. `pack`,
+  the default and upstream's behaviour, fills the fullest cache that fits: clean caches stay whole
+  for larger claims, small tenants share L3. `spread` fills the emptiest cache: each small claim gets
+  a cache of its own while there is slack — L3 isolation first — and a whole-cache claim arriving
+  later relies on defragmentation to consolidate the small tenants out of its way, rather than on
+  caches having been hoarded against its possible arrival. Claims no cache can hold take the largest
+  caches first under either policy.
+- Both allocation and defragmentation draw placements from the same policy-aware selector, so the two
+  can never disagree about where a claim belongs. `spread` works with or without
+  `fullPhysicalCPUsOnly`; without it, a claim still avoids splitting a physical core where it can,
+  but two claims may end up on one core's SMT siblings once the chosen cache offers nothing better —
+  whole-core allocation is what actually forbids that, and isolation-minded deployments should run
+  both. Requires `cpuDeviceMode: grouped`: in individual mode the scheduler names exact CPU devices
+  and the driver picks nothing.
+- Under `groupBy: uncorecache` the cache is the allocator's to choose, not the driver's, so the
+  strategy acts through the order the devices are published in: `pack` offers the caches that already
+  hold a claim first, `spread` the ones that hold none. The order is republished whenever a cache
+  changes between the two, and the devices of one NUMA node always stay together in it.
+
+`cpuPartitions` (list of partition, default: empty)
+
+- Describe the node's cores as named partitions, each with a `name`, a `role`, an explicit `cpus`
+  cpuset of whole cores, and an optional `smt` expectation. The CPUs no partition names form the
+  implicit partition `default`, which is the one a claim reaches without naming a partition, so the
+  name `default` may not be declared.
+- `role` says what the cores are for. `reserved`: no container ever runs there, the successor of
+  `reservedCPUs`. `default`: devices are published and containers without a claim run on whatever is
+  left unclaimed. `shared`: a pool a workload reaches by claiming it. `exclusive`: devices are
+  published and no container without a claim ever runs there.
+- `smt` is how many threads per core the partition expects the platform to leave online: `true` (the
+  default) accepts whatever the hardware has, `false` means one thread per core, and an integer is an
+  upper bound. The driver verifies the expectation against the running kernel and never changes
+  hotplug state itself, so offlining siblings stays the machine configuration's job.
+- Requires `cpuDeviceMode: grouped`. `reservedCPUs` in the same scope is an error rather than a merge:
+  each describes the same CPUs from the other end, and a `reserved` partition is how the list says it.
+- Names are DNS labels of at most 46 characters, since the device names built from them must stay
+  DNS labels. Partitions may not overlap.
+- The model, the machine configuration it expects and the runbook for changing it on a live node are
+  in [CPU Partitions](cpu-partitions.md).
+- The chart renders one `DeviceClass` per named partition, `dra.cpu-<name>`, and the `dra.cpu` class
+  selects the implicit partition alone. Classes are cluster-scoped while partitions are per node
+  type, so the chart covers the partitions of every profile and a name two node types share yields
+  one class. A claim reaches a named partition by naming its class and tolerating
+  `dra.cpu/partition=<name>` with `operator: Equal`; an existence toleration with an empty key would
+  match every taint and is not what a template should carry.
+
+```yaml
+driverConfig:
+  cpuDeviceMode: grouped
+  cpuPartitions:
+    - name: system
+      role: reserved
+      cpus: "0,128"
+    - name: helpers
+      role: shared
+      cpus: "4-7,132-135"
+    - name: dataplane
+      role: exclusive
+      cpus: "8-15"
+      smt: false
+    - name: vm
+      role: exclusive
+      cpus: "16-127,144-255"
+```
+
+`profiles` (map of string to profile, default: empty)
+
+- One `cpuPartitions` list per node type, and nothing else in a profile. CPU numbering is a property
+  of the node's hardware, so a fleet mixing node types cannot state one list for all of them —
+  `"1,17"` is a whole core on one part and two half cores on another. Every other field stays
+  fleet-wide policy.
+- A node selects its profile with the **`dra.cpu/profile` node label**; the driver reads it at
+  startup. Changing the label takes effect on the next driver restart, deliberately: the partitions
+  are the ground truth under every current placement, not a value to swap live. Naming a profile the
+  config does not declare fails that node's driver loudly — a typo must not run a node on another
+  node type's cores.
+- Declaring any profile makes `reservedCPUs` and `cpuPartitions` outside a profile errors, and a node
+  without the label refuses to start rather than picking up a description meant for a different part.
+  A node whose cores are all interchangeable is labelled `dra.cpu/profile=default`: that profile
+  always exists, is never declared, and leaves the whole node in the implicit `default` partition.
+- Every profile is validated on every node at startup, so a broken profile fails the fleet at rollout
+  rather than one node type at its next reboot.
+- With no profiles at all, the fleet-wide `reservedCPUs` and `cpuPartitions` still apply, and the
+  driver logs that they are on their way out.
+
+```yaml
+driverConfig:
+  cpuDeviceMode: grouped
+  profiles:
+    r7625:
+      cpuPartitions:
+        - name: system
+          role: reserved
+          cpus: "0,128"
+        - name: dataplane
+          role: exclusive
+          cpus: "8-15"
+          smt: false
+        - name: vm
+          role: exclusive
+          cpus: "16-127,144-255"
+    x3d:
+      cpuPartitions:
+        - name: system
+          role: reserved
+          cpus: "0,16"
+        - name: vm
+          role: exclusive
+          cpus: "1-15,17-31"
+```
+
+```console
+kubectl label node worker-a dra.cpu/profile=x3d
+kubectl label node --selector=node.kubernetes.io/instance-type=epyc-bare dra.cpu/profile=r7625
+kubectl label node worker-z dra.cpu/profile=default
+```
 
 #### Example
 

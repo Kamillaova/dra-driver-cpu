@@ -16,9 +16,16 @@ limitations under the License.
 package driver
 
 import (
+	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/go-logr/logr"
+	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/cpuset"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 	cdiSpec "tags.cncf.io/container-device-interface/specs-go"
@@ -30,6 +37,71 @@ const (
 	cdiClass        = "cpu"
 	cdiEnvVarPrefix = "DRA_CPUSET"
 	cdiSpecDir      = "/var/run/cdi"
+
+	// cdiPlacementsAnnotation records what each request of a claim currently
+	// holds: its CPUs and the role of the CPUs it was given.
+	//
+	// It lives in the CDI spec's device annotations rather than in its container
+	// edits because CDI annotations are, per the specification, "CDI-specific and
+	// do not affect container metadata": nothing is injected into the container,
+	// so the driver can rewrite them at will. The injected env var cannot serve
+	// this purpose, since a running container's environment is fixed at creation.
+	cdiPlacementsAnnotation = "dra.cpu/placements"
+
+	// cdiCPUSetAnnotation records the CPUs a claim is pinned to, without saying
+	// which request holds them. Specs written before the driver recorded
+	// placement per request carry this one instead.
+	cdiCPUSetAnnotation = "dra.cpu/cpuset"
+
+	// cdiRecordedAnnotation records how many CPUs the claim's allocation charged
+	// each device it names, which is what the scheduler has subtracted from those
+	// devices' capacities. The driver does not watch ResourceClaims, so after a
+	// restart this is where that answer comes from until a replayed Prepare hands
+	// the claim over again; absent means unknown, and an unknown answer leaves the
+	// published capacity uncorrected rather than guessing.
+	cdiRecordedAnnotation = "dra.cpu/recorded"
+
+	// cdiRelocatableAnnotation records whether the claim's own configuration
+	// permits its CPUs to change. The driver does not watch ResourceClaims, so
+	// after a restart this is where that answer comes from; absent means false,
+	// which is both the field's default and the right reading of a spec written
+	// before the driver recorded it.
+	cdiRelocatableAnnotation = "dra.cpu/relocatable"
+
+	// cdiAlignmentAnnotation records what the claim asks about landing split.
+	cdiAlignmentAnnotation = "dra.cpu/alignment"
+
+	// cdiRoundIDAnnotation records the defragmentation round currently in flight
+	// for this claim.
+	cdiRoundIDAnnotation = "dra.cpu/round.id"
+
+	// cdiRoundOriginAnnotation records the CPUs this claim held before the round.
+	cdiRoundOriginAnnotation = "dra.cpu/round.origin"
+
+	// cdiCorrelationAnnotation records admission and witness correlation for this claim.
+	cdiCorrelationAnnotation = "dra.cpu/correlation"
+
+	// cdiRoundTargetAnnotation records the CPUs this round is moving the claim to.
+	cdiRoundTargetAnnotation = "dra.cpu/round.target"
+
+	// cdiRoundPartnersAnnotation records the other claims participating in the
+	// same swap exchange.
+	cdiRoundPartnersAnnotation = "dra.cpu/round.partners"
+
+	// cdiEnvDynamicValue stands in for a cpuset in the injected variable when a
+	// claim's placement may change while its container runs.
+	//
+	// The variable is fixed when the container is created and cannot be corrected
+	// afterwards, so any cpuset it named would become a lie the first time the
+	// claim moved. This says as much, and the claim UID in the variable's name --
+	// the part the driver actually needs -- is unaffected.
+	//
+	// It is also the value an upstream driver does least harm with, should one
+	// take over these specs: it cannot parse it, so it passes the container over
+	// and leaves its cpuset alone. A stale-looking cpuset would instead have it
+	// reject the claim and, finding the container holding none, pin a guaranteed
+	// container to the shared pool.
+	cdiEnvDynamicValue = "dynamic"
 )
 
 // CdiManager handles the lifecycle of CDI allocations for the driver.
@@ -66,16 +138,65 @@ func (c *CdiManager) getSpecName(deviceName string) string {
 	return cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, deviceName) + ".json"
 }
 
-// AddDevice writes a dedicated CDI spec file for a single device allocation.
-func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar string) error {
+// AddDevice writes a dedicated CDI spec file for a single claim, recording the
+// claim's record as its current state and injecting envVar into the container.
+// One device carries every request of the claim.
+//
+// The spec is written atomically by the CDI cache, so a concurrent reader sees
+// either the previous placement or this one, never a mixture.
+//
+// CCX-FORK: upstream takes no record argument and records nothing of its own.
+func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar string, record store.ClaimRecord) error {
 	specName := c.getSpecName(deviceName)
+
+	placements, err := encodePlacements(record.Requests)
+	if err != nil {
+		return fmt.Errorf("failed to record the placement of CDI device %q: %w", deviceName, err)
+	}
+	alignment := record.Alignment
+	if alignment == "" {
+		alignment = v1alpha1.AlignmentBestEffort
+	}
+	annotations := map[string]string{
+		cdiPlacementsAnnotation:  placements,
+		cdiRelocatableAnnotation: strconv.FormatBool(record.Relocatable),
+		cdiAlignmentAnnotation:   string(alignment),
+	}
+	// A claim that charged nothing writes no annotation, so a spec is not made to
+	// carry the word for an empty answer. It reads back the same as one written
+	// before the driver kept them, which is the same answer.
+	if len(record.Recorded) > 0 {
+		recorded, err := json.Marshal(record.Recorded)
+		if err != nil {
+			return fmt.Errorf("failed to record the charged devices of CDI device %q: %w", deviceName, err)
+		}
+		annotations[cdiRecordedAnnotation] = string(recorded)
+	}
+	if record.Round != nil && record.Round.RoundID != "" {
+		annotations[cdiRoundIDAnnotation] = record.Round.RoundID
+		annotations[cdiRoundOriginAnnotation] = record.Round.Origin.String()
+		annotations[cdiRoundTargetAnnotation] = record.Round.Target.String()
+		partners, err := json.Marshal(record.Round.Partners)
+		if err != nil {
+			return fmt.Errorf("failed to record round partners of CDI device %q: %w", deviceName, err)
+		}
+		annotations[cdiRoundPartnersAnnotation] = string(partners)
+	}
+	if record.Correlation.NUMANode != nil || record.Correlation.Partition != "" || record.Correlation.FrontierSnapshot != "" || record.Correlation.WitnessRounds != nil || record.Correlation.WitnessPlan != "" || record.Correlation.InitialCPUSet != "" || record.Correlation.RuntimeOutcome != "" {
+		corrBytes, err := json.Marshal(record.Correlation)
+		if err != nil {
+			return fmt.Errorf("failed to record correlation of CDI device %q: %w", deviceName, err)
+		}
+		annotations[cdiCorrelationAnnotation] = string(corrBytes)
+	}
 
 	spec := &cdiSpec.Spec{
 		Version: cdiSpecVersion,
 		Kind:    c.cdiKind,
 		Devices: []cdiSpec.Device{
 			{
-				Name: deviceName,
+				Name:        deviceName,
+				Annotations: annotations,
 				ContainerEdits: cdiSpec.ContainerEdits{
 					Env: []string{envVar},
 				},
@@ -87,8 +208,230 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 		return fmt.Errorf("failed to write CDI spec %q: %w", specName, err)
 	}
 
-	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVar)
+	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVar,
+		"placements", placements, "recorded", annotations[cdiRecordedAnnotation], "relocatable", record.Relocatable)
 	return nil
+}
+
+type cdiRequestPlacement struct {
+	Request string `json:"request"`
+	CPUs    string `json:"cpus"`
+	Role    string `json:"role"`
+}
+
+// recordableRole reports whether a role is one this driver writes into a device
+// spec. The store reads any role that is not exclusive as CPUs another claim may
+// hold too, so a misspelling does not fail anywhere: it quietly turns a claim's
+// own CPUs into pool CPUs and hands them out again.
+func recordableRole(role store.Role) bool {
+	return role == store.RoleExclusive || role == store.RoleShared
+}
+
+func encodePlacements(requests []store.RequestAllocation) (string, error) {
+	placements := make([]cdiRequestPlacement, 0, len(requests))
+	for _, request := range requests {
+		placements = append(placements, cdiRequestPlacement{
+			Request: request.Request,
+			CPUs:    request.CPUs.String(),
+			Role:    string(request.Role),
+		})
+	}
+	encoded, err := json.Marshal(placements)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func decodePlacements(recorded string) ([]store.RequestAllocation, error) {
+	var placements []cdiRequestPlacement
+	if err := json.Unmarshal([]byte(recorded), &placements); err != nil {
+		return nil, err
+	}
+	// A JSON null and an empty array both unmarshal without error. Accepting
+	// either yields a claim recorded as holding nothing, which every later
+	// reader takes at face value: a replayed Prepare reuses it and the container
+	// is started on an empty cpuset, which the runtime reads as "unconstrained".
+	if len(placements) == 0 {
+		return nil, fmt.Errorf("no request placements recorded")
+	}
+	requests := make([]store.RequestAllocation, 0, len(placements))
+	for _, placement := range placements {
+		cpus, err := cpuset.Parse(placement.CPUs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse the CPUs of request %q: %w", placement.Request, err)
+		}
+		role := store.Role(placement.Role)
+		if !recordableRole(role) {
+			return nil, fmt.Errorf("request %q has unrecognised role %q", placement.Request, placement.Role)
+		}
+		requests = append(requests, store.RequestAllocation{
+			Request: placement.Request,
+			CPUs:    cpus,
+			Role:    role,
+		})
+	}
+	return requests, nil
+}
+
+// GetDeviceAllocations returns what the driver recorded for a claim, as its
+// device allocation carries it. Call Refresh before lookup to load the latest
+// on-disk specs.
+//
+// A spec written before the driver recorded placement per request names one
+// cpuset for the whole claim, or carries it only in the injected env var; both
+// describe a single exclusive request without a name. The spec file is
+// driver-owned, so unlike a container's environment its env value is current.
+// A missing or unparsable mobility annotation reads as immobile, which is the
+// field's default and cannot cost a claim anything but a move. A missing set of
+// charged devices reads as unknown, which leaves the published capacity
+// uncorrected for that claim; an unparsable one is an error, because a spec this
+// driver wrote is the one place that answer was kept.
+func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord, error) {
+	device := c.cache.GetDevice(cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName))
+	if device == nil {
+		return store.ClaimRecord{}, fmt.Errorf("failed to find CDI device %q", deviceName)
+	}
+	relocatable, _ := strconv.ParseBool(device.Annotations[cdiRelocatableAnnotation])
+	alignment := v1alpha1.Alignment(device.Annotations[cdiAlignmentAnnotation])
+	if alignment == "" {
+		alignment = v1alpha1.AlignmentBestEffort
+	}
+	charged, _, err := decodeRecordedDevices(device.Annotations[cdiRecordedAnnotation])
+	if err != nil {
+		return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
+			cdiRecordedAnnotation, device.Annotations[cdiRecordedAnnotation], deviceName, err)
+	}
+
+	var roundProv *store.RoundProvenance
+	if roundID, ok := device.Annotations[cdiRoundIDAnnotation]; ok && roundID != "" {
+		origin, err := cpuset.Parse(device.Annotations[cdiRoundOriginAnnotation])
+		if err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
+				cdiRoundOriginAnnotation, device.Annotations[cdiRoundOriginAnnotation], deviceName, err)
+		}
+		target, err := cpuset.Parse(device.Annotations[cdiRoundTargetAnnotation])
+		if err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
+				cdiRoundTargetAnnotation, device.Annotations[cdiRoundTargetAnnotation], deviceName, err)
+		}
+		partners, err := decodeRoundPartners(device.Annotations[cdiRoundPartnersAnnotation])
+		if err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
+				cdiRoundPartnersAnnotation, device.Annotations[cdiRoundPartnersAnnotation], deviceName, err)
+		}
+		roundProv = &store.RoundProvenance{
+			RoundID:  roundID,
+			Origin:   origin,
+			Target:   target,
+			Partners: partners,
+		}
+	}
+
+	var correlation store.ClaimCorrelation
+	if corrStr, ok := device.Annotations[cdiCorrelationAnnotation]; ok && corrStr != "" {
+		_ = json.Unmarshal([]byte(corrStr), &correlation)
+	}
+
+	if recorded, ok := device.Annotations[cdiPlacementsAnnotation]; ok {
+		requests, err := decodePlacements(recorded)
+		if err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiPlacementsAnnotation, recorded, deviceName, err)
+		}
+		return store.ClaimRecord{Requests: requests, Relocatable: relocatable, Alignment: alignment, Recorded: charged, Round: roundProv, Correlation: correlation}, nil
+	}
+
+	if recorded, ok := device.Annotations[cdiCPUSetAnnotation]; ok {
+		cpus, err := cpuset.Parse(recorded)
+		if err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiCPUSetAnnotation, recorded, deviceName, err)
+		}
+		return store.ClaimRecord{
+			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
+			Relocatable: relocatable,
+			Alignment:   alignment,
+			Recorded:    charged,
+			Round:       roundProv,
+			Correlation: correlation,
+		}, nil
+	}
+
+	allocations, err := parseDRAEnvToClaimAllocations(logr.Discard(), device.ContainerEdits.Env)
+	if err != nil {
+		return store.ClaimRecord{}, fmt.Errorf("failed to parse CDI device %q: %w", deviceName, err)
+	}
+	for _, cpus := range allocations {
+		return store.ClaimRecord{
+			Requests:    []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}},
+			Relocatable: relocatable,
+			Alignment:   alignment,
+			Recorded:    charged,
+			Round:       roundProv,
+			Correlation: correlation,
+		}, nil
+	}
+	return store.ClaimRecord{}, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
+}
+
+func decodeRoundPartners(recorded string) ([]types.UID, error) {
+	if recorded == "" {
+		return nil, nil
+	}
+	var partners []types.UID
+	if err := json.Unmarshal([]byte(recorded), &partners); err == nil {
+		return partners, nil
+	}
+	for _, p := range strings.Split(recorded, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			partners = append(partners, types.UID(p))
+		}
+	}
+	return partners, nil
+}
+
+// decodeRecordedDevices reads back how many CPUs a claim's allocation charged
+// each device, and whether the spec says at all.
+//
+// Absent is not an error and not zero: it is a spec written before the driver
+// kept the answer, and reading it as zero would make every running claim look
+// like a tenant of a device its allocation never named. The caller has to be
+// able to tell the two apart, so it is told.
+func decodeRecordedDevices(recorded string) (map[string]int, bool, error) {
+	if recorded == "" {
+		return nil, false, nil
+	}
+	var charged map[string]int
+	if err := json.Unmarshal([]byte(recorded), &charged); err != nil {
+		return nil, false, err
+	}
+	return charged, true, nil
+}
+
+// PreparedClaimAllocations returns what was recorded on disk for every claim
+// this driver previously prepared, keyed by claim UID. Call Refresh first to
+// load the latest specs. A device this driver would not itself have generated,
+// or whose recorded placement fails to parse, is skipped and logged rather than
+// aborting recovery of every other claim.
+func (c *CdiManager) PreparedClaimAllocations(logger logr.Logger) map[types.UID]store.ClaimRecord {
+	allocations := make(map[types.UID]store.ClaimRecord)
+	for _, qualified := range c.cache.ListDevices() {
+		vendor, class, name, err := cdiparser.ParseQualifiedName(qualified)
+		if err != nil || vendor != cdiVendor || class != cdiClass {
+			continue
+		}
+		claimUID, ok := claimUIDFromDeviceName(name)
+		if !ok {
+			logger.V(2).Info("ignoring CDI device this driver would not have generated", "device", qualified)
+			continue
+		}
+		record, err := c.GetDeviceAllocations(name)
+		if err != nil {
+			logger.Error(err, "ignoring CDI device with an unrecoverable placement", "device", qualified)
+			continue
+		}
+		allocations[claimUID] = record
+	}
+	return allocations
 }
 
 // Refresh reloads the CDI specs managed by the cache.

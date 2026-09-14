@@ -1,0 +1,41 @@
+include:
+  - project: cloud/ci/templates
+    ref: kamillaova/universal-templates
+    file:
+      - Docker.gitlab-ci.yml
+      - Helm.gitlab-ci.yml
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  PUBLISH_ALL_BRANCHES: "true"
+  CHART_DIR: deployment/helm/dra-driver-cpu
+
+# The formatting and vet gates the repository already ships, run where the work
+# actually happens. The GitHub workflow runs them only on pushes to main and on
+# pull requests against it, and this fork's branches are neither, so nothing had
+# ever run them here.
+#
+# `.pre` rather than a named stage: the included templates own the stage list,
+# and `.pre` exists whatever they set it to. Lint gates the pipeline that
+# publishes the image and the chart, which is the point -- a branch that does
+# not format is not one to publish from.
+lint:
+  stage: .pre
+  image: golang:1.26
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - .cache/go-mod
+      - .cache/golangci-lint
+  variables:
+    GOMODCACHE: $CI_PROJECT_DIR/.cache/go-mod
+    GOLANGCI_LINT_CACHE: $CI_PROJECT_DIR/.cache/golangci-lint
+  script:
+    - make install-golangci-lint
+    - make lint
