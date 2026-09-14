@@ -78,11 +78,12 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses
 
-- `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`
+- `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`, `sharedContainerCPUs`
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RequestAllocation`, `UnionOf`,
   `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
-  `GetRebindOrigin`, `GetResourceClaimRequests`, `GetResourceClaimAllocationUnion`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`
+  `GetRebindOrigin`, `GetResourceClaimRequests`, `GetResourceClaimAllocationUnion`, `HoldsExclusiveCPUs`, `ExclusiveClaimAllocations`,
+  `SetClaimlessCPUs` and `claimlessPoolLocked`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 

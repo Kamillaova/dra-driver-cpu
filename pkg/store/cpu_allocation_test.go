@@ -250,6 +250,31 @@ func TestReserveResourceClaimAllocationSharedPoolGuard(t *testing.T) {
 	}
 }
 
+// TestReserveResourceClaimAllocationGuardsTheClaimlessPartition: on a
+// partitioned node the pool a claimless container can reach is the default
+// partition, not every unreserved CPU. A claim emptying that partition must be
+// refused even while whole exclusive partitions sit idle, because those CPUs are
+// not somewhere a claimless container may be moved to.
+func TestReserveResourceClaimAllocationGuardsTheClaimlessPartition(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	claimless := cpuset.New(0, 1)
+
+	store := newTestCPUAllocation(logger, allCPUs, cpuset.New())
+	store.SetClaimlessCPUs(claimless)
+
+	err := store.ReserveResourceClaimAllocation(logger, "claim", exclusiveRequest(claimless), true)
+	require.ErrorContains(t, err, "would exhaust the shared CPU pool")
+
+	// The six idle CPUs of the exclusive partition are what the guard used to
+	// count, and counting them is what let the default partition be emptied.
+	require.True(t, store.GetSharedCPUs().Equals(allCPUs))
+
+	// A claim inside the exclusive partition leaves the claimless pool whole and
+	// is unaffected by the narrowing.
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "vm", exclusiveRequest(cpuset.New(2, 3, 4, 5, 6, 7)), true))
+}
+
 func TestCPUAllocationStoreCacheConsistency(t *testing.T) {
 	logger := testr.New(t)
 	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)

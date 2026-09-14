@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 20)
+	require.Len(t, descriptors, 21)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -55,6 +55,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_nri_stop_container_duration_seconds",
 		"dra_cpu_nri_remove_container_duration_seconds",
 		"dra_cpu_synchronize_skipped_claims_total",
+		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_defrag_excess_uncore_caches",
 		"dra_cpu_defrag_largest_alignable_free_cpus",
 		"dra_cpu_defrag_passes_total",
@@ -63,12 +64,13 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_pass_duration_seconds",
 	}, names)
 	require.Empty(t, descriptors[13].Labels)
+	require.Empty(t, descriptors[14].Labels)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
-	require.Equal(t, []string{"numa_node"}, descriptors[15].Labels)
-	require.Equal(t, []string{"result"}, descriptors[16].Labels)
+	require.Equal(t, []string{"numa_node"}, descriptors[16].Labels)
 	require.Equal(t, []string{"result"}, descriptors[17].Labels)
-	require.Empty(t, descriptors[18].Labels)
+	require.Equal(t, []string{"result"}, descriptors[18].Labels)
+	require.Empty(t, descriptors[19].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -106,6 +108,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_defrag_moves_total",
 		"dra_cpu_defrag_pass_duration_seconds",
 		"dra_cpu_defrag_passes_total",
+		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_nri_create_container_duration_seconds",
 		"dra_cpu_nri_remove_container_duration_seconds",
 		"dra_cpu_nri_stop_container_duration_seconds",
