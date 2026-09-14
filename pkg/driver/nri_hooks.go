@@ -18,14 +18,18 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
@@ -50,6 +54,8 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	podConfigStore := store.NewPodConfig()
 	claimTracker := store.NewClaimTracker()
 	var containerUpdates []*api.ContainerUpdate
+	var claimsToClearRound []types.UID
+	var observed []observedContainer
 	cdiCacheRefreshAttempted := false
 
 	for _, pod := range pods {
@@ -76,12 +82,14 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					caLogger.Info("ignoring claim the runtime injected no CDI device for during synchronize")
 					continue
 				}
+
 				if !cdiCacheRefreshAttempted {
 					err = cp.cdiMgr.Refresh()
 					cdiCacheRefreshAttempted = true
 					if err != nil {
 						logger.Error(err, "failed to refresh CDI cache, continuing with available CDI devices")
 					}
+					cp.reconcileActiveRounds(logger)
 				}
 
 				deviceName := getCDIDeviceName(uid)
@@ -147,14 +155,93 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					return nil, err
 				}
 				cLogger.V(2).Info("found guaranteed CPUs", "cpus", allGuaranteedCPUs.String())
-				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...).WithCgroup(container.GetLinux().GetCgroupsPath())
-
-				// Reconcile guaranteed container CPU mask.
-				guaranteedUpdate := &api.ContainerUpdate{
-					ContainerId: container.GetId(),
+				cgroupsPath := ""
+				if linux := container.GetLinux(); linux != nil {
+					cgroupsPath = linux.GetCgroupsPath()
 				}
-				guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
-				containerUpdates = append(containerUpdates, guaranteedUpdate)
+				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...).WithCgroup(cgroupsPath)
+
+				originUnion := cpuset.New()
+				targetUnion := cpuset.New()
+				hadRound := false
+				for _, uid := range claimUIDs {
+					rec, err := cp.cdiMgr.GetDeviceAllocations(getCDIDeviceName(uid))
+					if err == nil && rec.Round != nil && rec.Round.RoundID != "" {
+						hadRound = true
+						originUnion = originUnion.Union(rec.Round.Origin)
+						targetUnion = targetUnion.Union(rec.Round.Target)
+					} else if claimCPUs, ok := cpuAllocationStore.GetResourceClaimAllocation(uid); ok {
+						originUnion = originUnion.Union(claimCPUs)
+						targetUnion = targetUnion.Union(claimCPUs)
+					}
+				}
+				if !hadRound {
+					originUnion = allGuaranteedCPUs
+					targetUnion = allGuaranteedCPUs
+				}
+
+				var committedCPUs cpuset.CPUSet
+				if linux := container.GetLinux(); linux != nil {
+					if res := linux.GetResources(); res != nil && res.GetCpu() != nil {
+						committedCPUs, _ = cpuset.Parse(res.GetCpu().GetCpus())
+					}
+				}
+
+				var kernelCPUs cpuset.CPUSet
+				var kernelErr error
+				switch {
+				case cgroupsPath == "":
+					kernelErr = errors.New("the runtime reported no cgroups path for this container")
+				case cp.cgroupfs == nil:
+					kernelErr = errors.New("this driver reads no cgroup tree: it mounts one only for defragmentation")
+				default:
+					kernelCPUs, kernelErr = cgroupfs.CPUSet(cp.cgroupfs, cgroupsPath)
+				}
+
+				// CCX-FORK: the three-way check exists to settle a move the
+				// runtime never confirmed, and only a claim carrying a round
+				// annotation can be in that position. Every other container is
+				// upstream's case, where the record is simply the answer -- and
+				// asking a third source about it can only turn a container that
+				// needs pinning into one that is never pinned at all.
+				if !hadRound {
+					observed = append(observed, observedContainer{
+						logger:    cLogger,
+						claimUIDs: claimUIDs,
+						desired:   allGuaranteedCPUs,
+						elsewhere: committedCPUs.Union(kernelCPUs),
+					})
+					// Wherever either source can be read and disagrees. A driver
+					// that died before pinning leaves a container the runtime
+					// reports with no cpuset at all, which is this branch too: a
+					// guaranteed container then runs on the whole node while its
+					// claim charges a handful of CPUs, and nothing else will pin
+					// it, because CreateContainer has already been and gone.
+					if !committedCPUs.Equals(allGuaranteedCPUs) || (kernelErr == nil && !kernelCPUs.Equals(allGuaranteedCPUs)) {
+						cLogger.Info("owned container is not on the CPUs its claim holds, converging",
+							"committed", committedCPUs.String(), "kernel", kernelCPUs.String(), "desired", allGuaranteedCPUs.String())
+						containerUpdates = append(containerUpdates, cpusetUpdate(container.GetId(), allGuaranteedCPUs))
+					}
+				} else {
+					classification := cp.classifyContainer(allGuaranteedCPUs, committedCPUs, kernelCPUs, originUnion, targetUnion, kernelErr)
+					switch classification {
+					case containerSettled:
+						cLogger.V(2).Info("owned container is settled", "cpus", allGuaranteedCPUs.String())
+						claimsToClearRound = append(claimsToClearRound, claimUIDs...)
+					case containerForwardApplicable:
+						cLogger.Info("owned container is forward-applicable, converging", "cpus", allGuaranteedCPUs.String())
+						containerUpdates = append(containerUpdates, cpusetUpdate(container.GetId(), allGuaranteedCPUs))
+						claimsToClearRound = append(claimsToClearRound, claimUIDs...)
+					case containerRollbackApplicable:
+						cLogger.Info("owned container is rollback-applicable, reverting", "cpus", allGuaranteedCPUs.String())
+						containerUpdates = append(containerUpdates, cpusetUpdate(container.GetId(), allGuaranteedCPUs))
+						claimsToClearRound = append(claimsToClearRound, claimUIDs...)
+					case containerUnknown:
+						cLogger.Error(kernelErr, "owned container is in unknown state from three-way check, poisoning NUMA node",
+							"desired", allGuaranteedCPUs.String(), "committed", committedCPUs.String(), "kernel", kernelCPUs.String())
+						cp.poisonNUMANodeForCPUs(cLogger, allGuaranteedCPUs.Union(originUnion).Union(kernelCPUs))
+					}
+				}
 			}
 			podConfigStore.SetContainerState(types.UID(pod.GetUid()), state)
 			cLogger.V(6).Info("set container state", "claims", len(claimUIDs))
@@ -169,6 +256,11 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	cp.cpuAllocationStore = cpuAllocationStore
 	cp.claimTracker = claimTracker
 	cp.refreshAllocationMetrics()
+	cp.reportForeignCPUs(ctx, cpuAllocationStore, observed)
+
+	for _, uid := range claimsToClearRound {
+		_ = cp.writeClaimPlacement(logger, uid)
+	}
 
 	// Reconcile container CPU masks to handle cases where the NRI plugin might have crashed
 	// or restarted and missed updating the cgroup settings.
@@ -234,6 +326,127 @@ func (cp *CPUDriver) restoreUnstartedClaims(logger logr.Logger, allocations *sto
 		logger.Info("restored a prepared claim no running container holds",
 			"claimUID", claim.UID, "cpus", store.UnionOf(record.Requests).String())
 	}
+}
+
+// revertRoundOrigin puts a claim's exclusive requests back on the CPUs the round
+// moved them from, and reports whether it could.
+//
+// A round moves the claim's exclusive CPUs as a whole and spreads the target
+// over those requests in name order, each keeping its size; the reverse is the
+// same spread of the origin. Only the exclusive requests take part: a claim may
+// also hold a share of a pool, and a pool never moves. Writing the origin into
+// the first request instead would hand the claim's own CPUs to whichever request
+// sorts first -- for the shipped VM example, whose requests are "helpers" and
+// "vcpus", that is the pool share.
+//
+// A record whose exclusive requests no longer add up to the round's target is
+// left alone: something has already rewritten it, and guessing which request the
+// origin belongs to is how a claim ends up holding CPUs twice.
+func revertRoundOrigin(record *store.ClaimRecord) bool {
+	if record.Round == nil {
+		return false
+	}
+	origin, target := record.Round.Origin, record.Round.Target
+	if origin.IsEmpty() || origin.Size() != target.Size() {
+		return false
+	}
+	var moved []int
+	union := cpuset.New()
+	for i, request := range record.Requests {
+		if request.Role != store.RoleExclusive {
+			continue
+		}
+		moved = append(moved, i)
+		union = union.Union(request.CPUs)
+	}
+	if !union.Equals(target) {
+		return false
+	}
+	cpuIDs := origin.List()
+	for _, i := range moved {
+		size := record.Requests[i].CPUs.Size()
+		record.Requests[i].CPUs = cpuset.New(cpuIDs[:size]...)
+		cpuIDs = cpuIDs[size:]
+	}
+	return true
+}
+
+func cpusetUpdate(containerID string, cpus cpuset.CPUSet) *api.ContainerUpdate {
+	update := &api.ContainerUpdate{ContainerId: containerID}
+	update.SetLinuxCPUSetCPUs(cpus.String())
+	return update
+}
+
+// observedContainer is a claim-holding container Synchronize converged onto the
+// CPUs its claims hold, together with where the runtime and the kernel said it
+// was. Whether those CPUs belong to another claim cannot be told while the store
+// is still being rebuilt, so the question is asked once it is whole.
+type observedContainer struct {
+	logger    logr.Logger
+	claimUIDs []types.UID
+	desired   cpuset.CPUSet
+	// elsewhere is everywhere the container was seen, whether the runtime
+	// reported it or the kernel did. Empty when neither could say.
+	elsewhere cpuset.CPUSet
+}
+
+// reportForeignCPUs counts the converged containers that were running on CPUs
+// another claim holds, and says which.
+//
+// This is the shape a crash-looping driver leaves behind: nothing pinned the
+// container after its restart, so it came back on whatever the runtime gives a
+// container with no cpuset -- usually the whole node -- while its claim still
+// charged a handful of CPUs. The update converging it is already queued; this
+// is what makes the episode visible afterwards rather than silent.
+func (cp *CPUDriver) reportForeignCPUs(ctx context.Context, allocations *store.CPUAllocation, observed []observedContainer) {
+	if len(observed) == 0 {
+		return
+	}
+	claimed := cpuset.New()
+	for _, cpus := range allocations.ExclusiveClaimAllocations() {
+		claimed = claimed.Union(cpus)
+	}
+	var byUID map[types.UID]*resourceapi.ResourceClaim
+	for _, container := range observed {
+		foreign := container.elsewhere.Intersection(claimed).Difference(container.desired)
+		if foreign.IsEmpty() {
+			continue
+		}
+		cp.metrics.RecordSynchronizeForeignCPUs()
+		container.logger.Error(nil, "owned container was running on CPUs another claim holds, converging onto its own",
+			"foreignCPUs", foreign.String(), "desiredCPUs", container.desired.String())
+		if byUID == nil {
+			byUID = cp.allocatedClaimsByUID(container.logger)
+		}
+		for _, uid := range container.claimUIDs {
+			claim, ok := byUID[uid]
+			if !ok {
+				continue
+			}
+			cp.recordClaimEvent(ctx, claim, "ForeignCPUs", fmt.Sprintf(
+				"container was running on %s, which another claim holds, and has been converged onto %s",
+				foreign.String(), container.desired.String()))
+		}
+	}
+}
+
+// allocatedClaimsByUID is the projection indexed for lookup, or nil where there
+// is no projection to read. Built once per Synchronize and only when something
+// is actually being reported, since the common case reports nothing.
+func (cp *CPUDriver) allocatedClaimsByUID(logger logr.Logger) map[types.UID]*resourceapi.ResourceClaim {
+	if cp.claimReader == nil {
+		return map[types.UID]*resourceapi.ResourceClaim{}
+	}
+	claims, err := cp.claimReader.AllocatedClaims()
+	if err != nil {
+		logger.Error(err, "cannot name the claims a foreign-cpuset container holds; reporting the metric alone")
+		return map[types.UID]*resourceapi.ResourceClaim{}
+	}
+	byUID := make(map[types.UID]*resourceapi.ResourceClaim, len(claims))
+	for _, claim := range claims {
+		byUID[claim.UID] = claim
+	}
+	return byUID
 }
 
 // checkClaimPartition reports a restored claim whose CPUs no single partition
@@ -579,4 +792,121 @@ func (cp *CPUDriver) RemoveContainer(ctx context.Context, pod *api.PodSandbox, c
 	// we leaked state and StopContainer didn't clean up properly.
 	cp.metrics.RecordNRIRemoveContainer(nil, len(claimUIDs), time.Since(startTime))
 	return nil
+}
+
+type containerClassification int
+
+const (
+	containerSettled containerClassification = iota
+	containerForwardApplicable
+	containerRollbackApplicable
+	containerUnknown
+)
+
+func (cp *CPUDriver) classifyContainer(desired, committed, kernel, origin, target cpuset.CPUSet, kernelErr error) containerClassification {
+	if kernelErr != nil {
+		return containerUnknown
+	}
+
+	if kernel.IsEmpty() {
+		if committed.IsEmpty() {
+			if desired.Equals(target) {
+				return containerForwardApplicable
+			}
+			return containerRollbackApplicable
+		}
+		if committed.Equals(desired) {
+			return containerSettled
+		}
+		if desired.Equals(target) && committed.Equals(origin) {
+			return containerForwardApplicable
+		}
+		if desired.Equals(origin) && committed.Equals(target) {
+			return containerRollbackApplicable
+		}
+		return containerUnknown
+	}
+
+	if kernel.Equals(desired) && (committed.IsEmpty() || committed.Equals(desired)) {
+		return containerSettled
+	}
+
+	if desired.Equals(target) {
+		if (kernel.Equals(origin) || kernel.Equals(target)) && (committed.IsEmpty() || committed.Equals(origin) || committed.Equals(target)) {
+			return containerForwardApplicable
+		}
+		return containerUnknown
+	}
+
+	if desired.Equals(origin) {
+		if (kernel.Equals(target) || committed.Equals(target)) && (kernel.Equals(origin) || kernel.Equals(target)) && (committed.IsEmpty() || committed.Equals(origin) || committed.Equals(target)) {
+			return containerRollbackApplicable
+		}
+		if kernel.Equals(origin) && (committed.IsEmpty() || committed.Equals(origin)) {
+			return containerSettled
+		}
+		return containerUnknown
+	}
+
+	return containerUnknown
+}
+
+func (cp *CPUDriver) reconcileActiveRounds(logger logr.Logger) {
+	allocations := cp.cdiMgr.PreparedClaimAllocations(logger)
+	if len(allocations) == 0 {
+		return
+	}
+
+	rounds := make(map[string]map[types.UID]store.ClaimRecord)
+	for uid, record := range allocations {
+		if record.Round != nil && record.Round.RoundID != "" {
+			if rounds[record.Round.RoundID] == nil {
+				rounds[record.Round.RoundID] = make(map[types.UID]store.ClaimRecord)
+			}
+			rounds[record.Round.RoundID][uid] = record
+		}
+	}
+
+	if len(rounds) == 0 {
+		return
+	}
+
+	for roundID, participants := range rounds {
+		isComplete := true
+		for uid, rec := range participants {
+			for _, partnerUID := range rec.Round.Partners {
+				partnerRec, exists := participants[partnerUID]
+				if !exists {
+					isComplete = false
+					break
+				}
+				if !slices.Contains(partnerRec.Round.Partners, uid) {
+					isComplete = false
+					break
+				}
+			}
+			if !isComplete {
+				break
+			}
+		}
+
+		if isComplete {
+			logger.Info("active defrag round is complete, converging forward", "roundID", roundID, "participants", len(participants))
+			continue
+		}
+
+		logger.Info("active defrag round is incomplete, reverting to origin", "roundID", roundID, "participants", len(participants))
+		for uid, rec := range participants {
+			if !revertRoundOrigin(&rec) {
+				logger.Error(nil, "leaving an incomplete round's CDI spec as written: its requests do not hold the CPUs the round moved",
+					"roundID", roundID, "claimUID", uid, "target", rec.Round.Target.String(), "origin", rec.Round.Origin.String())
+				continue
+			}
+			envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, uid, cp.cdiEnvValue(rec))
+			if err := cp.cdiMgr.AddDevice(logger, getCDIDeviceName(uid), envVar, rec); err != nil {
+				logger.Error(err, "failed to revert incomplete round CDI spec", "roundID", roundID, "claimUID", uid)
+			}
+		}
+		_ = cp.cdiMgr.Refresh()
+	}
 }
