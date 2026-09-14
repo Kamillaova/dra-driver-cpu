@@ -40,6 +40,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -53,6 +56,7 @@ const (
 		"built-in defaults, then file values, then explicit CLI flags. " +
 		"Only values explicitly set on the command line override earlier layers. " +
 		"If empty, only CLI flags and built-in defaults are used."
+	nodeReadInterval = 2 * time.Second
 )
 
 var (
@@ -140,11 +144,6 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	printVersion(logger)
 	logger.Info("configuration successfully loaded", "configuration", cfg.Dump())
 
-	reservedCPUSet, err := cpuset.Parse(cfg.ReservedCPUs)
-	if err != nil {
-		return fmt.Errorf("failed to parse reserved CPUs: %w", err)
-	}
-
 	sfs, err := newSysFS(logger, cfg.SysFSOverlay)
 	if err != nil {
 		return err
@@ -229,6 +228,30 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	ctx, stop := signal.NotifyContext(ctx, unix.SIGINT, unix.SIGTERM)
 	defer stop()
 
+	// CCX-FORK: per-node config profiles. Upstream reads one config for every
+	// node; the fork folds in the profile the node's own label names, before
+	// anything reads the CPU carve-outs.
+	cfg.WarnDeprecatedCPUFields(logger)
+	profiled := len(cfg.Profiles) > 0
+	node, err := awaitNode(ctx, logger, clientset, nodeName, nodeReadInterval)
+	if err != nil {
+		return fmt.Errorf("can not read node %q to resolve its config profile: %w", nodeName, err)
+	}
+	profile := node.Labels[driverconfig.ProfileLabel]
+	cfg, err = cfg.WithProfile(profile)
+	if err != nil {
+		return err
+	}
+	if profiled {
+		logger.Info("applied config profile from the node label", "label", driverconfig.ProfileLabel, "profile", profile,
+			"cpuPartitions", cfg.CPUPartitions)
+	}
+
+	reservedCPUSet, err := cpuset.Parse(cfg.ReservedCPUs)
+	if err != nil {
+		return fmt.Errorf("failed to parse reserved CPUs: %w", err)
+	}
+
 	driverConfig := driver.Config{
 		DriverName:                            driverName,
 		NodeName:                              nodeName,
@@ -264,6 +287,42 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	logger.Info("driver started")
 
 	return waitForShutdown(ctx, stop, logger, server, asyncErr, httpErr)
+}
+
+// awaitNode reads the node object, waiting for an apiserver that is not
+// answering yet.
+//
+// A DaemonSet starts before the CNI and kube-proxy are ready, so the apiserver's
+// ClusterIP refuses connections for the first seconds of a node's life. Treating
+// that as fatal costs far more than the read is worth: the driver exits, and
+// every claim already allocated on the node stays unprepared until it wins the
+// race, while the containers holding those claims cannot start.
+//
+// Every error is retried, because none of the ones this call can return is
+// provably permanent during a boot: a 401 while the projected service account
+// token is still being written, a 403 while the binding from the same manifest
+// bundle has not been applied yet, and a 404 while the node object is being
+// recreated are all conditions that clear on their own. A misconfiguration that
+// does not clear is reported by the readiness probe, which stays red for as long
+// as this waits, and by a log line per attempt naming the node.
+func awaitNode(ctx context.Context, logger logr.Logger, clientset kubernetes.Interface, nodeName string, interval time.Duration) (*corev1.Node, error) {
+	var node *corev1.Node
+
+	err := wait.PollUntilContextCancel(ctx, interval, true, func(ctx context.Context) (bool, error) {
+		got, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			logger.Error(err, "waiting for the apiserver before resolving the node's config profile", "node", nodeName)
+			return false, nil
+		}
+		node = got
+
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return node, nil
 }
 
 func waitForShutdown(ctx context.Context, stop context.CancelFunc, logger logr.Logger, server *http.Server, asyncErr, httpErr <-chan error) error {
