@@ -159,6 +159,13 @@ type CPUDriver struct {
 	// ResourceClaims itself, so between the scheduler allocating a claim and the
 	// kubelet preparing it, this is the only view it has.
 	claimReader claimReader
+	// placementWriters serialises the claim-status writes of one claim against
+	// each other, so that two publishes racing for the same claim cannot land in
+	// the order their reads did not happen in. Entries live only while a write
+	// is waiting on or holding one, because a node prepares more claims over its
+	// life than it is ever worth keeping a mutex for.
+	placementWriters   map[types.UID]*placementWriter
+	placementWritersMu sync.Mutex
 	// storedSlices reads back the ResourceSlices the API server holds for this
 	// node, which is how a defragmentation round finds out that the capacity its
 	// move depends on has been stored. Nil until Start fills its cache, and left
