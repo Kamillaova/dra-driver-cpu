@@ -98,7 +98,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `activeExactPlans`,
   `defragRetries`, `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes`,
   `publishedCorrection`, `publishedFrontier`, `publishedFrontierInput`, `storedSlices`,
-  `claimReader`, `namespace` and `placementPolicy` fields, `deviceTopology.deviceIsPool`,
+  `claimReader`, `namespace`, `placementWriters`, `placementWritersMu` and `placementPolicy` fields,
+  `deviceTopology.deviceIsPool`,
   `Providers.CgroupFS` and `EnsureCgroupFS`, and `Config.DefragEnabled`,
   `Config.DefragAllowTransientOverlap` and `Config.Namespace`
 
@@ -156,7 +157,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 Wholly new files (`pkg/defrag`, `pkg/coreselect`, `pkg/cgroupfs`, `pkg/driver/defrag.go`,
 `reconcile.go`, `placements.go`, `deviceorder.go`, `poison.go`, `mirror.go`, `claim_reader.go`,
-`slicewatch.go`, `pkg/cpuinfo/coretopology.go`, `pkg/device/partition.go`, `api/attributes.go`,
+`status.go`, `slicewatch.go`, `pkg/cpuinfo/coretopology.go`, `pkg/device/partition.go`,
+`api/attributes.go`,
 `api/v1alpha1/projection.go`, `deployment/helm/dra-driver-cpu/templates/role.yaml`,
 `rolebinding.yaml`) are visible to `git diff --stat` on their own and are not repeated here.
 
