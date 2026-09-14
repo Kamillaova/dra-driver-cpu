@@ -35,6 +35,7 @@ type Recorder interface {
 	// it cannot adopt rather than failing the whole call, so it has something to
 	// count that upstream does not.
 	RecordSynchronizeSkippedClaim()
+	RecordMisplacedClaim()
 	// CCX-FORK: the defragmentation methods, which have no upstream counterpart
 	// because upstream never moves a prepared claim.
 	SetDefragState(cpumetrics.DefragState)
