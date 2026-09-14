@@ -58,6 +58,11 @@ type CPUAllocation struct {
 	cpuTopology   *cpuinfo.CPUTopology
 	availableCPUs cpuset.CPUSet
 	reservedCPUs  cpuset.CPUSet
+	// CCX-FORK: claimlessCPUs is where a container holding no claim can actually
+	// run, which on a partitioned node is narrower than availableCPUs by every
+	// unclaimed CPU of every exclusive partition. Empty means the node declares
+	// no partitions, and then the two are the same.
+	claimlessCPUs cpuset.CPUSet
 	// CCX-FORK: upstream holds one cpuset per claim, keyed by claim UID alone.
 	claims       map[types.UID]*claimAllocation
 	preparedCPUs cpuset.CPUSet
@@ -321,7 +326,14 @@ func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claim
 	if !exclusive.IsSubsetOf(sharedCPUs) {
 		return fmt.Errorf("claim %q has overlapping CPU assignment %q", claimUID, exclusive.String())
 	}
-	if hasSharedContainers && !exclusive.IsEmpty() && sharedCPUs.Difference(exclusive).IsEmpty() {
+	// CCX-FORK: against the pool a claimless container can reach rather than
+	// against every unreserved CPU. Upstream has no partitions, so the two agree
+	// there; here they differ by the unclaimed CPUs of every exclusive partition,
+	// and measuring the wrong one lets a claim empty the default partition while
+	// the guard is still looking at a hundred idle CPUs no claimless container
+	// may run on.
+	claimlessCPUs := s.claimlessPoolLocked()
+	if hasSharedContainers && !exclusive.IsEmpty() && claimlessCPUs.Difference(exclusive).IsEmpty() {
 		return fmt.Errorf("claim %q would exhaust the shared CPU pool while shared containers are running", claimUID)
 	}
 	s.claims[claimUID] = allocation
@@ -460,6 +472,27 @@ func (s *CPUAllocation) GetSharedCPUs() cpuset.CPUSet {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.availableCPUs.Difference(s.preparedCPUs)
+}
+
+// SetClaimlessCPUs records where a container holding no claim may run.
+//
+// CCX-FORK: a caller that never sets it leaves the store measuring its
+// exhaustion guard against every unreserved CPU, which is upstream's behaviour
+// and the right one for a node that declares no partitions.
+func (s *CPUAllocation) SetClaimlessCPUs(cpus cpuset.CPUSet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claimlessCPUs = cpus
+}
+
+// claimlessPoolLocked is what a claimless container has left to run on.
+func (s *CPUAllocation) claimlessPoolLocked() cpuset.CPUSet {
+	pool := s.availableCPUs
+	if !s.claimlessCPUs.IsEmpty() {
+		pool = s.claimlessCPUs
+	}
+
+	return pool.Difference(s.preparedCPUs)
 }
 
 // GetResourceClaimAllocation returns every CPU a claim was given, whatever the
