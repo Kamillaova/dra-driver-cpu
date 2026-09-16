@@ -156,8 +156,9 @@ spec:
 If omitted, `default-scheduler` schedules the pod without CCX cache scoring, repair frontier verification, or requeuing logic.
 
 ### 2. Single Claim Per Container
-Each container must reference at most one `dra.cpu` claim. Sharing a claim across multiple containers in the same pod
-fails with `CreateContainerError` (`AlreadyOwned`) because the driver's claim store enforces single-owner semantics.
+Each container must reference at most one `dra.cpu` claim. Several containers of one pod may reference the same
+claim, an init container and the container it prepares for instance, and each of them runs on the claim's CPUs; a
+container of another pod is refused with `CreateContainerError` (`AlreadyOwned`).
 
 ### 3. Claim Shapes per VM Size
 For an architecture with 16-CPU uncore caches (e.g. AMD EPYC), producers should use standard templates:
