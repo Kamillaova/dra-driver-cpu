@@ -87,8 +87,6 @@ spec:
       # see workload-requirements.md for the full rules.
       requests:
         cpu: "2"
-      limits:
-        cpu: "2"
       claims:
       - name: cpus
   resourceClaims:
