@@ -1467,7 +1467,7 @@ func TestCreateContainerSharesAClaimHoldingNoExclusiveCPUs(t *testing.T) {
 	// A second pod would be refused an exclusive claim, which one container owns.
 	require.Equal(t, poolCPUs.String(), consume("pod-b", "container-b").Linux.Resources.Cpu.Cpus)
 
-	_, owned := driver.claimTracker.Owner(claimUID)
+	_, owned := driver.claimTracker.Owners(claimUID)
 	require.False(t, owned, "a claim holding no exclusive CPUs binds to no container")
 	require.True(t, driver.cpuAllocationStore.GetSharedCPUs().Equals(allCPUs),
 		"pool CPUs stay available to shared containers and to other claims")
@@ -1507,7 +1507,7 @@ func TestSynchronizeRecordsAReservationForAClaimHoldingNoExclusiveCPUs(t *testin
 	_, err = d.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr})
 	require.NoError(t, err)
 
-	_, owned := d.claimTracker.Owner(claimUID)
+	_, owned := d.claimTracker.Owners(claimUID)
 	require.False(t, owned, "a claim holding no exclusive CPUs binds to no container")
 	// CreateContainer's CRI-O fallback checks every claim a container names, so
 	// a pool claim without a reservation would refuse the container after a
@@ -1515,6 +1515,59 @@ func TestSynchronizeRecordsAReservationForAClaimHoldingNoExclusiveCPUs(t *testin
 	reserved, recorded := d.claimTracker.ReservedFor(claimUID, types.UID(pod.Uid))
 	require.True(t, recorded)
 	require.True(t, reserved)
+}
+
+func TestCreateContainerBindsEveryContainerOfOnePod(t *testing.T) {
+	// An init container renders a configuration from the claim's device metadata
+	// and the long-running container consumes it, so both hold the claim and both
+	// are pinned to its CPUs. A container of another pod is still refused.
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range cpuset.New(0, 1, 2, 3).UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-two-containers")
+	claimedCPUs := cpuset.New(0, 1)
+	cpuAllocationStore := store.NewCPUAllocation(topo, cpuset.New())
+	requirePreparedResourceClaim(t, logger, cpuAllocationStore, claimUID, claimedCPUs)
+
+	d := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: cpuAllocationStore,
+		claimTracker:       store.NewClaimTracker(),
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		cdiMgr:             newMockCdiMgr(),
+		metrics:            cpumetrics.Noop(),
+	}
+	d.claimTracker.SetReservedFor(claimUID, []types.UID{"pod-uid", "pod-uid-2"})
+
+	pod := &api.PodSandbox{Id: "pod-id", Uid: "pod-uid", Name: "doca", Namespace: "volta"}
+	env := []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, claimedCPUs.String())}
+	initCtr := &api.Container{Id: "ctr-init", PodSandboxId: pod.Id, Name: "setup-host", Env: env}
+	appCtr := &api.Container{Id: "ctr-app", PodSandboxId: pod.Id, Name: "doca", Env: env}
+
+	initAdjust, _, err := d.CreateContainer(context.Background(), pod, initCtr)
+	require.NoError(t, err)
+	require.Equal(t, claimedCPUs.String(), initAdjust.Linux.Resources.Cpu.Cpus)
+
+	appAdjust, _, err := d.CreateContainer(context.Background(), pod, appCtr)
+	require.NoError(t, err, "a second container of the same pod may hold the claim")
+	require.Equal(t, claimedCPUs.String(), appAdjust.Linux.Resources.Cpu.Cpus)
+
+	owners, ok := d.claimTracker.Owners(claimUID)
+	require.True(t, ok)
+	require.Equal(t, []store.OwnerIdent{
+		{PodUID: "pod-uid", ContainerName: "setup-host"},
+		{PodUID: "pod-uid", ContainerName: "doca"},
+	}, owners)
+
+	otherPod := &api.PodSandbox{Id: "pod-id-2", Uid: "pod-uid-2", Name: "other", Namespace: "volta"}
+	otherCtr := &api.Container{Id: "ctr-other", PodSandboxId: otherPod.Id, Name: "app", Env: env}
+	_, _, err = d.CreateContainer(context.Background(), otherPod, otherCtr)
+	require.Error(t, err, "a container of another pod is still refused")
 }
 
 // projectedAllocatedClaims is what the scheduler projected for this node.

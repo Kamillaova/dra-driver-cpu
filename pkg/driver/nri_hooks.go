@@ -731,20 +731,20 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		}
 		guaranteedCPUs, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
 		if err != nil {
-			cp.claimTracker.Cleanup(newOwners...)
+			cp.claimTracker.ReleaseOwner(podUID, ctr.Name, newOwners...)
 			return nil, nil, err
 		}
 		logger.V(2).Info("guaranteed CPUs found", "cpus", guaranteedCPUs.String())
 		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...).WithCgroup(ctr.GetLinux().GetCgroupsPath())
 		adjust.SetLinuxCPUSetCPUs(guaranteedCPUs.String())
-		// A new owner means this is the first CreateContainer after Prepare, so
+		// A container that has just taken a claim may be the first to hold it, so
 		// existing shared containers must be moved off the newly claimed CPUs.
-		// On restart the owner already exists and no shared-container updates are
-		// needed.
+		// On restart the binding already exists and no shared-container updates
+		// are needed.
 		if len(newOwners) > 0 {
 			updates, err = cp.getSharedContainerUpdates(logger, containerId)
 			if err != nil {
-				cp.claimTracker.Cleanup(newOwners...)
+				cp.claimTracker.ReleaseOwner(podUID, ctr.Name, newOwners...)
 				return nil, nil, err
 			}
 		}
