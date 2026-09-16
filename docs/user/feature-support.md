@@ -23,11 +23,13 @@
 
 ### Sharing resource claims
 
-This driver strictly enforces a 1-to-1 mapping between Claims and Containers.
-It does not support sharing a single ResourceClaim among multiple containers or multiple pods,
-if that claims includes a resource (`dra.cpu`) managed by this driver.
-Attempting to share a claim among containers or pods will make all but the first pod consuming
-the claim to fail to start with the error `CreateContainerError` and remain in `Pending` state.
+A ResourceClaim that holds CPUs of its own binds to one pod, and every container of that pod may
+hold it. An init container that reads the claim's device metadata to render a configuration and the
+long-running container that consumes it both reference the claim, and both run on its CPUs.
+
+Sharing a claim across pods is not supported if that claim includes a resource (`dra.cpu`) managed
+by this driver. A container of a second pod fails to start with `CreateContainerError`, naming the
+pod and container that hold the claim.
 When the driver runs with `publishNodeAllocatableResourceMapping`, sharing across pods is
 rejected earlier by `kube-scheduler`: the second pod stays unschedulable with the message
 `node allocatable resource claim ... has a mapped device and cannot be shared across pods`.

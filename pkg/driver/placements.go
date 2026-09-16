@@ -52,9 +52,16 @@ type claimReport struct {
 	CPUs     string `json:"cpus"`
 	// MovingFrom is the CPUs a claim is moving away from and still holds, set only
 	// while a move is in flight.
-	MovingFrom    string `json:"movingFrom,omitempty"`
-	PodUID        string `json:"podUID,omitempty"`
-	ContainerName string `json:"containerName,omitempty"`
+	MovingFrom string `json:"movingFrom,omitempty"`
+	// Holders is every container the claim backs, which is one pod's containers:
+	// an init container and the container it renders configuration for may hold
+	// the same claim, and both are pinned to it.
+	Holders []claimHolder `json:"holders,omitempty"`
+}
+
+type claimHolder struct {
+	PodUID        string `json:"podUID"`
+	ContainerName string `json:"containerName"`
 	ContainerID   string `json:"containerID,omitempty"`
 }
 
@@ -258,11 +265,13 @@ func (cp *CPUDriver) claimReports(allocations map[types.UID]cpuset.CPUSet) []cla
 		if origin, inFlight := cp.cpuAllocationStore.GetRebindOrigin(claimUID); inFlight {
 			report.MovingFrom = origin.String()
 		}
-		if owner, ok := cp.claimTracker.Owner(claimUID); ok {
-			report.PodUID = string(owner.PodUID)
-			report.ContainerName = owner.ContainerName
-			if state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName); state != nil {
-				report.ContainerID = string(state.ContainerUID())
+		if owners, ok := cp.claimTracker.Owners(claimUID); ok {
+			for _, owner := range owners {
+				holder := claimHolder{PodUID: string(owner.PodUID), ContainerName: owner.ContainerName}
+				if state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName); state != nil {
+					holder.ContainerID = string(state.ContainerUID())
+				}
+				report.Holders = append(report.Holders, holder)
 			}
 		}
 		reports = append(reports, report)
