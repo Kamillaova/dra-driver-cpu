@@ -99,11 +99,26 @@ func (ci DRACPUInfo) ByNUMANode() map[int]DRACPUNUMAInfo {
 	return ret
 }
 
+// DRACPUCPUSetChange is one moment at which the container's own cpuset changed,
+// as the container itself saw it. A test measuring how long two containers hold
+// the same CPUs during an exchange needs both sides sampled far more often than
+// a report interval, and the container is the only place that can be done.
+type DRACPUCPUSetChange struct {
+	// At is when the change was first observed, in RFC 3339 with nanoseconds.
+	// Both containers of an exchange run on the same node, so their timestamps
+	// come from one clock and may be compared.
+	At   string `json:"at"`
+	CPUs string `json:"cpus"`
+}
+
 type DRACPUTester struct {
 	Buildinfo   DRACPUBuildinfo         `json:"buildinfo"`
 	Allocation  DRACPUAllocation        `json:"allocation"`
 	Runtimeinfo DRACPURuntimeinfo       `json:"runtimeinfo"`
 	Metadata    []DRACPURequestMetadata `json:"metadata"`
+	// CPUSetHistory is every cpuset this container has been seen on, oldest
+	// first, starting with the one it began with.
+	CPUSetHistory []DRACPUCPUSetChange `json:"cpusetHistory,omitempty"`
 }
 
 func NewBuildinfo() DRACPUBuildinfo {
