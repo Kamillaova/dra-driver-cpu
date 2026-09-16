@@ -474,12 +474,17 @@ func (cp *CPUDriver) containerIsCurrent(round *defragRound, containerUID types.U
 	if len(claimUIDs) == 0 {
 		return false
 	}
-	owner, ok := cp.claimTracker.Owner(claimUIDs[0])
+	owners, ok := cp.claimTracker.Owners(claimUIDs[0])
 	if !ok {
 		return false
 	}
-	state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
-	return state != nil && state.ContainerUID() == containerUID
+	for _, owner := range owners {
+		state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
+		if state != nil && state.ContainerUID() == containerUID {
+			return true
+		}
+	}
+	return false
 }
 
 // rollBackExchange puts the containers the runtime did move back on the CPUs
@@ -1260,36 +1265,41 @@ func (cp *CPUDriver) writeClaimPlacementWithRound(logger logr.Logger, claimUID t
 func (cp *CPUDriver) roundUpdates(logger logr.Logger, round *defragRound) error {
 	for _, move := range round.moves {
 		mLogger := logger.WithValues("claimUID", move.ClaimUID)
-		owner, ok := cp.claimTracker.Owner(move.ClaimUID)
+		owners, ok := cp.claimTracker.Owners(move.ClaimUID)
 		if !ok {
 			mLogger.V(2).Info("moved claim has no container yet")
 			continue
 		}
-		state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
-		if state == nil {
-			mLogger.V(2).Info("moved claim's container is not running")
-			continue
-		}
-		containerUID := state.ContainerUID()
-		if move.Exchange != 0 && !slices.Contains(round.exchangeContainers[move.Exchange], containerUID) {
-			round.exchangeContainers[move.Exchange] = append(round.exchangeContainers[move.Exchange], containerUID)
-		}
-		if _, done := round.updateByContainer[containerUID]; done {
-			continue
-		}
+		// Every container holding the claim, because a claim backs the containers
+		// of one pod and each of them is pinned to it: updating only the first
+		// would leave the rest on the CPUs the claim is leaving.
+		for _, owner := range owners {
+			state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
+			if state == nil {
+				mLogger.V(2).Info("moved claim's container is not running", "container", owner.ContainerName)
+				continue
+			}
+			containerUID := state.ContainerUID()
+			if move.Exchange != 0 && !slices.Contains(round.exchangeContainers[move.Exchange], containerUID) {
+				round.exchangeContainers[move.Exchange] = append(round.exchangeContainers[move.Exchange], containerUID)
+			}
+			if _, done := round.updateByContainer[containerUID]; done {
+				continue
+			}
 
-		// A container holding several claims must be pinned to all of them at
-		// once, moved or not.
-		claimUIDs := state.ClaimUIDs()
-		cpus, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
-		if err != nil {
-			return fmt.Errorf("cannot determine CPUs for container %q: %w", containerUID, err)
+			// A container holding several claims must be pinned to all of them at
+			// once, moved or not.
+			claimUIDs := state.ClaimUIDs()
+			cpus, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
+			if err != nil {
+				return fmt.Errorf("cannot determine CPUs for container %q: %w", containerUID, err)
+			}
+			update := &api.ContainerUpdate{ContainerId: string(containerUID)}
+			update.SetLinuxCPUSetCPUs(cpus.String())
+			round.updates = append(round.updates, update)
+			round.updateByContainer[containerUID] = update
+			round.claimsByContainer[containerUID] = claimUIDs
 		}
-		update := &api.ContainerUpdate{ContainerId: string(containerUID)}
-		update.SetLinuxCPUSetCPUs(cpus.String())
-		round.updates = append(round.updates, update)
-		round.updateByContainer[containerUID] = update
-		round.claimsByContainer[containerUID] = claimUIDs
 	}
 
 	// The pool is already narrowed by the reservations, so this moves shared
@@ -1435,16 +1445,20 @@ func (cp *CPUDriver) forgetDefragRetry(scope defragScope) {
 // new runtime ID, counts as converged rather than refused: a container created
 // after the reservation is pinned from the store, which already holds the target.
 func (cp *CPUDriver) moveWasRefused(move defrag.Move, refused map[types.UID]struct{}) bool {
-	owner, ok := cp.claimTracker.Owner(move.ClaimUID)
+	owners, ok := cp.claimTracker.Owners(move.ClaimUID)
 	if !ok {
 		return false
 	}
-	state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
-	if state == nil {
-		return false
+	for _, owner := range owners {
+		state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
+		if state == nil {
+			continue
+		}
+		if _, refusedIt := refused[state.ContainerUID()]; refusedIt {
+			return true
+		}
 	}
-	_, refusedIt := refused[state.ContainerUID()]
-	return refusedIt
+	return false
 }
 
 // abortMoves undoes reservations and recorded placements for moves that will not
