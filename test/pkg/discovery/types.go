@@ -39,6 +39,17 @@ type DRACPURuntimeinfo struct {
 	CPUAffinity string `json:"affinity"`
 }
 
+// DRACPURequestMetadata is what one request's KEP-5304 device metadata file
+// says: which claim and request it belongs to, and the driver's own attributes
+// for the device that satisfied it.
+type DRACPURequestMetadata struct {
+	Claim     string `json:"claim"`
+	Request   string `json:"request"`
+	Partition string `json:"partition"`
+	Role      string `json:"role"`
+	CPUs      string `json:"cpus"`
+}
+
 type DRACPUInfo struct {
 	Buildinfo DRACPUBuildinfo   `json:"buildinfo"`
 	CPUs      []cpuinfo.CPUInfo `json:"cpus"`
@@ -89,9 +100,10 @@ func (ci DRACPUInfo) ByNUMANode() map[int]DRACPUNUMAInfo {
 }
 
 type DRACPUTester struct {
-	Buildinfo   DRACPUBuildinfo   `json:"buildinfo"`
-	Allocation  DRACPUAllocation  `json:"allocation"`
-	Runtimeinfo DRACPURuntimeinfo `json:"runtimeinfo"`
+	Buildinfo   DRACPUBuildinfo         `json:"buildinfo"`
+	Allocation  DRACPUAllocation        `json:"allocation"`
+	Runtimeinfo DRACPURuntimeinfo       `json:"runtimeinfo"`
+	Metadata    []DRACPURequestMetadata `json:"metadata"`
 }
 
 func NewBuildinfo() DRACPUBuildinfo {
