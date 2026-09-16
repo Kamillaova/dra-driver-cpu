@@ -121,6 +121,12 @@ stopped making things worse there, and the containers involved keep running.
   shrunk before the containers are touched, and the origin grows once the runtime confirms. Fencing
   a NUMA node reaches it too — the taint has to, or the scheduler would keep sending claims to a
   node that refuses them.
+- **A round waits for its own shrink to be stored.** Publication is asynchronous and nothing reports
+  when a write landed, so the driver reads its node's own `ResourceSlice`s back and starts a batch
+  only once they show the destination short of the CPUs the move is about to take. A shrink that is
+  not stored in time abandons the round — the claim stays where it is, the reservation is released,
+  and the scope is tried again — so while the API server is unreachable nothing on the node moves.
+  Those rounds are counted in `dra_cpu_defrag_unpublished_rounds_total`.
 - **It cannot fix a bad node choice.** The scheduler sees only how many CPUs are free on a node, never
   their shape, so it can bind a large claim to a node that genuinely cannot free a cache while a
   neighbour could. A bound claim cannot move to another node.
@@ -242,8 +248,8 @@ pinning over QMP, and inotify-driven re-pinning on every move.
 
 ## Rolling out
 
-Passes are node-local and write nothing to the API, so 100 nodes are 100 independent instances with no
-coordination between them and no cluster-scale load. The flip side is that a planner bug reaches every
+Passes are node-local and write only what belongs to their own node, so 100 nodes are 100 independent
+instances with no coordination between them and no cluster-scale load. The flip side is that a planner bug reaches every
 node of a given topology at once: **stage a rollout by node type, not at random.**
 
 Rolling *back* to a driver without this feature needs the node drained first. See
