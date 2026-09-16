@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 21)
+	require.Len(t, descriptors, 22)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -56,6 +56,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_nri_remove_container_duration_seconds",
 		"dra_cpu_synchronize_skipped_claims_total",
 		"dra_cpu_misplaced_claims_total",
+		"dra_cpu_partition_verified",
 		"dra_cpu_defrag_excess_uncore_caches",
 		"dra_cpu_defrag_largest_alignable_free_cpus",
 		"dra_cpu_defrag_passes_total",
@@ -67,10 +68,11 @@ func TestDescriptors(t *testing.T) {
 	require.Empty(t, descriptors[14].Labels)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
-	require.Equal(t, []string{"numa_node"}, descriptors[16].Labels)
-	require.Equal(t, []string{"result"}, descriptors[17].Labels)
+	require.Equal(t, []string{"partition"}, descriptors[15].Labels)
+	require.Equal(t, []string{"numa_node"}, descriptors[17].Labels)
 	require.Equal(t, []string{"result"}, descriptors[18].Labels)
-	require.Empty(t, descriptors[19].Labels)
+	require.Equal(t, []string{"result"}, descriptors[19].Labels)
+	require.Empty(t, descriptors[20].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -168,6 +170,8 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordDefragMoves(ResultSuccess, 1)
 	m.RecordDefragBlockedMoves(1)
 	m.RecordSynchronizeSkippedClaim()
+	m.RecordMisplacedClaim()
+	m.SetPartitionState(map[string]bool{"dataplane": true})
 
 	families, err := reg.Gather()
 	require.NoError(t, err)

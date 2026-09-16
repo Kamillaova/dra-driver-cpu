@@ -117,6 +117,7 @@ type Metrics struct {
 	nriRemoveContainerDuration *prometheus.HistogramVec
 	synchronizeSkippedClaims   prometheus.Counter
 	misplacedClaims            prometheus.Counter
+	partitionVerified          *prometheus.GaugeVec
 
 	// CCX-FORK: upstream's collectors end above; the defragmentation ones and
 	// everything serving them in this file are the fork's.
@@ -241,6 +242,12 @@ var (
 		kind: metricCounter,
 		help: "Total number of restored claims whose CPUs no single CPU partition holds, which is what a partition list edited under a running node looks like.",
 	}
+	partitionVerifiedSpec = metricSpec{
+		name:   "dra_cpu_partition_verified",
+		kind:   metricGauge,
+		help:   "Whether a CPU partition's declaration matches this machine (1) or contradicts it, in which case the partition publishes no devices (0).",
+		labels: []string{"partition"},
+	}
 	defragExcessUncoreCachesSpec = metricSpec{
 		name: "dra_cpu_defrag_excess_uncore_caches",
 		kind: metricGauge,
@@ -293,6 +300,7 @@ var metricSpecs = []metricSpec{
 	nriRemoveContainerDurationSpec,
 	synchronizeSkippedClaimsSpec,
 	misplacedClaimsSpec,
+	partitionVerifiedSpec,
 	defragExcessUncoreCachesSpec,
 	defragAlignableFreeCPUsSpec,
 	defragPassesSpec,
@@ -345,6 +353,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		nriRemoveContainerDuration: newHistogramVec(nriRemoveContainerDurationSpec),
 		synchronizeSkippedClaims:   newCounter(synchronizeSkippedClaimsSpec),
 		misplacedClaims:            newCounter(misplacedClaimsSpec),
+		partitionVerified:          newGaugeVec(partitionVerifiedSpec),
 
 		defragExcessUncoreCaches:      newGauge(defragExcessUncoreCachesSpec),
 		defragAlignableFreeCPUs:       newGaugeVec(defragAlignableFreeCPUsSpec),
@@ -370,6 +379,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriRemoveContainerDuration,
 		m.synchronizeSkippedClaims,
 		m.misplacedClaims,
+		m.partitionVerified,
 		m.defragExcessUncoreCaches,
 		m.defragAlignableFreeCPUs,
 		m.defragPasses,
@@ -507,6 +517,20 @@ func (m *Metrics) RecordMisplacedClaim() {
 	m.misplacedClaims.Inc()
 }
 
+// SetPartitionState replaces the per-partition series wholesale, so a partition
+// a later configuration no longer declares stops reporting rather than keeping
+// its last value.
+func (m *Metrics) SetPartitionState(verified map[string]bool) {
+	m.partitionVerified.Reset()
+	for partition, ok := range verified {
+		value := 0.0
+		if ok {
+			value = 1.0
+		}
+		m.partitionVerified.WithLabelValues(partition).Set(value)
+	}
+}
+
 // SetDefragState replaces the per-NUMA-node series wholesale, so a node a pass
 // could not measure this time reports nothing rather than its last value.
 func (m *Metrics) SetDefragState(state DefragState) {
@@ -553,6 +577,7 @@ func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()                     {}
 func (noopRecorder) RecordMisplacedClaim()                              {}
+func (noopRecorder) SetPartitionState(map[string]bool)                  {}
 func (noopRecorder) SetDefragState(DefragState)                         {}
 func (noopRecorder) RecordDefragPass(Result, time.Duration)             {}
 func (noopRecorder) RecordDefragMoves(Result, int)                      {}
