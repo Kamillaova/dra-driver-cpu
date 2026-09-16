@@ -121,6 +121,7 @@ type Metrics struct {
 	nriStopContainerDuration   *prometheus.HistogramVec
 	nriRemoveContainerDuration *prometheus.HistogramVec
 	synchronizeSkippedClaims   prometheus.Counter
+	synchronizeForeignCPUs     prometheus.Counter
 	misplacedClaims            prometheus.Counter
 	partitionVerified          *prometheus.GaugeVec
 
@@ -257,6 +258,11 @@ var (
 		kind: metricCounter,
 		help: "Total number of claims or containers Synchronize could not adopt from the runtime's reported state, skipped rather than aborting the whole call.",
 	}
+	synchronizeForeignCPUsSpec = metricSpec{
+		name: "dra_cpu_synchronize_foreign_cpus_total",
+		kind: metricCounter,
+		help: "Total number of claim-holding containers Synchronize found running on CPUs another claim holds, each converged onto the CPUs its own claim holds.",
+	}
 	misplacedClaimsSpec = metricSpec{
 		name: "dra_cpu_misplaced_claims_total",
 		kind: metricCounter,
@@ -369,6 +375,7 @@ var metricSpecs = []metricSpec{
 	nriStopContainerDurationSpec,
 	nriRemoveContainerDurationSpec,
 	synchronizeSkippedClaimsSpec,
+	synchronizeForeignCPUsSpec,
 	misplacedClaimsSpec,
 	partitionVerifiedSpec,
 	defragExcessUncoreCachesSpec,
@@ -432,6 +439,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		nriStopContainerDuration:   newHistogramVec(nriStopContainerDurationSpec),
 		nriRemoveContainerDuration: newHistogramVec(nriRemoveContainerDurationSpec),
 		synchronizeSkippedClaims:   newCounter(synchronizeSkippedClaimsSpec),
+		synchronizeForeignCPUs:     newCounter(synchronizeForeignCPUsSpec),
 		misplacedClaims:            newCounter(misplacedClaimsSpec),
 		partitionVerified:          newGaugeVec(partitionVerifiedSpec),
 
@@ -468,6 +476,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriStopContainerDuration,
 		m.nriRemoveContainerDuration,
 		m.synchronizeSkippedClaims,
+		m.synchronizeForeignCPUs,
 		m.misplacedClaims,
 		m.partitionVerified,
 		m.defragExcessUncoreCaches,
@@ -620,6 +629,10 @@ func (m *Metrics) RecordSynchronizeSkippedClaim() {
 	m.synchronizeSkippedClaims.Inc()
 }
 
+func (m *Metrics) RecordSynchronizeForeignCPUs() {
+	m.synchronizeForeignCPUs.Inc()
+}
+
 func (m *Metrics) RecordMisplacedClaim() {
 	m.misplacedClaims.Inc()
 }
@@ -731,6 +744,7 @@ func (noopRecorder) RecordNRICreateContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()                     {}
+func (noopRecorder) RecordSynchronizeForeignCPUs()                      {}
 func (noopRecorder) RecordPrepareNoRoom(string)                         {}
 func (noopRecorder) RecordMisplacedClaim()                              {}
 func (noopRecorder) SetPartitionState(map[string]bool)                  {}
