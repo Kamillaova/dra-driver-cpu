@@ -9,6 +9,11 @@ correct while the defragmenter moves claims under it.
 | `vm-small-flexible.yaml`       | The movable class: two whole cores, no selector, `relocatable: true` so the defragmenter may re-home it   |
 | `qemu-launcher-configmap.yaml` | The workload contract in code: live CPUs from the cgroup, per-vCPU pinning via QMP, inotify re-pinning    |
 
+Neither manifest sets `schedulerName`, so both run under `default-scheduler`, which
+schedules them without cache scoring or repair checks. Where the CCXAlign scheduler
+is deployed, add `schedulerName: dracpu-scheduler` to each pod; see
+[CCX-Aligned Scheduling](../../../docs/user/ccx-aligned-scheduling.md).
+
 The image is yours to build; the shim needs `qemu-system-x86_64`, `python3` and
 `inotify-tools`. `/dev/kvm` is granted via `privileged` here for brevity — use a
 device plugin in production.
