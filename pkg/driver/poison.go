@@ -216,46 +216,50 @@ func (cp *CPUDriver) readBackOf(logger logr.Logger, step []defrag.Move) readBack
 	}
 	answer, seen := readBackForward, false
 	for _, move := range step {
-		owner, ok := cp.claimTracker.Owner(move.ClaimUID)
+		owners, ok := cp.claimTracker.Owners(move.ClaimUID)
 		if !ok {
 			continue
 		}
-		state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
-		if state == nil {
-			continue
-		}
-		live, err := cgroupfs.CPUSet(cp.cgroupfs, state.CgroupPath())
-		if err != nil {
-			logger.Error(err, "cannot read a container's CPUs back", "claimUID", move.ClaimUID)
-			return readBackUnknown
-		}
-		forward, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(state.ClaimUIDs()...)
-		if err != nil {
-			logger.Error(err, "cannot say where a container belongs", "claimUID", move.ClaimUID)
-			return readBackUnknown
-		}
-		origin, err := cp.cpuAllocationStore.GetResourceClaimOriginUnion(state.ClaimUIDs()...)
-		if err != nil {
-			logger.Error(err, "cannot say where a container came from", "claimUID", move.ClaimUID)
-			return readBackUnknown
-		}
+		// Every container the claim backs has to agree: they run on one cpuset,
+		// so one of them left behind is as unsettled as one of them alone would be.
+		for _, owner := range owners {
+			state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
+			if state == nil {
+				continue
+			}
+			live, err := cgroupfs.CPUSet(cp.cgroupfs, state.CgroupPath())
+			if err != nil {
+				logger.Error(err, "cannot read a container's CPUs back", "claimUID", move.ClaimUID)
+				return readBackUnknown
+			}
+			forward, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(state.ClaimUIDs()...)
+			if err != nil {
+				logger.Error(err, "cannot say where a container belongs", "claimUID", move.ClaimUID)
+				return readBackUnknown
+			}
+			origin, err := cp.cpuAllocationStore.GetResourceClaimOriginUnion(state.ClaimUIDs()...)
+			if err != nil {
+				logger.Error(err, "cannot say where a container came from", "claimUID", move.ClaimUID)
+				return readBackUnknown
+			}
 
-		var says readBack
-		switch {
-		case live.Equals(forward):
-			says = readBackForward
-		case live.Equals(origin):
-			says = readBackOrigin
-		default:
-			logger.Info("a container is on CPUs this driver cannot account for", "claimUID", move.ClaimUID,
-				"cpus", live.String(), "target", forward.String(), "origin", origin.String())
-			return readBackUnknown
+			var says readBack
+			switch {
+			case live.Equals(forward):
+				says = readBackForward
+			case live.Equals(origin):
+				says = readBackOrigin
+			default:
+				logger.Info("a container is on CPUs this driver cannot account for", "claimUID", move.ClaimUID,
+					"cpus", live.String(), "target", forward.String(), "origin", origin.String())
+				return readBackUnknown
+			}
+			if seen && says != answer {
+				logger.Info("the containers of one exchange are in different states", "claimUID", move.ClaimUID)
+				return readBackUnknown
+			}
+			answer, seen = says, true
 		}
-		if seen && says != answer {
-			logger.Info("the containers of one exchange are in different states", "claimUID", move.ClaimUID)
-			return readBackUnknown
-		}
-		answer, seen = says, true
 	}
 	return answer
 }

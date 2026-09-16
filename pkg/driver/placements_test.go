@@ -56,11 +56,13 @@ func TestServePlacementsReportsWhereClaimsAre(t *testing.T) {
 
 	require.Len(t, report.Claims, 2)
 	require.Equal(t, claimReport{
-		ClaimUID:      "claim-1",
-		CPUs:          "0,4",
-		PodUID:        "pod-uid-1",
-		ContainerName: "ctr-1",
-		ContainerID:   "ctr-uid-1",
+		ClaimUID: "claim-1",
+		CPUs:     "0,4",
+		Holders: []claimHolder{{
+			PodUID:        "pod-uid-1",
+			ContainerName: "ctr-1",
+			ContainerID:   "ctr-uid-1",
+		}},
 	}, report.Claims[0])
 	// A claim prepared but not yet started has no container to name.
 	require.Equal(t, claimReport{ClaimUID: "claim-2", CPUs: "1"}, report.Claims[1])
