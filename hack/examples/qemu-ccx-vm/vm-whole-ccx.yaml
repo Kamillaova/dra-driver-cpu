@@ -2,11 +2,13 @@
 # a split L3) to themselves.
 #
 # QEMU's own threads -- main loop, iothreads, vhost workers -- need CPU time
-# too, and left beside the vCPUs they steal it from them. CONTROL_CPUS sets that
-# many of the claim's own CPUs aside for them -- it counts CPUs, not cores, so a
-# whole core is 2 on an SMT2 part -- and the VM runs on the rest. Keeping the
-# vCPU count instead means a larger claim and a selector to match, which needs a
-# part whose cache is bigger than the vCPU set.
+# too, and left beside the vCPUs they steal it from them. On a node with a
+# shared partition the claim asks for a share of it in a second request, and the
+# launcher reads that request's CPUs from its own device metadata file. Where no
+# such partition exists, drop the helpers request and set CONTROL_CPUS instead:
+# it sets that many of the claim's own CPUs aside for the control threads -- it
+# counts CPUs, not cores, so a whole core is 2 on an SMT2 part -- and the VM runs
+# on the rest.
 #
 # The CEL selector keeps the pod off nodes whose caches are too small to ever
 # hold the vCPU set aligned. On a 7950X3D one CCX is 8 cores / 16 CPUs --
@@ -31,6 +33,21 @@ spec:
               # dra.cpu/uncoreCachesInGroup is also published, for spreading
               # across a known number of caches instead.
               expression: device.attributes["dra.cpu"].largestUncoreCacheCPUs >= 16
+      # A share of the node's pool, for every thread that is not a vCPU. One
+      # claim with two requests rather than two claims: a container holding two
+      # claims is pinned to their union and nothing inside it can tell which
+      # CPUs came from which.
+      - name: helpers
+        exactly:
+          deviceClassName: dra.cpu-helpers
+          capacity:
+            requests:
+              dra.cpu/cpu: "500m"
+          tolerations:
+          - key: dra.cpu/partition
+            operator: Equal
+            value: helpers
+            effect: NoSchedule
 ---
 apiVersion: v1
 kind: Pod
@@ -50,12 +67,13 @@ spec:
     # started. The launcher reads the live set from the cgroup instead.
     - name: VM_MEMORY_MB
       value: "16384"
-    # One whole core of the claim's 16 CPUs, leaving the launcher 14 vCPUs. Zero
-    # would leave the control threads beside the vCPUs, which is what this class
-    # exists to avoid. A value that is not a multiple of the SMT width splits a
+    # Zero because the helpers request above holds the control threads. Without
+    # that request, set this to a whole core's worth of the claim's own CPUs --
+    # it counts CPUs, so 2 on an SMT2 part -- and the launcher runs 14 vCPUs on
+    # what is left. A value that is not a multiple of the SMT width splits a
     # core, because the tail it carves is whole cores only at those sizes.
     - name: CONTROL_CPUS
-      value: "2"
+      value: "0"
     resources:
       # KEP-5517 mode (publishNodeAllocatableResourceMapping: true): the claim's
       # CPUs are accounted by the scheduler and added to the cgroup limits by
