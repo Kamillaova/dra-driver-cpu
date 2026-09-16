@@ -57,10 +57,10 @@ Reference: [kubernetes 1.35.0](https://github.com/kubernetes/kubernetes/blob/v1.
 
 ### Uncore cache defragmentation
 
-`defragEnabled: true` lets the driver move a running claim onto different CPUs to recover uncore cache
-alignment lost to claim churn, without restarting its container. It requires
-`assumeUnsolicitedUpdatesSafe: true`, since a move is pushed to the runtime unprompted. This is a
-fork-only feature; see [CPU Defragmentation](defragmentation.md).
+`defragEnabled: true` lets the driver move a running claim that states `cpuConfig.relocatable: true`
+onto different CPUs to recover uncore cache alignment lost to claim churn, without restarting its
+container. It requires `assumeUnsolicitedUpdatesSafe: true`, since a move is pushed to the runtime
+unprompted. This is a fork-only feature; see [CPU Defragmentation](defragmentation.md).
 
 ### Whole physical cores (FullPCPUsOnly)
 

@@ -167,7 +167,7 @@ func fillCachesDownTo(ctx context.Context, fxt *fixture.Fixture, image, nodeName
 			break
 		}
 		pod, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, image, nodeName,
-			claimSpecWithSelector(size, numaCEL(cfg, numaID)), fmt.Sprintf("%s-%d", prefix, i))
+			movableClaimSpecWithSelector(size, numaCEL(cfg, numaID)), fmt.Sprintf("%s-%d", prefix, i))
 		if err != nil {
 			fxt.Log.Info("stopped filling", "placed", len(fillers), "reason", err.Error())
 			break
@@ -352,7 +352,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 
 		ginkgo.By("placing a claim that no single cache can hold")
 		victim, victimUID, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-			claimSpecWithSelector(victimCPUs, numaCEL(cfgValues, fragNUMA)), "cpu-claim-victim")
+			movableClaimSpecWithSelector(victimCPUs, numaCEL(cfgValues, fragNUMA)), "cpu-claim-victim")
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		before := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, victim)
 		fxt.Log.Info("victim placement", "cpus", before.CPUAssigned.String())
@@ -445,7 +445,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 		claimTemplate := resourcev1.ResourceClaimTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: "cpu-claim-resize"},
 			Spec: resourcev1.ResourceClaimTemplateSpec{
-				Spec: claimSpecWithSelector(3*step, numaCEL(cfgValues, fragNUMA)),
+				Spec: movableClaimSpecWithSelector(3*step, numaCEL(cfgValues, fragNUMA)),
 			},
 		}
 		created, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &claimTemplate, metav1.CreateOptions{})
@@ -526,7 +526,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			name := fmt.Sprintf("cpu-claim-soak-%d", nextID)
 			nextID++
 			pod, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-				claimSpecWithSelector(sizeSteps*step, cel), name)
+				movableClaimSpecWithSelector(sizeSteps*step, cel), name)
 			if err != nil {
 				// A refused create is a legitimate outcome of churn: the pool may
 				// be too full, or too fragmented for the size. The soak's job is
@@ -695,7 +695,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			template := resourcev1.ResourceClaimTemplate{
 				ObjectMeta: metav1.ObjectMeta{Name: name},
 				Spec: resourcev1.ResourceClaimTemplateSpec{
-					Spec: claimSpecWithSelector(cpus, numaCEL(cfgValues, fragNUMA)),
+					Spec: movableClaimSpecWithSelector(cpus, numaCEL(cfgValues, fragNUMA)),
 				},
 			}
 			_, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &template, metav1.CreateOptions{})
@@ -804,7 +804,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 			ginkgo.By("placing one one-core claim per cache, as spread does naturally")
 			for i := range free {
 				_, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-					claimSpecWithSelector(step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-small-%d", i))
+					movableClaimSpecWithSelector(step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-small-%d", i))
 				if err != nil {
 					break
 				}
@@ -821,13 +821,13 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 					break
 				}
 				_, uid, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-					claimSpecWithSelector(step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-small-%d", i))
+					movableClaimSpecWithSelector(step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-small-%d", i))
 				if err != nil {
 					break
 				}
 				smallUIDs = append(smallUIDs, uid)
 				filler, _, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-					claimSpecWithSelector(hole-step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-filler-%d", i))
+					movableClaimSpecWithSelector(hole-step, numaCEL(cfgValues, fragNUMA)), fmt.Sprintf("cpu-claim-cf-filler-%d", i))
 				if err != nil {
 					break
 				}
@@ -882,7 +882,7 @@ var _ = ginkgo.Describe("CPU Defragmentation", ginkgo.Serial, ginkgo.Ordered, gi
 
 		ginkgo.By(fmt.Sprintf("requesting %d CPUs: two whole caches, while every cache hosts a small", bigSize))
 		bigPod, bigUID, err := tryCreateClaimedTesterPodWithSpec(ctx, fxt, dracpuTesterImage, targetNode.Name,
-			claimSpecWithSelector(bigSize, numaCEL(cfgValues, fragNUMA)), "cpu-claim-cf-big")
+			movableClaimSpecWithSelector(bigSize, numaCEL(cfgValues, fragNUMA)), "cpu-claim-cf-big")
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(),
 			"the scheduler must admit the claim: the CPUs exist, only their shape is wrong")
 
