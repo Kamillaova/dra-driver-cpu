@@ -593,6 +593,32 @@ func claimSpecWithSelector(cpus int, cel string) resourcev1.ResourceClaimSpec {
 	return spec
 }
 
+// movableClaimSpecWithSelector is claimSpecWithSelector for a claim that permits
+// the driver to change its CPUs while it runs. Mobility is the tenant's to
+// grant and defaults to off, so a claim that says nothing is never consolidated
+// -- which is what every defragmentation scenario needs a claim to be.
+func movableClaimSpecWithSelector(cpus int, cel string) resourcev1.ResourceClaimSpec {
+	ginkgo.GinkgoHelper()
+	spec := claimSpecWithSelector(cpus, cel)
+	rawConfig, err := json.Marshal(v1alpha1.OpaqueConfig{
+		APIVersion: v1alpha1.APIVersion,
+		CPUConfig:  v1alpha1.CPUConfig{Relocatable: true},
+	})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	spec.Devices.Config = []resourcev1.DeviceClaimConfiguration{
+		{
+			Requests: []string{spec.Devices.Requests[0].Name},
+			DeviceConfiguration: resourcev1.DeviceConfiguration{
+				Opaque: &resourcev1.OpaqueDeviceConfiguration{
+					Driver:     driverName,
+					Parameters: runtime.RawExtension{Raw: rawConfig},
+				},
+			},
+		},
+	}
+	return spec
+}
+
 // numaCEL pins a claim to one NUMA node's device. Only numanode grouping
 // publishes the attribute per device, so other modes get no selector and the
 // scenario spans the machine as it always did.
