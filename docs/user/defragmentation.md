@@ -40,6 +40,34 @@ obstacle rather than a move the driver keeps wanting and can never make. A node 
 never opted in therefore reports the spread it cannot repair and moves nothing, which is the correct
 outcome and is visible in `dra_cpu_defrag_excess_uncore_caches`.
 
+## Repairing a node with no free CPUs
+
+A move needs somewhere free to move to, and a node that packing has deliberately filled has nowhere.
+The repair left there is an **exchange**: two claims are re-cut over the CPUs they already hold
+between them, each keeping its own count, so a claim straddling two caches ends up whole on the one a
+smaller tenant was sitting in, and that tenant takes the CPUs the first one leaves behind.
+
+Both containers are updated in one batch, and the runtime applies the two cpuset writes in order, so
+for the instant between them the two claims sit on the same CPUs. That instant is what
+`defragAllowTransientOverlap` permits, and it is on by default: forbidding it forbids repairing a
+full node at all, which is the case the feature exists for. cgroup v2 allows two sibling containers
+to share a cpuset — only `cpuset.cpus.partition` makes a set exclusive, and neither the kubelet nor
+containerd uses partitions for pods — so what the two claims lose for those milliseconds is speed,
+not correctness.
+
+Set it to `false` on a node where even that is unacceptable. Every claim then moves only into CPUs
+nothing holds, a full node keeps the placement it has, and the refusal is visible rather than silent:
+those moves are counted in `dra_cpu_defrag_blocked_moves_total`, and `/placements?dryrun=1` reports
+that an exchange would have helped. A single workload that cannot afford the instant is better served
+by not permitting moves at all, with `cpuConfig.relocatable: false`.
+
+The hazard an exchange has and a move does not is a batch the runtime applies only in part: the two
+claims would then share CPUs for good, silently, because cgroup v2 does not object. The driver does
+not leave it there. Both claims hold both cpusets for the whole batch, so nothing else can be given
+those CPUs meanwhile; a refused half is sent again; and if the runtime refuses it a second time, the
+half it did move is put back. Each attempt has a deadline of its own, so a runtime that never answers
+is an unsettled round rather than a wait without end.
+
 ## What it does not do
 
 - **It does not change a claim's size.** A claim allocated 4 CPUs always has 4.
