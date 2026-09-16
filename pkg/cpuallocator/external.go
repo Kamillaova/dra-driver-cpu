@@ -153,12 +153,19 @@ func getOpaqueCPUSet(logger logr.Logger, driverName string, allocation *resource
 
 	// Return the matched config if found
 	if matchedConfig != nil && len(matchedConfig.Opaque.Parameters.Raw) > 0 {
-		parsedCPUSet, err := opaqueapi.ParseOpaqueConfig(matchedConfig.Opaque.Parameters.Raw)
+		parsed, err := opaqueapi.ParseOpaqueConfig(matchedConfig.Opaque.Parameters.Raw)
 		if err != nil {
 			return cpuset.New(), false, err
 		}
-		logger.V(4).Info("found cpuset override in opaque CPU set", "request", alloc.Request, "cpuset", parsedCPUSet.String())
-		return parsedCPUSet, true, nil
+		// CCX-FORK: upstream's parse refuses a configuration that names no
+		// cpuset, since to it a configuration is nothing else. One may now say
+		// only what the claim tolerates, so the demand belongs here, where a
+		// cpuset is what is being asked for.
+		if !parsed.HasCPUs {
+			return cpuset.New(), false, fmt.Errorf("opaque config: cpuConfig.cpuset is empty or missing")
+		}
+		logger.V(4).Info("found cpuset override in opaque CPU set", "request", alloc.Request, "cpuset", parsed.CPUs.String())
+		return parsed.CPUs, true, nil
 	}
 
 	return cpuset.New(), false, nil
