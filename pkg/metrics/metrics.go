@@ -138,6 +138,7 @@ type Metrics struct {
 	defragPoisonDurationSecsHist  prometheus.Histogram
 	defragReadbackMismatches      prometheus.Counter
 	flooredCapacityDevices        prometheus.Gauge
+	defragUnpublishedRounds       prometheus.Counter
 }
 
 type metricKind string
@@ -337,6 +338,11 @@ var (
 		kind: metricGauge,
 		help: "Number of devices whose published CPU capacity is held above the amount the driver computed, because publishing that amount would put the device below its own request policy. Those devices are tainted, so the capacity they over-state is withdrawn rather than handed out.",
 	}
+	defragUnpublishedRoundsSpec = metricSpec{
+		name: "dra_cpu_defrag_unpublished_rounds_total",
+		kind: metricCounter,
+		help: "Total number of defragmentation rounds abandoned because the capacity they shrink was not stored by the API server in time. While this rises no claim on the node is being moved.",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -370,6 +376,7 @@ var metricSpecs = []metricSpec{
 	defragPoisonDurationSpec,
 	defragReadbackMismatchesSpec,
 	flooredCapacityDevicesSpec,
+	defragUnpublishedRoundsSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -432,6 +439,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		defragPoisonDurationSecsHist:  newHistogram(defragPoisonDurationSpec),
 		defragReadbackMismatches:      newCounter(defragReadbackMismatchesSpec),
 		flooredCapacityDevices:        newGauge(flooredCapacityDevicesSpec),
+		defragUnpublishedRounds:       newCounter(defragUnpublishedRoundsSpec),
 	}
 
 	reg.MustRegister(
@@ -465,6 +473,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragPoisonDurationSecsHist,
 		m.defragReadbackMismatches,
 		m.flooredCapacityDevices,
+		m.defragUnpublishedRounds,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -677,6 +686,10 @@ func (m *Metrics) SetFlooredCapacityDevices(count int) {
 	m.flooredCapacityDevices.Set(float64(count))
 }
 
+func (m *Metrics) RecordDefragUnpublishedRound() {
+	m.defragUnpublishedRounds.Inc()
+}
+
 func (m *Metrics) RecordDefragBlockedMoves(count int) {
 	if count <= 0 {
 		return
@@ -714,3 +727,4 @@ func (noopRecorder) RecordDefragNodePoisoned()                          {}
 func (noopRecorder) RecordDefragNodeReopened(time.Duration)             {}
 func (noopRecorder) RecordDefragReadbackMismatch()                      {}
 func (noopRecorder) SetFlooredCapacityDevices(int)                      {}
+func (noopRecorder) RecordDefragUnpublishedRound()                      {}
