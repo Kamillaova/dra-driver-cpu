@@ -207,6 +207,7 @@ These carry no fork-only code and are intended to be offered upstream as separat
   verification against the node's own thread arity
 - shared-pool reconcile after unprepare — upstream issue #279
 - a claim held by every container of one pod, where upstream binds it to a single container
+- CPU limits kept off pods that hold CPU claims, where upstream's guide both set one and warned against it
 
 The defragmenter itself is not upstreamable in the near term: it needs a runtime opt-in, and moving a
 running container's cpuset is a semantic upstream has not sanctioned.
