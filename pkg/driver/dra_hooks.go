@@ -46,6 +46,19 @@ import (
 
 // PublishResources publishes ResourceSlice for CPU resources.
 func (cp *CPUDriver) PublishResources(ctx context.Context) {
+	if err := cp.publishResources(ctx); err != nil {
+		ctxlog.FromContext(ctx).Error(err, "error publishing resources")
+	}
+}
+
+// publishResources is PublishResources for a caller that has to know whether
+// the inventory reached the controller at all.
+//
+// CCX-FORK: upstream publishes once at startup and logs whatever comes back. A
+// defragmentation round publishes the capacity its move depends on and may not
+// touch a container until that capacity is stored, so a handoff that failed is
+// the round's answer rather than a log line.
+func (cp *CPUDriver) publishResources(ctx context.Context) error {
 	ctx, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen), "deviceMode", cp.cpuDeviceMode, "groupBy", cp.cpuDeviceGroupBy)
 
 	logger.V(4).Info("begin: publishing resources")
@@ -63,7 +76,7 @@ func (cp *CPUDriver) PublishResources(ctx context.Context) {
 
 	if chunks == nil {
 		logger.Info("no devices to publish or error occurred")
-		return
+		return nil
 	}
 
 	slices := make([]resourceslice.Slice, 0, len(chunks))
@@ -78,10 +91,7 @@ func (cp *CPUDriver) PublishResources(ctx context.Context) {
 		},
 	}
 
-	err := cp.draPlugin.PublishResources(ctx, resources)
-	if err != nil {
-		logger.Error(err, "error publishing resources")
-	}
+	return cp.draPlugin.PublishResources(ctx, resources)
 }
 
 // PrepareResourceClaims is called by the kubelet to prepare a resource claim.
