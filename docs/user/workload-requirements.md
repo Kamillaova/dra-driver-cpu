@@ -15,7 +15,7 @@ How to configure your workloads depends on whether KEP-5517 accounting is active
 
 To check which mode is active, inspect the driver's ResourceSlices (`kubectl get resourceslice -o yaml`): the devices include a `nodeAllocatableResources` entry only when the mapping is enabled.
 
-**One claim, one pod:** in both modes, a CPU `ResourceClaim` is held by the containers of a *single* pod. Every container of that pod may reference it — an init container and the container it prepares, for instance — and each of them runs on the claim's CPUs. A container of a second pod is refused. See [Sharing resource claims](feature-support.md#sharing-resource-claims).
+**One claim, one pod:** in both modes, a CPU `ResourceClaim` is held by the containers of a *single* pod. Every container of that pod may reference it — an init container and the container it prepares, for instance — and each of them runs on the CPUs of what it referenced: the whole claim, or one request of it where the container's `resources.claims` entry names a `request`. A container of a second pod is refused. See [Sharing resource claims](feature-support.md#sharing-resource-claims).
 
 ## Before KEP-5517 (before 1.37 or alpha FG `DRANodeAllocatableResources` disabled)
 
