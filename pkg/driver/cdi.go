@@ -151,6 +151,12 @@ func (c *CdiManager) getSpecName(deviceName string) string {
 // The spec is written atomically by the CDI cache, so a concurrent reader sees
 // either the previous placement or this one, never a mixture.
 //
+// This is the claim's record: it is where the driver reads a claim's placement,
+// mobility, reservation and round back from after a restart. A claim whose
+// requests are named is not handed this device to the kubelet at all -- its
+// containers are given the per-request devices below -- because a device
+// carrying no request names is injected into every container of the pod.
+//
 // CCX-FORK: upstream takes no record argument and records nothing of its own.
 func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar string, record store.ClaimRecord) error {
 	specName := c.getSpecName(deviceName)
@@ -224,6 +230,60 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 	logger.V(4).Info("Added CDI device", "deviceName", deviceName, "specName", specName, "env", envVar,
 		"placements", placements, "recorded", annotations[cdiRecordedAnnotation], "relocatable", record.Relocatable)
 	return nil
+}
+
+// AddRequestDevice writes the CDI spec for one request of a claim, which carries
+// the injected variable for that request and nothing else.
+//
+// This is the device a container is actually given. The kubelet injects it only
+// into the containers whose pod names this request, or into every container of
+// the pod when none of them names one, so what a container is pinned to follows
+// from what it asked for. The claim's own record stays on the device AddDevice
+// writes: keeping it in one place keeps a placement one atomic spec write.
+func (c *CdiManager) AddRequestDevice(logger logr.Logger, deviceName string, envVar string) error {
+	specName := c.getSpecName(deviceName)
+	spec := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    c.cdiKind,
+		Devices: []cdiSpec.Device{
+			{
+				Name: deviceName,
+				ContainerEdits: cdiSpec.ContainerEdits{
+					Env: []string{envVar},
+				},
+			},
+		},
+	}
+	if err := c.cache.WriteSpec(spec, specName); err != nil {
+		return fmt.Errorf("failed to write CDI spec %q: %w", specName, err)
+	}
+	logger.V(4).Info("Added CDI request device", "deviceName", deviceName, "specName", specName, "env", envVar)
+	return nil
+}
+
+// RemoveClaimDevices deletes every CDI spec written for a claim: the per-request
+// devices and the claim's own record.
+//
+// The request names come from the specs on disk rather than from the store, so
+// an Unprepare that follows a restart removes what an earlier driver wrote even
+// where the store was rebuilt from something that never named them. The record
+// goes last, so a failure part way leaves the claim still recorded as prepared
+// rather than leaving its CPUs recorded nowhere.
+func (c *CdiManager) RemoveClaimDevices(logger logr.Logger, claimUID types.UID) error {
+	for _, qualified := range c.cache.ListDevices() {
+		vendor, class, name, err := cdiparser.ParseQualifiedName(qualified)
+		if err != nil || vendor != cdiVendor || class != cdiClass {
+			continue
+		}
+		uid, request, ok := claimRequestFromDeviceName(name)
+		if !ok || uid != claimUID || request == "" {
+			continue
+		}
+		if err := c.RemoveDevice(logger, name); err != nil {
+			return err
+		}
+	}
+	return c.RemoveDevice(logger, getCDIDeviceName(claimUID))
 }
 
 type cdiRequestPlacement struct {

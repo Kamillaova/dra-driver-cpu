@@ -43,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceclaim"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/utils/cpuset"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
@@ -272,11 +273,39 @@ func getCDIDeviceName(uid types.UID) string {
 	return fmt.Sprintf("claim-%s", uid)
 }
 
-// claimUIDFromDeviceName reverses getCDIDeviceName, and reports whether name
-// has the shape this driver generates at all.
+// getCDIRequestDeviceName names the device carrying one request of a claim.
+//
+// The separator is the one the kubeletplugin library uses for the same pair in
+// its metadata specs, and it is a character a CDI device name may carry in the
+// middle while neither a claim UID nor a request name ever does, so the name
+// takes one apart again.
+func getCDIRequestDeviceName(uid types.UID, request string) string {
+	return fmt.Sprintf("claim-%s_%s", uid, request)
+}
+
+// claimUIDFromDeviceName reverses getCDIDeviceName, and reports whether name is
+// a claim's own record device.
+//
+// A device naming one request of a claim is not one: it carries no record, and
+// reading it as a claim would recover a claim whose UID is a UID and a request
+// name run together.
 func claimUIDFromDeviceName(name string) (types.UID, bool) {
 	uid, ok := strings.CutPrefix(name, "claim-")
-	return types.UID(uid), ok
+	if !ok || strings.Contains(uid, "_") {
+		return "", false
+	}
+	return types.UID(uid), true
+}
+
+// claimRequestFromDeviceName reverses both names: the request is empty for a
+// claim's record device.
+func claimRequestFromDeviceName(name string) (types.UID, string, bool) {
+	rest, ok := strings.CutPrefix(name, "claim-")
+	if !ok {
+		return "", "", false
+	}
+	uid, request, _ := strings.Cut(rest, "_")
+	return types.UID(uid), request, true
 }
 
 // reserveResourceClaimAllocation records a new claim allocation while applying
@@ -332,7 +361,13 @@ func (cp *CPUDriver) recordedDevices(claim *resourceapi.ResourceClaim) map[strin
 // addRequestCPUs merges one allocation result into the request it belongs to. A
 // request satisfied by several devices holds their union, and every device of
 // one request has the same role, since a device class selects one partition.
+//
+// Keyed on the base request name: a result satisfied out of a firstAvailable
+// list names the subrequest it chose, and only the request itself is a name
+// anything outside the claim can use. A pod names one, the kubelet filters CDI
+// devices by one, and the device metadata file is written under one.
 func addRequestCPUs(byRequest map[string]store.RequestAllocation, name string, cpus cpuset.CPUSet, role store.Role) {
+	name = resourceclaim.BaseRequestRef(name)
 	existing := byRequest[name]
 	byRequest[name] = store.RequestAllocation{
 		Request: name,
@@ -1121,6 +1156,40 @@ func (cp *CPUDriver) cdiEnvValue(record store.ClaimRecord) string {
 	return store.UnionOf(record.Requests).String()
 }
 
+// prepareRequestDevices writes one CDI device per request of a claim and returns
+// their qualified names, keyed by request.
+//
+// A record whose requests carry no name yields none: that is a claim recovered
+// from a spec written before the driver recorded placement per request, and the
+// one thing known about it is the set of CPUs it holds altogether. Its
+// containers keep being given the claim's own device.
+func (cp *CPUDriver) prepareRequestDevices(logger logr.Logger, claimUID types.UID, record store.ClaimRecord) (map[string]string, error) {
+	qualified := make(map[string]string, len(record.Requests))
+	for _, request := range record.Requests {
+		if request.Request == "" {
+			continue
+		}
+		deviceName := getCDIRequestDeviceName(claimUID, request.Request)
+		envVar := fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claimUID, request.Request, cp.cdiRequestEnvValue(record, request))
+		if err := cp.cdiMgr.AddRequestDevice(logger, deviceName, envVar); err != nil {
+			return nil, err
+		}
+		qualified[request.Request] = cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName)
+	}
+	return qualified, nil
+}
+
+// cdiRequestEnvValue is what one request's injected variable says, by the same
+// rule the claim-wide one follows: the CPUs when they are settled for the life
+// of the container, and the dynamic marker when the claim may be moved. A share
+// of a pool never moves, so it names its CPUs even under a relocatable claim.
+func (cp *CPUDriver) cdiRequestEnvValue(record store.ClaimRecord, request store.RequestAllocation) string {
+	if !requestCPUsAreFixed(record, request) {
+		return cdiEnvDynamicValue
+	}
+	return request.CPUs.String()
+}
+
 // CCX-FORK: upstream is handed the claim's cpuset and nothing else about the
 // claim.
 func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, record store.ClaimRecord, placement opaqueapi.ClaimPlacement) kubeletplugin.PrepareResult {
@@ -1135,16 +1204,31 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 	}
 
 	qualifiedName := cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName)
+	qualifiedByRequest, err := cp.prepareRequestDevices(logger, claim.UID, record)
+	if err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
 	logger.V(6).Info("prepared CDI device", "cdiDeviceName", deviceName, "envVar", envVar, "qualifiedName", qualifiedName)
 	preparedDevices := []kubeletplugin.Device{}
 	for _, allocResult := range claim.Status.Allocation.Devices.Results {
 		if allocResult.Driver != cp.driverName {
 			continue
 		}
+		requestName := resourceclaim.BaseRequestRef(allocResult.Request)
+		// CCX-FORK: upstream points every result at one device named after the
+		// claim, so a container naming one request is given the whole claim's
+		// cpuset. Each result carries its own request's device here; where the
+		// record names no requests -- a claim recovered from a spec written
+		// before they were recorded -- the claim's own device stands in, which
+		// is upstream's behaviour and the only one such a record can support.
+		deviceID := qualifiedName
+		if qualified, ok := qualifiedByRequest[requestName]; ok {
+			deviceID = qualified
+		}
 		preparedDevice := kubeletplugin.Device{
 			PoolName:     allocResult.Pool,
 			DeviceName:   allocResult.Device,
-			CDIDeviceIDs: []string{qualifiedName},
+			CDIDeviceIDs: []string{deviceID},
 		}
 		if allocResult.Request != "" {
 			preparedDevice.Requests = []string{allocResult.Request}
@@ -1174,7 +1258,7 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 			// rewritten afterwards, so it may name CPUs only where they are
 			// settled for the container's life. A claim whose CPUs may change
 			// reads them from the kernel instead.
-			if request, ok := byRequest[allocResult.Request]; ok && requestCPUsAreFixed(record, request) {
+			if request, ok := byRequest[requestName]; ok && requestCPUsAreFixed(record, request) {
 				metadataAttrs[string(device.AttributeCPUSet)] = resourceapi.DeviceAttribute{
 					StringValue: new(request.CPUs.String()),
 				}
@@ -1318,9 +1402,9 @@ func (cp *CPUDriver) unprepareResourceClaim(logger logr.Logger, claim kubeletplu
 			cp.recordClaimEventRef(context.Background(), claim.Namespace, claim.Name, claim.UID, "ClaimUnrepaired", "claim deallocated while still split")
 		}
 	}
-	// Remove the CDI spec first. If that fails, keep the allocation recorded so
+	// Remove the CDI specs first. If that fails, keep the allocation recorded so
 	// the driver does not make those CPUs available while stale CDI state remains.
-	if err := cp.cdiMgr.RemoveDevice(logger, getCDIDeviceName(claim.UID)); err != nil {
+	if err := cp.cdiMgr.RemoveClaimDevices(logger, claim.UID); err != nil {
 		return err
 	}
 	cp.cpuAllocationStore.RemoveResourceClaimAllocation(logger, claim.UID)
