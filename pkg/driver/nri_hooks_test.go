@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
@@ -27,10 +28,13 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/utils/cpuset"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
@@ -1622,4 +1626,89 @@ func TestSynchronizeLeavesAClaimTheProjectionDoesNotName(t *testing.T) {
 
 	_, held := driver.cpuAllocationStore.GetResourceClaimAllocation(gone)
 	require.False(t, held, "a spec the projection does not name must not resurrect its claim")
+}
+
+// TestReportForeignCPUsEventsTheClaim: the update converging such a container is
+// already queued by the time this runs, so the metric and the event on the claim
+// are the whole trace the episode leaves. This is the shape a crash-looping
+// driver produces, which is how it was found on a real node.
+func TestReportForeignCPUsEventsTheClaim(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpuID := range 8 {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	allocations := store.NewCPUAllocation(topo, cpuset.New())
+	requirePreparedResourceClaim(t, logger, allocations, "neighbour", cpuset.New(4, 5))
+
+	reg := prometheus.NewRegistry()
+	client := k8sfake.NewSimpleClientset()
+	cp := &CPUDriver{
+		driverName: testDriverName,
+		nodeName:   testNodeName,
+		kubeClient: client,
+		metrics:    cpumetrics.New(reg),
+		claimReader: fakeClaimReader{claims: []*resourceapi.ResourceClaim{{
+			ObjectMeta: metav1.ObjectMeta{UID: "mine", Namespace: "default", Name: "pod-claim"},
+		}}},
+	}
+
+	cp.reportForeignCPUs(context.Background(), allocations, []observedContainer{{
+		logger:    logger,
+		claimUIDs: []types.UID{"mine"},
+		desired:   cpuset.New(0, 1),
+		elsewhere: cpuset.New(0, 1, 4, 5),
+	}})
+
+	require.InDelta(t, 1, metricValue(t, reg, "dra_cpu_synchronize_foreign_cpus_total", nil), 0.01)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		events, err := client.CoreV1().Events("default").List(context.Background(), metav1.ListOptions{})
+		assert.NoError(c, err)
+		if !assert.Len(c, events.Items, 1) {
+			return
+		}
+		assert.Equal(c, "ForeignCPUs", events.Items[0].Reason)
+		assert.Equal(c, "pod-claim", events.Items[0].InvolvedObject.Name)
+		assert.Contains(c, events.Items[0].Message, "4-5")
+	}, time.Second, 10*time.Millisecond)
+}
+
+// TestReportForeignCPUsIsSilentWhereNothingOverlaps: a container on exactly the
+// CPUs its own claim holds is the normal case, and it must cost neither a metric
+// nor an event.
+func TestReportForeignCPUsIsSilentWhereNothingOverlaps(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpuID := range 8 {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	allocations := store.NewCPUAllocation(topo, cpuset.New())
+	requirePreparedResourceClaim(t, logger, allocations, "neighbour", cpuset.New(4, 5))
+
+	reg := prometheus.NewRegistry()
+	client := k8sfake.NewSimpleClientset()
+	cp := &CPUDriver{
+		driverName: testDriverName,
+		nodeName:   testNodeName,
+		kubeClient: client,
+		metrics:    cpumetrics.New(reg),
+	}
+
+	cp.reportForeignCPUs(context.Background(), allocations, []observedContainer{{
+		logger:    logger,
+		claimUIDs: []types.UID{"mine"},
+		desired:   cpuset.New(0, 1),
+		elsewhere: cpuset.New(0, 1),
+	}})
+
+	require.InDelta(t, 0, metricValue(t, reg, "dra_cpu_synchronize_foreign_cpus_total", nil), 0.01)
+	events, err := client.CoreV1().Events("default").List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, events.Items)
 }
