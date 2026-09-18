@@ -23,10 +23,13 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
+	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/utils/cpuset"
@@ -1508,4 +1511,115 @@ func TestSynchronizeRecordsAReservationForAClaimHoldingNoExclusiveCPUs(t *testin
 	reserved, recorded := d.claimTracker.ReservedFor(claimUID, types.UID(pod.Uid))
 	require.True(t, recorded)
 	require.True(t, reserved)
+}
+
+// projectedAllocatedClaims is what the scheduler projected for this node.
+type projectedAllocatedClaims []*resourceapi.ResourceClaim
+
+func (p projectedAllocatedClaims) AllocatedClaims() ([]*resourceapi.ResourceClaim, error) {
+	return p, nil
+}
+
+func (p projectedAllocatedClaims) IsProjectedDeallocated(types.UID) bool { return false }
+
+// GetProjectedClaims is not part of the interface at this commit and is not used
+// by Synchronize. It is here so that the stub keeps satisfying the interface
+// where a later commit widens it, rather than breaking a commit that has nothing
+// to do with this test.
+func (p projectedAllocatedClaims) GetProjectedClaims() (*v1alpha1.ProjectedClaims, error) {
+	return &v1alpha1.ProjectedClaims{}, nil
+}
+
+// projectedClaim is what the reader reconstructs from the projection: a UID, a
+// name and the allocated devices. It carries no reservation, because the
+// projection does not.
+func projectedClaim(uid types.UID) *resourceapi.ResourceClaim {
+	return &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{UID: uid, Name: string(uid), Namespace: "volta"},
+	}
+}
+
+// TestSynchronizeRestoresAClaimNoContainerHolds pins B97. A claim prepared
+// before a driver restart, whose container could not be created while the driver
+// was down, is invisible to a rebuild that walks running containers -- and the
+// container cannot start until the claim is in the store, so nothing breaks the
+// cycle. The projection names the claim and the CDI spec says where it is, which
+// is enough.
+func TestSynchronizeRestoresAClaimNoContainerHolds(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}
+	topo, _ := mockProvider.GetCPUTopology(logger)
+
+	stuck := types.UID("claim-stuck")
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{stuck: cpuset.New(2, 3)}),
+		claimReader:        projectedAllocatedClaims{projectedClaim(stuck)},
+		topology:           deviceTopology{cpuTopology: topo},
+		metrics:            cpumetrics.Noop(),
+	}
+
+	// The spec the driver wrote at Prepare, which is where the reservation comes
+	// back from.
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName(stuck)] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(2, 3), Role: store.RoleExclusive}},
+		ReservedFor: []types.UID{"pod-uid-stuck"},
+	}
+
+	// The runtime reports no pod and no container: the container never started.
+	_, err := driver.Synchronize(context.Background(), nil, nil)
+	require.NoError(t, err)
+
+	got, held := driver.cpuAllocationStore.GetResourceClaimAllocation(stuck)
+	require.True(t, held, "a claim the runtime cannot show must still be restored")
+	require.True(t, got.Equals(cpuset.New(2, 3)), "restored %s, want 2-3", got.String())
+	require.True(t, driver.cpuAllocationStore.GetSharedCPUs().Equals(allCPUs.Difference(cpuset.New(2, 3))),
+		"the restored claim's CPUs must leave the shared pool")
+
+	// B63's sibling: the reservation is restored with the claim, out of the spec
+	// the driver wrote at Prepare. Without it the container that is waiting to be
+	// created is refused for the pod's life on a runtime that reports no CDI
+	// devices of its own. The projection cannot supply it: it carries no
+	// reservation at all, which is why this reads the record.
+	reserved, recorded := driver.claimTracker.ReservedFor(stuck, types.UID("pod-uid-stuck"))
+	require.True(t, recorded, "a restored claim's reservation must be known")
+	require.True(t, reserved)
+}
+
+// TestSynchronizeLeavesAClaimTheProjectionDoesNotName: the CDI spec alone is not
+// authority. One left behind by an Unprepare this driver missed would otherwise
+// hold CPUs for a claim that no longer exists.
+func TestSynchronizeLeavesAClaimTheProjectionDoesNotName(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}
+	topo, _ := mockProvider.GetCPUTopology(logger)
+
+	gone := types.UID("claim-gone")
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{gone: cpuset.New(0, 1)}),
+		claimReader:        projectedAllocatedClaims{},
+		topology:           deviceTopology{cpuTopology: topo},
+		metrics:            cpumetrics.Noop(),
+	}
+
+	_, err := driver.Synchronize(context.Background(), nil, nil)
+	require.NoError(t, err)
+
+	_, held := driver.cpuAllocationStore.GetResourceClaimAllocation(gone)
+	require.False(t, held, "a spec the projection does not name must not resurrect its claim")
 }
