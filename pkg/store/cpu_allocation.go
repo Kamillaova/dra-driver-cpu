@@ -67,6 +67,16 @@ type RoundProvenance struct {
 	Partners []types.UID
 }
 
+type ClaimCorrelation struct {
+	NUMANode         *int
+	Partition        string
+	FrontierSnapshot string
+	WitnessRounds    *int
+	WitnessPlan      string
+	InitialCPUSet    string
+	RuntimeOutcome   string
+}
+
 // ClaimRecord is everything the driver records for one prepared claim: what each
 // of its requests holds, and whether the claim permits those CPUs to change
 // while its containers run.
@@ -91,7 +101,8 @@ type ClaimRecord struct {
 	ReservedFor []types.UID
 	// Round is the defragmentation round in flight when this record was written
 	// to disk, or nil when no round is active for the claim.
-	Round *RoundProvenance
+	Round       *RoundProvenance
+	Correlation ClaimCorrelation
 }
 
 // CPUAllocation is the single source of truth for CPU allocations.
@@ -129,6 +140,7 @@ type claimAllocation struct {
 	alignment   v1alpha1.Alignment
 	// recorded is what the claim's allocation charged each device it names.
 	recorded    map[string]int
+	correlation ClaimCorrelation
 	reservedFor []types.UID
 }
 
@@ -143,6 +155,7 @@ func newClaimAllocation(record ClaimRecord) *claimAllocation {
 		alignment:   record.Alignment,
 		recorded:    maps.Clone(record.Recorded),
 		reservedFor: slices.Clone(record.ReservedFor),
+		correlation: record.Correlation,
 	}
 }
 
@@ -694,7 +707,24 @@ func (s *CPUAllocation) GetClaimRecord(claimUID types.UID) (ClaimRecord, bool) {
 		Alignment:   allocation.alignment,
 		Recorded:    maps.Clone(allocation.recorded),
 		ReservedFor: slices.Clone(allocation.reservedFor),
+		Correlation: allocation.correlation,
 	}, true
+}
+
+func (s *CPUAllocation) SetClaimCorrelation(claimUID types.UID, corr ClaimCorrelation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if alloc, ok := s.claims[claimUID]; ok {
+		alloc.correlation = corr
+	}
+}
+
+func (s *CPUAllocation) UpdateClaimRuntimeOutcome(claimUID types.UID, outcome string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if alloc, ok := s.claims[claimUID]; ok {
+		alloc.correlation.RuntimeOutcome = outcome
+	}
 }
 
 // Alignment returns a claim's alignment policy. Defaults to AlignmentBestEffort.

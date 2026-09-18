@@ -210,3 +210,118 @@ func TestPublishClaimPlacementStatusFallsBackToTheProjection(t *testing.T) {
 	err := d.doPublishClaimPlacementStatus(context.Background(), logr.Discard(), claimUID, types.NamespacedName{})
 	require.ErrorContains(t, err, "not found in cache")
 }
+
+// TestPublishClaimPlacementStatusNarrowsCorrelationPerDevice pins B98. A claim
+// holding devices in two partitions records one correlation, taken from the
+// first device; publishing it whole told a reader that the ctrl pool device sat
+// in the spdk partition and had started on the spdk cores. Since each entry
+// names a device, each entry must describe that device.
+func TestPublishClaimPlacementStatusNarrowsCorrelationPerDevice(t *testing.T) {
+	const (
+		driverName = "dra.cpu"
+		poolName   = "c1-4"
+		spdkDevice = "cpudevcache000-spdk"
+		ctrlDevice = "cpudevpool000-ctrl"
+	)
+
+	spdkShare := types.UID("11111111-1111-1111-1111-111111111111")
+	ctrlShare := types.UID("22222222-2222-2222-2222-222222222222")
+	claimUID := types.UID("claim-two-partitions")
+
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "volta", UID: claimUID},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{Request: "poll", Driver: driverName, Pool: poolName, Device: spdkDevice, ShareID: &spdkShare},
+						{Request: "control", Driver: driverName, Pool: poolName, Device: ctrlDevice, ShareID: &ctrlShare},
+					},
+				},
+			},
+		},
+	}
+
+	topo := &cpuinfo.CPUTopology{CPUDetails: cpuinfo.CPUDetails{
+		2: {CpuID: 2, CoreID: 2, SocketID: 0, UncoreCacheID: 0},
+		3: {CpuID: 3, CoreID: 3, SocketID: 0, UncoreCacheID: 1},
+		4: {CpuID: 4, CoreID: 4, SocketID: 0, UncoreCacheID: 2},
+		5: {CpuID: 5, CoreID: 5, SocketID: 0, UncoreCacheID: 2},
+	}}
+
+	allocation := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, allocation.ReserveResourceClaimAllocation(logr.Discard(), claimUID, store.ClaimRecord{
+		Requests: []store.RequestAllocation{
+			{Request: "poll", CPUs: cpuset.New(4, 5), Role: store.RoleExclusive},
+			{Request: "control", CPUs: cpuset.New(2, 3), Role: store.RoleShared},
+		},
+		// One correlation for the whole claim, taken from the first device: the
+		// shape every prepared claim has.
+		Correlation: store.ClaimCorrelation{
+			Partition:        "spdk",
+			InitialCPUSet:    "2-5",
+			FrontierSnapshot: "3,2,1,0",
+			RuntimeOutcome:   "aligned",
+		},
+	}, false))
+
+	client := k8sfake.NewSimpleClientset(claim)
+	d := &CPUDriver{
+		nodeName:           poolName,
+		driverName:         driverName,
+		kubeClient:         client,
+		claimReader:        staticClaimReader{claims: []*resourceapi.ResourceClaim{claim}},
+		cpuAllocationStore: allocation,
+	}
+	d.topology.deviceNameToCPUs = map[string]cpuset.CPUSet{
+		spdkDevice: cpuset.New(4, 5),
+		ctrlDevice: cpuset.New(2, 3),
+	}
+	d.topology.deviceNameToPartition = map[string]string{spdkDevice: "spdk", ctrlDevice: "ctrl"}
+	d.topology.deviceNameToNUMANodeID = map[string]int{spdkDevice: 0, ctrlDevice: 0}
+	d.topology.cpuTopology = topo
+
+	require.NoError(t, d.doPublishClaimPlacementStatus(context.Background(), logr.Discard(), claimUID,
+		types.NamespacedName{Namespace: "volta", Name: "claim"}))
+
+	published, err := client.ResourceV1().ResourceClaims("volta").Get(context.Background(), "claim", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Len(t, published.Status.Devices, 2)
+
+	byDevice := map[string]v1alpha1.ClaimPlacementStatus{}
+	for _, device := range published.Status.Devices {
+		var placement v1alpha1.ClaimPlacementStatus
+		require.NoError(t, json.Unmarshal(device.Data.Raw, &placement))
+		byDevice[device.Device] = placement
+	}
+
+	spdk := byDevice[spdkDevice]
+	require.Equal(t, "spdk", spdk.Partition)
+	require.Equal(t, "4-5", spdk.CPUSet)
+	require.Equal(t, "4-5", spdk.InitialCPUSet)
+	require.Equal(t, "3,2,1,0", spdk.FrontierSnapshot, "the frontier was taken for this device's partition")
+	require.Equal(t, "aligned", spdk.RuntimeOutcome)
+	require.Equal(t, []int{2}, spdk.UncoreCaches)
+
+	ctrl := byDevice[ctrlDevice]
+	require.Equal(t, "ctrl", ctrl.Partition, "the ctrl device must not report the claim's first partition")
+	require.Equal(t, "2-3", ctrl.CPUSet)
+	require.Equal(t, "2-3", ctrl.InitialCPUSet, "the initial cpuset is this device's share of the claim's")
+	require.Empty(t, ctrl.FrontierSnapshot, "a frontier taken for another partition is not an answer for this one")
+	require.Empty(t, ctrl.RuntimeOutcome)
+	require.Equal(t, []int{0, 1}, ctrl.UncoreCaches, "a pool device names every cache its own CPUs sit in")
+}
+
+func TestUncoreCachesOf(t *testing.T) {
+	d := &CPUDriver{}
+	require.Nil(t, d.uncoreCachesOf(cpuset.New(0, 1)), "no topology, no caches")
+
+	d.topology.cpuTopology = &cpuinfo.CPUTopology{CPUDetails: cpuinfo.CPUDetails{
+		0: {CpuID: 0, UncoreCacheID: 3},
+		1: {CpuID: 1, UncoreCacheID: 1},
+		2: {CpuID: 2, UncoreCacheID: 3},
+		3: {CpuID: 3, UncoreCacheID: -1},
+	}}
+	require.Equal(t, []int{1, 3}, d.uncoreCachesOf(cpuset.New(0, 1, 2, 3)))
+	require.Empty(t, d.uncoreCachesOf(cpuset.New(3)), "a CPU with no known cache names none")
+}
