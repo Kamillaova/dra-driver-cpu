@@ -90,8 +90,10 @@ Fork-only symbols added to upstream files, which carry no marker of their own. A
 to an upstreamable piece (see below) are not repeated here: they leave with their PR.
 
 - `pkg/driver/cdi.go`: `cdiPlacementsAnnotation`, `cdiCPUSetAnnotation`, `cdiRecordedAnnotation`,
-  `cdiRelocatableAnnotation`, `cdiEnvDynamicValue`, `GetDeviceAllocations`, `cdiRequestPlacement`,
-  `encodePlacements`, `decodePlacements`, `decodeRecordedDevices`, `recordableRole`
+  `cdiRelocatableAnnotation`, `cdiRoundIDAnnotation`, `cdiRoundOriginAnnotation`,
+  `cdiRoundTargetAnnotation`, `cdiRoundPartnersAnnotation`, `cdiEnvDynamicValue`,
+  `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`, `decodePlacements`,
+  `decodeRecordedDevices`, `decodeRoundPartners`, `recordableRole`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `activeExactPlans`,
   `defragRetries`, `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes`,
@@ -110,10 +112,14 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   namespace lookup from POD_NAMESPACE
 
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
-  `restoreUnstartedClaims`, `recordedReservation`
+  `containerClassification`, `classifyContainer`, `reconcileActiveRounds`, `revertRoundOrigin`,
+  `nonExclusiveCPUs`, `cpusetUpdate`, `observedContainer`, `reportForeignCPUs`,
+  `allocatedClaimsByUID`, `restoreUnstartedClaims`, `recordedReservation`
+
+- `pkg/driver/poison.go`: `poisonNUMANodeForCPUs`
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
-  `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
+  `RoundProvenance`, `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
   `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
   `GetClaimRecord`, `SetRecordedDevices`, `IsRelocatable`, `HoldsExclusiveCPUs`,
@@ -133,7 +139,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `WarnDeprecatedCPUFields`
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods,
-  `SetFlooredCapacityDevices` and `RecordPrepareNoRoom`, and the collectors behind them
+  `SetFlooredCapacityDevices`, `RecordPrepareNoRoom` and `RecordSynchronizeForeignCPUs`, and the
+  collectors behind them
 
 - `test/e2e`: the defragmentation and whole-core suites, the claim-pod helpers in
   `e2e_suite_test.go`, and the `defragEnabled`/`defragAllowTransientOverlap`/`fullPhysicalCPUsOnly`
