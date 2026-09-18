@@ -84,6 +84,9 @@ const (
 	// cdiRoundOriginAnnotation records the CPUs this claim held before the round.
 	cdiRoundOriginAnnotation = "dra.cpu/round.origin"
 
+	// cdiCorrelationAnnotation records admission and witness correlation for this claim.
+	cdiCorrelationAnnotation = "dra.cpu/correlation"
+
 	// cdiRoundTargetAnnotation records the CPUs this round is moving the claim to.
 	cdiRoundTargetAnnotation = "dra.cpu/round.target"
 
@@ -191,6 +194,13 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 			return fmt.Errorf("failed to record round partners of CDI device %q: %w", deviceName, err)
 		}
 		annotations[cdiRoundPartnersAnnotation] = string(partners)
+	}
+	if record.Correlation.NUMANode != nil || record.Correlation.Partition != "" || record.Correlation.FrontierSnapshot != "" || record.Correlation.WitnessRounds != nil || record.Correlation.WitnessPlan != "" || record.Correlation.InitialCPUSet != "" || record.Correlation.RuntimeOutcome != "" {
+		corrBytes, err := json.Marshal(record.Correlation)
+		if err != nil {
+			return fmt.Errorf("failed to record correlation of CDI device %q: %w", deviceName, err)
+		}
+		annotations[cdiCorrelationAnnotation] = string(corrBytes)
 	}
 
 	spec := &cdiSpec.Spec{
@@ -338,6 +348,11 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		}
 	}
 
+	var correlation store.ClaimCorrelation
+	if corrStr, ok := device.Annotations[cdiCorrelationAnnotation]; ok && corrStr != "" {
+		_ = json.Unmarshal([]byte(corrStr), &correlation)
+	}
+
 	if recorded, ok := device.Annotations[cdiPlacementsAnnotation]; ok {
 		requests, err := decodePlacements(recorded)
 		if err != nil {
@@ -349,6 +364,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			Alignment:   alignment,
 			Recorded:    charged,
 			Round:       roundProv,
+			Correlation: correlation,
 			ReservedFor: reservedFor,
 		}, nil
 	}
@@ -364,6 +380,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			Alignment:   alignment,
 			Recorded:    charged,
 			Round:       roundProv,
+			Correlation: correlation,
 		}, nil
 	}
 
@@ -378,6 +395,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			Alignment:   alignment,
 			Recorded:    charged,
 			Round:       roundProv,
+			Correlation: correlation,
 		}, nil
 	}
 	return store.ClaimRecord{}, fmt.Errorf("CDI device %q records no CPU placement", deviceName)
