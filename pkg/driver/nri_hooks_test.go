@@ -1131,6 +1131,10 @@ func (r reservationReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, erro
 
 func (r reservationReader) IsProjectedDeallocated(types.UID) bool { return false }
 
+func (r reservationReader) GetProjectedClaims() (*v1alpha1.ProjectedClaims, error) {
+	return &v1alpha1.ProjectedClaims{}, nil
+}
+
 // TestSynchronizeTakesTheReservationFromTheRecord pins B57's authority half. A
 // pod spec can put any claim UID in a DRA_CPUSET_* variable, and on a runtime
 // that reports no CDI devices that variable used to be what Synchronize rebuilt
