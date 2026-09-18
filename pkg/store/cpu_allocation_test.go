@@ -1301,3 +1301,82 @@ func TestClosureReservations(t *testing.T) {
 	store.ReleaseClosure(1)
 	require.True(t, store.ReservedClosures().IsEmpty())
 }
+
+func TestGetRequestAllocationUnionTakesOnlyTheRequestsNamed(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-1", ClaimRecord{Requests: []RequestAllocation{
+		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: RoleExclusive},
+		poolRequest("helpers", cpuset.New(6, 7)),
+	}}, false))
+
+	whole, err := store.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: "claim-1"})
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(0, 1, 6, 7), whole, "a container naming no request holds the claim whole")
+
+	vcpus, err := store.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: "claim-1", Request: "vcpus"})
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(0, 1), vcpus)
+
+	helpers, err := store.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: "claim-1", Request: "helpers"})
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(6, 7), helpers)
+
+	both, err := store.GetRequestAllocationUnion(
+		ClaimRequestRef{ClaimUID: "claim-1", Request: "vcpus"},
+		ClaimRequestRef{ClaimUID: "claim-1", Request: "helpers"},
+	)
+	require.NoError(t, err)
+	require.Equal(t, whole, both, "naming every request is naming the claim")
+
+	_, err = store.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: "claim-1", Request: "invented"})
+	require.Error(t, err, "a request the claim does not hold is refused, not answered with nothing")
+	_, err = store.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: "claim-2"})
+	require.Error(t, err)
+}
+
+// TestGetRequestOriginUnionLeavesAPoolShareWhereItIs: a rollback pins a
+// container back to where it was running, and only exclusive requests ever move.
+// Reading the origin of a pool share as anything but the pool would take a
+// container off CPUs its claim never left.
+func TestGetRequestOriginUnionLeavesAPoolShareWhereItIs(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-1", ClaimRecord{Requests: []RequestAllocation{
+		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: RoleExclusive},
+		poolRequest("helpers", cpuset.New(6, 7)),
+	}}, false))
+	require.NoError(t, store.BeginRebind(logger, "claim-1", cpuset.New(2, 3)))
+
+	vcpus, err := store.GetRequestOriginUnion(ClaimRequestRef{ClaimUID: "claim-1", Request: "vcpus"})
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(0, 1), vcpus, "the moving request came from its origin")
+
+	helpers, err := store.GetRequestOriginUnion(ClaimRequestRef{ClaimUID: "claim-1", Request: "helpers"})
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(6, 7), helpers, "the pool share never moved")
+
+	whole, err := store.GetRequestOriginUnion(ClaimRequestRef{ClaimUID: "claim-1"})
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(0, 1, 6, 7), whole)
+
+	current, err := store.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: "claim-1", Request: "vcpus"})
+	require.NoError(t, err)
+	require.Equal(t, cpuset.New(2, 3), current, "while the origin is where it came from, the allocation is the target")
+}
+
+func TestHoldsExclusiveCPUsOfOneRequest(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-1", ClaimRecord{Requests: []RequestAllocation{
+		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: RoleExclusive},
+		poolRequest("helpers", cpuset.New(6, 7)),
+	}}, false))
+
+	require.True(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-1"}))
+	require.True(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-1", Request: "vcpus"}))
+	require.False(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-1", Request: "helpers"}),
+		"a container holding only a share of a pool takes nothing away from anything else")
+	require.False(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-1", Request: "invented"}))
+	require.False(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-2"}))
+}

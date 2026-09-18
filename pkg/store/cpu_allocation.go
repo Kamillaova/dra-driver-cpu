@@ -58,6 +58,17 @@ func UnionOf(requests []RequestAllocation) cpuset.CPUSet {
 	return union
 }
 
+// ClaimRequestRef is what a container holds of one claim: one of its requests,
+// or with Request empty every request it has.
+//
+// Empty means everything for the same reason it does in a pod's own
+// resources.claims entry, which is where these come from: a container that names
+// no request is given the whole claim.
+type ClaimRequestRef struct {
+	ClaimUID types.UID
+	Request  string
+}
+
 // RoundProvenance records a defragmentation round in flight when the claim's
 // placement was written.
 type RoundProvenance struct {
@@ -466,6 +477,91 @@ func (s *CPUAllocation) GetResourceClaimOriginUnion(claimUIDs ...types.UID) (cpu
 		union = union.Union(allocation.cpus().Difference(allocation.exclusiveCPUs())).Union(allocation.originCPUs())
 	}
 	return union, nil
+}
+
+// GetRequestAllocationUnion returns the CPUs the named requests grant together,
+// which is what a container naming them is pinned to. A ref carrying no request
+// name takes the claim whole, so a container that names none is this same call.
+//
+// A request the claim does not hold is an error rather than an empty set. It is
+// either an environment value a pod spec forged or a record from a claim that
+// has since been prepared differently, and a container pinned to nothing is a
+// guaranteed workload running unconstrained.
+//
+// CCX-FORK: upstream has no request granularity; a claim is one cpuset.
+func (s *CPUAllocation) GetRequestAllocationUnion(refs ...ClaimRequestRef) (cpuset.CPUSet, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	union := cpuset.New()
+	for _, ref := range refs {
+		allocation, ok := s.claims[ref.ClaimUID]
+		if !ok {
+			return cpuset.New(), fmt.Errorf("claim %q is not prepared by this driver", ref.ClaimUID)
+		}
+		if ref.Request == "" {
+			union = union.Union(allocation.cpus())
+			continue
+		}
+		request, ok := allocation.byRequest[ref.Request]
+		if !ok {
+			return cpuset.New(), fmt.Errorf("claim %q holds no request %q", ref.ClaimUID, ref.Request)
+		}
+		union = union.Union(request.CPUs)
+	}
+	return union, nil
+}
+
+// GetRequestOriginUnion is GetRequestAllocationUnion as it was before the moves
+// in flight, which for a request that is not moving is what it holds now. Only
+// exclusive requests ever move, so a share of a pool reads the same either way.
+func (s *CPUAllocation) GetRequestOriginUnion(refs ...ClaimRequestRef) (cpuset.CPUSet, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	union := cpuset.New()
+	for _, ref := range refs {
+		allocation, ok := s.claims[ref.ClaimUID]
+		if !ok {
+			return cpuset.New(), fmt.Errorf("claim %q is not prepared by this driver", ref.ClaimUID)
+		}
+		if ref.Request == "" {
+			if allocation.rebindOrigin == nil {
+				union = union.Union(allocation.cpus())
+				continue
+			}
+			union = union.Union(allocation.cpus().Difference(allocation.exclusiveCPUs())).Union(allocation.originCPUs())
+			continue
+		}
+		request, ok := allocation.byRequest[ref.Request]
+		if !ok {
+			return cpuset.New(), fmt.Errorf("claim %q holds no request %q", ref.ClaimUID, ref.Request)
+		}
+		if origin, moving := allocation.rebindOrigin[ref.Request]; moving {
+			union = union.Union(origin)
+			continue
+		}
+		union = union.Union(request.CPUs)
+	}
+	return union, nil
+}
+
+// HoldsExclusiveCPUsOf reports whether the named requests were given CPUs of the
+// claim's own. It is what binds a claim to a container: a container holding only
+// a share of a pool takes nothing away from anything else, whatever the claim's
+// other requests hold.
+func (s *CPUAllocation) HoldsExclusiveCPUsOf(ref ClaimRequestRef) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocation, ok := s.claims[ref.ClaimUID]
+	if !ok {
+		return false
+	}
+	if ref.Request == "" {
+		return !allocation.exclusiveCPUs().IsEmpty()
+	}
+	request, ok := allocation.byRequest[ref.Request]
+	return ok && request.Role == RoleExclusive && !request.CPUs.IsEmpty()
 }
 
 // BeginRebind starts moving a prepared claim's exclusive CPUs onto target,
