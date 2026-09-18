@@ -1084,6 +1084,12 @@ func TestSynchronizeRestoresClaimReservationsForCreateContainer(t *testing.T) {
 		topology: deviceTopology{cpuTopology: topo},
 		metrics:  cpumetrics.Noop(),
 	}
+	// The reservation comes from the claim's own record, written at Prepare from
+	// its status.reservedFor, not from the container that names the claim.
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName("claim-A")] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive}},
+		ReservedFor: []types.UID{types.UID(pod.Uid)},
+	}
 	runtimeCtrs := []*api.Container{
 		{Id: "p1-guaranteed", PodSandboxId: pod.Id, Name: "guaranteed-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
 	}
@@ -1104,6 +1110,91 @@ func TestSynchronizeRestoresClaimReservationsForCreateContainer(t *testing.T) {
 
 	_, recorded = driver.claimTracker.ReservedFor("claim-never-seen", types.UID(pod.Uid))
 	require.False(t, recorded)
+}
+
+// TestSynchronizeTakesTheReservationFromTheRecord pins B57's authority half. A
+// pod spec can put any claim UID in a DRA_CPUSET_* variable, and on a runtime
+// that reports no CDI devices that variable used to be what Synchronize rebuilt
+// the reservation from, so a pod naming another pod's claim was recorded as its
+// consumer.
+func TestSynchronizeTakesTheReservationFromTheRecord(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range cpuset.New(0, 1, 2, 3).UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	victim := types.UID("pod-uid-victim")
+	forger := &api.PodSandbox{Id: "pod-id-forger", Name: "forger", Namespace: "ns", Uid: "pod-uid-forger"}
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+			"claim-A": cpuset.New(0, 1),
+		}),
+		topology: deviceTopology{cpuTopology: topo},
+		metrics:  cpumetrics.Noop(),
+	}
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName("claim-A")] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive}},
+		ReservedFor: []types.UID{victim},
+	}
+
+	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{forger}, []*api.Container{
+		{Id: "forging-ctr", PodSandboxId: forger.Id, Name: "forging-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+	})
+	require.NoError(t, err)
+
+	reserved, recorded := driver.claimTracker.ReservedFor("claim-A", types.UID(forger.Uid))
+	require.True(t, recorded, "the claim's reservation is known, so the fallback has an answer")
+	require.False(t, reserved, "the container named the claim; the claim did not name the pod")
+
+	reserved, _ = driver.claimTracker.ReservedFor("claim-A", victim)
+	require.True(t, reserved, "the pod the claim itself names keeps its reservation")
+}
+
+// TestSynchronizeKeepsEveryPodOfAPoolClaimsReservation pins B57's cardinality
+// half: a pool claim is legitimately held by several pods, and rebuilding the
+// reservation one container at a time kept only the last of them, refusing the
+// others' containers after a restart.
+func TestSynchronizeKeepsEveryPodOfAPoolClaimsReservation(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range cpuset.New(0, 1, 2, 3).UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	pod1 := &api.PodSandbox{Id: "pod-id-1", Name: "pod-1", Namespace: "ns", Uid: "pod-uid-1"}
+	pod2 := &api.PodSandbox{Id: "pod-id-2", Name: "pod-2", Namespace: "ns", Uid: "pod-uid-2"}
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+			"claim-pool": cpuset.New(2, 3),
+		}),
+		topology: deviceTopology{cpuTopology: topo},
+		metrics:  cpumetrics.Noop(),
+	}
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName("claim-pool")] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.RoleShared}},
+		ReservedFor: []types.UID{types.UID(pod1.Uid), types.UID(pod2.Uid)},
+	}
+
+	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod1, pod2}, []*api.Container{
+		{Id: "ctr-1", PodSandboxId: pod1.Id, Name: "ctr-1", Env: []string{fmt.Sprintf("%s_claim-pool=%s", cdiEnvVarPrefix, "2,3")}},
+		{Id: "ctr-2", PodSandboxId: pod2.Id, Name: "ctr-2", Env: []string{fmt.Sprintf("%s_claim-pool=%s", cdiEnvVarPrefix, "2,3")}},
+	})
+	require.NoError(t, err)
+
+	for _, podUID := range []types.UID{types.UID(pod1.Uid), types.UID(pod2.Uid)} {
+		reserved, recorded := driver.claimTracker.ReservedFor("claim-pool", podUID)
+		require.True(t, recorded)
+		require.True(t, reserved, "both pods the claim names keep their reservation")
+	}
 }
 
 func TestSynchronizeDoesNotReserveForAContainerThatLosesTheOwnershipRace(t *testing.T) {
@@ -1128,6 +1219,10 @@ func TestSynchronizeDoesNotReserveForAContainerThatLosesTheOwnershipRace(t *test
 		topology: deviceTopology{cpuTopology: topo},
 		metrics:  cpumetrics.Noop(),
 	}
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName("claim-A")] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive}},
+		ReservedFor: []types.UID{types.UID(pod1.Uid)},
+	}
 	runtimeCtrs := []*api.Container{
 		{Id: "p1-first-owner", PodSandboxId: pod1.Id, Name: "first-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
 		{Id: "p2-second-owner", PodSandboxId: pod2.Id, Name: "second-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
@@ -1140,10 +1235,9 @@ func TestSynchronizeDoesNotReserveForAContainerThatLosesTheOwnershipRace(t *test
 	require.True(t, recorded)
 	require.True(t, reserved)
 
-	// pod2's container named the same claim but lost the ownership race, so it
-	// must not be credited as a reserved consumer -- or a runtime that reports
-	// no CDI devices at all would let it authenticate against a claim it never
-	// legitimately held.
+	// pod2's container named the same claim, and the claim's own reservation does
+	// not name pod2 -- so a runtime that reports no CDI devices at all cannot let
+	// it authenticate against a claim it never legitimately held.
 	reserved, recorded = driver.claimTracker.ReservedFor("claim-A", types.UID(pod2.Uid))
 	require.True(t, recorded)
 	require.False(t, reserved)
@@ -1392,7 +1486,10 @@ func TestSynchronizeRecordsAReservationForAClaimHoldingNoExclusiveCPUs(t *testin
 	}
 	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
 		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "2-3"),
-		store.ClaimRecord{Requests: []store.RequestAllocation{{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")}}}))
+		store.ClaimRecord{
+			Requests:    []store.RequestAllocation{{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")}},
+			ReservedFor: []types.UID{"pod-uid-1"},
+		}))
 
 	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
 	ctr := &api.Container{
