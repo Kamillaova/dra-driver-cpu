@@ -73,12 +73,29 @@ CPU units, down to a tenth of a CPU:
 ```
 
 The pool request can sit in the same claim as an exclusive request or in a claim of its own. A
-container runs on the union of every claim it holds either way, and it tells the two sets apart from
-the per-request metadata file described below. What the shape does decide is which containers share
-CPUs: the claim is the unit a container holds, so a container that names only one request of a claim
-still runs on all of that claim's CPUs. Where two containers of a pod must stay apart, give each set
-its own claim. A request that names no amount takes the smallest share rather than the whole pool,
-so a template that forgets the capacity cannot swallow what everything else is meant to share.
+container runs on the union of what it holds either way, and it tells the two sets apart from the
+per-request metadata file described below. What a container holds is what it names: a pod's
+`resources.claims` entry carries a request beside the claim name, and a container naming one request
+runs on that request's CPUs alone, while a container naming the claim and no request runs on all of
+them. So two containers of one pod can share a claim and still stay apart, one on the exclusive
+cores and the other on the pool:
+
+```yaml
+      containers:
+        - name: vm
+          resources:
+            claims:
+              - name: cpus
+                request: vcpus
+        - name: helper
+          resources:
+            claims:
+              - name: cpus
+                request: helpers
+```
+
+A request that names no amount takes the smallest share rather than the whole pool, so a template
+that forgets the capacity cannot swallow what everything else is meant to share.
 
 A pool's CPUs never move, so the driver names them in that request's device metadata file, mounted at
 `/var/run/kubernetes.io/dra-device-attributes/resourceclaims/<claim>/<request>/dra.cpu-metadata.json`

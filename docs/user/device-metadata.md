@@ -14,10 +14,12 @@ go in it.
 /var/run/kubernetes.io/dra-device-attributes/resourceclaims/{claimName}/{requestName}/dra.cpu-metadata.json
 ```
 
-One file per request of the claim, mounted read-only, and only into the containers that hold the
-claim, init containers included: a container that holds the claim can render a configuration from
-this file before the workload it prepares starts. The last segment carries the driver's name, so two
-drivers serving one request do not collide.
+One file per request of the claim, mounted read-only, and only into the containers that hold that
+request, init containers included: a container that holds it can render a configuration from this
+file before the workload it prepares starts. A container whose `resources.claims` entry names a
+`request` is given that request's file and runs on that request's CPUs; one that names no request is
+given them all. The last segment carries the driver's name, so two drivers serving one request do
+not collide.
 
 A claim generated from a ResourceClaimTemplate is not named in the pod spec at all — its name is
 generated — so its files sit under a different subdirectory, and the segment is the `podClaimName`,
