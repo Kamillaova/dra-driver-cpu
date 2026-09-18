@@ -107,7 +107,11 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `cdiAlignmentAnnotation`, `cdiRecordedAnnotation`, `cdiRoundIDAnnotation`, `cdiRoundOriginAnnotation`,
   `cdiRoundTargetAnnotation`, `cdiRoundPartnersAnnotation`, `cdiCorrelationAnnotation`, `cdiEnvDynamicValue`,
   `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`, `decodePlacements`,
-  `decodeRecordedDevices`, `decodeRoundPartners`, `recordableRole`
+  `decodeRecordedDevices`, `decodeRoundPartners`, `recordableRole`, `PreparedClaimAllocations`
+
+- `cmd/dracpu/app.go`: `waitForShutdown`
+
+- `pkg/cpuinfo/cpuinfo.go`: `OnlineCPUs`
 
 - `pkg/driver/driver.go`: the `applyMu`, `defrag`, `sysfs`, `pendingRounds`, `activeExactPlans`,
   `defragRetries`, `defragRetryDue`, `defragBatchInFlight`, `cgroupfs`, `poisonedNodes`,
@@ -115,23 +119,25 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `claimReader`, `namespace`, `placementWriters`, `placementWritersMu`, `placementPolicy` and
   `makeRoomTargets` fields, `makeRoomTarget`, `deviceTopology.deviceIsPool`,
   `deviceTopology.deviceNameToPartition`, `deviceTopology.deviceNameToUncoreCacheID`,
-  `devicePartition`, `Providers.CgroupFS` and `EnsureCgroupFS`, and `Config.DefragEnabled`,
-  `Config.DefragAllowTransientOverlap` and `Config.Namespace`
+  `devicePartition`, `Providers.CgroupFS` and `EnsureCgroupFS`, `seedAllocationStoreFromDisk`,
+  `promiseObligation`, and `Config.DefragEnabled`, `Config.DefragAllowTransientOverlap` and
+  `Config.Namespace`
 
 - `api`: `ClaimPlacement`, `ClaimConfig`, `parseV1Alpha1`; `v1alpha1.Alignment` with its two values,
-  the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields, `ProjectedClaim.OffersSplitAlternatives`,
-  `ProjectedClaim.Shape` and `ProjectedClaim.IsNeverSplit`
+  the `CPUConfig.Relocatable` and `CPUConfig.Alignment` fields, `v1alpha1.ClaimPlacementStatus`,
+  `ProjectedClaim.OffersSplitAlternatives`, `ProjectedClaim.Shape` and `ProjectedClaim.IsNeverSplit`
 
 - `pkg/driver/dra_hooks.go`: `cdiEnvValue`, `prepareClaim`, `claimConfig`, `claimOffersSplitAlternatives`,
   `requestCPUsAreFixed`, `requestAllocations`, `addRequestCPUs`, `recordedDevices`,
   `recordedDeviceFull`, `recordClaimEvent`, `recordClaimEventRef`, `ensureMakeRoomTarget`, `secureRepairWitness`, `releaseActiveExactPlanAndClosure`,
   `buildClaimCorrelation`, `admissionEventMessage`, `claimNameAndNamespace`,
+  `claimUIDFromDeviceName`, `placedCPUs`, `refreshMirrorMetrics`, `refreshObligationMetrics`,
   `publishResources`, `republishStaleSlices`, `rehomeCandidate`, `rehomeShare`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses, and the
   namespace lookup from POD_NAMESPACE
 
-- `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
+- `pkg/driver/nri_hooks.go`: `draEnvEntry`, `parseDRAEnv`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
   `containerClassification`, `classifyContainer`, `reconcileActiveRounds`, `revertRoundOrigin`,
   `nonExclusiveCPUs`, `cpusetUpdate`, `observedContainer`, `reportForeignCPUs`,
   `allocatedClaimsByUID`, `restoreUnstartedClaims`, `recordedReservation`
@@ -139,7 +145,9 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/poison.go`: `poisonNUMANodeForCPUs`
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
-  `RoundProvenance`, `ClaimCorrelation`, `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
+  `RoundProvenance`, `ClaimCorrelation`, `claimAllocation` and `newClaimAllocation` with its `cpus`,
+  `equals`, `exclusiveByRequest`, `exclusiveCPUs`, `exclusiveOverlap`, `exclusiveRequestNames`,
+  `originCPUs`, `placeExclusive` and `restoreExclusive` methods, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
   `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
   `GetClaimRecord`, `SetClaimCorrelation`, `UpdateClaimRuntimeOutcome`, `SetRecordedDevices`, `IsRelocatable`, `IsRepairable`, `Alignment`, `ReserveClosure`,
@@ -156,11 +164,12 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `internal/driverconfig`: `DefragEnabled`, `DefragAllowTransientOverlap`, `ServePlacements` and
   `validateDefrag`; `CachePlacementStrategy` and `validateCachePlacementStrategy`; the `Profiles` map,
-  `Profile`, `ProfileLabel`, `DefaultProfileName`, `WithProfile`, `asProfile`, `validateProfiles` and
-  `WarnDeprecatedCPUFields`
+  `Profile` with its `String` method, `ProfileLabel`, `DefaultProfileName`, `WithProfile`, `asProfile`,
+  `validateProfiles`, `listItemSchemas` and `WarnDeprecatedCPUFields`
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods,
   `SetFlooredCapacityDevices`, `RecordPrepareNoRoom`, `RecordPrepareNoWitness`,
+  `RecordSynchronizeSkippedClaim`, the `newCounter` and `newGaugeVec` constructors,
   `RecordSynchronizeForeignCPUs`, `RecordSliceHandoff` with `HandoffAccepted` and `HandoffRefused`,
   promise accounting, slice write amplification and downgrade gate methods, and the collectors behind
   them
