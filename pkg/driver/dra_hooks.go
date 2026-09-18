@@ -474,6 +474,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(logger logr.Logger, claim *reso
 		Requests:    requestAllocations(byRequest),
 		Relocatable: placement.Relocatable,
 		Recorded:    cp.recordedDevices(claim),
+		ReservedFor: reservedForPodUIDs(claim),
 	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
@@ -577,7 +578,11 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 		}
 	}
 
-	record := store.ClaimRecord{Requests: requestAllocations(byRequest), Relocatable: placement.Relocatable}
+	record := store.ClaimRecord{
+		Requests:    requestAllocations(byRequest),
+		Relocatable: placement.Relocatable,
+		ReservedFor: reservedForPodUIDs(claim),
+	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
