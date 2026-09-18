@@ -108,7 +108,7 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   namespace lookup from POD_NAMESPACE
 
 - `pkg/driver/nri_hooks.go`: `draEnvEntry`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
-  `recordedReservation`
+  `restoreUnstartedClaims`, `recordedReservation`
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
   `claimAllocation` and `newClaimAllocation`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
