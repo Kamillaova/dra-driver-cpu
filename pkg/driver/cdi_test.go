@@ -337,6 +337,33 @@ func TestGetDeviceAllocationsRoundTripsAPoolRequest(t *testing.T) {
 	require.Equal(t, record.Requests, got.Requests)
 }
 
+func TestGetDeviceAllocationsRoundTripsTheReservation(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-reserved"
+	record := store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive}},
+		ReservedFor: []types.UID{"pod-uid-a", "pod-uid-b"},
+	}
+	require.NoError(t, mgr.AddDevice(logger, deviceName, "DRA_CPUSET_claim-reserved=0-1", record))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, record.ReservedFor, got.ReservedFor)
+
+	// A spec written before the driver recorded reservations reads back as
+	// unknown rather than as an empty reservation.
+	plain := store.ClaimRecord{Requests: record.Requests}
+	require.NoError(t, mgr.AddDevice(logger, "claim-plain", "DRA_CPUSET_claim-plain=0-1", plain))
+	require.NoError(t, mgr.Refresh())
+	got, err = mgr.GetDeviceAllocations("claim-plain")
+	require.NoError(t, err)
+	require.Empty(t, got.ReservedFor)
+}
+
 func TestGetDeviceAllocationsFallsBackToEnv(t *testing.T) {
 	logger := testr.New(t)
 	tempCDIDir := t.TempDir()

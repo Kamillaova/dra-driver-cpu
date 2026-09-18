@@ -74,6 +74,10 @@ type ClaimRecord struct {
 	// is empty for a claim that was given no CPUs of its own, and for one whose
 	// record on disk was written before the driver kept this.
 	Recorded map[string]int
+	// ReservedFor is the pod UIDs the claim's own status.reservedFor named when
+	// the driver prepared it. It is the API server's record of who may hold the
+	// claim, which a pod spec cannot forge the way it can a DRA_CPUSET_* value.
+	ReservedFor []types.UID
 }
 
 // CPUAllocation is the single source of truth for CPU allocations.
@@ -106,7 +110,8 @@ type claimAllocation struct {
 	swapGroup   int
 	relocatable bool
 	// recorded is what the claim's allocation charged each device it names.
-	recorded map[string]int
+	recorded    map[string]int
+	reservedFor []types.UID
 }
 
 func newClaimAllocation(record ClaimRecord) *claimAllocation {
@@ -118,6 +123,7 @@ func newClaimAllocation(record ClaimRecord) *claimAllocation {
 		byRequest:   byRequest,
 		relocatable: record.Relocatable,
 		recorded:    maps.Clone(record.Recorded),
+		reservedFor: slices.Clone(record.ReservedFor),
 	}
 }
 
@@ -666,6 +672,7 @@ func (s *CPUAllocation) GetClaimRecord(claimUID types.UID) (ClaimRecord, bool) {
 		Requests:    allocation.requests(),
 		Relocatable: allocation.relocatable,
 		Recorded:    maps.Clone(allocation.recorded),
+		ReservedFor: slices.Clone(allocation.reservedFor),
 	}, true
 }
 

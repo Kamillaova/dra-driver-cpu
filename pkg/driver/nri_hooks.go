@@ -115,6 +115,18 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					continue
 				}
 				cp.checkClaimPartition(caLogger, desired)
+				// CCX-FORK: the claim's own reservation, recorded at Prepare and
+				// read back from the spec the driver wrote. A pod spec can name
+				// any claim UID in a DRA_CPUSET_* variable, so the container is
+				// not a source for who may hold the claim; CreateContainer's
+				// CRI-O fallback checks this, and it must not be forgeable.
+				//
+				// A spec written before the driver recorded it leaves the
+				// reservation unknown, which that fallback refuses. The
+				// projection cannot stand in: it carries no reservation.
+				if len(recorded.ReservedFor) > 0 {
+					claimTracker.SetReservedFor(uid, recorded.ReservedFor)
+				}
 				claimUIDs = append(claimUIDs, uid)
 			}
 
@@ -129,15 +141,6 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					claimUIDs = nil
 				}
 			}
-			// This container is exactly as trustworthy a source as a fresh
-			// Prepare: CreateContainer's CRI-O fallback reads this to
-			// authenticate a container recreated after this driver restarts, on
-			// a runtime that never reports CDI devices. Every claim it holds
-			// needs one, ownership or not, since that fallback checks them all.
-			for _, uid := range claimUIDs {
-				claimTracker.SetReservedFor(uid, []types.UID{types.UID(pod.Uid)})
-			}
-
 			var state *store.ContainerState
 			if len(claimUIDs) == 0 {
 				state = store.NewContainerState(container.GetName(), containerUID).WithCgroup(container.GetLinux().GetCgroupsPath())
