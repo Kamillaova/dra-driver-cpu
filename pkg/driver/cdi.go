@@ -66,6 +66,12 @@ const (
 	// before the driver recorded it.
 	cdiRelocatableAnnotation = "dra.cpu/relocatable"
 
+	// cdiReservedForAnnotation records the pod UIDs the claim's own
+	// status.reservedFor named at Prepare. After a restart the driver has no
+	// claim objects, and this is where a container's right to the claim is
+	// checked from on a runtime that reports no CDI devices of its own.
+	cdiReservedForAnnotation = "dra.cpu/reserved-for"
+
 	// cdiEnvDynamicValue stands in for a cpuset in the injected variable when a
 	// claim's placement may change while its container runs.
 	//
@@ -134,6 +140,13 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 	annotations := map[string]string{
 		cdiPlacementsAnnotation:  placements,
 		cdiRelocatableAnnotation: strconv.FormatBool(record.Relocatable),
+	}
+	if len(record.ReservedFor) > 0 {
+		reservedFor, err := json.Marshal(record.ReservedFor)
+		if err != nil {
+			return fmt.Errorf("failed to record the reservation of CDI device %q: %w", deviceName, err)
+		}
+		annotations[cdiReservedForAnnotation] = string(reservedFor)
 	}
 	// A claim that charged nothing writes no annotation, so a spec is not made to
 	// carry the word for an empty answer. It reads back the same as one written
@@ -255,12 +268,19 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			cdiRecordedAnnotation, device.Annotations[cdiRecordedAnnotation], deviceName, err)
 	}
 
+	var reservedFor []types.UID
+	if reservedStr, ok := device.Annotations[cdiReservedForAnnotation]; ok && reservedStr != "" {
+		if err := json.Unmarshal([]byte(reservedStr), &reservedFor); err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiReservedForAnnotation, reservedStr, deviceName, err)
+		}
+	}
+
 	if recorded, ok := device.Annotations[cdiPlacementsAnnotation]; ok {
 		requests, err := decodePlacements(recorded)
 		if err != nil {
 			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiPlacementsAnnotation, recorded, deviceName, err)
 		}
-		return store.ClaimRecord{Requests: requests, Relocatable: relocatable, Recorded: charged}, nil
+		return store.ClaimRecord{Requests: requests, Relocatable: relocatable, Recorded: charged, ReservedFor: reservedFor}, nil
 	}
 
 	if recorded, ok := device.Annotations[cdiCPUSetAnnotation]; ok {
