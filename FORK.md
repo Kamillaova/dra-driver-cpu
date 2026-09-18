@@ -107,7 +107,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `cdiAlignmentAnnotation`, `cdiRecordedAnnotation`, `cdiRoundIDAnnotation`, `cdiRoundOriginAnnotation`,
   `cdiRoundTargetAnnotation`, `cdiRoundPartnersAnnotation`, `cdiCorrelationAnnotation`, `cdiEnvDynamicValue`,
   `GetDeviceAllocations`, `cdiRequestPlacement`, `encodePlacements`, `decodePlacements`,
-  `decodeRecordedDevices`, `decodeRoundPartners`, `recordableRole`, `PreparedClaimAllocations`
+  `decodeRecordedDevices`, `decodeRoundPartners`, `recordableRole`, `PreparedClaimAllocations`,
+  `AddRequestDevice`, `RemoveClaimDevices`
 
 - `cmd/dracpu/app.go`: `waitForShutdown`
 
@@ -132,15 +133,17 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `recordedDeviceFull`, `recordClaimEvent`, `recordClaimEventRef`, `ensureMakeRoomTarget`, `secureRepairWitness`, `releaseActiveExactPlanAndClosure`,
   `buildClaimCorrelation`, `admissionEventMessage`, `claimNameAndNamespace`,
   `claimUIDFromDeviceName`, `placedCPUs`, `refreshMirrorMetrics`, `refreshObligationMetrics`,
-  `publishResources`, `republishStaleSlices`, `rehomeCandidate`, `rehomeShare`
+  `publishResources`, `republishStaleSlices`, `rehomeCandidate`, `rehomeShare`,
+  `getCDIRequestDeviceName`, `claimRequestFromDeviceName`, `prepareRequestDevices`, `cdiRequestEnvValue`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses, and the
   namespace lookup from POD_NAMESPACE
 
-- `pkg/driver/nri_hooks.go`: `draEnvEntry`, `parseDRAEnv`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
+- `pkg/driver/nri_hooks.go`: `draEnvEntry` and its `ref` method, `parseDRAEnv`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
   `containerClassification`, `classifyContainer`, `reconcileActiveRounds`, `revertRoundOrigin`,
   `nonExclusiveCPUs`, `cpusetUpdate`, `observedContainer`, `reportForeignCPUs`,
-  `allocatedClaimsByUID`, `restoreUnstartedClaims`, `recordedReservation`
+  `allocatedClaimsByUID`, `restoreUnstartedClaims`, `recordedReservation`, `roundOriginByRequest`,
+  `roundCPUsOf`, `requestOf`
 
 - `pkg/driver/poison.go`: `poisonNUMANodeForCPUs`
 
@@ -149,15 +152,16 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `equals`, `exclusiveByRequest`, `exclusiveCPUs`, `exclusiveOverlap`, `exclusiveRequestNames`,
   `originCPUs`, `placeExclusive` and `restoreExclusive` methods, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
-  `GetRebindOrigin`, `GetResourceClaimAllocationUnion`, `GetResourceClaimOriginUnion`, `ClaimRecord`,
+  `GetRebindOrigin`, `ClaimRequestRef`, `GetRequestAllocationUnion`, `GetRequestOriginUnion`, `ClaimRecord`,
   `GetClaimRecord`, `SetClaimCorrelation`, `UpdateClaimRuntimeOutcome`, `SetRecordedDevices`, `IsRelocatable`, `IsRepairable`, `Alignment`, `ReserveClosure`,
-  `ReleaseClosure`, `ReservedClosures`, `ReservedClosure`, `HoldsExclusiveCPUs`,
+  `ReleaseClosure`, `ReservedClosures`, `ReservedClosure`, `HoldsExclusiveCPUsOf`,
   `ExclusiveClaimAllocations`, `ClaimHolding` and `ClaimHoldings`, `SetClaimlessCPUs` and `claimlessPoolLocked`
 
 - `pkg/store/claim_tracker.go`: `Owner`
 
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`,
-  `ContainerState.WithCgroup`, `ContainerState.CgroupPath`
+  `ContainerState.WithCgroup`, `ContainerState.CgroupPath`, `ContainerState.WithClaimRequests`,
+  `ContainerState.ClaimRequests`
 
 - `go.mod`: the `require` and `replace` of the nested `api` module, which upstream builds as part of
   the root module

@@ -48,6 +48,7 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceclaim"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/utils/cpuset"
@@ -169,6 +170,43 @@ func (m *mockCdiMgr) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		return store.ClaimRecord{Requests: []store.RequestAllocation{{CPUs: cpus, Role: store.RoleExclusive}}}, nil
 	}
 	return store.ClaimRecord{}, fmt.Errorf("device %q records no placement", deviceName)
+}
+
+// AddRequestDevice records the env edit and no placement, as the real manager
+// does: a request's device carries the variable alone, and the claim's record
+// stays on the claim's own device.
+func (m *mockCdiMgr) AddRequestDevice(_ logr.Logger, deviceName string, envVar string) error {
+	if m.addError != nil {
+		return m.addError
+	}
+	m.devices[deviceName] = envVar
+	return nil
+}
+
+// RemoveClaimDevices removes what is on disk for a claim, found by name, the way
+// the real manager finds it in the CDI cache rather than by asking the store.
+func (m *mockCdiMgr) RemoveClaimDevices(logger logr.Logger, claimUID types.UID) error {
+	for deviceName := range m.devices {
+		uid, request, ok := claimRequestFromDeviceName(deviceName)
+		if !ok || uid != claimUID || request == "" {
+			continue
+		}
+		if err := m.RemoveDevice(logger, deviceName); err != nil {
+			return err
+		}
+	}
+	return m.RemoveDevice(logger, getCDIDeviceName(claimUID))
+}
+
+// expectedCDIDeviceID is the device a prepared result points the kubelet at: the
+// request's own where the result names a request, and the claim's record device
+// where it names none, which is all a record without request names can offer.
+func expectedCDIDeviceID(claimUID types.UID, request string) string {
+	name := getCDIDeviceName(claimUID)
+	if request != "" {
+		name = getCDIRequestDeviceName(claimUID, resourceclaim.BaseRequestRef(request))
+	}
+	return cdiparser.QualifiedName(cdiVendor, cdiClass, name)
 }
 
 func (m *mockCdiMgr) Refresh() error {
@@ -670,7 +708,15 @@ func TestPrepareResourceClaimsSucceedsBeforePublishResources(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, preparedClaims[claimUID].Err)
 			require.NotEmpty(t, preparedClaims[claimUID].Devices)
-			require.Len(t, mockCdiMgr.devices, 1)
+			expectedDevices := 1
+			if record, ok := driver.cpuAllocationStore.GetClaimRecord(claimUID); ok {
+				for _, request := range record.Requests {
+					if request.Request != "" {
+						expectedDevices++
+					}
+				}
+			}
+			require.Len(t, mockCdiMgr.devices, expectedDevices, "the claim's record device and one per named request")
 
 			_, ok := driver.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
 			require.True(t, ok)
@@ -1148,8 +1194,6 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 
 	claimUID := types.UID("claim-1")
 	cdiDeviceName := getCDIDeviceName(claimUID)
-	cdiQualifiedName := cdiparser.QualifiedName(cdiVendor, cdiClass, cdiDeviceName)
-
 	testCases := []struct {
 		name                    string
 		cpuInfos                []cpuinfo.CPUInfo
@@ -1430,7 +1474,7 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 							expectedPreparedDevices = append(expectedPreparedDevices, kubeletplugin.Device{
 								PoolName:     res.Pool,
 								DeviceName:   res.Device,
-								CDIDeviceIDs: []string{cdiQualifiedName},
+								CDIDeviceIDs: []string{expectedCDIDeviceID(claimUID, res.Request)},
 								Requests:     []string{res.Request},
 								Metadata:     expectedGroupMetadata(tc.groupBy, tc.cpuInfos, tc.reservedCPUs, res.Device, allocatedCPUs, cpusByRequest[res.Request]),
 							})
@@ -1455,7 +1499,14 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 					}
 					require.True(t, actualCPUSet.Equals(tc.expectedCPUSet), "Expected CPUSet %s, but got %s for test case %s", tc.expectedCPUSet.String(), actualCPUSet.String(), tc.name)
 					if tc.expectedCPUSet.Size() > 0 {
-						require.Equal(t, 1, len(mockCdiMgr.devices), "Expected 1 CDI device to be created")
+						// The claim's own record device, and one per named request.
+						expectedDevices := 1
+						for name := range cpusByRequest {
+							if name != "" {
+								expectedDevices++
+							}
+						}
+						require.Equal(t, expectedDevices, len(mockCdiMgr.devices), "Expected the claim's record device and one per named request")
 					} else {
 						require.Equal(t, 0, len(mockCdiMgr.devices), "Expected 0 CDI devices to be created")
 					}

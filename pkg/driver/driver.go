@@ -78,6 +78,9 @@ type KubeletPlugin interface {
 
 type cdiManager interface {
 	AddDevice(logger logr.Logger, deviceName string, envVar string, record store.ClaimRecord) error
+	// CCX-FORK: added; one device per request of a claim, which is what a
+	// container naming one request is given.
+	AddRequestDevice(logger logr.Logger, deviceName string, envVar string) error
 	Refresh() error
 	GetDeviceEnv(deviceName string) ([]string, error)
 	// CCX-FORK: added; GetDeviceEnv is upstream's and now unused by the driver.
@@ -85,6 +88,8 @@ type cdiManager interface {
 	// CCX-FORK: added, seeds the allocation store from disk before Start registers with the kubelet.
 	PreparedClaimAllocations(logger logr.Logger) map[types.UID]store.ClaimRecord
 	RemoveDevice(logger logr.Logger, deviceName string) error
+	// CCX-FORK: added; removes a claim's per-request devices with its record.
+	RemoveClaimDevices(logger logr.Logger, claimUID types.UID) error
 }
 
 // CPUInfoProvider is an interface for getting CPU information.

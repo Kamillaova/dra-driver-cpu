@@ -128,9 +128,9 @@ type defragRound struct {
 	// updateByContainer is this round's own update for each container it touches,
 	// so a retry sends what the driver sent rather than what the runtime echoed.
 	updateByContainer map[types.UID]*api.ContainerUpdate
-	// claimsByContainer is every claim each of those containers holds, which is
-	// what a rollback has to pin it back to.
-	claimsByContainer map[types.UID][]types.UID
+	// claimsByContainer is every claim each of those containers holds, request by
+	// request, which is what a rollback has to pin it back to.
+	claimsByContainer map[types.UID][]store.ClaimRequestRef
 	// outcomes is what became of each exchange. An exchange missing from it, or
 	// recorded as unsettled, is one the round cannot close.
 	outcomes map[int]exchangeOutcome
@@ -149,7 +149,7 @@ func newDefragRound(scope defragScope, allocations *store.CPUAllocation) *defrag
 		scope:              scope,
 		exchangeContainers: map[int][]types.UID{},
 		updateByContainer:  map[types.UID]*api.ContainerUpdate{},
-		claimsByContainer:  map[types.UID][]types.UID{},
+		claimsByContainer:  map[types.UID][]store.ClaimRequestRef{},
 		outcomes:           map[int]exchangeOutcome{},
 		store:              allocations,
 	}
@@ -470,11 +470,11 @@ func (cp *CPUDriver) settleExchanges(logger logr.Logger, round *defragRound, fai
 // Called with applyMu released: the two stores it reads take their own locks, and
 // the answer is a snapshot either way.
 func (cp *CPUDriver) containerIsCurrent(round *defragRound, containerUID types.UID) bool {
-	claimUIDs := round.claimsByContainer[containerUID]
-	if len(claimUIDs) == 0 {
+	refs := round.claimsByContainer[containerUID]
+	if len(refs) == 0 {
 		return false
 	}
-	owners, ok := cp.claimTracker.Owners(claimUIDs[0])
+	owners, ok := cp.claimTracker.Owners(refs[0].ClaimUID)
 	if !ok {
 		return false
 	}
@@ -531,7 +531,7 @@ func (cp *CPUDriver) rollbackUpdates(round *defragRound, exchange int, notApplie
 		if _, refused := notApplied[containerUID]; refused {
 			continue
 		}
-		cpus, err := round.store.GetResourceClaimOriginUnion(round.claimsByContainer[containerUID]...)
+		cpus, err := round.store.GetRequestOriginUnion(round.claimsByContainer[containerUID]...)
 		if err != nil {
 			return nil, fmt.Errorf("cannot determine the CPUs container %q came from: %w", containerUID, err)
 		}
@@ -1242,6 +1242,11 @@ func claimMovableIn(allocations *store.CPUAllocation, claimUID types.UID) bool {
 // rebuilding it is exact -- and reading it would mean querying the CDI cache,
 // which only learns of a spec when it is refreshed and so cannot be relied on to
 // know about a claim this driver prepared itself.
+//
+// The claim's per-request devices are left alone, because a move cannot change
+// what they say: only a relocatable claim is ever moved, and every variable a
+// relocatable claim injects for an exclusive request already says dynamic, while
+// a share of a pool keeps the CPUs it names wherever the claim's own go.
 func (cp *CPUDriver) writeClaimPlacement(logger logr.Logger, claimUID types.UID) error {
 	return cp.writeClaimPlacementWithRound(logger, claimUID, nil)
 }
@@ -1288,9 +1293,9 @@ func (cp *CPUDriver) roundUpdates(logger logr.Logger, round *defragRound) error 
 			}
 
 			// A container holding several claims must be pinned to all of them at
-			// once, moved or not.
-			claimUIDs := state.ClaimUIDs()
-			cpus, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
+			// once, moved or not, and to the requests of them it was given.
+			refs := state.ClaimRequests()
+			cpus, err := cp.cpuAllocationStore.GetRequestAllocationUnion(refs...)
 			if err != nil {
 				return fmt.Errorf("cannot determine CPUs for container %q: %w", containerUID, err)
 			}
@@ -1298,7 +1303,7 @@ func (cp *CPUDriver) roundUpdates(logger logr.Logger, round *defragRound) error 
 			update.SetLinuxCPUSetCPUs(cpus.String())
 			round.updates = append(round.updates, update)
 			round.updateByContainer[containerUID] = update
-			round.claimsByContainer[containerUID] = claimUIDs
+			round.claimsByContainer[containerUID] = refs
 		}
 	}
 

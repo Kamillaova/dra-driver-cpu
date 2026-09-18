@@ -349,52 +349,6 @@ func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claim
 	return nil
 }
 
-// GetResourceClaimAllocationUnion returns the union of the prepared cpusets of
-// the given claims, failing if any of them is not prepared by this driver.
-//
-// CCX-FORK: replaces upstream's ValidateResourceClaimAllocations, which compared
-// the store against caller-supplied cpusets instead of supplying them.
-func (s *CPUAllocation) GetResourceClaimAllocationUnion(claimUIDs ...types.UID) (cpuset.CPUSet, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	union := cpuset.New()
-	for _, claimUID := range claimUIDs {
-		allocation, ok := s.claims[claimUID]
-		if !ok {
-			return cpuset.New(), fmt.Errorf("claim %q is not prepared by this driver", claimUID)
-		}
-		union = union.Union(allocation.cpus())
-	}
-	return union, nil
-}
-
-// GetResourceClaimOriginUnion returns the union of the given claims' CPUs as
-// they were before the moves in flight, which for a claim that is not moving is
-// simply what it holds. It is what a container has to be pinned back to when a
-// move it took part in has to be undone, and it stays available for as long as
-// the move is in flight, since a mover never releases what it came from.
-//
-// CCX-FORK: upstream has no move, so a claim's CPUs have only one value.
-func (s *CPUAllocation) GetResourceClaimOriginUnion(claimUIDs ...types.UID) (cpuset.CPUSet, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	union := cpuset.New()
-	for _, claimUID := range claimUIDs {
-		allocation, ok := s.claims[claimUID]
-		if !ok {
-			return cpuset.New(), fmt.Errorf("claim %q is not prepared by this driver", claimUID)
-		}
-		if allocation.rebindOrigin == nil {
-			union = union.Union(allocation.cpus())
-			continue
-		}
-		union = union.Union(allocation.cpus().Difference(allocation.exclusiveCPUs())).Union(allocation.originCPUs())
-	}
-	return union, nil
-}
-
 // GetRequestAllocationUnion returns the CPUs the named requests grant together,
 // which is what a container naming them is pinned to. A ref carrying no request
 // name takes the claim whole, so a container that names none is this same call.
@@ -909,16 +863,6 @@ func (s *CPUAllocation) IsRelocatable(claimUID types.UID) bool {
 	defer s.mu.RUnlock()
 	allocation, ok := s.claims[claimUID]
 	return ok && allocation.relocatable
-}
-
-// HoldsExclusiveCPUs reports whether a claim was given CPUs it holds alone.
-// A claim that was not is bound to no single container: nothing it grants is
-// taken away from anything else, so several containers and pods may reference it.
-func (s *CPUAllocation) HoldsExclusiveCPUs(claimUID types.UID) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	allocation, ok := s.claims[claimUID]
-	return ok && !allocation.exclusiveCPUs().IsEmpty()
 }
 
 // ClaimHolding is one prepared claim as the capacity published for a device is

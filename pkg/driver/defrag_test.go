@@ -1422,7 +1422,7 @@ func TestRetainUnsettledKeepsOnlyWhatIsWorthSendingAgain(t *testing.T) {
 		round.exchangeContainers[exchange] = containers
 		for _, containerUID := range containers {
 			round.updateByContainer[containerUID] = &api.ContainerUpdate{ContainerId: string(containerUID)}
-			round.claimsByContainer[containerUID] = []types.UID{"claim-of-" + containerUID}
+			round.claimsByContainer[containerUID] = []store.ClaimRequestRef{{ClaimUID: "claim-of-" + containerUID}}
 		}
 	}
 	round.updates = []*api.ContainerUpdate{{ContainerId: "moved-ctr"}, {ContainerId: "ctr-a"}, {ContainerId: "ctr-b"}, {ContainerId: "ctr-c"}}
