@@ -17,9 +17,11 @@ limitations under the License.
 package cpuallocator
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr/testr"
+	topology "github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -209,6 +211,80 @@ func TestExternalValidate(t *testing.T) {
 				t.Fatalf("Validate(%v, %v, %v) unexpected error: %v", tt.preferredCPUs, tt.preparedCPUs, tt.assignedCPUs, err)
 			}
 		})
+	}
+}
+
+// TestExternalRequireWholeCoresRefusesASplitCore pins B79: RequireWholeCores is
+// the only check that an operator-written cpuset keeps a core's SMT siblings
+// together, and nothing exercised it.
+func TestExternalRequireWholeCoresRefusesASplitCore(t *testing.T) {
+	// Four cores of two threads each: 0/4, 1/5, 2/6, 3/7.
+	details := topology.CPUDetails{}
+	for cpuID := range 8 {
+		details[cpuID] = topology.CPUInfo{CpuID: cpuID, CoreID: cpuID % 4, SocketID: 0, NUMANodeID: 0}
+	}
+	topo := &topology.CPUTopology{CPUDetails: details}
+
+	allocationWith := func(cpus string) *resourceapi.AllocationResult {
+		return &resourceapi.AllocationResult{
+			Devices: resourceapi.DeviceAllocationResult{
+				Config: []resourceapi.DeviceAllocationConfiguration{
+					{
+						Source:   resourceapi.AllocationConfigSourceClaim,
+						Requests: []string{"req"},
+						DeviceConfiguration: resourceapi.DeviceConfiguration{
+							Opaque: &resourceapi.OpaqueDeviceConfiguration{
+								Driver:     "dra.cpu",
+								Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1alpha1","cpuConfig":{"cpuset":"` + cpus + `"}}`)},
+							},
+						},
+					},
+				},
+				Results: []resourceapi.DeviceRequestAllocationResult{
+					{
+						Request: "req",
+						Driver:  "dra.cpu",
+						Device:  "cpudevmachine",
+						ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{
+							resourceapi.QualifiedName(device.CPUResourceQualifiedName): *resource.NewQuantity(2, resource.DecimalSI),
+						},
+					},
+				},
+			},
+		}
+	}
+	result := allocationWith("0,4").Devices.Results[0]
+	logger := testr.New(t)
+	managed := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+
+	unarmed := NewExternal("dra.cpu", managed, cpuset.New())
+	got, err := unarmed.GetPreferredCPUs(logger, allocationWith("0,1"), result)
+	if err != nil {
+		t.Fatalf("without RequireWholeCores a split cpuset is the operator's business: %v", err)
+	}
+	if !got.Equals(cpuset.New(0, 1)) {
+		t.Fatalf("GetPreferredCPUs = %v, want 0-1", got)
+	}
+
+	armed := NewExternal("dra.cpu", managed, cpuset.New())
+	armed.RequireWholeCores(topo)
+
+	got, err = armed.GetPreferredCPUs(logger, allocationWith("0,4"), result)
+	if err != nil {
+		t.Fatalf("a whole core must pass: %v", err)
+	}
+	if !got.Equals(cpuset.New(0, 4)) {
+		t.Fatalf("GetPreferredCPUs = %v, want 0,4", got)
+	}
+
+	_, err = armed.GetPreferredCPUs(logger, allocationWith("0,1"), result)
+	if err == nil {
+		t.Fatal("cpuset 0,1 takes one thread of two cores, which fullPhysicalCPUsOnly forbids")
+	}
+	for _, want := range []string{"split a physical core", "1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not name %q", err, want)
+		}
 	}
 }
 

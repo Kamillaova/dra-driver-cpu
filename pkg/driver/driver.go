@@ -271,11 +271,20 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	logger.Info("creating CPU allocator", "method", config.Allocator)
 	switch config.Allocator {
 	case driverconfig.AllocatorExternal:
-		plugin.cpuAllocator = cpuallocator.NewExternal(config.DriverName, managedCPUs, config.ReservedCPUs)
+		external := cpuallocator.NewExternal(config.DriverName, managedCPUs, config.ReservedCPUs)
+		if config.FullPhysicalCPUsOnly {
+			external.RequireWholeCores(topo)
+		}
+		plugin.cpuAllocator = external
 	default:
 		plugin.cpuAllocator = cpuallocator.NewCPUManager(config.DriverName, topo)
 	}
 	plugin.fullPhysicalCPUsOnly = config.FullPhysicalCPUsOnly
+	if plugin.fullPhysicalCPUsOnly {
+		if err := validateReservedCPUsAlignment(topo, config.ReservedCPUs); err != nil {
+			return nil, err
+		}
+	}
 
 	var devices []resourceapi.Device
 
@@ -310,6 +319,19 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	}
 
 	return plugin, nil
+}
+
+// validateReservedCPUsAlignment checks reservedCPUs against the node when
+// fullPhysicalCPUsOnly is set: a reservation splitting a physical core leaves
+// the orphaned sibling neither reserved nor usable by a whole-core claim,
+// silently exposing it to the shared pool where a claimless container can
+// SMT-contend whatever the claim on its sibling is running.
+func validateReservedCPUsAlignment(topo *cpuinfo.CPUTopology, reservedCPUs cpuset.CPUSet) error {
+	if split := reservedCPUs.Difference(topo.CPUDetails.CompleteCores(reservedCPUs)); !split.IsEmpty() {
+		return fmt.Errorf("reservedCPUs %q splits physical cores on %s, which fullPhysicalCPUsOnly requires never happens: reserve entire cores or none of them",
+			reservedCPUs.String(), split.String())
+	}
+	return nil
 }
 
 // numaNodeThreadsPerCore reindexes deviceThreadsPerCore by NUMA node ID, for
