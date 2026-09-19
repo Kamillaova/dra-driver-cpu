@@ -11,9 +11,9 @@
   - Preference for aligning allocations to UncoreCache boundaries.
 - **Multiple Device Exposure Modes**: `individual` (one device per CPU, fine-grained
   attribute-based selection — ideal for HPC and performance-critical workloads) or `grouped`
-  (NUMA/socket/machine aggregates exposed as consumable capacity — fewer API objects, scales
-  to large systems). See [Configuration](configuration.md#driver-configuration) for the
-  full description and how to choose.
+  (uncore cache/NUMA/socket/machine aggregates exposed as consumable capacity — fewer API
+  objects, scales to large systems). See [Configuration](configuration.md#driver-configuration)
+  for the full description and how to choose.
 - **Device Health Reporting**: The driver reports per-device health to the kubelet via the DRA `WatchHealthStatus` gRPC API, reflected in `pod.status.containerStatuses[].allocatedResourcesStatus`. Devices are reported `Healthy` and go `Unknown` if the driver stops sending updates. `Unhealthy` is reserved for future use. See [Device Health Reporting](workload-requirements.md#device-health-reporting).
 
 ## Not Supported
@@ -23,11 +23,13 @@
 
 ### Sharing resource claims
 
-This driver strictly enforces a 1-to-1 mapping between Claims and Containers.
-It does not support sharing a single ResourceClaim among multiple containers or multiple pods,
-if that claims includes a resource (`dra.cpu`) managed by this driver.
-Attempting to share a claim among containers or pods will make all but the first pod consuming
-the claim to fail to start with the error `CreateContainerError` and remain in `Pending` state.
+A ResourceClaim that holds CPUs of its own binds to one pod, and every container of that pod may
+hold it. An init container that reads the claim's device metadata to render a configuration and the
+long-running container that consumes it both reference the claim, and both run on its CPUs.
+
+Sharing a claim across pods is not supported if that claim includes a resource (`dra.cpu`) managed
+by this driver. A container of a second pod fails to start with `CreateContainerError`, naming the
+pod and container that hold the claim.
 When the driver runs with `publishNodeAllocatableResourceMapping`, sharing across pods is
 rejected earlier by `kube-scheduler`: the second pod stays unschedulable with the message
 `node allocatable resource claim ... has a mapped device and cannot be shared across pods`.
@@ -52,8 +54,39 @@ Reference: [kubernetes 1.35.0](https://github.com/kubernetes/kubernetes/blob/v1.
 | DistributeCPUsAcrossCores | alpha    | inactive                   | none yet; postponed till k8s feature graduates to beta                 |                       |
 | DistributeCPUsAcrossNUMA  | beta     | active                     | see issue: https://github.com/kubernetes-sigs/dra-driver-cpu/issues/46 | see below for details |
 | PreferAlignByUnCoreCache  | beta     | active                     | builtin; enabled by default                                            |                       |
-| FullPCPUsOnly             | GA       | N/A                        | see issue: https://github.com/kubernetes-sigs/dra-driver-cpu/issues/45 |                       |
+| FullPCPUsOnly             | GA       | N/A                        | `fullPhysicalCPUsOnly: true` config option                             | see note below        |
 | StrictCPUReservation      | GA       | N/A                        | builtin; enabled by default                                            |                       |
+
+### Uncore cache defragmentation
+
+`defragEnabled: true` lets the driver move a running claim that states `cpuConfig.relocatable: true`
+onto different CPUs to recover uncore cache alignment lost to claim churn, without restarting its
+container. It requires `assumeUnsolicitedUpdatesSafe: true`, since a move is pushed to the runtime
+unprompted. This is a fork-only feature; see [CPU Defragmentation](defragmentation.md).
+
+### Whole physical cores (FullPCPUsOnly)
+
+`fullPhysicalCPUsOnly: true` allocates whole physical cores, so a core's SMT siblings are never
+split between two claims, nor between a claim and the shared pool. Requires `cpuDeviceMode: grouped`.
+
+It differs from the kubelet CPU Manager in how a request that is not a whole-core multiple is
+handled. The kubelet rejects the pod at admission with an `SMTAlignmentError`. DRA has no
+reject-unless-multiple primitive, so the driver instead publishes a capacity `requestPolicy` whose
+step is the core size and lets the scheduler round the request up. The effect is visible in the
+claim's `status.allocation`, and it resolves at scheduling time rather than failing once the pod is
+already bound.
+
+Two topologies switch the option off rather than failing the driver, because the config is usually
+fleet-wide and refusing to start would take out a whole node pool:
+
+- **Mixed thread counts per core**, as on Intel hybrid parts where performance cores are SMT and
+  efficiency cores are not: there is no single allocation step.
+- **SMT disabled**: every core has one thread, so there is nothing to keep together.
+
+Both are decided per device, from that device's own cores, not once for the node. A node whose
+NUMA nodes differ — one uniform, one hybrid — keeps whole-core allocation on the uniform one and
+drops it only where there is no step to round to. `dra.cpu/threadsPerCore` is each device's own
+answer, and is `0` where its cores do not agree.
 
 ### Distributing CPUs across NUMA nodes
 

@@ -31,6 +31,52 @@ type Recorder interface {
 	RecordNRICreateContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRIStopContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRIRemoveContainer(err error, claimCount int, elapsed time.Duration)
+	// CCX-FORK: upstream's Recorder ends above. Synchronize here skips a claim
+	// it cannot adopt rather than failing the whole call, so it has something to
+	// count that upstream does not.
+	RecordSynchronizeSkippedClaim()
+	RecordSynchronizeForeignCPUs()
+	// CCX-FORK: added; a container that started on CPUs a pass had already moved
+	// its claim off.
+	RecordStartedContainerConverged()
+	RecordMisplacedClaim()
+	// CCX-FORK: RecordPrepareNoRoom is the fork's, and belongs with the prepare
+	// counters above rather than with the defragmentation block below: it counts
+	// an admission the node refused, whether or not anything ever moved.
+	RecordPrepareNoRoom(shape string)
+	RecordPrepareNoWitness()
+	// CCX-FORK: the defragmentation methods, which have no upstream counterpart
+	// because upstream never moves a prepared claim.
+	SetDefragState(cpumetrics.DefragState)
+	RecordDefragPass(result cpumetrics.Result, duration time.Duration)
+	RecordDefragMoves(result cpumetrics.Result, count int)
+	RecordDefragBlockedMoves(count int)
+	RecordDefragSwapOverlap(duration time.Duration)
+	RecordDefragPartialBatch()
+	RecordDefragRollback(result cpumetrics.Result)
+	SetDefragNodePoisoned(numaNodeID int, poisoned bool)
+	RecordDefragNodePoisoned()
+	RecordDefragNodeReopened(duration time.Duration)
+	RecordDefragReadbackMismatch()
+	SetFlooredCapacityDevices(count int)
+	SetClaimsRetractedByAbsence(count int)
+	RecordDefragUnpublishedRound()
+	SetPartitionState(verified map[string]bool)
+	// CCX-FORK: the promise-accounting, write-amplification and downgrade-gate
+	// metrics. Upstream's Recorder ends well above; these measure whether the
+	// frontier the scheduler reads is one the driver can still honour.
+	RecordFrontierAdmissionOutcome(outcome string)
+	SetFrontierOldestObligationSeconds(seconds float64)
+	RecordRepairRounds(advertisedRounds, actualRounds string)
+	RecordTimeToAlignment(seconds float64)
+	RecordSliceWritesPerRound(writes int)
+	RecordSliceUpdate(bytes int)
+	RecordSliceHandoff(outcome string)
+	RecordStoreToDriverDelay(seconds float64)
+	RecordFrontierUnusableDuration(seconds float64)
+	RecordSliceZeroCommitRefresh()
+	SetClaimsOffRecordedCache(count int)
+	SetMaxAbsCacheError(errorCPUs int)
 }
 
 func (cp *CPUDriver) refreshAllocationMetrics() {
@@ -44,4 +90,5 @@ func (cp *CPUDriver) refreshAllocationMetrics() {
 		ReservedCPUs:         snapshot.ReservedCPUs,
 		ActiveResourceClaims: snapshot.ActiveResourceClaims,
 	})
+	cp.refreshMirrorMetrics()
 }

@@ -114,7 +114,7 @@ func TestSetOwnerSequential(t *testing.T) {
 			},
 		},
 		{
-			name: "duplicate binding - container",
+			name: "second container of the same pod",
 			bindings: []binding{
 				{
 					claim: k8stypes.UID("claim-123"),
@@ -130,7 +130,7 @@ func TestSetOwnerSequential(t *testing.T) {
 						PodUID:        "pod-AAA",
 						ContainerName: "cnt-2",
 					},
-					expectOK: false,
+					expectOK: true,
 				},
 			},
 		},
@@ -251,4 +251,83 @@ func TestLen(t *testing.T) {
 
 	bnd.Cleanup("claim-123", "claim-456", "claim-789")
 	require.Equal(t, bnd.Len(), 0)
+}
+
+func TestClaimTrackerOwners(t *testing.T) {
+	logger := testr.New(t)
+	tracker := NewClaimTracker()
+
+	_, ok := tracker.Owners("claim-1")
+	require.False(t, ok, "an unbound claim has no owner")
+
+	_, err := tracker.SetOwner(logger, "pod-1", "ctr-1", "claim-1", "claim-2")
+	require.NoError(t, err)
+
+	owners, ok := tracker.Owners("claim-1")
+	require.True(t, ok)
+	require.Equal(t, []OwnerIdent{{PodUID: "pod-1", ContainerName: "ctr-1"}}, owners)
+	owners, ok = tracker.Owners("claim-2")
+	require.True(t, ok)
+	require.Equal(t, []OwnerIdent{{PodUID: "pod-1", ContainerName: "ctr-1"}}, owners)
+
+	tracker.Cleanup("claim-1")
+	_, ok = tracker.Owners("claim-1")
+	require.False(t, ok)
+	_, ok = tracker.Owners("claim-2")
+	require.True(t, ok, "cleaning up one claim must not unbind the others")
+}
+
+func TestSetOwnerBindsEveryContainerOfOnePod(t *testing.T) {
+	// The shape this exists for: an init container reads the claim's device
+	// metadata to render a configuration, and the long-running container that
+	// consumes it runs on the same CPUs.
+	logger := testr.New(t)
+	tracker := NewClaimTracker()
+
+	newly, err := tracker.SetOwner(logger, "pod-1", "setup-host", "claim-1")
+	require.NoError(t, err)
+	require.Equal(t, []k8stypes.UID{"claim-1"}, newly)
+
+	newly, err = tracker.SetOwner(logger, "pod-1", "app", "claim-1")
+	require.NoError(t, err, "a second container of the same pod may hold the claim")
+	require.Equal(t, []k8stypes.UID{"claim-1"}, newly)
+
+	owners, ok := tracker.Owners("claim-1")
+	require.True(t, ok)
+	require.Equal(t, []OwnerIdent{
+		{PodUID: "pod-1", ContainerName: "setup-host"},
+		{PodUID: "pod-1", ContainerName: "app"},
+	}, owners, "in the order they took it")
+
+	_, err = tracker.SetOwner(logger, "pod-2", "app", "claim-1")
+	require.Error(t, err, "a container of another pod is still refused")
+	var already AlreadyOwned
+	require.ErrorAs(t, err, &already)
+	require.Equal(t, OwnerIdent{PodUID: "pod-1", ContainerName: "setup-host"}, already.Owner)
+}
+
+func TestReleaseOwnerKeepsTheOtherContainersAndTheReservation(t *testing.T) {
+	logger := testr.New(t)
+	tracker := NewClaimTracker()
+	tracker.SetReservedFor("claim-1", ClaimReservation{PodUIDs: []k8stypes.UID{"pod-1"}})
+	_, err := tracker.SetOwner(logger, "pod-1", "setup-host", "claim-1")
+	require.NoError(t, err)
+	_, err = tracker.SetOwner(logger, "pod-1", "app", "claim-1")
+	require.NoError(t, err)
+
+	tracker.ReleaseOwner("pod-1", "app", "claim-1")
+
+	owners, ok := tracker.Owners("claim-1")
+	require.True(t, ok)
+	require.Equal(t, []OwnerIdent{{PodUID: "pod-1", ContainerName: "setup-host"}}, owners)
+	reservation, recorded := tracker.ReservedFor("claim-1")
+	require.True(t, recorded, "a rollback must not erase the reservation recorded at Prepare")
+	require.True(t, reservation.HasPod("pod-1"))
+
+	tracker.ReleaseOwner("pod-1", "setup-host", "claim-1")
+	_, ok = tracker.Owners("claim-1")
+	require.False(t, ok, "releasing the last container unbinds the claim")
+	reservation, recorded = tracker.ReservedFor("claim-1")
+	require.True(t, recorded)
+	require.True(t, reservation.HasPod("pod-1"))
 }

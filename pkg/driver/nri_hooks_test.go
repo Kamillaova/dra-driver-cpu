@@ -20,16 +20,27 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
+	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/utils/cpuset"
+	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 )
 
 func TestParseDRAEnvToClaimAllocations(t *testing.T) {
@@ -126,6 +137,18 @@ func TestCreateContainer(t *testing.T) {
 		}
 	}
 
+	// reservedForPod builds a ClaimTracker recording pod as the sole reserved
+	// consumer of each claim, the bookkeeping a real Prepare call leaves behind
+	// (see PrepareResourceClaims) and which CreateContainer falls back to when
+	// the runtime reports no CDI devices at all.
+	reservedForPod := func(claimUIDs ...string) *store.ClaimTracker {
+		ct := store.NewClaimTracker()
+		for _, claimUID := range claimUIDs {
+			ct.SetReservedFor(types.UID(claimUID), store.ClaimReservation{PodUIDs: []types.UID{types.UID(pod.Uid)}})
+		}
+		return ct
+	}
+
 	testCases := []struct {
 		name                        string
 		podConfigStore              *store.PodConfig
@@ -144,7 +167,7 @@ func TestCreateContainer(t *testing.T) {
 				requirePreparedResourceClaim(t, logger, store, types.UID(claimUID), cpuset.New(0, 1, 2, 3))
 				return store
 			}(),
-			claimTracker: store.NewClaimTracker(),
+			claimTracker: reservedForPod(claimUID),
 			container:    newTestContainer(claimUID, "0-3"),
 			expectedContainerAdjustment: &api.ContainerAdjustment{
 				Linux: &api.LinuxContainerAdjustment{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-3"}}},
@@ -202,7 +225,7 @@ func TestCreateContainer(t *testing.T) {
 				requirePreparedResourceClaim(t, logger, store, types.UID(claimUID), cpuset.New(2, 3))
 				return store
 			}(),
-			claimTracker: store.NewClaimTracker(),
+			claimTracker: reservedForPod(claimUID),
 			container:    newTestContainer(claimUID, "2-3"),
 			expectedContainerAdjustment: &api.ContainerAdjustment{
 				Linux: &api.LinuxContainerAdjustment{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "2-3"}}},
@@ -230,7 +253,7 @@ func TestCreateContainer(t *testing.T) {
 				requirePreparedResourceClaim(t, logger, allocation, types.UID(claimUID), allCPUs)
 				return allocation
 			}(),
-			claimTracker:          store.NewClaimTracker(),
+			claimTracker:          reservedForPod(claimUID),
 			container:             newTestContainer(claimUID, "0-7"),
 			expectedErrorContains: "cannot update shared containers: no shared CPUs available",
 		},
@@ -242,7 +265,7 @@ func TestCreateContainer(t *testing.T) {
 				requirePreparedResourceClaim(t, logger, allocation, types.UID(claimUID), allCPUs)
 				return allocation
 			}(),
-			claimTracker: store.NewClaimTracker(),
+			claimTracker: reservedForPod(claimUID),
 			container:    newTestContainer(claimUID, "0-7"),
 			expectedContainerAdjustment: &api.ContainerAdjustment{
 				Linux: &api.LinuxContainerAdjustment{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-7"}}},
@@ -263,32 +286,61 @@ func TestCreateContainer(t *testing.T) {
 			expectedErrorContains: "failed to parse cpuset value",
 		},
 		{
+			// The claim was never prepared, so it was never reserved for any
+			// pod either: the runtime-CDI-device fallback rejects it before
+			// the allocation store is even consulted.
 			name:               "container with DRA env for unprepared claim fails closed",
 			podConfigStore:     store.NewPodConfig(),
 			cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
 			claimTracker:       store.NewClaimTracker(),
 			container:          newTestContainer(claimUID, "0-3"),
 			expectedErrorContains: fmt.Sprintf(
-				"claim %q is not prepared by this driver",
+				"container claims %q but its reservation was never recorded",
 				claimUID,
 			),
 		},
 		{
-			name:           "container with DRA env that differs from prepared allocation fails closed",
+			// A container's environment is fixed when it is created, so once a
+			// claim can move the env names where the claim used to be. The store
+			// is the live record and decides; disagreeing with it would leave a
+			// moved claim unable to start or restart its container.
+			name:           "container is pinned to the prepared allocation, not to its DRA env",
 			podConfigStore: store.NewPodConfig(),
 			cpuAllocationStore: func() *store.CPUAllocation {
 				store := store.NewCPUAllocation(topo, cpuset.New())
 				requirePreparedResourceClaim(t, logger, store, types.UID(claimUID), cpuset.New(0, 1))
 				return store
 			}(),
-			claimTracker: store.NewClaimTracker(),
+			claimTracker: reservedForPod(claimUID),
 			container:    newTestContainer(claimUID, "0-3"),
-			expectedErrorContains: fmt.Sprintf(
-				"validation failed for claim %q: cpuset mismatch (expected %q, got %q)",
-				claimUID,
-				"0-1",
-				"0-3",
-			),
+			expectedContainerAdjustment: &api.ContainerAdjustment{
+				Linux: &api.LinuxContainerAdjustment{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1"}}},
+			},
+			expectedContainerUpdates: []*api.ContainerUpdate{},
+		},
+		{
+			name:           "container holding several claims gets the union of their allocations",
+			podConfigStore: store.NewPodConfig(),
+			cpuAllocationStore: func() *store.CPUAllocation {
+				store := store.NewCPUAllocation(topo, cpuset.New())
+				requirePreparedResourceClaim(t, logger, store, "claim-uid-1", cpuset.New(0, 1))
+				requirePreparedResourceClaim(t, logger, store, "claim-uid-2", cpuset.New(5))
+				return store
+			}(),
+			claimTracker: reservedForPod("claim-uid-1", "claim-uid-2"),
+			container: &api.Container{
+				Id:           "ctr-id-1",
+				PodSandboxId: pod.Id,
+				Name:         "my-ctr",
+				Env: []string{
+					fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-uid-1", "6"),
+					fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-uid-2", "7"),
+				},
+			},
+			expectedContainerAdjustment: &api.ContainerAdjustment{
+				Linux: &api.LinuxContainerAdjustment{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1,5"}}},
+			},
+			expectedContainerUpdates: []*api.ContainerUpdate{},
 		},
 	}
 
@@ -316,6 +368,238 @@ func TestCreateContainer(t *testing.T) {
 			require.ElementsMatch(t, tc.expectedContainerUpdates, updates)
 		})
 	}
+}
+
+func TestCreateContainerRuntimeCDIDeviceAuthentication(t *testing.T) {
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	pod := &api.PodSandbox{Id: "pod-id-1", Name: "my-pod", Namespace: "my-ns", Uid: "pod-uid-1"}
+	victimClaim := types.UID("claim-uid-victim")
+
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	logger := testr.New(t)
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	cdiNameFor := func(uid types.UID) string {
+		return cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName(uid))
+	}
+
+	// A forged env entry naming a claim prepared for another container.
+	forgingContainer := func(reported []*api.CDIDevice) *api.Container {
+		return &api.Container{
+			Id:           "forging-ctr",
+			PodSandboxId: pod.Id,
+			Name:         "forging-ctr",
+			Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, victimClaim, "0-3")},
+			CDIDevices:   reported,
+		}
+	}
+
+	testCases := []struct {
+		name      string
+		container *api.Container
+		// reservedFor is who victimClaim's own reservation (recorded at
+		// Prepare) names, consulted only when the runtime reports no CDI
+		// devices at all. Empty means the reservation was never recorded.
+		reservedFor           types.UID
+		expectedErrorContains string
+	}{
+		{
+			name:      "runtime confirms the claim",
+			container: forgingContainer([]*api.CDIDevice{{Name: cdiNameFor(victimClaim)}}),
+		},
+		{
+			name:                  "runtime reports a different claim",
+			container:             forgingContainer([]*api.CDIDevice{{Name: cdiNameFor("claim-uid-other")}}),
+			expectedErrorContains: "the runtime injected no CDI device for it",
+		},
+		{
+			name: "runtime reports another driver's device only",
+			container: forgingContainer([]*api.CDIDevice{
+				{Name: "example.com/gpu=gpu0"},
+			}),
+			expectedErrorContains: "the runtime injected no CDI device for it",
+		},
+		{
+			// CRI-O never populates the field. An empty list must stay
+			// inconclusive rather than an outright rejection, so this driver
+			// keeps working there -- but it must fall back to the claim's own
+			// reservation rather than trust the forged env entry blindly.
+			name:                  "runtime reports nothing and the pod is not in the claim's reservation",
+			container:             forgingContainer(nil),
+			reservedFor:           "pod-uid-legitimate-owner",
+			expectedErrorContains: "the pod is not in its reservation",
+		},
+		{
+			name:        "runtime reports nothing but the pod is the claim's reserved consumer",
+			container:   forgingContainer(nil),
+			reservedFor: types.UID(pod.Uid),
+		},
+		{
+			name:      "runtime reports nothing and the claim's reservation was never recorded",
+			container: forgingContainer(nil),
+			// Distinct from the refusal above on purpose: a claim prepared by a
+			// driver too old to record its reservation is a different thing to
+			// explain than a pod that is not in one.
+			expectedErrorContains: "its reservation was never recorded",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			allocation := store.NewCPUAllocation(topo, cpuset.New())
+			requirePreparedResourceClaim(t, logger, allocation, victimClaim, cpuset.New(0, 1, 2, 3))
+
+			claimTracker := store.NewClaimTracker()
+			if tc.reservedFor != "" {
+				claimTracker.SetReservedFor(victimClaim, store.ClaimReservation{PodUIDs: []types.UID{tc.reservedFor}})
+			}
+			plugin := &CPUDriver{
+				podConfigStore:     store.NewPodConfig(),
+				cpuAllocationStore: allocation,
+				claimTracker:       claimTracker,
+				metrics:            cpumetrics.Noop(),
+			}
+
+			_, _, err := plugin.CreateContainer(context.Background(), pod, tc.container)
+			if tc.expectedErrorContains != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.expectedErrorContains)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestCreateContainerAcceptsAPodGroupReservation: a claim may be reserved for a
+// PodGroup rather than for pods, and then it names no pod UID at all. The pod
+// carries its group's name in its spec and nowhere the runtime reports, so on a
+// runtime that reports no CDI devices the driver has to read the pod to answer
+// whether it is entitled to the claim -- and answer no whenever it cannot.
+func TestCreateContainerAcceptsAPodGroupReservation(t *testing.T) {
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	claimUID := types.UID("claim-grouped")
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "member", Namespace: "ns"}
+
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	logger := testr.New(t)
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	group := func(name string) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: types.UID(pod.Uid)},
+			Spec:       v1.PodSpec{SchedulingGroup: &v1.PodSchedulingGroup{PodGroupName: &name}},
+		}
+	}
+
+	for _, tc := range []struct {
+		name        string
+		live        *v1.Pod
+		wantRefusal bool
+	}{
+		{name: "the pod is in the reserved group", live: group("training-run-7")},
+		{
+			name:        "the pod is in another group",
+			live:        group("someone-elses-run"),
+			wantRefusal: true,
+		},
+		{
+			name: "the pod is in no group at all",
+			live: &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: pod.Name, Namespace: pod.Namespace, UID: types.UID(pod.Uid),
+			}},
+			wantRefusal: true,
+		},
+		{
+			name:        "the pod cannot be read",
+			live:        nil,
+			wantRefusal: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allocation := store.NewCPUAllocation(topo, cpuset.New())
+			requirePreparedResourceClaim(t, logger, allocation, claimUID, cpuset.New(0, 1, 2, 3))
+			claimTracker := store.NewClaimTracker()
+			claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodGroups: []string{"training-run-7"}})
+
+			objects := []runtime.Object{}
+			if tc.live != nil {
+				objects = append(objects, tc.live)
+			}
+			plugin := &CPUDriver{
+				podConfigStore:     store.NewPodConfig(),
+				cpuAllocationStore: allocation,
+				claimTracker:       claimTracker,
+				kubeClient:         k8sfake.NewSimpleClientset(objects...),
+				metrics:            cpumetrics.Noop(),
+			}
+
+			// The runtime reports no CDI devices, which is the only path that
+			// asks the question at all.
+			ctr := &api.Container{
+				Id:           "ctr-1",
+				PodSandboxId: pod.Id,
+				Name:         "ctr",
+				Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-3")},
+			}
+			_, _, err := plugin.CreateContainer(context.Background(), pod, ctr)
+			if tc.wantRefusal {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "the pod is not in its reservation")
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestSynchronizeSkipsClaimsTheRuntimeDoesNotConfirm(t *testing.T) {
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	claimUID := types.UID("claim-uid-1")
+
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	logger := testr.New(t)
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
+	ctr := &api.Container{
+		Id:           "ctr-1",
+		PodSandboxId: pod.Id,
+		Name:         "ctr",
+		Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0,1")},
+		// The runtime reports a device for some other claim, so this
+		// container's DRA env entry is not corroborated.
+		CDIDevices: []*api.CDIDevice{
+			{Name: cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName("claim-uid-other"))},
+		},
+	}
+
+	mgr := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: cpuset.New(0, 1)})
+	plugin := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             mgr,
+		metrics:            cpumetrics.Noop(),
+	}
+
+	_, err := plugin.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr})
+	require.NoError(t, err, "an unconfirmed claim is skipped, not fatal")
+
+	// The claim was not adopted, so its CPUs stay in the shared pool rather
+	// than being reserved on the strength of a forgeable env entry.
+	require.Equal(t, allCPUs, plugin.cpuAllocationStore.GetSharedCPUs())
+	require.Zero(t, plugin.claimTracker.Len())
 }
 
 func TestStopContainer(t *testing.T) {
@@ -393,11 +677,13 @@ func TestGuaranteedContainerRestartWithoutReprepare(t *testing.T) {
 	claimUID := types.UID("claim-restart")
 	claimCPUs := cpuset.New(0, 1)
 	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
-	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, claimCPUs, false))
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(claimCPUs), false))
+	claimTracker := store.NewClaimTracker()
+	claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{"pod"}})
 	driver := &CPUDriver{
 		podConfigStore:     store.NewPodConfig(),
 		cpuAllocationStore: cpuStore,
-		claimTracker:       store.NewClaimTracker(),
+		claimTracker:       claimTracker,
 		topology:           deviceTopology{cpuTopology: topo},
 		metrics:            cpumetrics.Noop(),
 	}
@@ -467,11 +753,12 @@ func TestGuaranteedContainerRestartNotBlockedByEmptySharedPool(t *testing.T) {
 
 	claimUID := types.UID("claim-full")
 	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
-	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, allCPUs, false))
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(allCPUs), false))
 	claimTracker := store.NewClaimTracker()
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "ns"}
 	_, err = claimTracker.SetOwner(logger, types.UID(pod.Uid), "app", claimUID)
 	require.NoError(t, err)
+	claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{types.UID(pod.Uid)}})
 
 	driver := &CPUDriver{
 		podConfigStore:     store.NewPodConfig(),
@@ -757,7 +1044,12 @@ func TestNRISynchronize(t *testing.T) {
 			expectedRefreshCalls: 1,
 		},
 		{
-			name: "runtime DRA env that mismatches driver-owned CDI spec is ignored",
+			// A container whose env names CPUs other than the driver's record is
+			// one that was moved after it started: its environment was frozen at
+			// creation and cannot be corrected. The claim must be carried to the
+			// recorded placement, not dropped, or its CPUs leak into the shared
+			// pool while the container still runs on them.
+			name: "container on a stale cpuset is converged, not dropped",
 			driver: &CPUDriver{
 				podConfigStore:     store.NewPodConfig(),
 				cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
@@ -770,12 +1062,82 @@ func TestNRISynchronize(t *testing.T) {
 			},
 			runtimePods: []*api.PodSandbox{pod1},
 			runtimeCtrs: []*api.Container{
-				{Id: "p1-invalid", PodSandboxId: pod1.Id, Name: "invalid-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+				{Id: "p1-stale", PodSandboxId: pod1.Id, Name: "stale-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
 			},
 			expectedUpdates: []*api.ContainerUpdate{
 				{
-					ContainerId: "p1-invalid",
-					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-7"}}},
+					ContainerId: "p1-stale",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "2-3"}}},
+				},
+			},
+			expectedRefreshCalls: 1,
+		},
+		{
+			// Two distinct claims whose driver-owned CDI specs record the same
+			// CPUs: an inconsistency in the runtime's reported state, not
+			// something that should cost every other pod and container a
+			// driver until the runtime gives up retrying it.
+			name: "a claim overlapping an earlier one during synchronize is skipped, not fatal",
+			driver: &CPUDriver{
+				podConfigStore:     store.NewPodConfig(),
+				cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+				claimTracker:       store.NewClaimTracker(),
+				cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+					"claim-A": cpuset.New(0, 1),
+					"claim-B": cpuset.New(0, 1),
+				}),
+				topology: deviceTopology{cpuTopology: topo},
+				metrics:  cpumetrics.Noop(),
+			},
+			runtimePods: []*api.PodSandbox{pod1, pod2},
+			runtimeCtrs: []*api.Container{
+				{Id: "p1-guaranteed", PodSandboxId: pod1.Id, Name: "guaranteed-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+				{Id: "p2-guaranteed", PodSandboxId: pod2.Id, Name: "guaranteed-ctr", Env: []string{fmt.Sprintf("%s_claim-B=%s", cdiEnvVarPrefix, "0,1")}},
+			},
+			expectedUpdates: []*api.ContainerUpdate{
+				{
+					ContainerId: "p1-guaranteed",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1"}}},
+				},
+				{
+					// claim-B lost the race for 0-1 and is skipped, so its
+					// container is treated as unclaimed and falls back to the
+					// shared pool rather than the call failing outright.
+					ContainerId: "p2-guaranteed",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "2-7"}}},
+				},
+			},
+			expectedRefreshCalls: 1,
+		},
+		{
+			// The same claim named by two different containers: whichever is
+			// processed second loses claimTracker's ownership check. Also an
+			// inconsistency in the runtime's reported state, and also must not
+			// fail every other pod and container being synchronized.
+			name: "a claim already owned by a different container during synchronize is skipped, not fatal",
+			driver: &CPUDriver{
+				podConfigStore:     store.NewPodConfig(),
+				cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+				claimTracker:       store.NewClaimTracker(),
+				cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+					"claim-A": cpuset.New(0, 1),
+				}),
+				topology: deviceTopology{cpuTopology: topo},
+				metrics:  cpumetrics.Noop(),
+			},
+			runtimePods: []*api.PodSandbox{pod1, pod2},
+			runtimeCtrs: []*api.Container{
+				{Id: "p1-first-owner", PodSandboxId: pod1.Id, Name: "first-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+				{Id: "p2-second-owner", PodSandboxId: pod2.Id, Name: "second-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+			},
+			expectedUpdates: []*api.ContainerUpdate{
+				{
+					ContainerId: "p1-first-owner",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1"}}},
+				},
+				{
+					ContainerId: "p2-second-owner",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "2-7"}}},
 				},
 			},
 			expectedRefreshCalls: 1,
@@ -797,6 +1159,193 @@ func TestNRISynchronize(t *testing.T) {
 			require.ElementsMatch(t, tc.expectedUpdates, updates)
 		})
 	}
+}
+
+func TestSynchronizeRestoresClaimReservationsForCreateContainer(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}
+	topo, _ := mockProvider.GetCPUTopology(logger)
+
+	pod := &api.PodSandbox{Id: "pod-id-1", Name: "my-pod", Namespace: "my-ns", Uid: "pod-uid-1"}
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+			"claim-A": cpuset.New(0, 1),
+		}),
+		topology: deviceTopology{cpuTopology: topo},
+		metrics:  cpumetrics.Noop(),
+	}
+	// The reservation comes from the claim's own record, written at Prepare from
+	// its status.reservedFor, not from the container that names the claim.
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName("claim-A")] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive}},
+		ReservedFor: []types.UID{types.UID(pod.Uid)},
+	}
+	runtimeCtrs := []*api.Container{
+		{Id: "p1-guaranteed", PodSandboxId: pod.Id, Name: "guaranteed-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+	}
+
+	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod}, runtimeCtrs)
+	require.NoError(t, err)
+
+	// This is what CreateContainer's CRI-O fallback (nil reportedCDIDevices)
+	// reads, on a container recreated after a driver restart with no fresh
+	// Prepare in between.
+	reservation, recorded := driver.claimTracker.ReservedFor("claim-A")
+	reserved := reservation.HasPod(types.UID(pod.Uid))
+	require.True(t, recorded)
+	require.True(t, reserved)
+
+	reservation, recorded = driver.claimTracker.ReservedFor("claim-A")
+	reserved = reservation.HasPod(types.UID("some-other-pod"))
+	require.True(t, recorded)
+	require.False(t, reserved)
+
+	_, recorded = driver.claimTracker.ReservedFor("claim-never-seen")
+	require.False(t, recorded)
+}
+
+// TestSynchronizeTakesTheReservationFromTheRecord pins B57's authority half. A
+// pod spec can put any claim UID in a DRA_CPUSET_* variable, and on a runtime
+// that reports no CDI devices that variable used to be what Synchronize rebuilt
+// the reservation from, so a pod naming another pod's claim was recorded as its
+// consumer.
+func TestSynchronizeTakesTheReservationFromTheRecord(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range cpuset.New(0, 1, 2, 3).UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	victim := types.UID("pod-uid-victim")
+	forger := &api.PodSandbox{Id: "pod-id-forger", Name: "forger", Namespace: "ns", Uid: "pod-uid-forger"}
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+			"claim-A": cpuset.New(0, 1),
+		}),
+		topology: deviceTopology{cpuTopology: topo},
+		metrics:  cpumetrics.Noop(),
+	}
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName("claim-A")] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive}},
+		ReservedFor: []types.UID{victim},
+	}
+
+	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{forger}, []*api.Container{
+		{Id: "forging-ctr", PodSandboxId: forger.Id, Name: "forging-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+	})
+	require.NoError(t, err)
+
+	reservation, recorded := driver.claimTracker.ReservedFor("claim-A")
+	reserved := reservation.HasPod(types.UID(forger.Uid))
+	require.True(t, recorded, "the claim's reservation is known, so the fallback has an answer")
+	require.False(t, reserved, "the container named the claim; the claim did not name the pod")
+
+	reservation, _ = driver.claimTracker.ReservedFor("claim-A")
+	reserved = reservation.HasPod(victim)
+	require.True(t, reserved, "the pod the claim itself names keeps its reservation")
+}
+
+// TestSynchronizeKeepsEveryPodOfAPoolClaimsReservation pins B57's cardinality
+// half: a pool claim is legitimately held by several pods, and rebuilding the
+// reservation one container at a time kept only the last of them, refusing the
+// others' containers after a restart.
+func TestSynchronizeKeepsEveryPodOfAPoolClaimsReservation(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range cpuset.New(0, 1, 2, 3).UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	pod1 := &api.PodSandbox{Id: "pod-id-1", Name: "pod-1", Namespace: "ns", Uid: "pod-uid-1"}
+	pod2 := &api.PodSandbox{Id: "pod-id-2", Name: "pod-2", Namespace: "ns", Uid: "pod-uid-2"}
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+			"claim-pool": cpuset.New(2, 3),
+		}),
+		topology: deviceTopology{cpuTopology: topo},
+		metrics:  cpumetrics.Noop(),
+	}
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName("claim-pool")] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.RoleShared}},
+		ReservedFor: []types.UID{types.UID(pod1.Uid), types.UID(pod2.Uid)},
+	}
+
+	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod1, pod2}, []*api.Container{
+		{Id: "ctr-1", PodSandboxId: pod1.Id, Name: "ctr-1", Env: []string{fmt.Sprintf("%s_claim-pool=%s", cdiEnvVarPrefix, "2,3")}},
+		{Id: "ctr-2", PodSandboxId: pod2.Id, Name: "ctr-2", Env: []string{fmt.Sprintf("%s_claim-pool=%s", cdiEnvVarPrefix, "2,3")}},
+	})
+	require.NoError(t, err)
+
+	for _, podUID := range []types.UID{types.UID(pod1.Uid), types.UID(pod2.Uid)} {
+		reservation, recorded := driver.claimTracker.ReservedFor("claim-pool")
+		reserved := reservation.HasPod(podUID)
+		require.True(t, recorded)
+		require.True(t, reserved, "both pods the claim names keep their reservation")
+	}
+}
+
+func TestSynchronizeDoesNotReserveForAContainerThatLosesTheOwnershipRace(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}
+	topo, _ := mockProvider.GetCPUTopology(logger)
+
+	pod1 := &api.PodSandbox{Id: "pod-id-1", Name: "my-pod-1", Namespace: "my-ns", Uid: "pod-uid-1"}
+	pod2 := &api.PodSandbox{Id: "pod-id-2", Name: "my-pod-2", Namespace: "my-ns", Uid: "pod-uid-2"}
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+			"claim-A": cpuset.New(0, 1),
+		}),
+		topology: deviceTopology{cpuTopology: topo},
+		metrics:  cpumetrics.Noop(),
+	}
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName("claim-A")] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive}},
+		ReservedFor: []types.UID{types.UID(pod1.Uid)},
+	}
+	runtimeCtrs := []*api.Container{
+		{Id: "p1-first-owner", PodSandboxId: pod1.Id, Name: "first-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+		{Id: "p2-second-owner", PodSandboxId: pod2.Id, Name: "second-owner-ctr", Env: []string{fmt.Sprintf("%s_claim-A=%s", cdiEnvVarPrefix, "0,1")}},
+	}
+
+	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod1, pod2}, runtimeCtrs)
+	require.NoError(t, err)
+
+	reservation, recorded := driver.claimTracker.ReservedFor("claim-A")
+	reserved := reservation.HasPod(types.UID(pod1.Uid))
+	require.True(t, recorded)
+	require.True(t, reserved)
+
+	// pod2's container named the same claim, and the claim's own reservation does
+	// not name pod2 -- so a runtime that reports no CDI devices at all cannot let
+	// it authenticate against a claim it never legitimately held.
+	reservation, recorded = driver.claimTracker.ReservedFor("claim-A")
+	reserved = reservation.HasPod(types.UID(pod2.Uid))
+	require.True(t, recorded)
+	require.False(t, reserved)
 }
 
 func TestStopContainerKeepsClaimOutOfSharedPoolUntilUnprepare(t *testing.T) {
@@ -855,4 +1404,751 @@ func TestStopContainerKeepsClaimOutOfSharedPoolUntilUnprepare(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, unprepared[claimUID])
 	require.True(t, driver.cpuAllocationStore.GetSharedCPUs().Equals(allCPUs))
+}
+
+func TestSynchronizeKeepsStaleContainersClaimCPUsReserved(t *testing.T) {
+	// The failure this guards against: a claim moved after its container started
+	// has a frozen, now-wrong env var. Dropping it on that basis would return
+	// CPUs the container is still pinned to into the shared pool, so two
+	// workloads would end up on the same "exclusive" CPUs.
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 8 {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpu, CoreID: cpu, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-moved")
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
+	ctr := &api.Container{
+		Id:           "ctr-1",
+		PodSandboxId: pod.Id,
+		Name:         "ctr",
+		// Frozen at creation: the claim was on 0-1 back then.
+		Env: []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-1")},
+	}
+
+	// The driver's own record says it has since moved to 4-5.
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: cpuset.New(4, 5)}),
+		metrics:            cpumetrics.Noop(),
+	}
+
+	updates, err := d.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr})
+	require.NoError(t, err)
+
+	// The recorded placement is reserved, so it stays out of the shared pool.
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
+	require.True(t, ok, "claim must be adopted, not dropped")
+	require.Equal(t, cpuset.New(4, 5), got)
+	require.Equal(t, cpuset.New(0, 1, 2, 3, 6, 7), d.cpuAllocationStore.GetSharedCPUs())
+
+	// And the container is carried to it.
+	require.Len(t, updates, 1)
+	require.Equal(t, "ctr-1", updates[0].GetContainerId())
+	require.Equal(t, "4-5", updates[0].GetLinux().GetResources().GetCpu().GetCpus())
+}
+
+func TestDynamicEnvIsAcceptedAndNamesItsClaim(t *testing.T) {
+	logger := testr.New(t)
+	entries, err := parseDRAEnv(logger, []string{
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-dynamic", cdiEnvDynamicValue),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-fixed", "2-3"),
+		"UNRELATED=whatever",
+	})
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	require.Equal(t, types.UID("claim-dynamic"), entries[0].claimUID)
+	require.True(t, entries[0].dynamic)
+	require.True(t, entries[0].cpus.IsEmpty())
+
+	require.Equal(t, types.UID("claim-fixed"), entries[1].claimUID)
+	require.False(t, entries[1].dynamic)
+	require.Equal(t, cpuset.New(2, 3), entries[1].cpus)
+
+	// A value that is neither is still rejected: the prefix is reserved, and a
+	// pod setting a bad one must not be started as if it held nothing.
+	_, err = parseDRAEnv(logger, []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, "claim-bad", "a-b")})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to parse cpuset value")
+}
+
+func TestSynchronizeAdoptsAClaimWithADynamicEnv(t *testing.T) {
+	// The env says nothing about placement, so the spec on disk is the only
+	// record, and the container must be pinned from it.
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 8 {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpu, CoreID: cpu, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-1")
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgr(),
+		metrics:            cpumetrics.Noop(),
+	}
+	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue), exclusiveOn(cpuset.New(2, 3))))
+
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
+	ctr := &api.Container{
+		Id:           "ctr-uid-1",
+		PodSandboxId: pod.Id,
+		Name:         "ctr",
+		Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue)},
+	}
+
+	updates, err := d.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr})
+	require.NoError(t, err)
+
+	got, ok := d.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
+	require.True(t, ok, "the claim must be adopted, not dropped")
+	require.Equal(t, cpuset.New(2, 3), got)
+	require.Len(t, updates, 1)
+	require.Equal(t, "ctr-uid-1", updates[0].GetContainerId())
+	require.Equal(t, "2-3", updates[0].GetLinux().GetResources().GetCpu().GetCpus())
+}
+
+func TestCreateContainerSharesAClaimHoldingNoExclusiveCPUs(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-pool")
+	poolCPUs := cpuset.New(2, 3)
+	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, store.ClaimRecord{Requests: []store.RequestAllocation{
+		{Request: "helpers", CPUs: poolCPUs, Role: store.Role("shared")},
+	}}, false))
+	claimTracker := store.NewClaimTracker()
+	claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{"pod-a", "pod-b"}})
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: cpuStore,
+		claimTracker:       claimTracker,
+		topology:           deviceTopology{cpuTopology: topo},
+		metrics:            cpumetrics.Noop(),
+	}
+
+	consume := func(podUID types.UID, containerID string) *api.ContainerAdjustment {
+		t.Helper()
+		pod := &api.PodSandbox{Id: string(podUID), Uid: string(podUID), Name: string(podUID), Namespace: "ns"}
+		ctr := &api.Container{
+			Id:           containerID,
+			PodSandboxId: pod.Id,
+			Name:         "app",
+			Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, poolCPUs.String())},
+		}
+		adjustment, _, err := driver.CreateContainer(context.Background(), pod, ctr)
+		require.NoError(t, err)
+		return adjustment
+	}
+
+	require.Equal(t, poolCPUs.String(), consume("pod-a", "container-a").Linux.Resources.Cpu.Cpus)
+	// A second pod would be refused an exclusive claim, which one container owns.
+	require.Equal(t, poolCPUs.String(), consume("pod-b", "container-b").Linux.Resources.Cpu.Cpus)
+
+	_, owned := driver.claimTracker.Owners(claimUID)
+	require.False(t, owned, "a claim holding no exclusive CPUs binds to no container")
+	require.True(t, driver.cpuAllocationStore.GetSharedCPUs().Equals(allCPUs),
+		"pool CPUs stay available to shared containers and to other claims")
+}
+
+func TestSynchronizeRecordsAReservationForAClaimHoldingNoExclusiveCPUs(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range cpuset.New(0, 1, 2, 3).UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-pool")
+	d := &CPUDriver{
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgr(),
+		metrics:            cpumetrics.Noop(),
+	}
+	require.NoError(t, d.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "2-3"),
+		store.ClaimRecord{
+			Requests:    []store.RequestAllocation{{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")}},
+			ReservedFor: []types.UID{"pod-uid-1"},
+		}))
+
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "pod", Namespace: "ns"}
+	ctr := &api.Container{
+		Id: "ctr-uid-1", PodSandboxId: pod.Id, Name: "ctr",
+		Env: []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "2-3")},
+	}
+
+	_, err = d.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{ctr})
+	require.NoError(t, err)
+
+	_, owned := d.claimTracker.Owners(claimUID)
+	require.False(t, owned, "a claim holding no exclusive CPUs binds to no container")
+	// CreateContainer's CRI-O fallback checks every claim a container names, so
+	// a pool claim without a reservation would refuse the container after a
+	// driver restart.
+	reservation, recorded := d.claimTracker.ReservedFor(claimUID)
+	reserved := reservation.HasPod(types.UID(pod.Uid))
+	require.True(t, recorded)
+	require.True(t, reserved)
+}
+
+func TestCreateContainerBindsEveryContainerOfOnePod(t *testing.T) {
+	// An init container renders a configuration from the claim's device metadata
+	// and the long-running container consumes it, so both hold the claim and both
+	// are pinned to its CPUs. A container of another pod is still refused.
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range cpuset.New(0, 1, 2, 3).UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	claimUID := types.UID("claim-two-containers")
+	claimedCPUs := cpuset.New(0, 1)
+	cpuAllocationStore := store.NewCPUAllocation(topo, cpuset.New())
+	requirePreparedResourceClaim(t, logger, cpuAllocationStore, claimUID, claimedCPUs)
+
+	d := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: cpuAllocationStore,
+		claimTracker:       store.NewClaimTracker(),
+		topology:           deviceTopology{cpuTopology: topo, reservedCPUs: cpuset.New()},
+		cdiMgr:             newMockCdiMgr(),
+		metrics:            cpumetrics.Noop(),
+	}
+	d.claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{"pod-uid", "pod-uid-2"}})
+
+	pod := &api.PodSandbox{Id: "pod-id", Uid: "pod-uid", Name: "doca", Namespace: "volta"}
+	env := []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, claimedCPUs.String())}
+	initCtr := &api.Container{Id: "ctr-init", PodSandboxId: pod.Id, Name: "setup-host", Env: env}
+	appCtr := &api.Container{Id: "ctr-app", PodSandboxId: pod.Id, Name: "doca", Env: env}
+
+	initAdjust, _, err := d.CreateContainer(context.Background(), pod, initCtr)
+	require.NoError(t, err)
+	require.Equal(t, claimedCPUs.String(), initAdjust.Linux.Resources.Cpu.Cpus)
+
+	appAdjust, _, err := d.CreateContainer(context.Background(), pod, appCtr)
+	require.NoError(t, err, "a second container of the same pod may hold the claim")
+	require.Equal(t, claimedCPUs.String(), appAdjust.Linux.Resources.Cpu.Cpus)
+
+	owners, ok := d.claimTracker.Owners(claimUID)
+	require.True(t, ok)
+	require.Equal(t, []store.OwnerIdent{
+		{PodUID: "pod-uid", ContainerName: "setup-host"},
+		{PodUID: "pod-uid", ContainerName: "doca"},
+	}, owners)
+
+	otherPod := &api.PodSandbox{Id: "pod-id-2", Uid: "pod-uid-2", Name: "other", Namespace: "volta"}
+	otherCtr := &api.Container{Id: "ctr-other", PodSandboxId: otherPod.Id, Name: "app", Env: env}
+	_, _, err = d.CreateContainer(context.Background(), otherPod, otherCtr)
+	require.Error(t, err, "a container of another pod is still refused")
+}
+
+// projectedAllocatedClaims is what the scheduler projected for this node.
+type projectedAllocatedClaims []*resourceapi.ResourceClaim
+
+func (p projectedAllocatedClaims) AllocatedClaims() ([]*resourceapi.ResourceClaim, error) {
+	return p, nil
+}
+
+func (p projectedAllocatedClaims) IsProjectedDeallocated(types.UID, *store.ProjectionWatermark) bool {
+	return false
+}
+
+func (p projectedAllocatedClaims) ProjectedAllocatedAt(types.UID) (store.ProjectionWatermark, bool) {
+	return store.ProjectionWatermark{}, false
+}
+
+// GetProjectedClaims is not part of the interface at this commit and is not used
+// by Synchronize. It is here so that the stub keeps satisfying the interface
+// where a later commit widens it, rather than breaking a commit that has nothing
+// to do with this test.
+func (p projectedAllocatedClaims) GetProjectedClaims() (*v1alpha1.ProjectedClaims, error) {
+	return &v1alpha1.ProjectedClaims{}, nil
+}
+
+// projectedClaim is what the reader reconstructs from the projection: a UID, a
+// name and the allocated devices. It carries no reservation, because the
+// projection does not.
+func projectedClaim(uid types.UID) *resourceapi.ResourceClaim {
+	return &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{UID: uid, Name: string(uid), Namespace: "volta"},
+	}
+}
+
+// TestSynchronizeRestoresAClaimNoContainerHolds pins B97. A claim prepared
+// before a driver restart, whose container could not be created while the driver
+// was down, is invisible to a rebuild that walks running containers -- and the
+// container cannot start until the claim is in the store, so nothing breaks the
+// cycle. The projection names the claim and the CDI spec says where it is, which
+// is enough.
+func TestSynchronizeRestoresAClaimNoContainerHolds(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}
+	topo, _ := mockProvider.GetCPUTopology(logger)
+
+	stuck := types.UID("claim-stuck")
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{stuck: cpuset.New(2, 3)}),
+		claimReader:        projectedAllocatedClaims{projectedClaim(stuck)},
+		topology:           deviceTopology{cpuTopology: topo},
+		metrics:            cpumetrics.Noop(),
+	}
+
+	// The spec the driver wrote at Prepare, which is where the reservation comes
+	// back from.
+	driver.cdiMgr.(*mockCdiMgr).placements[getCDIDeviceName(stuck)] = store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(2, 3), Role: store.RoleExclusive}},
+		ReservedFor: []types.UID{"pod-uid-stuck"},
+	}
+
+	// The runtime reports no pod and no container: the container never started.
+	_, err := driver.Synchronize(context.Background(), nil, nil)
+	require.NoError(t, err)
+
+	got, held := driver.cpuAllocationStore.GetResourceClaimAllocation(stuck)
+	require.True(t, held, "a claim the runtime cannot show must still be restored")
+	require.True(t, got.Equals(cpuset.New(2, 3)), "restored %s, want 2-3", got.String())
+	require.True(t, driver.cpuAllocationStore.GetSharedCPUs().Equals(allCPUs.Difference(cpuset.New(2, 3))),
+		"the restored claim's CPUs must leave the shared pool")
+
+	// B63's sibling: the reservation is restored with the claim, out of the spec
+	// the driver wrote at Prepare. Without it the container that is waiting to be
+	// created is refused for the pod's life on a runtime that reports no CDI
+	// devices of its own. The projection cannot supply it: it carries no
+	// reservation at all, which is why this reads the record.
+	reservation, recorded := driver.claimTracker.ReservedFor(stuck)
+	reserved := reservation.HasPod(types.UID("pod-uid-stuck"))
+	require.True(t, recorded, "a restored claim's reservation must be known")
+	require.True(t, reserved)
+}
+
+// TestSynchronizeLeavesAClaimTheProjectionDoesNotName: the CDI spec alone is not
+// authority. One left behind by an Unprepare this driver missed would otherwise
+// hold CPUs for a claim that no longer exists.
+func TestSynchronizeLeavesAClaimTheProjectionDoesNotName(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID})
+	}
+	mockProvider := &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}
+	topo, _ := mockProvider.GetCPUTopology(logger)
+
+	gone := types.UID("claim-gone")
+	driver := &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: store.NewCPUAllocation(topo, cpuset.New()),
+		claimTracker:       store.NewClaimTracker(),
+		cdiMgr:             newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{gone: cpuset.New(0, 1)}),
+		claimReader:        projectedAllocatedClaims{},
+		topology:           deviceTopology{cpuTopology: topo},
+		metrics:            cpumetrics.Noop(),
+	}
+
+	_, err := driver.Synchronize(context.Background(), nil, nil)
+	require.NoError(t, err)
+
+	_, held := driver.cpuAllocationStore.GetResourceClaimAllocation(gone)
+	require.False(t, held, "a spec the projection does not name must not resurrect its claim")
+}
+
+// TestReportForeignCPUsEventsTheClaim: the update converging such a container is
+// already queued by the time this runs, so the metric and the event on the claim
+// are the whole trace the episode leaves. This is the shape a crash-looping
+// driver produces, which is how it was found on a real node.
+func TestReportForeignCPUsEventsTheClaim(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpuID := range 8 {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	allocations := store.NewCPUAllocation(topo, cpuset.New())
+	requirePreparedResourceClaim(t, logger, allocations, "neighbour", cpuset.New(4, 5))
+
+	reg := prometheus.NewRegistry()
+	client := k8sfake.NewSimpleClientset()
+	cp := &CPUDriver{
+		driverName: testDriverName,
+		nodeName:   testNodeName,
+		kubeClient: client,
+		metrics:    cpumetrics.New(reg),
+		claimReader: fakeClaimReader{claims: []*resourceapi.ResourceClaim{{
+			ObjectMeta: metav1.ObjectMeta{UID: "mine", Namespace: "default", Name: "pod-claim"},
+		}}},
+	}
+
+	cp.reportForeignCPUs(context.Background(), allocations, []observedContainer{{
+		logger:    logger,
+		claimUIDs: []types.UID{"mine"},
+		desired:   cpuset.New(0, 1),
+		elsewhere: cpuset.New(0, 1, 4, 5),
+	}})
+
+	require.InDelta(t, 1, metricValue(t, reg, "dra_cpu_synchronize_foreign_cpus_total", nil), 0.01)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		events, err := client.CoreV1().Events("default").List(context.Background(), metav1.ListOptions{})
+		assert.NoError(c, err)
+		if !assert.Len(c, events.Items, 1) {
+			return
+		}
+		assert.Equal(c, "ForeignCPUs", events.Items[0].Reason)
+		assert.Equal(c, "pod-claim", events.Items[0].InvolvedObject.Name)
+		assert.Contains(c, events.Items[0].Message, "4-5")
+	}, time.Second, 10*time.Millisecond)
+}
+
+// TestReportForeignCPUsIsSilentWhereNothingOverlaps: a container on exactly the
+// CPUs its own claim holds is the normal case, and it must cost neither a metric
+// nor an event.
+func TestReportForeignCPUsIsSilentWhereNothingOverlaps(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for cpuID := range 8 {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	allocations := store.NewCPUAllocation(topo, cpuset.New())
+	requirePreparedResourceClaim(t, logger, allocations, "neighbour", cpuset.New(4, 5))
+
+	reg := prometheus.NewRegistry()
+	client := k8sfake.NewSimpleClientset()
+	cp := &CPUDriver{
+		driverName: testDriverName,
+		nodeName:   testNodeName,
+		kubeClient: client,
+		metrics:    cpumetrics.New(reg),
+	}
+
+	cp.reportForeignCPUs(context.Background(), allocations, []observedContainer{{
+		logger:    logger,
+		claimUIDs: []types.UID{"mine"},
+		desired:   cpuset.New(0, 1),
+		elsewhere: cpuset.New(0, 1),
+	}})
+
+	require.InDelta(t, 0, metricValue(t, reg, "dra_cpu_synchronize_foreign_cpus_total", nil), 0.01)
+	events, err := client.CoreV1().Events("default").List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, events.Items)
+}
+
+// twoRequestClaimDriver is a driver holding one claim of two requests: CPUs 0-1
+// the claim holds alone, and a share of a pool on 2-3.
+func twoRequestClaimDriver(t *testing.T, claimUID types.UID) *CPUDriver {
+	t.Helper()
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range cpuset.New(0, 1, 2, 3, 4, 5).UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, store.ClaimRecord{Requests: []store.RequestAllocation{
+		{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")},
+		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive},
+	}}, false))
+	tracker := store.NewClaimTracker()
+	tracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{"pod-1"}})
+	return &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: cpuStore,
+		claimTracker:       tracker,
+		topology:           deviceTopology{cpuTopology: topo},
+		cdiMgr:             newMockCdiMgr(),
+		metrics:            cpumetrics.Noop(),
+	}
+}
+
+// requestEnv is the variable the kubelet injects for one request of a claim,
+// with the CDI device name the runtime reports for it.
+func requestEnv(claimUID types.UID, request, cpus string) (string, string) {
+	return fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claimUID, request, cpus),
+		cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIRequestDeviceName(claimUID, request))
+}
+
+func TestCreateContainerPinsAContainerToTheRequestsItNames(t *testing.T) {
+	claimUID := types.UID("claim-1")
+	driver := twoRequestClaimDriver(t, claimUID)
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-1", Name: "vm", Namespace: "ns"}
+
+	vcpusEnv, vcpusDevice := requestEnv(claimUID, "vcpus", "0-1")
+	helpersEnv, helpersDevice := requestEnv(claimUID, "helpers", "2-3")
+
+	create := func(name string, env []string, devices ...string) *api.ContainerAdjustment {
+		t.Helper()
+		ctr := &api.Container{Id: "ctr-" + name, PodSandboxId: pod.Id, Name: name, Env: env}
+		for _, device := range devices {
+			ctr.CDIDevices = append(ctr.CDIDevices, &api.CDIDevice{Name: device})
+		}
+		adjustment, _, err := driver.CreateContainer(context.Background(), pod, ctr)
+		require.NoError(t, err)
+		return adjustment
+	}
+
+	require.Equal(t, "0-1", create("vcpus", []string{vcpusEnv}, vcpusDevice).Linux.Resources.Cpu.Cpus,
+		"a container naming one request is pinned to that request's CPUs, not to the whole claim")
+	require.Equal(t, "2-3", create("helpers", []string{helpersEnv}, helpersDevice).Linux.Resources.Cpu.Cpus)
+	require.Equal(t, "0-3", create("both", []string{vcpusEnv, helpersEnv}, vcpusDevice, helpersDevice).Linux.Resources.Cpu.Cpus)
+
+	// A container created before the driver wrote one device per request carries
+	// the claim's own variable, and still holds the claim whole.
+	claimWide := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-1")
+	require.Equal(t, "0-3", create("legacy", []string{claimWide},
+		cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName(claimUID))).Linux.Resources.Cpu.Cpus)
+
+	owners, owned := driver.claimTracker.Owners(claimUID)
+	require.True(t, owned)
+	var names []string
+	for _, owner := range owners {
+		names = append(names, owner.ContainerName)
+	}
+	require.NotContains(t, names, "helpers",
+		"a container given only a share of a pool binds nothing to itself")
+	require.Contains(t, names, "vcpus")
+}
+
+func TestCreateContainerRefusesARequestItWasNotGiven(t *testing.T) {
+	claimUID := types.UID("claim-1")
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-1", Name: "vm", Namespace: "ns"}
+	vcpusEnv, vcpusDevice := requestEnv(claimUID, "vcpus", "0-1")
+	helpersEnv, _ := requestEnv(claimUID, "helpers", "2-3")
+	inventedEnv, inventedDevice := requestEnv(claimUID, "invented", "4-5")
+
+	t.Run("a request the runtime injected no device for", func(t *testing.T) {
+		driver := twoRequestClaimDriver(t, claimUID)
+		ctr := &api.Container{
+			Id: "ctr-1", PodSandboxId: pod.Id, Name: "helpers",
+			Env:        []string{vcpusEnv, helpersEnv},
+			CDIDevices: []*api.CDIDevice{{Name: vcpusDevice}},
+		}
+		_, _, err := driver.CreateContainer(context.Background(), pod, ctr)
+		require.ErrorContains(t, err, "helpers")
+	})
+
+	t.Run("a request the claim does not hold", func(t *testing.T) {
+		driver := twoRequestClaimDriver(t, claimUID)
+		ctr := &api.Container{
+			Id: "ctr-1", PodSandboxId: pod.Id, Name: "app",
+			Env:        []string{inventedEnv},
+			CDIDevices: []*api.CDIDevice{{Name: inventedDevice}},
+		}
+		_, _, err := driver.CreateContainer(context.Background(), pod, ctr)
+		require.ErrorContains(t, err, "invented",
+			"a request no claim holds is refused rather than answered with no CPUs at all")
+	})
+}
+
+// TestRecoveryReadsOnlyAClaimsRecordDevice: the per-request devices carry a
+// variable and no record, so a driver that read them back as claims would
+// recover a claim whose UID is a UID and a request name run together, holding
+// the CPUs of one request as if they were the whole claim's.
+func TestRecoveryReadsOnlyAClaimsRecordDevice(t *testing.T) {
+	logger := testr.New(t)
+	claimUID := types.UID("claim-1")
+	mgr := newMockCdiMgr()
+	record := store.ClaimRecord{Requests: []store.RequestAllocation{
+		{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")},
+		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive},
+	}}
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimUID),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-3"), record))
+	for _, request := range record.Requests {
+		env, _ := requestEnv(claimUID, request.Request, request.CPUs.String())
+		require.NoError(t, mgr.AddRequestDevice(logger, getCDIRequestDeviceName(claimUID, request.Request), env))
+	}
+
+	recovered := mgr.PreparedClaimAllocations(logger)
+	require.Len(t, recovered, 1)
+	require.Equal(t, record.Requests, recovered[claimUID].Requests)
+}
+
+// TestRoundOriginInvertsTheMoveItReverses: the origin a container is rolled back
+// to is read by spreading the round's origin over the same requests the target
+// was spread over, so the two have to divide a set the same way. A reverse that
+// merely gave each request the right number of CPUs would put a container back
+// on CPUs its own claim never held there.
+func TestRoundOriginInvertsTheMoveItReverses(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for core := 0; core < 16; core++ {
+		infos = append(infos,
+			cpuinfo.CPUInfo{CpuID: core, CoreID: core, SocketID: 0, NUMANodeID: 0},
+			cpuinfo.CPUInfo{CpuID: core + 128, CoreID: core, SocketID: 0, NUMANodeID: 0},
+		)
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	origin := cpuset.New(0, 1, 2, 3, 128, 129, 130, 131)
+	target := cpuset.New(8, 9, 10, 11, 136, 137, 138, 139)
+	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, "claim-1", store.ClaimRecord{Requests: []store.RequestAllocation{
+		{Request: "alpha", CPUs: cpuset.New(0, 1, 128, 129), Role: store.RoleExclusive},
+		{Request: "beta", CPUs: cpuset.New(2, 3, 130, 131), Role: store.RoleExclusive},
+	}}, false))
+	require.NoError(t, cpuStore.BeginRebind(logger, "claim-1", target))
+
+	moved, ok := cpuStore.GetClaimRecord("claim-1")
+	require.True(t, ok)
+	moved.Round = &store.RoundProvenance{RoundID: "round-1", Origin: origin, Target: target}
+
+	for _, request := range []string{"alpha", "beta"} {
+		back, forward := roundCPUsOf(topo, moved, request)
+		require.Equal(t, forward, requestCPUs(t, moved, request),
+			"the target of %q is what the store placed it on", request)
+		require.Equal(t, back, requestCPUs(t, beforeTheMove(t, logger, topo, origin), request),
+			"the origin of %q is where the same spread would have put it", request)
+		require.Equal(t, back, topo.CPUDetails.CompleteCores(back),
+			"request %q rolls back onto whole cores", request)
+	}
+}
+
+// beforeTheMove is the same claim placed on origin, which is what the claim
+// looked like before the round started.
+func beforeTheMove(t *testing.T, logger logr.Logger, topo *cpuinfo.CPUTopology, origin cpuset.CPUSet) store.ClaimRecord {
+	t.Helper()
+	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, "claim-1", store.ClaimRecord{Requests: []store.RequestAllocation{
+		{Request: "alpha", CPUs: cpuset.New(0, 1, 128, 129), Role: store.RoleExclusive},
+		{Request: "beta", CPUs: cpuset.New(2, 3, 130, 131), Role: store.RoleExclusive},
+	}}, false))
+	require.NoError(t, cpuStore.BeginRebind(logger, "claim-1", origin))
+	record, ok := cpuStore.GetClaimRecord("claim-1")
+	require.True(t, ok)
+	return record
+}
+
+func requestCPUs(t *testing.T, record store.ClaimRecord, request string) cpuset.CPUSet {
+	t.Helper()
+	held, ok := requestOf(record, request)
+	require.True(t, ok)
+	return held.CPUs
+}
+
+func TestRoundCPUsOfProjectsAMoveOntoOneRequest(t *testing.T) {
+	// The round moved the claim's exclusive CPUs from 0-3 to 8-11 as a whole, and
+	// the record spreads the target over the exclusive requests in name order,
+	// each keeping its size: dpdk two, vcpus two.
+	record := store.ClaimRecord{
+		Requests: []store.RequestAllocation{
+			{Request: "ctrl", CPUs: cpuset.New(20, 21), Role: store.Role("shared")},
+			{Request: "dpdk", CPUs: cpuset.New(8, 9), Role: store.RoleExclusive},
+			{Request: "vcpus", CPUs: cpuset.New(10, 11), Role: store.RoleExclusive},
+		},
+		Round: &store.RoundProvenance{
+			RoundID: "round-1",
+			Origin:  cpuset.New(0, 1, 2, 3),
+			Target:  cpuset.New(8, 9, 10, 11),
+		},
+	}
+
+	origin, target := roundCPUsOf(nil, record, "dpdk")
+	require.Equal(t, cpuset.New(0, 1), origin)
+	require.Equal(t, cpuset.New(8, 9), target)
+
+	origin, target = roundCPUsOf(nil, record, "vcpus")
+	require.Equal(t, cpuset.New(2, 3), origin)
+	require.Equal(t, cpuset.New(10, 11), target)
+
+	origin, target = roundCPUsOf(nil, record, "ctrl")
+	require.Equal(t, cpuset.New(20, 21), origin, "a pool share is where it always was")
+	require.Equal(t, cpuset.New(20, 21), target)
+
+	origin, target = roundCPUsOf(nil, record, "")
+	require.Equal(t, cpuset.New(0, 1, 2, 3, 20, 21), origin, "a container naming no request moves with the whole claim")
+	require.Equal(t, cpuset.New(8, 9, 10, 11, 20, 21), target)
+
+	// A record whose exclusive requests no longer add up to the target answers
+	// for the claim rather than guessing which request an origin belongs to.
+	rewritten := record
+	rewritten.Requests = []store.RequestAllocation{{Request: "dpdk", CPUs: cpuset.New(8, 9), Role: store.RoleExclusive}}
+	origin, target = roundCPUsOf(nil, rewritten, "dpdk")
+	require.Equal(t, cpuset.New(0, 1, 2, 3), origin)
+	require.Equal(t, cpuset.New(8, 9, 10, 11), target)
+}
+
+func TestSynchronizeKeepsEachContainerOnItsOwnRequest(t *testing.T) {
+	logger := testr.New(t)
+	claimUID := types.UID("claim-1")
+	driver := twoRequestClaimDriver(t, claimUID)
+	record := store.ClaimRecord{
+		Requests: []store.RequestAllocation{
+			{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")},
+			{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive},
+		},
+		ReservedFor: []types.UID{"pod-1"},
+	}
+	require.NoError(t, driver.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-3"), record))
+
+	vcpusEnv, vcpusDevice := requestEnv(claimUID, "vcpus", "0-1")
+	helpersEnv, helpersDevice := requestEnv(claimUID, "helpers", "2-3")
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-1", Name: "vm", Namespace: "ns"}
+	containers := []*api.Container{
+		{
+			Id: "ctr-vcpus", PodSandboxId: pod.Id, Name: "vcpus",
+			Env:        []string{vcpusEnv},
+			CDIDevices: []*api.CDIDevice{{Name: vcpusDevice}},
+			Linux:      &api.LinuxContainer{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1"}}},
+		},
+		{
+			Id: "ctr-helpers", PodSandboxId: pod.Id, Name: "helpers",
+			Env:        []string{helpersEnv},
+			CDIDevices: []*api.CDIDevice{{Name: helpersDevice}},
+			Linux:      &api.LinuxContainer{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-3"}}},
+		},
+	}
+
+	updates, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod}, containers)
+	require.NoError(t, err)
+
+	byContainer := map[string]string{}
+	for _, update := range updates {
+		byContainer[update.ContainerId] = update.Linux.Resources.Cpu.Cpus
+	}
+	require.NotContains(t, byContainer, "ctr-vcpus", "a container already on its request's CPUs is left alone")
+	require.Equal(t, "2-3", byContainer["ctr-helpers"],
+		"a container running on the whole claim is converged onto the request it was given")
 }

@@ -20,12 +20,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/discovery"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
 	podmatchers "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/matchers/pod"
@@ -50,6 +52,21 @@ func TestE2E(t *testing.T) {
 	ginkgo.RunSpecs(t, "DRA CPU Driver E2E Suite")
 }
 
+func isReleaseGate() bool {
+	return os.Getenv("DRACPU_E2E_RELEASE_GATE") != ""
+}
+
+func assertScenarioRan(ran bool, msg string) {
+	ginkgo.GinkgoHelper()
+	if !ran {
+		if isReleaseGate() {
+			ginkgo.Fail("release gate requires scenario to run: " + msg)
+		} else {
+			ginkgo.Skip(msg)
+		}
+	}
+}
+
 // shared code which is not ready yet to be moved into a test/pkg/... package
 
 const (
@@ -57,6 +74,8 @@ const (
 	argReservedCPUs       = "--reserved-cpus="
 	argCPUDeviceMode      = "--cpu-device-mode="
 	argGroupBy            = "--group-by="
+	profileLabel          = "dra.cpu/profile"
+	defaultProfileName    = "default"
 	daemonSetNamespace    = "kube-system"
 	daemonSetLabel        = "app=dracpu"
 	driverPodPollInterval = 2 * time.Second
@@ -162,6 +181,9 @@ func makeCPUSetFromDiscoveredCPUInfo(cpuInfo discovery.DRACPUInfo) cpuset.CPUSet
 type CPUAllocation struct {
 	CPUAssigned cpuset.CPUSet
 	CPUAffinity cpuset.CPUSet
+	// Metadata is what the container's own KEP-5304 metadata files say about
+	// each request of each claim it holds.
+	Metadata []discovery.DRACPURequestMetadata
 }
 
 func unmarshalLatestReport(data string, v any) error {
@@ -191,6 +213,7 @@ func getTesterPodCPUAllocation(cs kubernetes.Interface, ctx context.Context, pod
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse assigned cpuset: %q", testerInfo.Allocation.CPUs)
 	ret.CPUAffinity, err = cpuset.Parse(testerInfo.Runtimeinfo.CPUAffinity)
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse affinity cpuset: %q", testerInfo.Runtimeinfo.CPUAffinity)
+	ret.Metadata = testerInfo.Metadata
 	return ret
 }
 
@@ -327,6 +350,103 @@ type driverConfigValues struct {
 	GroupBy                               string `json:"groupBy,omitempty"`
 	ReservedCPUs                          string `json:"reservedCPUs,omitempty"`
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
+	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly,omitempty"`
+	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+	// ReconcileSharedOnUnprepare defaults to true in the driver, so a config
+	// file that does not mention it leaves it on: absent must read as true,
+	// which a plain bool cannot express.
+	ReconcileSharedOnUnprepare *bool `json:"reconcileSharedOnUnprepare,omitempty"`
+	DefragEnabled              bool  `json:"defragEnabled,omitempty"`
+	// DefragAllowTransientOverlap defaults to true in the driver, so absent
+	// reads as true here for the same reason ReconcileSharedOnUnprepare does.
+	DefragAllowTransientOverlap *bool                    `json:"defragAllowTransientOverlap,omitempty"`
+	CPUPartitions               []driverConfigPartition  `json:"cpuPartitions,omitempty"`
+	CachePlacementStrategy      string                   `json:"cachePlacementStrategy,omitempty"`
+	Profiles                    map[string]profileValues `json:"profiles,omitempty"`
+}
+
+type profileValues struct {
+	CPUPartitions []driverConfigPartition `json:"cpuPartitions,omitempty"`
+}
+
+// driverConfigPartition is one entry of the driver's cpuPartitions list. The
+// thread-arity expectation is read raw, since the config file spells it as a
+// boolean or a count and the suite only asks whether it is one thread per core.
+type driverConfigPartition struct {
+	Name string          `json:"name"`
+	Role string          `json:"role"`
+	CPUs string          `json:"cpus"`
+	SMT  json.RawMessage `json:"smt,omitempty"`
+}
+
+// poolPartition is the partition a workload reaches by claiming it, empty when
+// the node's cores describe none.
+func (v driverConfigValues) poolPartition() (driverConfigPartition, bool) {
+	for _, partition := range v.CPUPartitions {
+		if partition.Role == device.PARTITION_ROLE_SHARED {
+			return partition, true
+		}
+	}
+	return driverConfigPartition{}, false
+}
+
+// singleThreadPartition returns the first partition declaring one online thread
+// per core, which is the shape a node has to be prepared for by hand.
+func (v driverConfigValues) singleThreadPartition() (driverConfigPartition, bool) {
+	for _, partition := range v.CPUPartitions {
+		switch string(partition.SMT) {
+		case "false", "1":
+			return partition, true
+		}
+	}
+	return driverConfigPartition{}, false
+}
+
+// effectiveFor mirrors the driver's config-profile resolution: the node's
+// dra.cpu/profile label picks the partitions describing that node's cores.
+func (v driverConfigValues) effectiveFor(node *v1.Node) driverConfigValues {
+	ginkgo.GinkgoHelper()
+	if len(v.Profiles) == 0 {
+		name := node.Labels[profileLabel]
+		gomega.Expect(name == "" || name == defaultProfileName).To(gomega.BeTrue(),
+			"node %s selects config profile %q, which the driver config does not declare", node.Name, name)
+		return v
+	}
+	name := node.Labels[profileLabel]
+	gomega.Expect(name).ToNot(gomega.BeEmpty(), "node %s carries no %s label, so its driver would not have started", node.Name, profileLabel)
+	profile, declared := v.Profiles[name]
+	gomega.Expect(declared || name == defaultProfileName).To(gomega.BeTrue(),
+		"node %s selects config profile %q, which the driver config does not declare", node.Name, name)
+	v.CPUPartitions = profile.CPUPartitions
+	return v
+}
+
+func discoverNodeCPUInfo(ctx context.Context, fxt *fixture.Fixture, nodeName, image string) discovery.DRACPUInfo {
+	ginkgo.GinkgoHelper()
+	infoPod := discovery.MakePod(fxt.Namespace.Name, image)
+	infoPod = e2epod.PinToNode(infoPod, nodeName)
+	infoPod, err := e2epod.RunToCompletion(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot run the discovery pod")
+	data, err := e2epod.GetLogs(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get the discovery pod logs")
+	var info discovery.DRACPUInfo
+	gomega.Expect(unmarshalLatestReport(data, &info)).To(gomega.Succeed())
+	return info
+}
+
+// reconcilesSharedOnUnprepare reports whether the driver widens shared
+// containers as soon as a claim is released, rather than at their next
+// lifecycle event.
+func (v driverConfigValues) reconcilesSharedOnUnprepare() bool {
+	return v.AssumeUnsolicitedUpdatesSafe &&
+		(v.ReconcileSharedOnUnprepare == nil || *v.ReconcileSharedOnUnprepare)
+}
+
+// allowsTransientOverlap reports whether the driver may exchange the CPUs of two
+// claims, which is the only repair a node with no free CPUs has.
+func (v driverConfigValues) allowsTransientOverlap() bool {
+	return v.DefragEnabled &&
+		(v.DefragAllowTransientOverlap == nil || *v.DefragAllowTransientOverlap)
 }
 
 // getDriverConfigValues reads the ConfigMap if the daemonset uses --config=, else falls back to
@@ -392,6 +512,68 @@ func makeTesterPodWithNamedClaim(ns, image, claimName string, nodeName string, n
 	return e2epod.PinToNode(pod, nodeName)
 }
 
+// createClaimedTesterPod places a pod holding one exclusive claim of numCPUs and
+// returns it along with the claim's UID, which is how /placements names it.
+func createClaimedTesterPod(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, string) {
+	ginkgo.GinkgoHelper()
+	pod, claimUID, err := tryCreateClaimedTesterPodWithUID(ctx, fxt, image, nodeName, cfg, numCPUs, claimTemplateName)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	return pod, claimUID
+}
+
+func tryCreateClaimedTesterPodWithUID(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, string, error) {
+	return tryCreateClaimedTesterPodWithSpec(ctx, fxt, image, nodeName,
+		makeResourceClaimSpec(numCPUs, cfg.CPUDeviceMode == "grouped"), claimTemplateName)
+}
+
+func tryCreateClaimedTesterPodWithSpec(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, spec resourcev1.ResourceClaimSpec, claimTemplateName string) (*v1.Pod, string, error) {
+	claimTemplate := resourcev1.ResourceClaimTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: claimTemplateName},
+		Spec: resourcev1.ResourceClaimTemplateSpec{
+			Spec: spec,
+		},
+	}
+	created, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &claimTemplate, metav1.CreateOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Deliberately without a standard CPU request. Mirroring the claim's CPUs
+	// into requests is what the docs ask of a workload, but it makes the
+	// scheduler count them twice, and a test that fills a node with claims runs
+	// out of node-allocatable cpu long before it runs out of claimable CPUs.
+	pod := makeTesterPodWithExclusiveCPUClaimWithoutCPURequest(fxt.Namespace.Name, image, created.Name, nodeName)
+	pod, err = fxt.K8SClientset.CoreV1().Pods(fxt.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	if err := e2epod.WaitToBeRunning(ctx, fxt.K8SClientset, pod.Namespace, pod.Name); err != nil {
+		// A refusal is a legitimate outcome for callers that fill a node -- but a
+		// pod left behind Pending is not: it would be admitted the moment the
+		// caller deletes something, and haunt the rest of the test with a claim
+		// nobody is tracking.
+		if deleteErr := e2epod.DeleteSync(ctx, fxt.K8SClientset, pod); deleteErr != nil {
+			return nil, "", fmt.Errorf("pod %s was refused (%w) and could not be cleaned up: %w", pod.Name, err, deleteErr)
+		}
+		return nil, "", err
+	}
+
+	// The generated claim carries the pod's own name, and its UID is what the
+	// driver knows it by.
+	claims, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	for _, claim := range claims.Items {
+		for _, ref := range claim.OwnerReferences {
+			if ref.UID == pod.UID {
+				return pod, string(claim.UID), nil
+			}
+		}
+	}
+	return nil, "", fmt.Errorf("no resource claim found for pod %s/%s", pod.Namespace, pod.Name)
+}
+
 func makeResourceClaimSpec(cpus int, isConsumable bool) resourcev1.ResourceClaimSpec {
 	if !isConsumable {
 		return resourcev1.ResourceClaimSpec{
@@ -425,6 +607,113 @@ func makeResourceClaimSpec(cpus int, isConsumable bool) resourcev1.ResourceClaim
 			},
 		},
 	}
+}
+
+func claimSpecWithSelector(cpus int, cel string) resourcev1.ResourceClaimSpec {
+	spec := makeResourceClaimSpec(cpus, true)
+	if cel != "" {
+		spec.Devices.Requests[0].Exactly.Selectors = []resourcev1.DeviceSelector{
+			{CEL: &resourcev1.CELDeviceSelector{Expression: cel}},
+		}
+	}
+	return spec
+}
+
+// movableClaimSpecWithSelector is claimSpecWithSelector for a claim that permits
+// the driver to change its CPUs while it runs. Mobility is the tenant's to
+// grant and defaults to off, so a claim that says nothing is never consolidated
+// -- which is what every defragmentation scenario needs a claim to be.
+func movableClaimSpecWithSelector(cpus int, cel string) resourcev1.ResourceClaimSpec {
+	ginkgo.GinkgoHelper()
+	spec := claimSpecWithSelector(cpus, cel)
+	rawConfig, err := json.Marshal(v1alpha1.OpaqueConfig{
+		APIVersion: v1alpha1.APIVersion,
+		CPUConfig:  v1alpha1.CPUConfig{Relocatable: true},
+	})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	spec.Devices.Config = []resourcev1.DeviceClaimConfiguration{
+		{
+			Requests: []string{spec.Devices.Requests[0].Name},
+			DeviceConfiguration: resourcev1.DeviceConfiguration{
+				Opaque: &resourcev1.OpaqueDeviceConfiguration{
+					Driver:     driverName,
+					Parameters: runtime.RawExtension{Raw: rawConfig},
+				},
+			},
+		},
+	}
+	return spec
+}
+
+func repairableClaimSpecWithSelector(cpus int, cel string) resourcev1.ResourceClaimSpec {
+	ginkgo.GinkgoHelper()
+	var selectors []resourcev1.DeviceSelector
+	if cel != "" {
+		selectors = []resourcev1.DeviceSelector{
+			{CEL: &resourcev1.CELDeviceSelector{Expression: cel}},
+		}
+	}
+	rawConfig, err := json.Marshal(v1alpha1.OpaqueConfig{
+		APIVersion: v1alpha1.APIVersion,
+		CPUConfig: v1alpha1.CPUConfig{
+			Relocatable: true,
+			Alignment:   v1alpha1.AlignmentRepairable,
+		},
+	})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	reqName := "request-cpus"
+	return resourcev1.ResourceClaimSpec{
+		Devices: resourcev1.DeviceClaim{
+			Requests: []resourcev1.DeviceRequest{
+				{
+					Name: reqName,
+					FirstAvailable: []resourcev1.DeviceSubRequest{
+						{
+							Name:            "aligned",
+							DeviceClassName: driverName,
+							Selectors:       selectors,
+							Capacity: &resourcev1.CapacityRequirements{
+								Requests: map[resourcev1.QualifiedName]resource.Quantity{
+									"dra.cpu/cpu": *resource.NewQuantity(int64(cpus), resource.DecimalSI),
+								},
+							},
+						},
+						{
+							Name:            "split",
+							DeviceClassName: driverName,
+							Selectors:       selectors,
+							Capacity: &resourcev1.CapacityRequirements{
+								Requests: map[resourcev1.QualifiedName]resource.Quantity{
+									"dra.cpu/cpu": *resource.NewQuantity(int64(cpus), resource.DecimalSI),
+								},
+							},
+						},
+					},
+				},
+			},
+			Config: []resourcev1.DeviceClaimConfiguration{
+				{
+					Requests: []string{reqName},
+					DeviceConfiguration: resourcev1.DeviceConfiguration{
+						Opaque: &resourcev1.OpaqueDeviceConfiguration{
+							Driver:     driverName,
+							Parameters: runtime.RawExtension{Raw: rawConfig},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// numaCEL pins a claim to one NUMA node's device. Only numanode grouping
+// publishes the attribute per device, so other modes get no selector and the
+// scenario spans the machine as it always did.
+func numaCEL(cfg driverConfigValues, numaID int) string {
+	if cfg.GroupBy != "numanode" && cfg.GroupBy != "uncorecache" {
+		return ""
+	}
+	return fmt.Sprintf(`device.attributes["dra.cpu"].numaNodeID == %d`, numaID)
 }
 
 func makeResourceClaimSpecWithOpaqueConfig(cpus int, isConsumable bool, cpusetStr string) resourcev1.ResourceClaimSpec {

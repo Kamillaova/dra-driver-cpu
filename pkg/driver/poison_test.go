@@ -1,0 +1,257 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package driver
+
+import (
+	"context"
+	"testing"
+
+	"github.com/containerd/nri/pkg/api"
+	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	devattr "github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	"github.com/stretchr/testify/require"
+	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/cpuset"
+)
+
+// fencedDriver is the node an unsettleable exchange leaves behind: the runtime
+// refused one container, then refused to put the other back, so nobody can say
+// which CPUs the two containers are on.
+func fencedDriver(t *testing.T) *defragTestDriver {
+	t.Helper()
+	d := exchangeDriver(t)
+	d.updater.reply = func(call int, updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
+		if call < 3 {
+			return refusing("ctr-uid-2")(call, updates)
+		}
+		return refusing("ctr-uid-1")(call, updates)
+	}
+	d.defragPass(context.Background())
+	require.True(t, d.nodeIsPoisoned(0), "an exchange nobody can settle must fence its NUMA node")
+	return d
+}
+
+func TestPoisonedNodeIsFencedAndCounted(t *testing.T) {
+	d := fencedDriver(t)
+
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_poisoned_nodes_total", nil), 0.01)
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_numa_node_poisoned", map[string]string{"numa_node": "0"}), 0.01)
+
+	// A fence does not stop the node being measured. A gauge that disappears
+	// when a node is in trouble is the one nobody can alert on.
+	require.Positive(t, metricValue(t, d.metrics, "dra_cpu_defrag_excess_uncore_caches", nil))
+}
+
+func TestPoisonedNodeIsNotPlannedOn(t *testing.T) {
+	d := fencedDriver(t)
+	sent := d.updater.allCalls()
+
+	// The unsettled round is sent again, under the same reservation, because
+	// that is the one thing that can still finish it. Nothing new is planned.
+	d.updater.reply = nil
+	d.defragPass(context.Background())
+
+	calls := d.updater.allCalls()
+	require.Len(t, calls, len(sent)+1)
+	require.Equal(t, sent[0], calls[len(calls)-1], "a fenced node sends its unsettled round again and plans nothing new")
+}
+
+func TestPoisonedNodeTaintsItsDevices(t *testing.T) {
+	d := fencedDriver(t)
+	d.devicesPerResourceSlice = 64
+	d.topology.devicesByPartition = [][]resourceapi.Device{{{Name: "numa-0"}, {Name: "numa-1"}}}
+	d.topology.deviceNameToCPUs = map[string]cpuset.CPUSet{
+		"numa-0": cpuset.New(0, 1, 2, 3),
+		"numa-1": cpuset.New(4, 5),
+	}
+
+	d.applyMu.Lock()
+	slices, _ := d.refreshDeviceOrder()
+	d.applyMu.Unlock()
+
+	require.Len(t, slices, 1)
+	require.Equal(t, []resourceapi.DeviceTaint{{
+		Key:    devattr.PoisonTaintKey,
+		Value:  "0",
+		Effect: resourceapi.DeviceTaintEffectNoSchedule,
+	}}, slices[0][0].Taints, "a device reaching into the fenced node is tainted")
+	require.Empty(t, slices[0][1].Taints, "a device that does not is untouched")
+}
+
+func TestPoisonedNodeReopensWhenTheKernelAgrees(t *testing.T) {
+	d := fencedDriver(t)
+	// The runtime did apply the first half and refused the second, so the kernel
+	// says the exchange never completed: both containers are where they started.
+	d.liveCPUs("ctr-uid-1", cpuset.New(0, 3))
+	d.liveCPUs("ctr-uid-2", cpuset.New(1, 2))
+	d.updater.reply = nil
+
+	d.liftPoison(testr.New(t), 0)
+
+	require.False(t, d.nodeIsPoisoned(0))
+	require.NotContains(t, d.pendingRounds, defaultScope(0))
+	first, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 3), first, "the ledger is rebuilt from what the kernel says")
+	require.Equal(t, cpuset.New(0, 3), d.recordedPlacement(t, "claim-1"))
+	for _, claimUID := range []string{"claim-1", "claim-2"} {
+		_, inFlight := d.cpuAllocationStore.GetRebindOrigin(types.UID(claimUID))
+		require.False(t, inFlight)
+	}
+	require.Positive(t, metricValue(t, d.metrics, "dra_cpu_defrag_poisoned_duration_seconds", nil))
+}
+
+func TestPoisonedNodeCommitsAnExchangeTheKernelSaysCompleted(t *testing.T) {
+	d := fencedDriver(t)
+	// The other coherent answer: both containers took their new cpusets after
+	// all, and the reply that said otherwise was lost or wrong.
+	d.liveCPUs("ctr-uid-1", cpuset.New(0, 1))
+	d.liveCPUs("ctr-uid-2", cpuset.New(2, 3))
+
+	d.liftPoison(testr.New(t), 0)
+
+	require.False(t, d.nodeIsPoisoned(0))
+	first, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	second, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-2")
+	require.Equal(t, cpuset.New(0, 1), first)
+	require.Equal(t, cpuset.New(2, 3), second)
+}
+
+func TestPoisonedNodeStaysFencedWhileTheKernelDisagrees(t *testing.T) {
+	d := fencedDriver(t)
+	// Half applied: exactly the state the fence exists for, and the one the
+	// driver may not settle by guessing.
+	d.liveCPUs("ctr-uid-1", cpuset.New(0, 1))
+	d.liveCPUs("ctr-uid-2", cpuset.New(1, 2))
+
+	d.liftPoison(testr.New(t), 0)
+
+	require.True(t, d.nodeIsPoisoned(0))
+	require.Contains(t, d.pendingRounds, defaultScope(0))
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_defrag_readback_mismatches_total", nil), 0.01)
+
+	// So does a node whose containers cannot be read at all.
+	d.cgroups = nil
+	d.cgroupfs = nil
+	d.liftPoison(testr.New(t), 0)
+	require.True(t, d.nodeIsPoisoned(0))
+}
+
+func TestPreparingOnAPoisonedNodeFailsClosed(t *testing.T) {
+	d := fencedDriver(t)
+	d.topology.deviceNameToCPUs = map[string]cpuset.CPUSet{"numa-0": cpuset.New(0, 1, 2, 3)}
+
+	d.applyMu.Lock()
+	fenced := d.poisonedNUMANodesOf(d.topology.deviceNameToCPUs["numa-0"])
+	d.applyMu.Unlock()
+
+	require.Equal(t, []int{0}, fenced,
+		"a device reaching into the fenced node hands out nothing until a read-back agrees")
+}
+
+// TestPoisonNodeDoesNotPanicWithDefragmentationOff: the fence is a map, and a
+// nil one reads as empty but panics the moment anything writes to it. Nothing
+// fences a node with the feature off today, but that is a fact about the
+// callers rather than about the type, and finding out otherwise costs the
+// driver its process.
+func TestPoisonNodeDoesNotPanicWithDefragmentationOff(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	cp, err := New(logger, Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:   testSysFS(infos),
+	}, &Config{
+		DriverName:     testDriverName,
+		NodeName:       testNodeName,
+		KubeletRootDir: "/var/lib/kubelet",
+		CPUDeviceMode:  devattr.CPU_DEVICE_MODE_GROUPED,
+	})
+	require.NoError(t, err)
+	require.False(t, cp.defrag.enabled)
+	require.NotNil(t, cp.poisonedNodes)
+
+	require.False(t, cp.nodeIsPoisoned(0))
+	cp.poisonNode(logger, defragScope{numaNodeID: 0, partition: devattr.DefaultPartitionName})
+	require.True(t, cp.nodeIsPoisoned(0))
+}
+
+// TestSynchronizeFenceNeedsItsOwnEvidence: a fence Synchronize raised has no
+// round to settle, and the container that raised it was not converged -- the
+// three-way check poisons and sends nothing, because it could not say where the
+// container belongs. Retiring that fence on the absence of a round would hand
+// the CPUs back while a container nothing could place is still running on them
+// (B47).
+func TestSynchronizeFenceNeedsItsOwnEvidence(t *testing.T) {
+	logger := testr.New(t)
+	scope := defaultScope(0)
+
+	t.Run("a container that disagrees keeps the fence", func(t *testing.T) {
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeFixedClaim(t, "claim-1", cpuset.New(0, 1))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		d.liveCPUs("ctr-1", cpuset.New(2, 3))
+		d.poisonNodeBecause(logger, scope, fencedBySynchronize)
+
+		d.liftPoison(logger, 0)
+
+		require.True(t, d.nodeIsPoisoned(0), "the container is not where the ledger says, so the fence stands")
+	})
+
+	t.Run("containers that agree lift it", func(t *testing.T) {
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeFixedClaim(t, "claim-1", cpuset.New(0, 1))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		d.liveCPUs("ctr-1", cpuset.New(0, 1))
+		d.poisonNodeBecause(logger, scope, fencedBySynchronize)
+
+		d.liftPoison(logger, 0)
+
+		require.False(t, d.nodeIsPoisoned(0), "every container agrees with the ledger, which is the evidence")
+	})
+
+	t.Run("a cgroup it cannot read keeps the fence", func(t *testing.T) {
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeFixedClaim(t, "claim-1", cpuset.New(0, 1))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		// No liveCPUs: the kernel has nothing to say about this container.
+		d.poisonNodeBecause(logger, scope, fencedBySynchronize)
+
+		d.liftPoison(logger, 0)
+
+		require.True(t, d.nodeIsPoisoned(0), "an unanswered question is not an answer")
+	})
+
+	t.Run("a round's fence is unaffected", func(t *testing.T) {
+		// Synchronize rebuilt the stores from the specs on disk and converged the
+		// containers onto them, which is the same answer a read-back would have
+		// given, so a scope with no pending round retires as it always did.
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeFixedClaim(t, "claim-1", cpuset.New(0, 1))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		d.liveCPUs("ctr-1", cpuset.New(2, 3))
+		d.poisonNode(logger, scope)
+
+		d.liftPoison(logger, 0)
+
+		require.False(t, d.nodeIsPoisoned(0))
+	})
+}
