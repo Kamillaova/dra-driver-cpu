@@ -193,3 +193,65 @@ func TestPoisonNodeDoesNotPanicWithDefragmentationOff(t *testing.T) {
 	cp.poisonNode(logger, defragScope{numaNodeID: 0, partition: devattr.DefaultPartitionName})
 	require.True(t, cp.nodeIsPoisoned(0))
 }
+
+// TestSynchronizeFenceNeedsItsOwnEvidence: a fence Synchronize raised has no
+// round to settle, and the container that raised it was not converged -- the
+// three-way check poisons and sends nothing, because it could not say where the
+// container belongs. Retiring that fence on the absence of a round would hand
+// the CPUs back while a container nothing could place is still running on them
+// (B47).
+func TestSynchronizeFenceNeedsItsOwnEvidence(t *testing.T) {
+	logger := testr.New(t)
+	scope := defaultScope(0)
+
+	t.Run("a container that disagrees keeps the fence", func(t *testing.T) {
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeFixedClaim(t, "claim-1", cpuset.New(0, 1))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		d.liveCPUs("ctr-1", cpuset.New(2, 3))
+		d.poisonNodeBecause(logger, scope, fencedBySynchronize)
+
+		d.liftPoison(logger, 0)
+
+		require.True(t, d.nodeIsPoisoned(0), "the container is not where the ledger says, so the fence stands")
+	})
+
+	t.Run("containers that agree lift it", func(t *testing.T) {
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeFixedClaim(t, "claim-1", cpuset.New(0, 1))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		d.liveCPUs("ctr-1", cpuset.New(0, 1))
+		d.poisonNodeBecause(logger, scope, fencedBySynchronize)
+
+		d.liftPoison(logger, 0)
+
+		require.False(t, d.nodeIsPoisoned(0), "every container agrees with the ledger, which is the evidence")
+	})
+
+	t.Run("a cgroup it cannot read keeps the fence", func(t *testing.T) {
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeFixedClaim(t, "claim-1", cpuset.New(0, 1))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		// No liveCPUs: the kernel has nothing to say about this container.
+		d.poisonNodeBecause(logger, scope, fencedBySynchronize)
+
+		d.liftPoison(logger, 0)
+
+		require.True(t, d.nodeIsPoisoned(0), "an unanswered question is not an answer")
+	})
+
+	t.Run("a round's fence is unaffected", func(t *testing.T) {
+		// Synchronize rebuilt the stores from the specs on disk and converged the
+		// containers onto them, which is the same answer a read-back would have
+		// given, so a scope with no pending round retires as it always did.
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeFixedClaim(t, "claim-1", cpuset.New(0, 1))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		d.liveCPUs("ctr-1", cpuset.New(2, 3))
+		d.poisonNode(logger, scope)
+
+		d.liftPoison(logger, 0)
+
+		require.False(t, d.nodeIsPoisoned(0))
+	})
+}

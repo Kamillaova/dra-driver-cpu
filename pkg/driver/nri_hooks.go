@@ -265,7 +265,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					case containerUnknown:
 						cLogger.Error(kernelErr, "owned container is in unknown state from three-way check, poisoning NUMA node",
 							"desired", allGuaranteedCPUs.String(), "committed", committedCPUs.String(), "kernel", kernelCPUs.String())
-						cp.poisonNUMANodeForCPUs(cLogger, allGuaranteedCPUs.Union(originUnion).Union(kernelCPUs))
+						cp.poisonNUMANodeForCPUs(cLogger, allGuaranteedCPUs.Union(originUnion).Union(kernelCPUs), fencedBySynchronize)
 					}
 				}
 			}

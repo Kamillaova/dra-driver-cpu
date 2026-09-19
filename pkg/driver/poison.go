@@ -40,27 +40,52 @@ import (
 // with the ledger.
 type poisonedNode struct {
 	since time.Time
-	// scopes are the planning regions whose unsettled rounds fenced this node.
-	// The node reopens when every one of them has been settled from a read-back.
-	scopes map[defragScope]struct{}
+	// scopes are the planning regions that fenced this node, each with what
+	// raised it. The node reopens when every one of them has been settled from a
+	// read-back.
+	scopes map[defragScope]fenceCause
 }
+
+// fenceCause is what raised a fence, which decides what evidence lifts it.
+type fenceCause int
+
+const (
+	// fencedByRound is an exchange the runtime would neither finish nor undo.
+	// Its round is the thing to ask, and its read-back settles it.
+	fencedByRound fenceCause = iota
+	// fencedBySynchronize is a container Synchronize's three-way check could not
+	// place at all. There is no round to ask, and the container was left where
+	// it was rather than converged, so the evidence has to come from the
+	// containers themselves.
+	fencedBySynchronize
+)
 
 // poisonNode fences the NUMA node of a scope whose exchange could not be
 // settled. Called with applyMu held.
 func (cp *CPUDriver) poisonNode(logger logr.Logger, scope defragScope) {
+	cp.poisonNodeBecause(logger, scope, fencedByRound)
+}
+
+// poisonNodeBecause fences a scope's NUMA node, recording what raised it. A
+// scope already fenced by a round is not downgraded: a round's read-back is the
+// stronger evidence and it is still owed. Called with applyMu held.
+func (cp *CPUDriver) poisonNodeBecause(logger logr.Logger, scope defragScope, cause fenceCause) {
 	fence, already := cp.poisonedNodes[scope.numaNodeID]
 	if !already {
-		fence = &poisonedNode{since: time.Now(), scopes: map[defragScope]struct{}{}}
+		fence = &poisonedNode{since: time.Now(), scopes: map[defragScope]fenceCause{}}
 		cp.poisonedNodes[scope.numaNodeID] = fence
 		cp.metrics.RecordDefragNodePoisoned()
 		cp.metrics.SetDefragNodePoisoned(scope.numaNodeID, true)
 		logger.Info("fencing a NUMA node: an exchange there could not be settled either way, so two claims may be sharing CPUs and this driver cannot say which",
 			"numaNode", scope.numaNodeID)
 	}
-	fence.scopes[scope] = struct{}{}
+	if existing, ok := fence.scopes[scope]; ok && existing == fencedByRound {
+		return
+	}
+	fence.scopes[scope] = cause
 }
 
-func (cp *CPUDriver) poisonNUMANodeForCPUs(logger logr.Logger, cpus cpuset.CPUSet) {
+func (cp *CPUDriver) poisonNUMANodeForCPUs(logger logr.Logger, cpus cpuset.CPUSet, cause fenceCause) {
 	if cp.topology.cpuTopology == nil {
 		return
 	}
@@ -76,7 +101,7 @@ func (cp *CPUDriver) poisonNUMANodeForCPUs(logger logr.Logger, cpus cpuset.CPUSe
 					break
 				}
 			}
-			cp.poisonNode(logger, scope)
+			cp.poisonNodeBecause(logger, scope, cause)
 		}
 	}
 }
@@ -118,6 +143,64 @@ func (cp *CPUDriver) poisonedNUMANodesOf(cpus cpuset.CPUSet) []int {
 	return fenced
 }
 
+// settleFromContainers asks the kernel where every container holding CPUs of a
+// scope is actually running, and reports whether they all sit where the ledger
+// says they do.
+//
+// This is the evidence a fence Synchronize raised needs. That fence says one
+// container could not be placed at all, and nothing moved it afterwards, so the
+// only thing that can retire it is the containers themselves agreeing with the
+// record. Anything it cannot read -- no cgroup tree, no cgroup path, a claim it
+// cannot price -- leaves the fence up, because an unanswered question is not an
+// answer.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) settleFromContainers(logger logr.Logger, scope defragScope) bool {
+	if cp.cgroupfs == nil || cp.topology.cpuTopology == nil {
+		return false
+	}
+	scopeCPUs := cp.topology.cpuTopology.CPUDetails.CPUsInNUMANodes(scope.numaNodeID)
+	if partition, ok := cp.defragPartition(scope.partition, cp.defragAllocatable(cp.topology.cpuTopology.CPUDetails.CPUs())); ok {
+		scopeCPUs = scopeCPUs.Intersection(partition.CPUs)
+	}
+
+	for claimUID, claimCPUs := range cp.cpuAllocationStore.ExclusiveClaimAllocations() {
+		if claimCPUs.Intersection(scopeCPUs).IsEmpty() {
+			continue
+		}
+		owners, held := cp.claimTracker.Owners(claimUID)
+		if !held {
+			// No container holds it, so no container can be in the wrong place.
+			continue
+		}
+		for _, owner := range owners {
+			state := cp.podConfigStore.GetContainerState(owner.PodUID, owner.ContainerName)
+			if state == nil {
+				continue
+			}
+			desired, err := cp.cpuAllocationStore.GetRequestAllocationUnion(state.ClaimRequests()...)
+			if err != nil {
+				logger.V(2).Info("cannot say where a fenced scope's container belongs", "claimUID", claimUID)
+				return false
+			}
+			if state.CgroupPath() == "" {
+				return false
+			}
+			live, err := cgroupfs.CPUSet(cp.cgroupfs, state.CgroupPath())
+			if err != nil {
+				logger.V(2).Info("cannot read a fenced scope's container back", "claimUID", claimUID)
+				return false
+			}
+			if !live.Equals(desired) {
+				logger.Info("fenced scope keeps its fence: a container is not where the ledger says",
+					"claimUID", claimUID, "kernel", live.String(), "desired", desired.String())
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // liftPoison asks the kernel where the participants of a fenced node's unsettled
 // exchanges are actually running, and reopens the node when what it says agrees
 // with the ledger.
@@ -136,12 +219,21 @@ func (cp *CPUDriver) liftPoison(logger logr.Logger, numaNodeID int) {
 		return
 	}
 	logger = logger.WithValues("numaNode", numaNodeID)
-	for scope := range fence.scopes {
+	for scope, cause := range fence.scopes {
 		round := cp.pendingRounds[scope]
 		if round == nil || round.store != cp.cpuAllocationStore {
-			// Synchronize rebuilt the stores from the specs on disk and converged
-			// the containers onto them, which is the same answer a read-back would
-			// have given.
+			// A scope Synchronize fenced has no round to ask, and its container
+			// was not converged: the three-way check poisons and sends nothing,
+			// precisely because it could not say where the container belongs. So
+			// the containers are asked directly, and the fence stays up until
+			// they agree with the ledger.
+			//
+			// A scope a round fenced is different: Synchronize rebuilt the stores
+			// from the specs on disk and converged the containers onto them,
+			// which is the same answer a read-back would have given.
+			if cause == fencedBySynchronize && !cp.settleFromContainers(logger.WithValues(scope.logValues()...), scope) {
+				continue
+			}
 			delete(fence.scopes, scope)
 			continue
 		}

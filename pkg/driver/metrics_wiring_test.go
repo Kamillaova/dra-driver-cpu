@@ -202,7 +202,7 @@ func TestMetricsFrontierUnusableDurationOnLiftPoison(t *testing.T) {
 
 	driver.poisonedNodes[0] = &poisonedNode{
 		since:  time.Now().Add(-100 * time.Millisecond),
-		scopes: map[defragScope]struct{}{},
+		scopes: map[defragScope]fenceCause{},
 	}
 
 	driver.liftPoison(logger, 0)
