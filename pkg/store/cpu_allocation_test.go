@@ -1456,3 +1456,62 @@ func TestHoldsExclusiveCPUsOfOneRequest(t *testing.T) {
 	require.False(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-1", Request: "invented"}))
 	require.False(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-2"}))
 }
+
+// roundRecord is a claim's record as its spec on disk carries it mid-round: the
+// placement is the target, and the round says where it came from.
+func roundRecord(roundID string, cpus, origin cpuset.CPUSet) ClaimRecord {
+	record := exclusiveRequest(cpus)
+	record.Relocatable = true
+	record.Round = &RoundProvenance{RoundID: roundID, Origin: origin, Target: cpus}
+	return record
+}
+
+// TestRecoveredRoundHoldsBothCpusets: a driver that went down mid-round comes
+// back with the claim's record on disk saying where the claim was moved to and
+// where from. Holding only the target would leave the CPUs its container may
+// still be running on free for the next claim (B59).
+func TestRecoveredRoundHoldsBothCpusets(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-1",
+		roundRecord("round-1", cpuset.New(4, 5), cpuset.New(0, 1)), false))
+
+	require.Equal(t, cpuset.New(2, 3, 6, 7), store.GetSharedCPUs(),
+		"neither the target nor the origin is on offer while the round is unsettled")
+	origin, moving := store.GetRebindOrigin("claim-1")
+	require.True(t, moving, "a recovered round is a move in flight, so nothing plans a second one")
+	require.Equal(t, cpuset.New(0, 1), origin)
+
+	// A newcomer may have neither half.
+	require.Error(t, store.ReserveResourceClaimAllocation(logger, "claim-2", exclusiveRequest(cpuset.New(0, 1)), false))
+	require.Error(t, store.ReserveResourceClaimAllocation(logger, "claim-3", exclusiveRequest(cpuset.New(4, 5)), false))
+
+	store.SettleRecoveredRound(logger, "claim-1")
+
+	require.Equal(t, cpuset.New(0, 1, 2, 3, 6, 7), store.GetSharedCPUs(), "the origin is released once the round settles")
+	_, moving = store.GetRebindOrigin("claim-1")
+	require.False(t, moving)
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-2", exclusiveRequest(cpuset.New(0, 1)), false))
+}
+
+// TestRecoveredSwapKeepsBothParticipants: in a swap each claim's target is the
+// other's origin, so recovering them one at a time means the second is asked for
+// CPUs the first is already holding. Refusing it would lose a claim whose
+// container is running, which is worse than the hazard the refusal exists for.
+func TestRecoveredSwapKeepsBothParticipants(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-a",
+		roundRecord("round-7", cpuset.New(2, 3), cpuset.New(0, 1)), false))
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-b",
+		roundRecord("round-7", cpuset.New(0, 1), cpuset.New(2, 3)), false),
+		"the other participant of the same round may take the CPUs it is holding as its origin")
+
+	require.Equal(t, cpuset.New(4, 5, 6, 7), store.GetSharedCPUs())
+
+	// A claim of another round gets no such licence.
+	require.Error(t, store.ReserveResourceClaimAllocation(logger, "claim-c",
+		roundRecord("round-8", cpuset.New(0, 1), cpuset.New(6, 7)), false))
+}

@@ -148,6 +148,20 @@ type claimAllocation struct {
 	// rebindOrigin is the exclusive CPUs of each request before the move in
 	// flight, and is nil when none is.
 	rebindOrigin map[string]cpuset.CPUSet
+	// recoveredOrigin is where a round that was in flight when the driver went
+	// down had moved this claim from, as its record on disk kept it. It is a flat
+	// set rather than a map because that is how the round recorded it, and
+	// splitting it back across the requests would be a guess: the record says
+	// what the claim left, not which request held which part of it.
+	//
+	// The claim occupies it as surely as it occupies its target -- a container is
+	// still running on one of the two and only a read-back says which -- so it is
+	// held against every other claim until the round is settled.
+	recoveredOrigin cpuset.CPUSet
+	// roundID names that round, which is what tells the other participants of it
+	// from a claim arriving later: a partner may be given CPUs this claim is
+	// holding as its origin, and a newcomer may not.
+	roundID string
 	// swapGroup identifies the exchange this claim is part of, and is zero for a
 	// claim moving into free CPUs on its own. The group is recorded rather than
 	// inferred from which CPUs the movers hold, because it has to survive one of
@@ -166,7 +180,7 @@ func newClaimAllocation(record ClaimRecord) *claimAllocation {
 	for _, request := range record.Requests {
 		byRequest[request.Request] = request
 	}
-	return &claimAllocation{
+	allocation := &claimAllocation{
 		byRequest:   byRequest,
 		relocatable: record.Relocatable,
 		alignment:   record.Alignment,
@@ -174,6 +188,15 @@ func newClaimAllocation(record ClaimRecord) *claimAllocation {
 		reservedFor: slices.Clone(record.ReservedFor),
 		correlation: record.Correlation,
 	}
+	// CCX-FORK: a record read back from disk may carry a round that was in
+	// flight when the driver went down. Dropping it would leave the claim
+	// holding its target alone, and the CPUs its container may still be running
+	// on free for the next claim to be given.
+	if record.Round != nil && record.Round.RoundID != "" && !record.Round.Origin.IsEmpty() {
+		allocation.recoveredOrigin = record.Round.Origin
+		allocation.roundID = record.Round.RoundID
+	}
+	return allocation
 }
 
 // requests returns the claim's allocations ordered by request name, so callers
@@ -206,11 +229,20 @@ func (c *claimAllocation) exclusiveCPUs() cpuset.CPUSet {
 }
 
 func (c *claimAllocation) originCPUs() cpuset.CPUSet {
-	cpus := cpuset.New()
+	cpus := c.recoveredOrigin
+	if cpus.IsEmpty() {
+		cpus = cpuset.New()
+	}
 	for _, origin := range c.rebindOrigin {
 		cpus = cpus.Union(origin)
 	}
 	return cpus
+}
+
+// movingFromRecoveredRound reports whether this claim is mid-round because the
+// driver restarted into one, rather than because this driver began it.
+func (c *claimAllocation) movingFromRecoveredRound() bool {
+	return c.rebindOrigin == nil && !c.recoveredOrigin.IsEmpty()
 }
 
 // exclusiveOverlap is the CPUs more than one exclusive request of the claim was
@@ -413,7 +445,13 @@ func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claim
 		return fmt.Errorf("claim %q was given CPUs %q for more than one of its exclusive requests", claimUID, overlap.String())
 	}
 	exclusive := allocation.exclusiveCPUs()
-	sharedCPUs := s.availableCPUs.Difference(s.preparedCPUs)
+	// CCX-FORK: a claim recovered into a round the driver restarted through may
+	// be given CPUs another participant of that same round is holding as its
+	// origin. That is what a swap looks like from disk -- each claim's target is
+	// the other's origin -- and refusing it would lose one of the two, leaving
+	// its CPUs available while its container runs on them. Only the round's own
+	// participants are let through; to anything else those CPUs are held.
+	sharedCPUs := s.availableCPUs.Difference(s.preparedCPUs).Union(s.recoveredOriginsOfRoundLocked(allocation.roundID))
 	if !exclusive.IsSubsetOf(sharedCPUs) {
 		return fmt.Errorf("claim %q has overlapping CPU assignment %q", claimUID, exclusive.String())
 	}
@@ -428,9 +466,48 @@ func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claim
 		return fmt.Errorf("claim %q would exhaust the shared CPU pool while shared containers are running", claimUID)
 	}
 	s.claims[claimUID] = allocation
-	s.preparedCPUs = s.preparedCPUs.Union(exclusive)
+	s.preparedCPUs = s.preparedCPUs.Union(exclusive).Union(allocation.recoveredOrigin)
+	if allocation.movingFromRecoveredRound() {
+		logger.Info("reserved a claim the driver restarted mid-round, holding both cpusets until it settles",
+			"cpus", allocation.cpus().String(), "recoveredOrigin", allocation.recoveredOrigin.String(), "roundID", allocation.roundID)
+		return nil
+	}
 	logger.Info("reserved allocation for resource claim", "cpus", allocation.cpus().String())
 	return nil
+}
+
+// recoveredOriginsOfRoundLocked is what the other participants of one round are
+// holding as their origins, which is the only set a claim of that same round may
+// be reserved onto while they hold it.
+func (s *CPUAllocation) recoveredOriginsOfRoundLocked(roundID string) cpuset.CPUSet {
+	origins := cpuset.New()
+	if roundID == "" {
+		return origins
+	}
+	for _, allocation := range s.claims {
+		if allocation.roundID == roundID {
+			origins = origins.Union(allocation.recoveredOrigin)
+		}
+	}
+	return origins
+}
+
+// SettleRecoveredRound releases the origin a claim was recovered holding, once
+// its container has been placed on one of the two cpusets and the round is no
+// longer in flight. A claim this driver moved itself is untouched: its round is
+// settled by CommitRebind or AbortRebind, which know which way it went.
+func (s *CPUAllocation) SettleRecoveredRound(logger logr.Logger, claimUID types.UID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	allocation, ok := s.claims[claimUID]
+	if !ok || !allocation.movingFromRecoveredRound() {
+		return
+	}
+	released := allocation.recoveredOrigin
+	allocation.recoveredOrigin = cpuset.New()
+	allocation.roundID = ""
+	s.preparedCPUs = s.heldByClaimsLocked()
+	logger.Info("settled a claim recovered mid-round", "released", released.Difference(allocation.exclusiveCPUs()).String())
 }
 
 // GetRequestAllocationUnion returns the CPUs the named requests grant together,
@@ -741,7 +818,13 @@ func (s *CPUAllocation) GetRebindOrigin(claimUID types.UID) (cpuset.CPUSet, bool
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	allocation, ok := s.claims[claimUID]
-	if !ok || allocation.rebindOrigin == nil {
+	if !ok {
+		return cpuset.CPUSet{}, false
+	}
+	// CCX-FORK: a claim recovered into a round this driver did not begin is
+	// moving just as surely as one it did, and nothing may plan a second move
+	// for it while the first is unsettled.
+	if allocation.rebindOrigin == nil && allocation.recoveredOrigin.IsEmpty() {
 		return cpuset.CPUSet{}, false
 	}
 	return allocation.originCPUs(), true

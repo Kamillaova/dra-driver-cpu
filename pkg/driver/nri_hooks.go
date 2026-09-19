@@ -285,6 +285,10 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	cp.reportForeignCPUs(ctx, cpuAllocationStore, observed)
 
 	for _, uid := range claimsToClearRound {
+		// The container has been placed on one of the two cpusets the claim held,
+		// so the round it was recovered into is over: the record stops carrying
+		// it and the store stops holding the CPUs it came from.
+		cp.cpuAllocationStore.SettleRecoveredRound(logger, uid)
 		_ = cp.writeClaimPlacement(logger, uid)
 	}
 

@@ -154,7 +154,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `originCPUs`, `placeExclusive` and `restoreExclusive` methods, `SpreadExclusive`, `spreadByCPUID`,
   `spreadWholeCores`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
   `BeginSwap`, `CommitSwap`, `AbortSwap`, `swapInFlight`, `heldByClaimsLocked`, `sortedUIDs`,
-  `GetRebindOrigin`, `ClaimRequestRef`, `GetRequestAllocationUnion`, `GetRequestOriginUnion`, `ClaimRecord`,
+  `GetRebindOrigin`, `movingFromRecoveredRound`, `recoveredOriginsOfRoundLocked`, `SettleRecoveredRound`,
+  `ClaimRequestRef`, `GetRequestAllocationUnion`, `GetRequestOriginUnion`, `ClaimRecord`,
   `GetClaimRecord`, `SetClaimCorrelation`, `UpdateClaimRuntimeOutcome`, `SetRecordedDevices`, `IsRelocatable`, `IsRepairable`, `Alignment`, `ReserveClosure`,
   `ReleaseClosure`, `ReservedClosures`, `ReservedClosure`, `HoldsExclusiveCPUsOf`,
   `ExclusiveClaimAllocations`, `ClaimHolding` and `ClaimHoldings`, `SetClaimlessCPUs` and `claimlessPoolLocked`
