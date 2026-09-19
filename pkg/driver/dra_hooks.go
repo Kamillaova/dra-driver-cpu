@@ -494,6 +494,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 	record := store.ClaimRecord{
 		Requests:    requestAllocations(byRequest),
 		Relocatable: placement.Relocatable,
+		Alignment:   placement.Alignment,
 		Recorded:    cp.recordedDevices(claim),
 		ReservedFor: reservedForPodUIDs(claim),
 	}
@@ -667,6 +668,7 @@ func (cp *CPUDriver) prepareResourceClaim(logger logr.Logger, claim *resourceapi
 	record := store.ClaimRecord{
 		Requests:    requestAllocations(byRequest),
 		Relocatable: placement.Relocatable,
+		Alignment:   placement.Alignment,
 		ReservedFor: reservedForPodUIDs(claim),
 	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
