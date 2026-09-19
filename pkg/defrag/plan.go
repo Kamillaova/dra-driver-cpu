@@ -81,6 +81,16 @@ type Options struct {
 	// keeps the placement it has. The plan still says an exchange would have
 	// helped, since that is the answer to why the claim is still split.
 	AllowSwaps bool
+	// Exchangeable reports whether two claims may be exchanged with each other.
+	// Nil permits every pair.
+	//
+	// It is for pairs whose exchange the caller could not settle afterwards. The
+	// driver refuses a pair of claims that one container holds: their CPUs are
+	// re-cut between them, so that container ends up on the same set it started
+	// on, and a read-back of it says neither that the exchange happened nor that
+	// it did not. Such a pair also improves nothing, since the container's own
+	// placement is what it was.
+	Exchangeable func(a, b types.UID) bool
 	// KeepFreePoolNonEmpty drops moves until at least one free CPU is left over.
 	// Set it whenever a container without a claim is running on the node: while
 	// a move is in flight its claim holds both its old and its new CPUs, so a
@@ -91,6 +101,10 @@ type Options struct {
 
 func (o Options) eligible(claimUID types.UID) bool {
 	return o.Eligible == nil || o.Eligible(claimUID)
+}
+
+func (o Options) exchangeable(a, b types.UID) bool {
+	return o.Exchangeable == nil || o.Exchangeable(a, b)
 }
 
 // PlanNode plans the moves that bring one NUMA node closer to the best packing
@@ -324,6 +338,9 @@ func exchangeFor(topo *Topology, p Placement, placements []Placement, ideal map[
 	bestGain := 0
 	for _, q := range packingOrder(placements) {
 		if q.ClaimUID == p.ClaimUID || !opts.eligible(q.ClaimUID) {
+			continue
+		}
+		if !opts.exchangeable(p.ClaimUID, q.ClaimUID) {
 			continue
 		}
 		if _, done := moved[q.ClaimUID]; done {

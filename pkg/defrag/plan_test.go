@@ -815,6 +815,28 @@ func TestPlanNodeExchangesAZeroSlackCycle(t *testing.T) {
 	require.True(t, nextFree.IsEmpty())
 }
 
+// TestPlanNodeSkipsAPairItMayNotExchange: the caller knows pairs whose exchange
+// it could not settle afterwards, and says so through Exchangeable. Such a pair
+// is blocked rather than planned, exactly as an immobile partner is.
+func TestPlanNodeSkipsAPairItMayNotExchange(t *testing.T) {
+	topo := topologyOf([]int{2, 2})
+	dtopo := requireTopology(t, topo, 0, topo.CPUDetails.CPUs())
+
+	placements := []defrag.Placement{
+		placement("claim-1", 0, 3),
+		placement("claim-2", 1, 2),
+	}
+	free := cpuset.New()
+
+	plan, err := defrag.PlanNode(dtopo, placements, free, selectorFor(topo), defrag.Options{
+		AllowSwaps:   true,
+		Exchangeable: func(types.UID, types.UID) bool { return false },
+	})
+	require.NoError(t, err)
+	require.Empty(t, plan.Moves, "the only repair was a pair the caller refused")
+	require.Positive(t, plan.Blocked)
+}
+
 // TestPlanNodeExchangeNeedsBothClaimsMovable: an exchange disturbs two
 // workloads, so a claim that never asked to be moved is no more a partner than
 // it is a mover. It is then a fixed obstacle the ideal is built around, and the

@@ -655,6 +655,7 @@ func (cp *CPUDriver) beginDefragRound(ctx context.Context, logger logr.Logger, s
 				opts := defrag.ExactOptions{
 					Eligible:             cp.claimMovableForExact,
 					AllowSwaps:           cp.defrag.allowTransientOverlap,
+					Exchangeable:         cp.claimsExchangeable,
 					KeepFreePoolNonEmpty: view.keepFreePoolNonEmpty,
 				}
 				inFlight := cp.allocatedUnpreparedCPUs(scope.numaNodeID)
@@ -684,6 +685,7 @@ func (cp *CPUDriver) beginDefragRound(ctx context.Context, logger logr.Logger, s
 					opts := defrag.ExactOptions{
 						Eligible:             cp.claimMovableForExact,
 						AllowSwaps:           cp.defrag.allowTransientOverlap,
+						Exchangeable:         cp.claimsExchangeable,
 						KeepFreePoolNonEmpty: view.keepFreePoolNonEmpty,
 					}
 					inFlight := cp.allocatedUnpreparedCPUs(scope.numaNodeID)
@@ -1031,8 +1033,9 @@ func (cp *CPUDriver) planScopeMoves(logger logr.Logger, scope defragScope, onlin
 	}
 
 	plan, err := defrag.PlanNode(view.topology, view.placements, view.free, cp.defragSelector(logger, view.threadsPerCore), defrag.Options{
-		Eligible:   cp.claimMovable,
-		AllowSwaps: cp.defrag.allowTransientOverlap,
+		Eligible:     cp.claimMovable,
+		AllowSwaps:   cp.defrag.allowTransientOverlap,
+		Exchangeable: cp.claimsExchangeable,
 		// While a move is in flight its claim holds both its old and its new
 		// CPUs, so a round that took every free CPU would leave the shared pool
 		// momentarily empty, which NRI cannot express.
@@ -1243,6 +1246,35 @@ func (cp *CPUDriver) selectMoveCPUs(logger logr.Logger, topo *cpuinfo.CPUTopolog
 // claimMovable reports whether a claim may be moved now. Called with applyMu held.
 func (cp *CPUDriver) claimMovable(claimUID types.UID) bool {
 	return claimMovableIn(cp.cpuAllocationStore, claimUID)
+}
+
+// claimsExchangeable refuses to exchange two claims one container holds.
+//
+// An exchange re-cuts the pair's CPUs between them, so a container holding both
+// ends on the set it started on: the exchange improves nothing for it, and if
+// the runtime applies only half of it there is nothing to read back that would
+// say so. The fence a half-applied exchange raises lifts on the two containers'
+// own cpusets, which is evidence only while the two claims run in different
+// ones.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) claimsExchangeable(a, b types.UID) bool {
+	ownersOfA, ok := cp.claimTracker.Owners(a)
+	if !ok {
+		return true
+	}
+	ownersOfB, ok := cp.claimTracker.Owners(b)
+	if !ok {
+		return true
+	}
+	for _, ownerOfA := range ownersOfA {
+		for _, ownerOfB := range ownersOfB {
+			if ownerOfA.Equal(ownerOfB) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (cp *CPUDriver) claimMovableForExact(claimUID types.UID) bool {

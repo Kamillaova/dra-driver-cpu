@@ -1641,6 +1641,42 @@ func TestDefragPassRunsADependentChainOneStepPerRound(t *testing.T) {
 	d.applyMu.Unlock()
 }
 
+func TestDefragPassNeverExchangesTwoClaimsOfOneContainer(t *testing.T) {
+	// The exchange that would repair these two claims is one the driver could not
+	// settle: they run in the same container, so re-cutting their CPUs between
+	// them leaves that container on the set it started on. If the runtime applied
+	// half of it, the read-back the fence lifts on would read the same cpuset
+	// either way and the NUMA node would stay fenced with no way back.
+	d := newDefragTestDriver(t, 2, 2)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 3))
+	d.placeClaim(t, "claim-2", cpuset.New(1, 2))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1", "claim-2")
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls(), "the only repair on offer cannot be settled, so there is no repair")
+	first, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	second, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-2")
+	require.Equal(t, cpuset.New(0, 3), first)
+	require.Equal(t, cpuset.New(1, 2), second)
+	require.Positive(t, metricValue(t, d.metrics, "dra_cpu_defrag_blocked_moves_total", nil),
+		"and the spread it leaves is reported rather than hidden")
+
+	// The same two claims in two containers are exchanged as before: what the
+	// guard refuses is the pair, not the shape of the repair.
+	e := newDefragTestDriver(t, 2, 2)
+	e.placeClaim(t, "claim-1", cpuset.New(0, 3))
+	e.placeClaim(t, "claim-2", cpuset.New(1, 2))
+	e.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	e.runContainer(t, "pod-2", "ctr-2", "ctr-uid-2", "claim-2")
+
+	e.defragPass(context.Background())
+
+	require.Len(t, e.updater.allCalls(), 1)
+	moved, _ := e.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 1), moved)
+}
+
 func TestDefragPassNeverPlansARepairThatEmptiesThePool(t *testing.T) {
 	// The same floor the greedy planner is held to, for the exact search that
 	// repairs a claim asking to be made whole. The repair needs the default

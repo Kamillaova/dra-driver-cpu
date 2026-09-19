@@ -1003,6 +1003,7 @@ func (cp *CPUDriver) secureRepairWitness(ctx context.Context, logger logr.Logger
 	opts := defrag.ExactOptions{
 		Eligible:             cp.claimMovableForExact,
 		AllowSwaps:           cp.defrag.allowTransientOverlap,
+		Exchangeable:         cp.claimsExchangeable,
 		KeepFreePoolNonEmpty: view.keepFreePoolNonEmpty,
 	}
 	inFlight := cp.allocatedUnpreparedCPUs(numaNodeID)

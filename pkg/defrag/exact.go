@@ -146,6 +146,9 @@ type ExactOptions struct {
 	// CanonicaliseCaches controls whether states are canonicalised under cache permutations.
 	// Defaults to true. Setting false enables the uncanonicalised oracle comparison.
 	CanonicaliseCaches bool
+	// Exchangeable reports whether two claims may be exchanged with each other,
+	// as it does in Options and for the same reason. Nil permits every pair.
+	Exchangeable func(a, b types.UID) bool
 	// KeepFreePoolNonEmpty refuses a move that would take the last free CPU, the
 	// same rule PlanNode is held to. While a move is in flight its claim holds
 	// both its old and its new CPUs, so the CPUs it takes leave the pool before
@@ -158,6 +161,10 @@ type ExactOptions struct {
 
 func (o ExactOptions) eligible(claimUID types.UID) bool {
 	return o.Eligible == nil || o.Eligible(claimUID)
+}
+
+func (o ExactOptions) exchangeable(a, b types.UID) bool {
+	return o.Exchangeable == nil || o.Exchangeable(a, b)
 }
 
 // ExactPlan represents the result of an exact bounded search.
@@ -647,7 +654,7 @@ func exactSearchInternal(topo *Topology, placements []Placement, free, inFlight 
 				}
 				for j := i + 1; j < len(claimUIDs); j++ {
 					u2 := claimUIDs[j]
-					if !opts.eligible(u2) {
+					if !opts.eligible(u2) || !opts.exchangeable(u1, u2) {
 						continue
 					}
 					p1 := Placement{ClaimUID: u1, CPUs: curr.placements[u1]}

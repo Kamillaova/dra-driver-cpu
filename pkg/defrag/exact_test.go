@@ -505,6 +505,36 @@ func TestExactSearchFindsARepairBehindAnExchange(t *testing.T) {
 	}
 }
 
+// TestExactSearchSkipsAPairItMayNotExchange: the exact search takes the same
+// refusal PlanNode does, for the same pairs and the same reason.
+func TestExactSearchSkipsAPairItMayNotExchange(t *testing.T) {
+	topo := fakeTopology(2, 2)
+	placements := []Placement{
+		{ClaimUID: types.UID("claim-0"), CPUs: parseCPUSet("0,3")},
+		{ClaimUID: types.UID("claim-1"), CPUs: parseCPUSet("1-2")},
+	}
+	goal := GoalMakeClaimWhole{ClaimUID: types.UID("claim-0")}
+
+	plan, err := ExactSearch(topo, placements, cpuset.New(), cpuset.New(), goal, nil, ExactOptions{AllowSwaps: true})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if plan.Status != SearchReachable {
+		t.Fatalf("the exchange this test refuses below is not even on offer: %v", plan.Status)
+	}
+
+	refused, err := ExactSearch(topo, placements, cpuset.New(), cpuset.New(), goal, nil, ExactOptions{
+		AllowSwaps:   true,
+		Exchangeable: func(types.UID, types.UID) bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(refused.Moves) != 0 {
+		t.Fatalf("a pair the caller refused was exchanged anyway: %v", refused.Moves)
+	}
+}
+
 // TestExactSearchAnswersWithTheRepairASpentBudgetFound: the budget bounds the
 // work, not the answer. A search that found a repair and then ran out while
 // looking for a cheaper one of the same length has a plan to give, and throwing
