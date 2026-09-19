@@ -248,6 +248,8 @@ func TestStartedContainerIsConvergedOntoItsClaimsCPUs(t *testing.T) {
 	require.Len(t, calls[0], 1)
 	require.Equal(t, "ctr-1", calls[0][0].GetContainerId())
 	require.Equal(t, "4-5", calls[0][0].GetLinux().GetResources().GetCpu().GetCpus())
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_started_containers_converged_total", nil), 0.01,
+		"the correction is counted, since it is silent otherwise and happens under ordinary churn")
 }
 
 func TestStartedContainerIsLeftAloneWhenItAgreesOrIsMoving(t *testing.T) {

@@ -40,6 +40,14 @@ obstacle rather than a move the driver keeps wanting and can never make. A node 
 never opted in therefore reports the spread it cannot repair and moves nothing, which is the correct
 outcome and is visible in `dra_cpu_defrag_excess_uncore_caches`.
 
+**A claim of several requests moves as one claim, and each request keeps its own shape.** The CPUs a
+move lands on are divided between the claim's requests in name order, each keeping the number it had
+and whole physical cores where it held whole cores. So a claim whose `vcpus` request held four cores
+and whose `helpers` request held two still holds four and two afterwards, and no core is split
+between them — which matters when the pod gives a container a request each, since two containers
+sharing one core's threads is what `fullPhysicalCPUsOnly` exists to prevent. A share of a pool never
+moves at all: the pool is where it is.
+
 ## Repairing a node with no free CPUs
 
 A move needs somewhere free to move to, and a node that packing has deliberately filled has nowhere.
@@ -205,6 +213,21 @@ A pass is one read of the online CPU set and then pure computation over the clai
 holds, and it stops as soon as it finds a region as well packed as its claims allow, so an arrival
 that lands aligned — the normal case on a node with free caches — costs about a millisecond and moves
 nothing.
+
+**A pass may land while a container is still starting**, because a claim is prepared before its
+containers are created and the pass that repairs its placement runs immediately after that prepare. A
+container created before the move and started after it cannot keep the move's update: the runtime
+writes the container's own specification when it starts it, and that specification carries the cpuset
+the container was created with. So the driver reads the container's cpuset back when it starts, and
+pins it onto the CPUs its claims hold if the two disagree:
+
+```
+"container started on CPUs its claims have left, converging" kernel="50-53,178-181" desired="16-19,144-147"
+```
+
+That line is normal under churn — a claim admitted while a pass is repairing the node hits the window
+often — and it is the correction working, not a fault. A container whose claim is moving *now* is left
+alone: it is legitimately on one of the two cpusets its claim holds while the round decides which.
 
 **Who pays.** A pass repacks largest claim first, so a large misplaced claim is repaired by moving the
 small claims standing in its way. That is what best-effort placement means for the smaller claims, and

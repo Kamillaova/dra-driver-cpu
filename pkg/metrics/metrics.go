@@ -131,6 +131,7 @@ type Metrics struct {
 	nriRemoveContainerDuration *prometheus.HistogramVec
 	synchronizeSkippedClaims   prometheus.Counter
 	synchronizeForeignCPUs     prometheus.Counter
+	startedContainersConverged prometheus.Counter
 	misplacedClaims            prometheus.Counter
 	partitionVerified          *prometheus.GaugeVec
 
@@ -289,6 +290,11 @@ var (
 		name: "dra_cpu_synchronize_foreign_cpus_total",
 		kind: metricCounter,
 		help: "Total number of claim-holding containers Synchronize found running on CPUs another claim holds, each converged onto the CPUs its own claim holds.",
+	}
+	startedContainersConvergedSpec = metricSpec{
+		name: "dra_cpu_started_containers_converged_total",
+		kind: metricCounter,
+		help: "Total number of containers found, when they started, on CPUs their claims no longer hold, each pinned onto the CPUs its claims do hold. Rises when a defragmentation pass moves a claim while one of its containers is between creation and start.",
 	}
 	misplacedClaimsSpec = metricSpec{
 		name: "dra_cpu_misplaced_claims_total",
@@ -476,6 +482,7 @@ var metricSpecs = []metricSpec{
 	nriRemoveContainerDurationSpec,
 	synchronizeSkippedClaimsSpec,
 	synchronizeForeignCPUsSpec,
+	startedContainersConvergedSpec,
 	misplacedClaimsSpec,
 	partitionVerifiedSpec,
 	defragExcessUncoreCachesSpec,
@@ -554,6 +561,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		nriRemoveContainerDuration: newHistogramVec(nriRemoveContainerDurationSpec),
 		synchronizeSkippedClaims:   newCounter(synchronizeSkippedClaimsSpec),
 		synchronizeForeignCPUs:     newCounter(synchronizeForeignCPUsSpec),
+		startedContainersConverged: newCounter(startedContainersConvergedSpec),
 		misplacedClaims:            newCounter(misplacedClaimsSpec),
 		partitionVerified:          newGaugeVec(partitionVerifiedSpec),
 
@@ -605,6 +613,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriRemoveContainerDuration,
 		m.synchronizeSkippedClaims,
 		m.synchronizeForeignCPUs,
+		m.startedContainersConverged,
 		m.misplacedClaims,
 		m.partitionVerified,
 		m.defragExcessUncoreCaches,
@@ -785,6 +794,13 @@ func (m *Metrics) RecordSynchronizeSkippedClaim() {
 
 func (m *Metrics) RecordSynchronizeForeignCPUs() {
 	m.synchronizeForeignCPUs.Inc()
+}
+
+// RecordStartedContainerConverged counts a container that started on CPUs its
+// claims had left, which is the window a pass moving a claim during that
+// container's startup opens.
+func (m *Metrics) RecordStartedContainerConverged() {
+	m.startedContainersConverged.Inc()
 }
 
 func (m *Metrics) RecordMisplacedClaim() {
@@ -988,6 +1004,7 @@ func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordSynchronizeSkippedClaim()                     {}
 func (noopRecorder) RecordSynchronizeForeignCPUs()                      {}
+func (noopRecorder) RecordStartedContainerConverged()                   {}
 func (noopRecorder) RecordPrepareNoRoom(string)                         {}
 func (noopRecorder) RecordPrepareNoWitness()                            {}
 func (noopRecorder) RecordMisplacedClaim()                              {}

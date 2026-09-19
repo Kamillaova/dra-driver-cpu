@@ -958,6 +958,7 @@ func (cp *CPUDriver) convergeStartedContainer(ctx context.Context, logger logr.L
 
 	logger.Info("container started on CPUs its claims have left, converging",
 		"kernel", live.String(), "desired", desired.String())
+	cp.metrics.RecordStartedContainerConverged()
 	failed, err := cp.containerUpdater.UpdateContainers([]*api.ContainerUpdate{cpusetUpdate(string(containerUID), desired)})
 	if err != nil {
 		logger.Error(err, "cannot converge a started container")

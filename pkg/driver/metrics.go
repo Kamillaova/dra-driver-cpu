@@ -36,6 +36,9 @@ type Recorder interface {
 	// count that upstream does not.
 	RecordSynchronizeSkippedClaim()
 	RecordSynchronizeForeignCPUs()
+	// CCX-FORK: added; a container that started on CPUs a pass had already moved
+	// its claim off.
+	RecordStartedContainerConverged()
 	RecordMisplacedClaim()
 	// CCX-FORK: RecordPrepareNoRoom is the fork's, and belongs with the prepare
 	// counters above rather than with the defragmentation block below: it counts

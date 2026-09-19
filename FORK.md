@@ -175,7 +175,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods,
   `SetFlooredCapacityDevices`, `RecordPrepareNoRoom`, `RecordPrepareNoWitness`,
-  `RecordSynchronizeSkippedClaim`, the `newCounter` and `newGaugeVec` constructors,
+  `RecordSynchronizeSkippedClaim`, `RecordStartedContainerConverged`,
+  the `newCounter` and `newGaugeVec` constructors,
   `RecordSynchronizeForeignCPUs`, `RecordSliceHandoff` with `HandoffAccepted` and `HandoffRefused`,
   promise accounting, slice write amplification and downgrade gate methods, and the collectors behind
   them
@@ -222,6 +223,8 @@ These carry no fork-only code and are intended to be offered upstream as separat
   verification against the node's own thread arity
 - shared-pool reconcile after unprepare — upstream issue #279
 - a claim held by every container of one pod, where upstream binds it to a single container
+- a container pinned to the requests it names, where upstream pins it to every request of every claim
+  it holds: one CDI device per claim and base request, and a per-request injected variable
 - CPU limits kept off pods that hold CPU claims, where upstream's guide both set one and warned against it
 
 The defragmenter itself is not upstreamable in the near term: it needs a runtime opt-in, and moving a

@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 47)
+	require.Len(t, descriptors, 48)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -58,6 +58,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_nri_remove_container_duration_seconds",
 		"dra_cpu_synchronize_skipped_claims_total",
 		"dra_cpu_synchronize_foreign_cpus_total",
+		"dra_cpu_started_containers_converged_total",
 		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_partition_verified",
 		"dra_cpu_defrag_excess_uncore_caches",
@@ -183,6 +184,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_slice_updates_total",
 		"dra_cpu_slice_writes_per_round",
 		"dra_cpu_slice_zero_commit_refreshes_total",
+		"dra_cpu_started_containers_converged_total",
 		"dra_cpu_store_to_driver_delay_seconds",
 		"dra_cpu_synchronize_foreign_cpus_total",
 		"dra_cpu_synchronize_skipped_claims_total",
