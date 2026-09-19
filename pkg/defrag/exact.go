@@ -187,6 +187,21 @@ func (p *ExactPlan) MatchesLedger(placements []Placement) bool {
 	return true
 }
 
+// takeSolution records the witness the search settled on.
+//
+// A search that stops early still answers with a plan when it has one. Breadth
+// first order is what makes that honest: a witness found at depth d cannot be
+// beaten by anything still queued, since everything queued is at depth d or
+// deeper. What running out of work costs is the choice between witnesses of the
+// same depth, where the level was cut short before the cheapest of them was
+// reached.
+func (p *ExactPlan) takeSolution(best *searchState) {
+	p.Status = SearchReachable
+	p.Moves = best.moves
+	p.DisplacedCPUs = best.displacedCPUs
+	p.ComputeClosure()
+}
+
 // ComputeClosure calculates and stores the union of all From and To CPU sets across all moves.
 func (p *ExactPlan) ComputeClosure() cpuset.CPUSet {
 	closure := cpuset.New()
@@ -494,8 +509,12 @@ func exactSearchInternal(topo *Topology, placements []Placement, free, inFlight 
 
 		workCount++
 		if workCount > budget {
-			plan.Status = SearchNotProven
 			plan.WorkCount = workCount
+			if bestSolution != nil {
+				plan.takeSolution(bestSolution)
+				return plan, nil
+			}
+			plan.Status = SearchNotProven
 			return plan, nil
 		}
 
@@ -675,10 +694,7 @@ func exactSearchInternal(topo *Topology, placements []Placement, free, inFlight 
 
 	plan.WorkCount = workCount
 	if bestSolution != nil {
-		plan.Status = SearchReachable
-		plan.Moves = bestSolution.moves
-		plan.DisplacedCPUs = bestSolution.displacedCPUs
-		plan.ComputeClosure()
+		plan.takeSolution(bestSolution)
 		return plan, nil
 	}
 

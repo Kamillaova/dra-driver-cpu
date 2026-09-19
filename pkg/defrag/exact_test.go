@@ -433,6 +433,37 @@ func TestDepthCutoffIsNotProofOfUnreachability(t *testing.T) {
 	}
 }
 
+// TestExactSearchAnswersWithTheRepairASpentBudgetFound: the budget bounds the
+// work, not the answer. A search that found a repair and then ran out while
+// looking for a cheaper one of the same length has a plan to give, and throwing
+// it away leaves the claim split for the life of its pod with nothing to say why.
+func TestExactSearchAnswersWithTheRepairASpentBudgetFound(t *testing.T) {
+	topo := fakeTopology(3, 4)
+	placements := []Placement{
+		// Split over caches 0 and 1, and cache 0 has room for it whole.
+		{ClaimUID: types.UID("claim-split"), CPUs: parseCPUSet("0,4")},
+		// Movable, and moving it satisfies nothing, so its successor is queued
+		// behind the repair rather than ending the search.
+		{ClaimUID: types.UID("claim-other"), CPUs: parseCPUSet("5")},
+	}
+	free := parseCPUSet("1-3,8-11")
+	goal := GoalMakeClaimWhole{ClaimUID: types.UID("claim-split")}
+
+	plan, err := ExactSearch(topo, placements, free, cpuset.New(), goal, nil, ExactOptions{Budget: 1})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if plan.Status != SearchReachable {
+		t.Fatalf("a repair was found and then discarded with the budget: %v", plan.Status)
+	}
+	if len(plan.Moves) != 1 || plan.Moves[0].ClaimUID != "claim-split" {
+		t.Fatalf("the plan is not the repair the search found: %v", plan.Moves)
+	}
+	if got := topo.ExcessSpread(plan.Moves[0].To); got != 0 {
+		t.Fatalf("the repair does not make the claim whole: %v", plan.Moves[0].To)
+	}
+}
+
 // TestExactSearchKeepsACPUInTheSharedPool: the only repair on offer takes the
 // node's last free CPU, and while it is in flight the claim holds both that CPU
 // and the ones it is leaving, so the containers holding no claim would be given
