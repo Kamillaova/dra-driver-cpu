@@ -227,3 +227,65 @@ func TestReconcileReleasesApplyMuDuringTheRuntimeCall(t *testing.T) {
 	require.Len(t, updater.allCalls(), 1)
 	require.True(t, lockWasFree.Load(), "applyMu was held across the runtime call")
 }
+
+// TestStartedContainerIsConvergedOntoItsClaimsCPUs: a pass that moves a claim
+// while one of its containers is between creation and start leaves that
+// container on the CPUs the claim released -- the runtime writes the container's
+// own spec when it starts it, and that spec carries the cpuset CreateContainer
+// chose. Reading the cgroup back once the container is running is what closes
+// the window (B114).
+func TestStartedContainerIsConvergedOntoItsClaimsCPUs(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(4, 5))
+	d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+	// The claim holds 4-5; the container came up on the CPUs it was created for.
+	d.liveCPUs("ctr-1", cpuset.New(0, 1))
+
+	d.convergeStartedContainer(context.Background(), testr.New(t), "pod-1", "app", "ctr-1")
+
+	calls := d.updater.allCalls()
+	require.Len(t, calls, 1, "the container is on CPUs its claim does not hold, so it is converged")
+	require.Len(t, calls[0], 1)
+	require.Equal(t, "ctr-1", calls[0][0].GetContainerId())
+	require.Equal(t, "4-5", calls[0][0].GetLinux().GetResources().GetCpu().GetCpus())
+}
+
+func TestStartedContainerIsLeftAloneWhenItAgreesOrIsMoving(t *testing.T) {
+	t.Run("already on its claim's CPUs", func(t *testing.T) {
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeClaim(t, "claim-1", cpuset.New(4, 5))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		d.liveCPUs("ctr-1", cpuset.New(4, 5))
+
+		d.convergeStartedContainer(context.Background(), testr.New(t), "pod-1", "app", "ctr-1")
+
+		require.Empty(t, d.updater.allCalls(), "nothing to correct")
+	})
+
+	t.Run("a move in flight", func(t *testing.T) {
+		// The claim holds both cpusets and its container is on one of them; which
+		// one is the round's to settle, and a correction here would fight it.
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeClaim(t, "claim-1", cpuset.New(4, 5))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		d.liveCPUs("ctr-1", cpuset.New(4, 5))
+		require.NoError(t, d.cpuAllocationStore.BeginRebind(testr.New(t), "claim-1", cpuset.New(0, 1)))
+
+		d.convergeStartedContainer(context.Background(), testr.New(t), "pod-1", "app", "ctr-1")
+
+		require.Empty(t, d.updater.allCalls(), "the round settles a moving claim, not this")
+	})
+
+	t.Run("a container the driver does not know", func(t *testing.T) {
+		d := newDefragTestDriver(t, 2, 4)
+		d.placeClaim(t, "claim-1", cpuset.New(4, 5))
+		d.runContainer(t, "pod-1", "app", "ctr-1", "claim-1")
+		d.liveCPUs("ctr-1", cpuset.New(0, 1))
+
+		// A replacement container carries the same name and a new id, and the
+		// state still describes the one that went.
+		d.convergeStartedContainer(context.Background(), testr.New(t), "pod-1", "app", "ctr-2")
+
+		require.Empty(t, d.updater.allCalls())
+	})
+}

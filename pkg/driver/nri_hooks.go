@@ -878,6 +878,96 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	return adjust, updates, nil
 }
 
+// PostStartContainer converges a container whose claims moved while it was
+// starting.
+//
+// CCX-FORK: upstream's claims never move, so a container is pinned once and the
+// question does not arise.
+//
+// A move carries its containers by asking the runtime to update them, and a
+// container that has been created but not started cannot keep such an update:
+// the runtime writes the container's own spec when it starts it, and that spec
+// carries the cpuset CreateContainer chose. A pass that lands in the gap between
+// the two -- seventeen milliseconds, on the node where this was found -- leaves
+// the container running on CPUs its claim has since released, which the next
+// claim may be given, and nothing notices until a restart brings Synchronize's
+// read-back.
+//
+// So the cgroup is read back here, once the container is running and an update
+// will stick. The work happens on its own goroutine: the runtime is waiting on
+// this hook, and an unsolicited update issued from inside one is what deadlocks
+// a pre-nri#301 Adaptation.
+func (cp *CPUDriver) PostStartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
+	if cp.containerUpdater == nil || cp.cgroupfs == nil {
+		return nil
+	}
+	ctx, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen), "pod", ctxlog.KObj(pod), "podUID", pod.Uid, "container", ctr.Name, "containerID", ctr.Id)
+	// Every container on the node starts through here, and only one holding a
+	// claim can be on the wrong CPUs. The environment answers that without the
+	// lock the convergence itself needs. A container whose environment does not
+	// parse never passed CreateContainer, so there is nothing of ours to move.
+	entries, err := parseDRAEnv(logger, ctr.GetEnv())
+	if err != nil || len(entries) == 0 {
+		return nil //nolint:nilerr // an unreadable container is not one to converge
+	}
+	go cp.convergeStartedContainer(context.WithoutCancel(ctx), logger, types.UID(pod.GetUid()), ctr.GetName(), types.UID(ctr.GetId()))
+	return nil
+}
+
+// convergeStartedContainer pins a just-started container onto the CPUs its
+// claims hold, where the kernel says it is somewhere else.
+//
+// A claim with a move in flight is expected to disagree: its container is on one
+// of the two cpusets the claim holds and the round settles which. Only a claim
+// that is not moving can be wrong here, and then the kernel is the authority --
+// the record says where the container belongs, and this is the one place that
+// asks where it actually is.
+func (cp *CPUDriver) convergeStartedContainer(ctx context.Context, logger logr.Logger, podUID types.UID, containerName string, containerUID types.UID) {
+	cp.applyMu.Lock()
+	state := cp.podConfigStore.GetContainerState(podUID, containerName)
+	if state == nil || state.ContainerUID() != containerUID || !state.HasExclusiveCPUAllocation() {
+		cp.applyMu.Unlock()
+		return
+	}
+	refs := state.ClaimRequests()
+	for _, ref := range refs {
+		if _, moving := cp.cpuAllocationStore.GetRebindOrigin(ref.ClaimUID); moving {
+			cp.applyMu.Unlock()
+			return
+		}
+	}
+	desired, err := cp.cpuAllocationStore.GetRequestAllocationUnion(refs...)
+	cgroupPath := state.CgroupPath()
+	cp.applyMu.Unlock()
+
+	if err != nil {
+		logger.Error(err, "cannot say where a started container belongs")
+		return
+	}
+	if cgroupPath == "" {
+		return
+	}
+	live, err := cgroupfs.CPUSet(cp.cgroupfs, cgroupPath)
+	if err != nil {
+		logger.V(2).Info("cannot read a started container's CPUs back", "err", err.Error())
+		return
+	}
+	if live.Equals(desired) {
+		return
+	}
+
+	logger.Info("container started on CPUs its claims have left, converging",
+		"kernel", live.String(), "desired", desired.String())
+	failed, err := cp.containerUpdater.UpdateContainers([]*api.ContainerUpdate{cpusetUpdate(string(containerUID), desired)})
+	if err != nil {
+		logger.Error(err, "cannot converge a started container")
+		return
+	}
+	for _, update := range failed {
+		logger.Info("runtime refused a started container's update", "containerID", update.GetContainerId())
+	}
+}
+
 // StopContainer removes runtime container state without changing DRA-owned allocations.
 //
 // CPU-allocation lifetime across the DRA and NRI hooks:

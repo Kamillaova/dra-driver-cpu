@@ -142,7 +142,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/nri_hooks.go`: `draEnvEntry` and its `ref` method, `parseDRAEnv`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
   `containerClassification`, `classifyContainer`, `reconcileActiveRounds`, `revertRoundOrigin`,
   `nonExclusiveCPUs`, `cpusetUpdate`, `observedContainer`, `reportForeignCPUs`,
-  `allocatedClaimsByUID`, `restoreUnstartedClaims`, `roundOriginByRequest`,
+  `allocatedClaimsByUID`, `restoreUnstartedClaims`, `roundOriginByRequest`, `PostStartContainer`,
+  `convergeStartedContainer`,
   `roundCPUsOf`, `requestOf`
 
 - `pkg/driver/poison.go`: `poisonNUMANodeForCPUs`
