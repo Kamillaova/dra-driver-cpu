@@ -1369,6 +1369,78 @@ func TestGetRequestOriginUnionLeavesAPoolShareWhereItIs(t *testing.T) {
 	require.Equal(t, cpuset.New(2, 3), current, "while the origin is where it came from, the allocation is the target")
 }
 
+// smtTestTopology is a machine whose cores carry two threads numbered far
+// apart, which is the shape every AMD and Intel server has and the one that made
+// B112 possible: a target's sorted CPU ids are every thread 0 and then every
+// thread 1, so dividing by id splits every core in two.
+func smtTestTopology(t *testing.T, cores int) *cpuinfo.CPUTopology {
+	t.Helper()
+	var infos []cpuinfo.CPUInfo
+	for core := 0; core < cores; core++ {
+		infos = append(infos,
+			cpuinfo.CPUInfo{CpuID: core, CoreID: core, SocketID: 0, NUMANodeID: 0},
+			cpuinfo.CPUInfo{CpuID: core + 128, CoreID: core, SocketID: 0, NUMANodeID: 0},
+		)
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(testr.New(t))
+	require.NoError(t, err)
+	return topo
+}
+
+// TestRebindKeepsEveryRequestOnWholeCores: a move divides its target between the
+// claim's requests, and dividing it by CPU id gives the first request one thread
+// of every core and the second the other. The claim still holds whole cores, so
+// nothing that asks the claim notices, while the containers pinned to those
+// requests share every core between them (B112).
+func TestRebindKeepsEveryRequestOnWholeCores(t *testing.T) {
+	logger := testr.New(t)
+	topo := smtTestTopology(t, 16)
+	store := NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-1", ClaimRecord{Requests: []RequestAllocation{
+		{Request: "alpha", CPUs: cpuset.New(0, 1, 128, 129), Role: RoleExclusive},
+		{Request: "beta", CPUs: cpuset.New(2, 3, 130, 131), Role: RoleExclusive},
+	}}, false))
+
+	// Eight whole cores, exactly what the claim holds, somewhere else.
+	target := cpuset.New(8, 9, 10, 11, 136, 137, 138, 139)
+	require.NoError(t, store.BeginRebind(logger, "claim-1", target))
+
+	record, ok := store.GetClaimRecord("claim-1")
+	require.True(t, ok)
+	byRequest := map[string]cpuset.CPUSet{}
+	for _, request := range record.Requests {
+		byRequest[request.Request] = request.CPUs
+	}
+	require.Equal(t, cpuset.New(8, 9, 136, 137), byRequest["alpha"])
+	require.Equal(t, cpuset.New(10, 11, 138, 139), byRequest["beta"])
+
+	for name, cpus := range byRequest {
+		require.Equal(t, cpus, topo.CPUDetails.CompleteCores(cpus),
+			"request %q holds whole cores after the move, as it did before it", name)
+	}
+	require.True(t, byRequest["alpha"].Intersection(byRequest["beta"]).IsEmpty())
+	require.Equal(t, target, byRequest["alpha"].Union(byRequest["beta"]))
+}
+
+// TestRebindDividesByCPUIDWhenCoresCannotBeKept: a request of one thread cannot
+// be given a whole core, and the claim then holds what it holds.
+func TestRebindDividesByCPUIDWhenCoresCannotBeKept(t *testing.T) {
+	logger := testr.New(t)
+	topo := smtTestTopology(t, 16)
+	store := NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, store.ReserveResourceClaimAllocation(logger, "claim-1", ClaimRecord{Requests: []RequestAllocation{
+		{Request: "alpha", CPUs: cpuset.New(0), Role: RoleExclusive},
+		{Request: "beta", CPUs: cpuset.New(128), Role: RoleExclusive},
+	}}, false))
+
+	require.NoError(t, store.BeginRebind(logger, "claim-1", cpuset.New(9, 137)))
+
+	record, ok := store.GetClaimRecord("claim-1")
+	require.True(t, ok)
+	require.Equal(t, cpuset.New(9), record.Requests[0].CPUs)
+	require.Equal(t, cpuset.New(137), record.Requests[1].CPUs)
+}
+
 func TestHoldsExclusiveCPUsOfOneRequest(t *testing.T) {
 	logger := testr.New(t)
 	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
