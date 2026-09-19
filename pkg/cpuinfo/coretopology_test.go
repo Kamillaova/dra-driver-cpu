@@ -51,6 +51,21 @@ var repeatingClusterCoreIDs = CPUDetails{
 	3: {CpuID: 3, CoreID: 0, ClusterID: 1, SocketID: 0, NUMANodeID: 0, UncoreCacheID: 0},
 }
 
+// repeatedCoreIDsWithSiblings is the shape the triple cannot describe: one
+// package, no cluster level at all (every CPU reports -1, as an arm64 machine
+// does), and core_id repeated because the big and little cores are numbered from
+// zero each. The kernel's own sibling lists tell them apart and nothing else
+// does.
+//
+//	big core   -> {0,1}, both reporting core_id 0
+//	little core -> {2,3}, both reporting core_id 0
+var repeatedCoreIDsWithSiblings = CPUDetails{
+	0: {CpuID: 0, CoreID: 0, ClusterID: -1, SocketID: 0, SiblingCPUSet: cpuset.New(0, 1)},
+	1: {CpuID: 1, CoreID: 0, ClusterID: -1, SocketID: 0, SiblingCPUSet: cpuset.New(0, 1)},
+	2: {CpuID: 2, CoreID: 0, ClusterID: -1, SocketID: 0, SiblingCPUSet: cpuset.New(2, 3)},
+	3: {CpuID: 3, CoreID: 0, ClusterID: -1, SocketID: 0, SiblingCPUSet: cpuset.New(2, 3)},
+}
+
 // hybridCores has cores of differing thread counts, as on Intel P/E-core parts:
 // core 0 is SMT, cores 1 and 2 are single-threaded.
 var hybridCores = CPUDetails{
@@ -63,7 +78,10 @@ var hybridCores = CPUDetails{
 func TestCoreOf(t *testing.T) {
 	loc, ok := repeatingCoreIDs.CoreOf(6)
 	assert.True(t, ok)
-	assert.Equal(t, CoreLocation{SocketID: 1, ClusterID: 0, CoreID: 0}, loc)
+	assert.Equal(t, CoreLocation{FirstThread: 2}, loc, "a core is named by its lowest thread, whichever of its threads is asked")
+	same, ok := repeatingCoreIDs.CoreOf(2)
+	assert.True(t, ok)
+	assert.Equal(t, loc, same)
 
 	_, ok = repeatingCoreIDs.CoreOf(99)
 	assert.False(t, ok, "absent CPU must not report a core")
@@ -116,17 +134,38 @@ func TestSiblingsOf(t *testing.T) {
 	}
 }
 
+// TestCoreIdentityComesFromTheSiblingList: two cores of one package reporting
+// the same core_id and no cluster are one key under the triple, and whole-core
+// reasoning then hands out half of each as a complete core.
+func TestCoreIdentityComesFromTheSiblingList(t *testing.T) {
+	big, ok := repeatedCoreIDsWithSiblings.CoreOf(0)
+	assert.True(t, ok)
+	little, ok := repeatedCoreIDsWithSiblings.CoreOf(2)
+	assert.True(t, ok)
+	assert.NotEqual(t, big, little, "two cores sharing a core_id must not share a key")
+
+	assert.Equal(t, cpuset.New(0, 1), repeatedCoreIDsWithSiblings.SiblingsOf(0))
+	assert.Equal(t, cpuset.New(2, 3), repeatedCoreIDsWithSiblings.SiblingsOf(2))
+	assert.Equal(t, cpuset.New(0, 1), repeatedCoreIDsWithSiblings.CPUsInCoreLocations(big))
+
+	// One thread of each core is not a complete core, however the two are
+	// numbered.
+	assert.Equal(t, cpuset.New(), repeatedCoreIDsWithSiblings.CompleteCores(cpuset.New(0, 2)))
+	assert.Equal(t, cpuset.New(0, 1), repeatedCoreIDsWithSiblings.CompleteCores(cpuset.New(0, 1, 2)))
+	assert.Equal(t, 2, repeatedCoreIDsWithSiblings.UniformThreadsPerCore(cpuset.New(0, 1, 2, 3)))
+}
+
 func TestCPUsInCoreLocations(t *testing.T) {
 	got := repeatingCoreIDs.CPUsInCoreLocations(
-		CoreLocation{SocketID: 0, CoreID: 1},
-		CoreLocation{SocketID: 1, CoreID: 0},
+		CoreLocation{FirstThread: 1},
+		CoreLocation{FirstThread: 2},
 	)
 	assert.Equal(t, cpuset.New(1, 5, 2, 6), got)
 
 	assert.Equal(t, cpuset.New(), repeatingCoreIDs.CPUsInCoreLocations(),
 		"no locations must select no CPUs")
 	assert.Equal(t, cpuset.New(), repeatingCoreIDs.CPUsInCoreLocations(
-		CoreLocation{SocketID: 9, CoreID: 9}), "unknown location selects nothing")
+		CoreLocation{FirstThread: 99}), "unknown location selects nothing")
 }
 
 func TestCompleteCores(t *testing.T) {

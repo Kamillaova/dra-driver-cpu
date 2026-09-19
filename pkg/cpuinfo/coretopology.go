@@ -20,25 +20,66 @@ import (
 	"k8s.io/utils/cpuset"
 )
 
-// CoreLocation identifies one physical core.
+// CoreLocation identifies one physical core, by the lowest logical CPU that
+// sits on it.
 //
-// CoreID on its own does not identify a core: the kernel restarts core_id
-// numbering on every socket, and on architectures with a cluster level between
-// socket and core it can repeat within a socket too. Whole-core reasoning must
-// therefore key on all three fields, as GetCPUTopology already does when it
-// counts NumCores.
+// The identity comes from the sibling list the kernel publishes for each CPU,
+// which names every thread of that CPU's core and is exact on every
+// architecture. The (physical_package_id, cluster_id, core_id) triple is not:
+// core_id is unique only within a (package, cluster), and a platform that
+// publishes no cluster_id -- every CPU then reports -1 -- may repeat core_id
+// within a package, which is the shape of an arm64 machine whose big and little
+// cores number from zero each. Two distinct cores sharing a key is the one
+// mistake whole-core reasoning may not make: it would report half of each as a
+// complete core.
+//
+// A topology carrying no sibling lists falls back to the triple, resolved to the
+// lowest CPU sharing it, which is as good as that topology can support. Anything
+// the sysfs parser builds carries them, since it fails a CPU whose core_cpus_list
+// and thread_siblings_list are both unreadable.
 type CoreLocation struct {
-	SocketID  int
-	ClusterID int
-	CoreID    int
+	// FirstThread is the lowest logical CPU of the core. It is an identity
+	// rather than a member: the CPU it names may itself be outside the set
+	// being reasoned about.
+	FirstThread int
 }
 
-func coreLocationOf(info CPUInfo) CoreLocation {
-	return CoreLocation{
-		SocketID:  info.SocketID,
-		ClusterID: info.ClusterID,
-		CoreID:    info.CoreID,
+// coreLocationOf is the core identity of one CPU, for a topology whose CPUs
+// carry sibling lists. ok is false when this CPU carries none and the caller has
+// to fall back to the triple.
+func coreLocationOf(info CPUInfo) (CoreLocation, bool) {
+	if info.SiblingCPUSet.IsEmpty() {
+		return CoreLocation{}, false
 	}
+	return CoreLocation{FirstThread: info.SiblingCPUSet.List()[0]}, true
+}
+
+// coreIdent is the (package, cluster, core) triple, used only to group the CPUs
+// of a topology that publishes no sibling lists.
+type coreIdent struct {
+	socketID  int
+	clusterID int
+	coreID    int
+}
+
+func coreIdentOf(info CPUInfo) coreIdent {
+	return coreIdent{socketID: info.SocketID, clusterID: info.ClusterID, coreID: info.CoreID}
+}
+
+// coreLocationByTriple is the identity of the core cpuID's triple names, which
+// is the lowest CPU of this topology reporting that same triple.
+func (d CPUDetails) coreLocationByTriple(info CPUInfo) CoreLocation {
+	want := coreIdentOf(info)
+	first := -1
+	for cpuID, other := range d {
+		if coreIdentOf(other) != want {
+			continue
+		}
+		if first == -1 || cpuID < first {
+			first = cpuID
+		}
+	}
+	return CoreLocation{FirstThread: first}
 }
 
 // CoreOf returns the physical core cpuID sits on. ok is false when cpuID is not
@@ -48,7 +89,10 @@ func (d CPUDetails) CoreOf(cpuID int) (loc CoreLocation, ok bool) {
 	if !ok {
 		return CoreLocation{}, false
 	}
-	return coreLocationOf(info), true
+	if loc, ok := coreLocationOf(info); ok {
+		return loc, true
+	}
+	return d.coreLocationByTriple(info), true
 }
 
 // CPUsInCoreLocations returns the logical CPU IDs on the given physical cores.
@@ -62,8 +106,12 @@ func (d CPUDetails) CPUsInCoreLocations(locs ...CoreLocation) cpuset.CPUSet {
 		wanted[loc] = struct{}{}
 	}
 	var cpuIDs []int
-	for cpuID, info := range d {
-		if _, ok := wanted[coreLocationOf(info)]; ok {
+	for cpuID := range d {
+		loc, ok := d.CoreOf(cpuID)
+		if !ok {
+			continue
+		}
+		if _, ok := wanted[loc]; ok {
 			cpuIDs = append(cpuIDs, cpuID)
 		}
 	}
@@ -94,17 +142,20 @@ func (d CPUDetails) SiblingsOf(cpuID int) cpuset.CPUSet {
 // partial cores as complete.
 func (d CPUDetails) CompleteCores(cpus cpuset.CPUSet) cpuset.CPUSet {
 	threadsPerCore := make(map[CoreLocation]int, len(d))
-	for _, info := range d {
-		threadsPerCore[coreLocationOf(info)]++
+	for cpuID := range d {
+		loc, ok := d.CoreOf(cpuID)
+		if !ok {
+			continue
+		}
+		threadsPerCore[loc]++
 	}
 
 	present := make(map[CoreLocation][]int, len(threadsPerCore))
 	for _, cpuID := range cpus.List() {
-		info, ok := d[cpuID]
+		loc, ok := d.CoreOf(cpuID)
 		if !ok {
 			continue
 		}
-		loc := coreLocationOf(info)
 		present[loc] = append(present[loc], cpuID)
 	}
 
