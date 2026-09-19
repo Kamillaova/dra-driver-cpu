@@ -59,6 +59,7 @@ type Recorder interface {
 	RecordDefragNodeReopened(duration time.Duration)
 	RecordDefragReadbackMismatch()
 	SetFlooredCapacityDevices(count int)
+	SetClaimsRetractedByAbsence(count int)
 	RecordDefragUnpublishedRound()
 	SetPartitionState(verified map[string]bool)
 	// CCX-FORK: the promise-accounting, write-amplification and downgrade-gate

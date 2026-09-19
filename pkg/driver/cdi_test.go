@@ -369,6 +369,34 @@ func TestGetDeviceAllocationsRoundTripsTheReservation(t *testing.T) {
 	require.Empty(t, got.ReservedFor)
 }
 
+func TestGetDeviceAllocationsRoundTripsTheProjectionWatermark(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-marked"
+	record := store.ClaimRecord{
+		Requests:   []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive}},
+		Projection: &store.ProjectionWatermark{Lineage: "projection-a", Generation: 42},
+	}
+	require.NoError(t, mgr.AddDevice(logger, deviceName, "DRA_CPUSET_claim-marked=0-1", record))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, record.Projection, got.Projection,
+		"the mark absence is judged against has to survive the restart it exists for")
+
+	// A spec written before the driver kept the mark reads back without one, and
+	// a claim without one has its capacity correction held until Unprepare.
+	plain := store.ClaimRecord{Requests: record.Requests}
+	require.NoError(t, mgr.AddDevice(logger, "claim-unmarked", "DRA_CPUSET_claim-unmarked=0-1", plain))
+	require.NoError(t, mgr.Refresh())
+	got, err = mgr.GetDeviceAllocations("claim-unmarked")
+	require.NoError(t, err)
+	require.Nil(t, got.Projection)
+}
+
 func TestGetDeviceAllocationsFallsBackToEnv(t *testing.T) {
 	logger := testr.New(t)
 	tempCDIDir := t.TempDir()

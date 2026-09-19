@@ -1578,7 +1578,13 @@ func (p projectedAllocatedClaims) AllocatedClaims() ([]*resourceapi.ResourceClai
 	return p, nil
 }
 
-func (p projectedAllocatedClaims) IsProjectedDeallocated(types.UID) bool { return false }
+func (p projectedAllocatedClaims) IsProjectedDeallocated(types.UID, *store.ProjectionWatermark) bool {
+	return false
+}
+
+func (p projectedAllocatedClaims) ProjectedAllocatedAt(types.UID) (store.ProjectionWatermark, bool) {
+	return store.ProjectionWatermark{}, false
+}
 
 // GetProjectedClaims is not part of the interface at this commit and is not used
 // by Synchronize. It is here so that the stub keeps satisfying the interface

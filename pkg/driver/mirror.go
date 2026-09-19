@@ -85,6 +85,7 @@ func (cp *CPUDriver) capacityMirror() capacityMirror {
 	}
 
 	mirror := capacityMirror{}
+	retracted := 0
 	for claimUID, holding := range cp.cpuAllocationStore.ClaimHoldings() {
 		if len(holding.Recorded) == 0 {
 			// A claim whose record was written before the driver kept the devices
@@ -96,20 +97,25 @@ func (cp *CPUDriver) capacityMirror() capacityMirror {
 			// capacity the device had before the mirror existed.
 			continue
 		}
+		// Asked once per claim rather than once per device: the answer is the
+		// claim's, and the reader parses the projection to give it.
+		//
+		// The departure term exists to hold a device's capacity down until the
+		// scheduler stops subtracting the claim there, and once the scheduler's
+		// own projection stops carrying the claim it has stopped -- so holding
+		// the capacity down any longer withdraws CPUs nothing is accounting for.
+		takenBack := cp.claimReader != nil && cp.claimReader.IsProjectedDeallocated(claimUID, holding.Projection)
+		departures := 0
 		for name, cpus := range devices {
 			charged, occupied := holding.Recorded[name], cpus.Intersection(holding.Held).Size()
 			terms := mirror[name]
 			switch {
 			case charged > occupied:
-				// Unless the scheduler has already taken the claim back. The
-				// departure term exists to hold a device's capacity down until
-				// the scheduler stops subtracting a claim there, and once its
-				// own projection says the claim is gone it has stopped -- so
-				// holding the capacity down any longer withdraws CPUs nothing
-				// is accounting for.
-				if cp.claimReader == nil || !cp.claimReader.IsProjectedDeallocated(claimUID) {
-					terms.departed += charged - occupied
+				if takenBack {
+					departures++
+					continue
 				}
+				terms.departed += charged - occupied
 			case occupied > charged:
 				terms.squatters += occupied - charged
 			default:
@@ -117,7 +123,11 @@ func (cp *CPUDriver) capacityMirror() capacityMirror {
 			}
 			mirror[name] = terms
 		}
+		if departures > 0 {
+			retracted++
+		}
 	}
+	cp.metrics.SetClaimsRetractedByAbsence(retracted)
 	return mirror
 }
 

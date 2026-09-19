@@ -97,10 +97,14 @@ func (r *oracleClaimReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, err
 	return slices.Clone(r.claims), nil
 }
 
-func (r *oracleClaimReader) IsProjectedDeallocated(claimUID types.UID) bool {
+func (r *oracleClaimReader) IsProjectedDeallocated(claimUID types.UID, _ *store.ProjectionWatermark) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.deallocated != nil && r.deallocated[claimUID]
+}
+
+func (r *oracleClaimReader) ProjectedAllocatedAt(types.UID) (store.ProjectionWatermark, bool) {
+	return store.ProjectionWatermark{}, false
 }
 
 func (r *oracleClaimReader) GetProjectedClaims() (*v1alpha1.ProjectedClaims, error) {

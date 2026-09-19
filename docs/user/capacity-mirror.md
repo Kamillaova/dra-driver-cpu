@@ -46,6 +46,15 @@ B publishes 24 and is charged 8, so 16 CPUs are on offer there and the cache rea
 publishes 8 and is charged 8, so nothing more fits and the cache really is full. When the moved claim
 ends, B's charge drops to 0 and the driver publishes 16 again.
 
+**A departure lasts only as long as the charge it corrects.** The last column above is reached when the
+allocator takes the claim back, which it may do before the kubelet unprepares it, and from that moment
+nothing is subtracting the claim from B: publishing 24 there would offer CPUs twice. The driver learns
+of it from the same projection the scheduler writes — the claim listed as deallocated, or missing from a
+projection newer than the one the driver first saw it allocated in. Absence from an older projection, or
+from one written by a different projector, says nothing: a projection that has not caught up yet lists
+nothing either. A claim the driver never saw listed keeps its correction until Unprepare, which is what
+every claim did before this rule.
+
 ## What a move does, in order
 
 1. The round reserves the move. The claim now holds both the CPUs it is taking and the ones it is

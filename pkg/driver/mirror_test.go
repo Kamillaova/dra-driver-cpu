@@ -280,6 +280,91 @@ func TestCapacityFloorFollowsTheRequestPolicy(t *testing.T) {
 	require.Equal(t, int64(8), capacityFloor(withPolicy(4, 4)))
 }
 
+// TestStampProjectionWatermarkMarksAClaimOnce: a claim prepared before the
+// projector listed it is marked by the first projection that does, and the mark
+// is written to its record on disk so a restart keeps it. A second projection
+// does not move the mark: absence is judged against where the claim was first
+// seen, and a mark that crept forward would never read as absent.
+func TestStampProjectionWatermarkMarksAClaimOnce(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	claimUID := types.UID("claim-1")
+	d.placeClaim(t, claimUID, cpuset.New(0, 1))
+
+	first := store.ProjectionWatermark{Lineage: "projection-a", Generation: 4}
+	d.claimReader = fakeClaimReader{allocatedAt: map[types.UID]store.ProjectionWatermark{claimUID: first}}
+	d.stampProjectionWatermarks(testr.New(t))
+
+	record, ok := d.cpuAllocationStore.GetClaimRecord(claimUID)
+	require.True(t, ok)
+	require.Equal(t, &first, record.Projection)
+	onDisk, err := d.cdi.GetDeviceAllocations(getCDIDeviceName(claimUID))
+	require.NoError(t, err)
+	require.Equal(t, &first, onDisk.Projection, "the mark has to survive a restart, so it is written where the record is")
+
+	// A claim in the middle of a move is left unmarked: the record on disk carries
+	// its round, and rewriting the record from the store alone would drop it.
+	moving := types.UID("claim-moving")
+	d.placeClaim(t, moving, cpuset.New(2, 3))
+	require.NoError(t, d.cpuAllocationStore.BeginRebind(testr.New(t), moving, cpuset.New(4, 5)))
+	d.claimReader = fakeClaimReader{allocatedAt: map[types.UID]store.ProjectionWatermark{
+		moving: {Lineage: "projection-a", Generation: 5},
+	}}
+	d.stampProjectionWatermarks(testr.New(t))
+
+	movingRecord, ok := d.cpuAllocationStore.GetClaimRecord(moving)
+	require.True(t, ok)
+	require.Nil(t, movingRecord.Projection, "a claim mid-move must not have its record rewritten")
+
+	later := store.ProjectionWatermark{Lineage: "projection-a", Generation: 9}
+	d.claimReader = fakeClaimReader{allocatedAt: map[types.UID]store.ProjectionWatermark{claimUID: later}}
+	d.stampProjectionWatermarks(testr.New(t))
+
+	record, _ = d.cpuAllocationStore.GetClaimRecord(claimUID)
+	require.Equal(t, &first, record.Projection, "a claim already marked keeps the mark it has")
+}
+
+// TestDepartureTermIsJudgedAgainstTheClaimsOwnWatermark: the claim's record says
+// which projection it was first seen allocated in, and that is what its absence
+// from a later one is judged against. The mirror has to hand the reader that
+// mark rather than ask whether the claim is listed at all.
+func TestDepartureTermIsJudgedAgainstTheClaimsOwnWatermark(t *testing.T) {
+	d := newDefragTestDriver(t, 2, 4)
+	cache0, cache1 := "cache-0", "cache-1"
+	d.topology.deviceNameToCPUs = map[string]cpuset.CPUSet{
+		cache0: cpuset.New(0, 1, 2, 3),
+		cache1: cpuset.New(4, 5, 6, 7),
+	}
+	mark := store.ProjectionWatermark{Lineage: "projection-a", Generation: 3}
+	claimUID := types.UID("claim-moved")
+	require.NoError(t, d.cpuAllocationStore.ReserveResourceClaimAllocation(testr.New(t), claimUID, store.ClaimRecord{
+		Requests:    []store.RequestAllocation{{Request: "main", Role: store.RoleExclusive, CPUs: cpuset.New(4, 5, 6, 7)}},
+		Relocatable: true,
+		Recorded:    map[string]int{cache0: 4},
+		Projection:  &mark,
+	}, false))
+
+	reader := fakeClaimReader{asked: map[types.UID]*store.ProjectionWatermark{}}
+	d.claimReader = reader
+
+	d.applyMu.Lock()
+	mirror := d.capacityMirror()
+	d.applyMu.Unlock()
+
+	require.Equal(t, 4, mirror[cache0].departed)
+	require.Equal(t, &mark, reader.asked[claimUID], "the reader was asked without the claim's own mark")
+
+	// And a reader that reads the claim as gone retracts the term and says so.
+	gone := fakeClaimReader{deallocated: map[types.UID]bool{claimUID: true}}
+	d.claimReader = gone
+
+	d.applyMu.Lock()
+	retracted := d.capacityMirror()
+	d.applyMu.Unlock()
+
+	require.Equal(t, 0, retracted[cache0].departed)
+	require.InDelta(t, 1, metricValue(t, d.metrics, "dra_cpu_capacity_mirror_retracted_by_absence", nil), 0.01)
+}
+
 func TestDepartureTermRetractsOnProjectedDeallocation(t *testing.T) {
 	d := newDefragTestDriver(t, 2, 4)
 	cache0 := "cache-0"

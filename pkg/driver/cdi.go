@@ -87,6 +87,15 @@ const (
 	// cdiCorrelationAnnotation records admission and witness correlation for this claim.
 	cdiCorrelationAnnotation = "dra.cpu/correlation"
 
+	// cdiProjectionLineageAnnotation and cdiProjectionGenerationAnnotation record
+	// the projection this driver first saw the claim listed as allocated in.
+	// Absence from a newer projection of the same lineage is how a deallocation
+	// the projector marked for one write only is still seen; absent here, nothing
+	// is concluded from absence and the claim's capacity correction stands until
+	// Unprepare.
+	cdiProjectionLineageAnnotation    = "dra.cpu/projection.lineage"
+	cdiProjectionGenerationAnnotation = "dra.cpu/projection.generation"
+
 	// cdiRoundTargetAnnotation records the CPUs this round is moving the claim to.
 	cdiRoundTargetAnnotation = "dra.cpu/round.target"
 
@@ -200,6 +209,10 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 			return fmt.Errorf("failed to record round partners of CDI device %q: %w", deviceName, err)
 		}
 		annotations[cdiRoundPartnersAnnotation] = string(partners)
+	}
+	if record.Projection != nil && record.Projection.Lineage != "" {
+		annotations[cdiProjectionLineageAnnotation] = record.Projection.Lineage
+		annotations[cdiProjectionGenerationAnnotation] = strconv.FormatInt(record.Projection.Generation, 10)
 	}
 	if record.Correlation.NUMANode != nil || record.Correlation.Partition != "" || record.Correlation.FrontierSnapshot != "" || record.Correlation.WitnessRounds != nil || record.Correlation.WitnessPlan != "" || record.Correlation.InitialCPUSet != "" || record.Correlation.RuntimeOutcome != "" {
 		corrBytes, err := json.Marshal(record.Correlation)
@@ -413,6 +426,16 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		_ = json.Unmarshal([]byte(corrStr), &correlation)
 	}
 
+	var projection *store.ProjectionWatermark
+	if lineage, ok := device.Annotations[cdiProjectionLineageAnnotation]; ok && lineage != "" {
+		generation, err := strconv.ParseInt(device.Annotations[cdiProjectionGenerationAnnotation], 10, 64)
+		if err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w",
+				cdiProjectionGenerationAnnotation, device.Annotations[cdiProjectionGenerationAnnotation], deviceName, err)
+		}
+		projection = &store.ProjectionWatermark{Lineage: lineage, Generation: generation}
+	}
+
 	if recorded, ok := device.Annotations[cdiPlacementsAnnotation]; ok {
 		requests, err := decodePlacements(recorded)
 		if err != nil {
@@ -424,6 +447,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			Alignment:   alignment,
 			Recorded:    charged,
 			Round:       roundProv,
+			Projection:  projection,
 			Correlation: correlation,
 			ReservedFor: reservedFor,
 		}, nil
@@ -440,6 +464,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			Alignment:   alignment,
 			Recorded:    charged,
 			Round:       roundProv,
+			Projection:  projection,
 			Correlation: correlation,
 		}, nil
 	}
@@ -455,6 +480,7 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			Alignment:   alignment,
 			Recorded:    charged,
 			Round:       roundProv,
+			Projection:  projection,
 			Correlation: correlation,
 		}, nil
 	}

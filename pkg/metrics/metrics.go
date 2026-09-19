@@ -151,6 +151,7 @@ type Metrics struct {
 	defragPoisonDurationSecsHist    prometheus.Histogram
 	defragReadbackMismatches        prometheus.Counter
 	flooredCapacityDevices          prometheus.Gauge
+	claimsRetractedByAbsence        prometheus.Gauge
 	defragUnpublishedRounds         prometheus.Counter
 	frontierAdmissions              *prometheus.CounterVec
 	frontierOldestObligationSeconds prometheus.Gauge
@@ -385,6 +386,11 @@ var (
 		kind: metricGauge,
 		help: "Number of devices whose published CPU capacity is held above the amount the driver computed, because publishing that amount would put the device below its own request policy. Those devices are tainted, so the capacity they over-state is withdrawn rather than handed out.",
 	}
+	claimsRetractedByAbsenceSpec = metricSpec{
+		name: "dra_cpu_capacity_mirror_retracted_by_absence",
+		kind: metricGauge,
+		help: "Number of prepared claims whose capacity correction is withdrawn because a projection newer than the one they were first seen in no longer lists them. A projector that omits a claim it should list shows up here, and the capacity it understates is capacity the node will not hand out.",
+	}
 	defragUnpublishedRoundsSpec = metricSpec{
 		name: "dra_cpu_defrag_unpublished_rounds_total",
 		kind: metricCounter,
@@ -499,6 +505,7 @@ var metricSpecs = []metricSpec{
 	defragPoisonDurationSpec,
 	defragReadbackMismatchesSpec,
 	flooredCapacityDevicesSpec,
+	claimsRetractedByAbsenceSpec,
 	defragUnpublishedRoundsSpec,
 	frontierAdmissionsSpec,
 	frontierOldestObligationSpec,
@@ -579,6 +586,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		defragPoisonDurationSecsHist:    newHistogram(defragPoisonDurationSpec),
 		defragReadbackMismatches:        newCounter(defragReadbackMismatchesSpec),
 		flooredCapacityDevices:          newGauge(flooredCapacityDevicesSpec),
+		claimsRetractedByAbsence:        newGauge(claimsRetractedByAbsenceSpec),
 		defragUnpublishedRounds:         newCounter(defragUnpublishedRoundsSpec),
 		frontierAdmissions:              newCounterVec(frontierAdmissionsSpec),
 		frontierOldestObligationSeconds: newGauge(frontierOldestObligationSpec),
@@ -630,6 +638,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.defragPoisonDurationSecsHist,
 		m.defragReadbackMismatches,
 		m.flooredCapacityDevices,
+		m.claimsRetractedByAbsence,
 		m.defragUnpublishedRounds,
 		m.frontierAdmissions,
 		m.frontierOldestObligationSeconds,
@@ -887,6 +896,10 @@ func (m *Metrics) SetFlooredCapacityDevices(count int) {
 	m.flooredCapacityDevices.Set(float64(count))
 }
 
+func (m *Metrics) SetClaimsRetractedByAbsence(count int) {
+	m.claimsRetractedByAbsence.Set(float64(count))
+}
+
 func (m *Metrics) RecordDefragUnpublishedRound() {
 	m.defragUnpublishedRounds.Inc()
 }
@@ -1021,6 +1034,7 @@ func (noopRecorder) RecordDefragNodePoisoned()                          {}
 func (noopRecorder) RecordDefragNodeReopened(time.Duration)             {}
 func (noopRecorder) RecordDefragReadbackMismatch()                      {}
 func (noopRecorder) SetFlooredCapacityDevices(int)                      {}
+func (noopRecorder) SetClaimsRetractedByAbsence(int)                    {}
 func (noopRecorder) RecordDefragUnpublishedRound()                      {}
 func (noopRecorder) RecordFrontierAdmissionOutcome(string)              {}
 func (noopRecorder) SetFrontierOldestObligationSeconds(float64)         {}

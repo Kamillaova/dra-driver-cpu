@@ -22,7 +22,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	resourceapi "k8s.io/api/resource/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,7 +39,8 @@ import (
 
 type claimReader interface {
 	AllocatedClaims() ([]*resourceapi.ResourceClaim, error)
-	IsProjectedDeallocated(claimUID types.UID) bool
+	IsProjectedDeallocated(claimUID types.UID, mark *store.ProjectionWatermark) bool
+	ProjectedAllocatedAt(claimUID types.UID) (store.ProjectionWatermark, bool)
 	GetProjectedClaims() (*v1alpha1.ProjectedClaims, error)
 }
 
@@ -53,25 +57,34 @@ type claimConfigMapReader struct {
 // will not parse is: it was written by something, and silently reading a node as
 // empty would hand out CPUs a claim already holds.
 func (r *claimConfigMapReader) getProjected() (v1alpha1.ProjectedClaims, bool, error) {
+	projected, _, ok, err := r.getProjectedFrom()
+	return projected, ok, err
+}
+
+// getProjectedFrom is getProjected with the lineage of what it read: the
+// ConfigMap's own UID, which changes when a projection is deleted and written
+// again and so tells one projector's counting from another's.
+func (r *claimConfigMapReader) getProjectedFrom() (v1alpha1.ProjectedClaims, string, bool, error) {
 	var none v1alpha1.ProjectedClaims
 	cmName := v1alpha1.ProjectedClaimsConfigMapName(r.nodeName)
 	cm, err := r.lister.Get(cmName)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			return none, false, nil
+			return none, "", false, nil
 		}
-		return none, false, err
+		return none, "", false, err
 	}
+	lineage := string(cm.UID)
 	data, ok := cm.Data[v1alpha1.ProjectedClaimsKey]
 	if !ok || data == "" {
-		return none, false, nil
+		return none, "", false, nil
 	}
 	var projected v1alpha1.ProjectedClaims
 	if err := json.Unmarshal([]byte(data), &projected); err != nil {
-		return none, false, fmt.Errorf("the projected claims of node %q do not parse: %w", r.nodeName, err)
+		return none, "", false, fmt.Errorf("the projected claims of node %q do not parse: %w", r.nodeName, err)
 	}
 	if projected.APIVersion != "" && projected.APIVersion != v1alpha1.APIVersion {
-		return none, false, nil
+		return none, "", false, nil
 	}
 	// Whatever the ConfigMap says now, including a generation lower than one
 	// already seen. An informer's cache never moves backwards, so a lower
@@ -79,7 +92,7 @@ func (r *claimConfigMapReader) getProjected() (v1alpha1.ProjectedClaims, bool, e
 	// restarted and began counting again. Holding a floor against it would
 	// leave this driver on a projection nothing can ever supersede, silently,
 	// for as long as the node lives.
-	return projected, true, nil
+	return projected, lineage, true, nil
 }
 
 func (r *claimConfigMapReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, error) {
@@ -120,8 +133,19 @@ func (r *claimConfigMapReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, 
 	return claims, nil
 }
 
-func (r *claimConfigMapReader) IsProjectedDeallocated(claimUID types.UID) bool {
-	projected, ok, err := r.getProjected()
+// IsProjectedDeallocated reports whether the scheduler has taken a claim's
+// allocation back, which is the moment it stops subtracting the claim from the
+// devices it was charged to.
+//
+// Two ways to know. The projection says so outright, which it does for one write
+// only -- the projector marks the claim and its own write re-enqueues the node,
+// so the next projection simply omits it. Or the claim is missing from a
+// projection newer than the one it was first seen allocated in, which says the
+// same thing and keeps saying it. Absence alone is not enough: a projector that
+// is lagging, or one writing its first projection, lists nothing yet, and
+// reading that as a deallocation would retract every correction the node has.
+func (r *claimConfigMapReader) IsProjectedDeallocated(claimUID types.UID, mark *store.ProjectionWatermark) bool {
+	projected, lineage, ok, err := r.getProjectedFrom()
 	if err != nil || !ok {
 		return false
 	}
@@ -130,7 +154,25 @@ func (r *claimConfigMapReader) IsProjectedDeallocated(claimUID types.UID) bool {
 			return pc.State == v1alpha1.ClaimStateDeallocated
 		}
 	}
-	return false
+	if mark == nil || mark.Lineage != lineage {
+		return false
+	}
+	return projected.Generation > mark.Generation
+}
+
+// ProjectedAllocatedAt is where a claim is listed as allocated now, which is the
+// mark the driver keeps to judge its later absence by.
+func (r *claimConfigMapReader) ProjectedAllocatedAt(claimUID types.UID) (store.ProjectionWatermark, bool) {
+	projected, lineage, ok, err := r.getProjectedFrom()
+	if err != nil || !ok || lineage == "" {
+		return store.ProjectionWatermark{}, false
+	}
+	for _, pc := range projected.Claims {
+		if types.UID(pc.UID) == claimUID && pc.State == v1alpha1.ClaimStateAllocated {
+			return store.ProjectionWatermark{Lineage: lineage, Generation: projected.Generation}, true
+		}
+	}
+	return store.ProjectionWatermark{}, false
 }
 
 func (r *claimConfigMapReader) GetProjectedClaims() (*v1alpha1.ProjectedClaims, error) {
@@ -139,6 +181,64 @@ func (r *claimConfigMapReader) GetProjectedClaims() (*v1alpha1.ProjectedClaims, 
 		return nil, err
 	}
 	return &projected, nil
+}
+
+// projectionWatermark is where the projection lists this claim as allocated
+// now, which is the mark its later absence is judged against. Nil when there is
+// no projection, or when it does not carry the claim yet: a claim is marked by
+// the first projection that does carry it, whether that is this one or a later
+// one.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) projectionWatermark(claimUID types.UID) *store.ProjectionWatermark {
+	if cp.claimReader == nil {
+		return nil
+	}
+	mark, ok := cp.claimReader.ProjectedAllocatedAt(claimUID)
+	if !ok {
+		return nil
+	}
+	return &mark
+}
+
+// stampProjectionWatermarks marks the prepared claims a projection has caught up
+// with, and records the mark on disk so that it survives a restart.
+//
+// A claim prepared before the projector listed it carries no mark, and until it
+// does, absence says nothing about it: the capacity its departure corrects
+// stands until Unprepare, which is what this driver did for every claim before
+// the mark existed. So the arrival of a projection is when to look again.
+func (cp *CPUDriver) stampProjectionWatermarks(logger logr.Logger) {
+	cp.applyMu.Lock()
+	defer cp.applyMu.Unlock()
+
+	if cp.claimReader == nil || cp.cpuAllocationStore == nil {
+		return
+	}
+	for claimUID, holding := range cp.cpuAllocationStore.ClaimHoldings() {
+		if holding.Projection != nil {
+			continue
+		}
+		// Not while the claim is moving. Writing its record back is what marks it,
+		// and the record on disk is also where the round in flight is written; a
+		// rewrite from the store alone would drop the round, and a restart would
+		// then recover the claim on its target with no memory of the CPUs its
+		// container may still be running on. The next projection marks it, or the
+		// next Prepare does.
+		if _, moving := cp.cpuAllocationStore.GetRebindOrigin(claimUID); moving {
+			continue
+		}
+		mark, ok := cp.claimReader.ProjectedAllocatedAt(claimUID)
+		if !ok || !cp.cpuAllocationStore.SetProjectionWatermark(claimUID, mark) {
+			continue
+		}
+		cLogger := logger.WithValues("claimUID", claimUID, "generation", mark.Generation)
+		if err := cp.writeClaimPlacement(cLogger, claimUID); err != nil {
+			cLogger.Error(err, "cannot record where the projection first listed a claim")
+			continue
+		}
+		cLogger.V(2).Info("marked where the projection first listed a claim as allocated")
+	}
 }
 
 // watchAllocatedClaims gives the driver its reader and keeps it fed from the
@@ -175,10 +275,12 @@ func watchAllocatedClaims(ctx context.Context, cp *CPUDriver) error {
 
 	if _, err := cmInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
+			cp.stampProjectionWatermarks(ctxlog.FromContext(ctx))
 			cp.republishStaleSlicesLocking(context.Background())
 			cp.reconcileMakeRoomTargets(context.Background())
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
+			cp.stampProjectionWatermarks(ctxlog.FromContext(ctx))
 			cp.republishStaleSlicesLocking(context.Background())
 			cp.reconcileMakeRoomTargets(context.Background())
 		},

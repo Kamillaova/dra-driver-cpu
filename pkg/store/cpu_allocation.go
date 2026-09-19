@@ -78,6 +78,26 @@ type RoundProvenance struct {
 	Partners []types.UID
 }
 
+// ProjectionWatermark is the projection this driver first saw a claim listed as
+// allocated in: which projection, and how far along it was.
+//
+// It is what lets absence be read as deallocation. A projection lists a claim as
+// deallocated for one write only, so a driver that watched for the word alone
+// would miss it and go on correcting a device's capacity for a claim the
+// scheduler has already taken back. Absence from a *newer* projection of the
+// same lineage says the same thing and keeps saying it; absence from an older
+// one, or from a projection written by a different projector, says nothing at
+// all.
+type ProjectionWatermark struct {
+	// Lineage is the projection's identity, so that a projector restarted from
+	// an empty ConfigMap -- whose generation begins again at one -- is not read
+	// as a newer projection that has dropped every claim.
+	Lineage string
+	// Generation is how far along that projection was when this claim was first
+	// seen in it, allocated.
+	Generation int64
+}
+
 type ClaimCorrelation struct {
 	NUMANode         *int
 	Partition        string
@@ -112,7 +132,12 @@ type ClaimRecord struct {
 	ReservedFor []types.UID
 	// Round is the defragmentation round in flight when this record was written
 	// to disk, or nil when no round is active for the claim.
-	Round       *RoundProvenance
+	Round *RoundProvenance
+	// Projection is where the driver first saw this claim listed as allocated,
+	// and is nil for a claim it has not seen listed at all. It is written once
+	// and never revised: it is a mark on the past, not a record of the latest
+	// projection.
+	Projection  *ProjectionWatermark
 	Correlation ClaimCorrelation
 }
 
@@ -171,6 +196,7 @@ type claimAllocation struct {
 	alignment   v1alpha1.Alignment
 	// recorded is what the claim's allocation charged each device it names.
 	recorded    map[string]int
+	projection  *ProjectionWatermark
 	correlation ClaimCorrelation
 	reservedFor []types.UID
 }
@@ -187,6 +213,10 @@ func newClaimAllocation(record ClaimRecord) *claimAllocation {
 		recorded:    maps.Clone(record.Recorded),
 		reservedFor: slices.Clone(record.ReservedFor),
 		correlation: record.Correlation,
+	}
+	if record.Projection != nil {
+		mark := *record.Projection
+		allocation.projection = &mark
 	}
 	// CCX-FORK: a record read back from disk may carry a round that was in
 	// flight when the driver went down. Dropping it would leave the claim
@@ -918,14 +948,35 @@ func (s *CPUAllocation) GetClaimRecord(claimUID types.UID) (ClaimRecord, bool) {
 	if !ok {
 		return ClaimRecord{}, false
 	}
-	return ClaimRecord{
+	record := ClaimRecord{
 		Requests:    allocation.requests(),
 		Relocatable: allocation.relocatable,
 		Alignment:   allocation.alignment,
 		Recorded:    maps.Clone(allocation.recorded),
 		ReservedFor: slices.Clone(allocation.reservedFor),
 		Correlation: allocation.correlation,
-	}, true
+	}
+	if allocation.projection != nil {
+		mark := *allocation.projection
+		record.Projection = &mark
+	}
+	return record, true
+}
+
+// SetProjectionWatermark marks where the driver first saw a claim listed as
+// allocated, and reports whether that was news. A claim that already carries a
+// mark keeps it: a later one would move the line absence is judged against
+// forward, and a claim the projection has already dropped would never be read as
+// deallocated at all.
+func (s *CPUAllocation) SetProjectionWatermark(claimUID types.UID, mark ProjectionWatermark) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	allocation, ok := s.claims[claimUID]
+	if !ok || allocation.projection != nil || mark.Lineage == "" {
+		return false
+	}
+	allocation.projection = &mark
+	return true
 }
 
 func (s *CPUAllocation) SetClaimCorrelation(claimUID types.UID, corr ClaimCorrelation) {
@@ -1043,6 +1094,10 @@ func (s *CPUAllocation) IsRelocatable(claimUID types.UID) bool {
 type ClaimHolding struct {
 	Held     cpuset.CPUSet
 	Recorded map[string]int
+	// Projection is where the driver first saw this claim listed as allocated,
+	// and is what tells absence from a later projection from a projection that
+	// has not listed the claim yet. Nil for a claim never seen listed.
+	Projection *ProjectionWatermark
 }
 
 // ClaimHoldings returns every prepared claim that holds CPUs of its own, in one
@@ -1060,7 +1115,12 @@ func (s *CPUAllocation) ClaimHoldings() map[types.UID]ClaimHolding {
 		if held.IsEmpty() {
 			continue
 		}
-		holdings[claimUID] = ClaimHolding{Held: held, Recorded: maps.Clone(allocation.recorded)}
+		holding := ClaimHolding{Held: held, Recorded: maps.Clone(allocation.recorded)}
+		if allocation.projection != nil {
+			mark := *allocation.projection
+			holding.Projection = &mark
+		}
+		holdings[claimUID] = holding
 	}
 	return holdings
 }

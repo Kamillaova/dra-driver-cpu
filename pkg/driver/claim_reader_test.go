@@ -24,6 +24,7 @@ import (
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
@@ -106,9 +107,103 @@ func TestClaimConfigMapReaderAllocatedClaims(t *testing.T) {
 	require.Equal(t, driverName, claims[0].Status.Allocation.Devices.Results[0].Driver)
 	require.Equal(t, "cache-0", claims[0].Status.Allocation.Devices.Results[0].Device)
 
-	require.False(t, reader.IsProjectedDeallocated("claim-1"))
-	require.True(t, reader.IsProjectedDeallocated("claim-2"))
-	require.False(t, reader.IsProjectedDeallocated("claim-unknown"))
+	require.False(t, reader.IsProjectedDeallocated("claim-1", nil))
+	require.True(t, reader.IsProjectedDeallocated("claim-2", nil))
+	require.False(t, reader.IsProjectedDeallocated("claim-unknown", nil))
+}
+
+// TestClaimConfigMapReaderReadsAbsenceAgainstTheWatermark: the projector marks
+// a claim deallocated for one write only, so the reading that has to last is
+// absence -- but only absence from a projection newer than the one the claim was
+// first seen in, and only from the same projector.
+func TestClaimConfigMapReaderReadsAbsenceAgainstTheWatermark(t *testing.T) {
+	nodeName := "test-node"
+	namespace := "default"
+	cmName := v1alpha1.ProjectedClaimsConfigMapName(nodeName)
+
+	// Generation 7 lists nothing: the claim below was prepared against an
+	// earlier one and has since gone.
+	data, err := json.Marshal(v1alpha1.ProjectedClaims{APIVersion: v1alpha1.APIVersion, Generation: 7})
+	require.NoError(t, err)
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmName,
+			Namespace: namespace,
+			UID:       "projection-a",
+		},
+		Data: map[string]string{v1alpha1.ProjectedClaimsKey: string(data)},
+	}
+
+	d := &CPUDriver{
+		nodeName:   nodeName,
+		driverName: "dra.cpu",
+		namespace:  namespace,
+		kubeClient: k8sfake.NewSimpleClientset(cm),
+		metrics:    cpumetrics.Noop(),
+	}
+	require.NoError(t, watchAllocatedClaims(context.Background(), d))
+	reader := d.claimReader
+
+	for _, tc := range []struct {
+		name string
+		mark *store.ProjectionWatermark
+		want bool
+	}{
+		{"no mark at all", nil, false},
+		{"first seen in an older projection", &store.ProjectionWatermark{Lineage: "projection-a", Generation: 6}, true},
+		{"first seen in this very projection", &store.ProjectionWatermark{Lineage: "projection-a", Generation: 7}, false},
+		{"first seen in a newer projection", &store.ProjectionWatermark{Lineage: "projection-a", Generation: 8}, false},
+		{"first seen in another projector's", &store.ProjectionWatermark{Lineage: "projection-b", Generation: 1}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, reader.IsProjectedDeallocated("claim-gone", tc.mark))
+		})
+	}
+
+	_, ok := reader.ProjectedAllocatedAt("claim-gone")
+	require.False(t, ok, "a claim the projection does not list is not marked")
+}
+
+// TestClaimConfigMapReaderMarksWhereAClaimWasFirstSeen: the mark is the lineage
+// and generation of the projection listing the claim as allocated.
+func TestClaimConfigMapReaderMarksWhereAClaimWasFirstSeen(t *testing.T) {
+	nodeName := "test-node"
+	namespace := "default"
+
+	projected := v1alpha1.ProjectedClaims{
+		APIVersion: v1alpha1.APIVersion,
+		Generation: 12,
+		Claims: []v1alpha1.ProjectedClaim{
+			{UID: "claim-live", Namespace: namespace, Name: "c", State: v1alpha1.ClaimStateAllocated},
+			{UID: "claim-gone", Namespace: namespace, Name: "d", State: v1alpha1.ClaimStateDeallocated},
+		},
+	}
+	data, err := json.Marshal(projected)
+	require.NoError(t, err)
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      v1alpha1.ProjectedClaimsConfigMapName(nodeName),
+			Namespace: namespace,
+			UID:       "projection-a",
+		},
+		Data: map[string]string{v1alpha1.ProjectedClaimsKey: string(data)},
+	}
+
+	d := &CPUDriver{
+		nodeName:   nodeName,
+		driverName: "dra.cpu",
+		namespace:  namespace,
+		kubeClient: k8sfake.NewSimpleClientset(cm),
+		metrics:    cpumetrics.Noop(),
+	}
+	require.NoError(t, watchAllocatedClaims(context.Background(), d))
+
+	mark, ok := d.claimReader.ProjectedAllocatedAt("claim-live")
+	require.True(t, ok)
+	require.Equal(t, store.ProjectionWatermark{Lineage: "projection-a", Generation: 12}, mark)
+
+	_, ok = d.claimReader.ProjectedAllocatedAt("claim-gone")
+	require.False(t, ok, "a claim listed as deallocated is not one that was seen allocated")
 }
 
 func TestClaimConfigMapReaderMissingOrCorrupt(t *testing.T) {
@@ -132,7 +227,7 @@ func TestClaimConfigMapReaderMissingOrCorrupt(t *testing.T) {
 	claims, err := reader.AllocatedClaims()
 	require.NoError(t, err)
 	require.Empty(t, claims)
-	require.False(t, reader.IsProjectedDeallocated("any-claim"))
+	require.False(t, reader.IsProjectedDeallocated("any-claim", nil))
 
 	// Create ConfigMap with corrupt JSON
 	corruptCM := &corev1.ConfigMap{
@@ -241,15 +336,30 @@ func TestClaimConfigMapReaderAcceptsARestartedProjector(t *testing.T) {
 type fakeClaimReader struct {
 	claims      []*resourceapi.ResourceClaim
 	deallocated map[types.UID]bool
-	projected   *v1alpha1.ProjectedClaims
+	allocatedAt map[types.UID]store.ProjectionWatermark
+	// asked records the mark each claim was judged against, for a test whose
+	// point is that the record's own mark is what reaches the reader.
+	asked     map[types.UID]*store.ProjectionWatermark
+	projected *v1alpha1.ProjectedClaims
 }
 
 func (f fakeClaimReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, error) {
 	return f.claims, nil
 }
 
-func (f fakeClaimReader) IsProjectedDeallocated(claimUID types.UID) bool {
+func (f fakeClaimReader) IsProjectedDeallocated(claimUID types.UID, mark *store.ProjectionWatermark) bool {
+	if f.asked != nil {
+		f.asked[claimUID] = mark
+	}
 	return f.deallocated != nil && f.deallocated[claimUID]
+}
+
+func (f fakeClaimReader) ProjectedAllocatedAt(claimUID types.UID) (store.ProjectionWatermark, bool) {
+	if f.allocatedAt == nil {
+		return store.ProjectionWatermark{}, false
+	}
+	mark, ok := f.allocatedAt[claimUID]
+	return mark, ok
 }
 
 func (f fakeClaimReader) GetProjectedClaims() (*v1alpha1.ProjectedClaims, error) {

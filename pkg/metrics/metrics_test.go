@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 48)
+	require.Len(t, descriptors, 49)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -75,6 +75,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_defrag_poisoned_duration_seconds",
 		"dra_cpu_defrag_readback_mismatches_total",
 		"dra_cpu_capacity_mirror_floored_devices",
+		"dra_cpu_capacity_mirror_retracted_by_absence",
 		"dra_cpu_defrag_unpublished_rounds_total",
 		"dra_cpu_frontier_admissions_total",
 		"dra_cpu_frontier_oldest_obligation_seconds",
@@ -151,6 +152,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_available_cpus",
 		"dra_cpu_capacity_mirror_floored_devices",
 		"dra_cpu_capacity_mirror_max_abs_cache_error",
+		"dra_cpu_capacity_mirror_retracted_by_absence",
 		"dra_cpu_claim_allocated_cpus",
 		"dra_cpu_claims_off_recorded_cache",
 		"dra_cpu_defrag_blocked_moves_total",

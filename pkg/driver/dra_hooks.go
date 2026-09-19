@@ -558,6 +558,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 		Alignment:   placement.Alignment,
 		Recorded:    cp.recordedDevices(claim),
 		ReservedFor: reservedForPodUIDs(claim),
+		Projection:  cp.projectionWatermark(claim.UID),
 	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
@@ -893,6 +894,7 @@ func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logge
 		Relocatable: placement.Relocatable,
 		Alignment:   placement.Alignment,
 		ReservedFor: reservedForPodUIDs(claim),
+		Projection:  cp.projectionWatermark(claim.UID),
 	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {

@@ -149,7 +149,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
 - `pkg/driver/poison.go`: `poisonNUMANodeForCPUs`
 
 - `pkg/store/cpu_allocation.go`: `Role`, `RoleExclusive`, `RoleShared`, `RequestAllocation`, `UnionOf`,
-  `RoundProvenance`, `ClaimCorrelation`, `claimAllocation` and `newClaimAllocation` with its `cpus`,
+  `RoundProvenance`, `ProjectionWatermark`, `SetProjectionWatermark`, `ClaimCorrelation`,
+  `claimAllocation` and `newClaimAllocation` with its `cpus`,
   `equals`, `exclusiveByRequest`, `exclusiveCPUs`, `exclusiveOverlap`, `exclusiveRequestNames`,
   `originCPUs`, `placeExclusive` and `restoreExclusive` methods, `SpreadExclusive`, `spreadByCPUID`,
   `spreadWholeCores`, `BeginRebind`, `CommitRebind`, `AbortRebind`,
@@ -175,7 +176,7 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `validateProfiles`, `listItemSchemas` and `WarnDeprecatedCPUFields`
 
 - `pkg/metrics/metrics.go`: `DefragState`, the `Recorder` defragmentation methods,
-  `SetFlooredCapacityDevices`, `RecordPrepareNoRoom`, `RecordPrepareNoWitness`,
+  `SetFlooredCapacityDevices`, `SetClaimsRetractedByAbsence`, `RecordPrepareNoRoom`, `RecordPrepareNoWitness`,
   `RecordSynchronizeSkippedClaim`, `RecordStartedContainerConverged`,
   the `newCounter` and `newGaugeVec` constructors,
   `RecordSynchronizeForeignCPUs`, `RecordSliceHandoff` with `HandoffAccepted` and `HandoffRefused`,

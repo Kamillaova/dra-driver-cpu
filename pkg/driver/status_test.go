@@ -42,7 +42,13 @@ func (r staticClaimReader) AllocatedClaims() ([]*resourceapi.ResourceClaim, erro
 	return r.claims, nil
 }
 
-func (r staticClaimReader) IsProjectedDeallocated(types.UID) bool { return false }
+func (r staticClaimReader) IsProjectedDeallocated(types.UID, *store.ProjectionWatermark) bool {
+	return false
+}
+
+func (r staticClaimReader) ProjectedAllocatedAt(types.UID) (store.ProjectionWatermark, bool) {
+	return store.ProjectionWatermark{}, false
+}
 
 // GetProjectedClaims is not part of the interface at this commit and is not
 // used by the publisher. It is here so that the stub keeps satisfying the
