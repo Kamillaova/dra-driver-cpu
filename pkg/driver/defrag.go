@@ -114,8 +114,16 @@ const (
 	exchangeUndone
 )
 
-// defragRound is one scope's set of moves that has been reserved and written
-// to disk and is waiting for the runtime to confirm it.
+// defragRound is the one step a scope has reserved and written to disk and is
+// waiting for the runtime to confirm: a move into free CPUs, or the moves of one
+// exchange, which are legal only together.
+//
+// One step, because a mover holds both its cpusets until it commits: a plan
+// whose later move takes CPUs an earlier one is vacating cannot be reserved in
+// one round, and reserving it as a whole is how a chain of two dependent moves
+// ends up dropped instead of executed. It is also what keeps a batch from
+// touching one container on behalf of two steps at once, which leaves a rollback
+// with no cpuset to put it back on that is true of both.
 type defragRound struct {
 	id          string
 	scope       defragScope
@@ -698,23 +706,13 @@ func (cp *CPUDriver) beginDefragRound(ctx context.Context, logger logr.Logger, s
 	}
 
 	round := newDefragRound(scope, cp.cpuAllocationStore)
-	for _, step := range defragSteps(moves) {
-		if !cp.beginDefragStep(logger, round, step) {
-			continue
-		}
-		round.moves = append(round.moves, step...)
-	}
-	if len(round.moves) < len(moves) && cp.hasActiveExactPlan(scope.numaNodeID) {
-		cp.abortMoves(logger, round.moves)
+	step := defragSteps(moves)[0]
+	if !cp.beginDefragStep(logger, round, step) {
 		cp.clearActiveExactPlan(scope.numaNodeID)
 		cp.cpuAllocationStore.ReleaseClosure(scope.numaNodeID)
 		return nil
 	}
-	if len(round.moves) == 0 {
-		cp.clearActiveExactPlan(scope.numaNodeID)
-		cp.cpuAllocationStore.ReleaseClosure(scope.numaNodeID)
-		return nil
-	}
+	round.moves = step
 
 	if err := cp.roundUpdates(logger, round); err != nil {
 		logger.Error(err, "abandoning defragmentation round", "numMoves", len(round.moves))
@@ -1074,6 +1072,36 @@ func (cp *CPUDriver) clearActiveExactPlan(numaNodeID int) {
 	}
 }
 
+// advanceActiveExactPlan drops the moves a round committed from the NUMA node's
+// plan and reports whether the plan has any left.
+//
+// A plan outlives the rounds that execute it. Its moves go out one step per
+// pass, and the closure it reserved stays reserved until the last of them
+// commits: a target the plan means to use is vacated by an earlier move, so
+// letting a Prepare take it between two rounds would strand the rest of the
+// plan.
+//
+// Called with applyMu held.
+func (cp *CPUDriver) advanceActiveExactPlan(logger logr.Logger, round *defragRound) bool {
+	plan := cp.getActiveExactPlan(round.scope.numaNodeID)
+	if plan == nil {
+		return false
+	}
+	done := stepClaims(round.moves)
+	remaining := make([]defrag.Move, 0, len(plan.Moves))
+	for _, move := range plan.Moves {
+		if !slices.Contains(done, move.ClaimUID) {
+			remaining = append(remaining, move)
+		}
+	}
+	plan.Moves = remaining
+	if len(remaining) == 0 {
+		return false
+	}
+	logger.V(2).Info("exact plan has further moves, keeping it and its closure", "numMoves", len(remaining))
+	return true
+}
+
 // getActiveExactPlan returns the active exact plan for the NUMA node.
 // Called with applyMu held.
 func (cp *CPUDriver) getActiveExactPlan(numaNodeID int) *defrag.ExactPlan {
@@ -1409,8 +1437,10 @@ func (cp *CPUDriver) finishDefragRound(logger logr.Logger, round *defragRound, f
 		return cpumetrics.ResultError
 	}
 	delete(cp.pendingRounds, round.scope)
-	cp.clearActiveExactPlan(round.scope.numaNodeID)
-	cp.cpuAllocationStore.ReleaseClosure(round.scope.numaNodeID)
+	if reverted > 0 || !cp.advanceActiveExactPlan(logger, round) {
+		cp.clearActiveExactPlan(round.scope.numaNodeID)
+		cp.cpuAllocationStore.ReleaseClosure(round.scope.numaNodeID)
+	}
 
 	if committed > 0 {
 		// Two jobs at once. The CPUs the moved claims left are back in the pool

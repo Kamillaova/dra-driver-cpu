@@ -1594,6 +1594,84 @@ func TestDefragPassRepairsRepairableClaimWithExactSearch(t *testing.T) {
 	d.applyMu.Unlock()
 }
 
+func TestDefragPassRunsADependentChainOneStepPerRound(t *testing.T) {
+	// The repair the split claim needs takes CPUs another claim is still running
+	// on, so the two moves cannot be reserved together: a mover holds both its
+	// cpusets until it commits, and the second move's target is the first move's
+	// origin. The plan is executed a step at a time instead, and stays the node's
+	// plan until its last move commits.
+	d := newDefragTestDriver(t, 4, 4)
+	d.placeRepairableClaim(t, "claim-split", cpuset.New(0, 1, 4))
+	d.placeClaim(t, "claim-in-the-way", cpuset.New(2, 3))
+	d.placeClaim(t, "claim-c", cpuset.New(5, 6, 7))
+	d.placeClaim(t, "claim-y", cpuset.New(8, 9))
+	d.placeClaim(t, "claim-z", cpuset.New(12, 13))
+	d.runContainer(t, "pod-split", "ctr", "ctr-uid-split", "claim-split")
+	d.runContainer(t, "pod-way", "ctr", "ctr-uid-way", "claim-in-the-way")
+	d.runContainer(t, "pod-c", "ctr", "ctr-uid-c", "claim-c")
+	d.runContainer(t, "pod-y", "ctr", "ctr-uid-y", "claim-y")
+	d.runContainer(t, "pod-z", "ctr", "ctr-uid-z", "claim-z")
+
+	nodeTopo, err := defrag.NewTopology(d.topology.cpuTopology, 0, d.allCPUs)
+	require.NoError(t, err)
+
+	d.defragPass(context.Background())
+
+	require.Len(t, d.updater.allCalls(), 1, "one round")
+	inTheWay, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-in-the-way")
+	require.Equal(t, cpuset.New(10, 11), inTheWay, "the claim standing in the way steps aside first")
+	split, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-split")
+	require.Equal(t, cpuset.New(0, 1, 4), split, "and the claim that needs its CPUs waits for the next round")
+
+	d.applyMu.Lock()
+	require.True(t, d.hasActiveExactPlan(0), "the plan outlives the round that executed its first step")
+	require.False(t, d.cpuAllocationStore.ReservedClosure(0).IsEmpty(), "and so does the closure it reserved")
+	d.applyMu.Unlock()
+
+	d.defragPass(context.Background())
+
+	require.Len(t, d.updater.allCalls(), 2, "the second step is the second round")
+	split, _ = d.cpuAllocationStore.GetResourceClaimAllocation("claim-split")
+	require.Equal(t, 0, nodeTopo.ExcessSpread(split), "the repair the plan existed for never happened")
+	require.Equal(t, split, d.recordedPlacement(t, "claim-split"))
+
+	d.applyMu.Lock()
+	require.False(t, d.hasActiveExactPlan(0), "a finished plan is cleared")
+	require.True(t, d.cpuAllocationStore.ReservedClosure(0).IsEmpty())
+	d.applyMu.Unlock()
+}
+
+func TestDefragRoundCarriesOneStepSoNoContainerIsInTwo(t *testing.T) {
+	// Two claims of one scope both want to move, and a round takes one of them.
+	// A batch carrying both would carry one update for a container holding a
+	// claim from each, and undoing either step would then have to put that
+	// container back onto CPUs the other step is taking.
+	d := newDefragTestDriver(t, 2, 4)
+	d.placeClaim(t, "claim-1", cpuset.New(0, 4))
+	d.placeClaim(t, "claim-2", cpuset.New(1, 5))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.runContainer(t, "pod-2", "ctr-2", "ctr-uid-2", "claim-2")
+
+	d.defragPass(context.Background())
+
+	calls := d.updater.allCalls()
+	require.Len(t, calls, 1)
+	require.Len(t, calls[0], 1, "one step is one container")
+
+	first, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	second, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-2")
+	moved := cpuinfoSpread(d.CPUDriver, first) + cpuinfoSpread(d.CPUDriver, second)
+	require.Equal(t, 3, moved, "exactly one of the two claims is repaired in a round")
+
+	d.defragPass(context.Background())
+
+	require.Len(t, d.updater.allCalls(), 2, "the other follows in the next round")
+	first, _ = d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	second, _ = d.cpuAllocationStore.GetResourceClaimAllocation("claim-2")
+	require.Equal(t, 1, cpuinfoSpread(d.CPUDriver, first))
+	require.Equal(t, 1, cpuinfoSpread(d.CPUDriver, second))
+}
+
 func TestAllocatedUnpreparedCPUsTreatedAsConsumed(t *testing.T) {
 	d := newDefragTestDriver(t, 2, 4)
 	d.topology.deviceNameToCPUs = map[string]cpuset.CPUSet{

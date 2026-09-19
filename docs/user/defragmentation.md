@@ -204,7 +204,10 @@ it freed are what the following move needs, so a repair that needs several round
 back rather than waiting between them.
 
 A pass plans and applies one round per NUMA node and CPU partition, which is what bounds how much of
-a machine one batch disturbs; a claim is never moved across either boundary anyway. A region whose
+a machine one batch disturbs; a claim is never moved across either boundary anyway. A round carries
+one step: one claim's move, or the two moves of an exchange, which are legal only together. A repair
+of several moves — one claim stepping aside so that another can be made whole — takes a round each,
+because the CPUs a move frees belong to the container running on them until it commits. A region whose
 round the runtime refused or never confirmed is tried again on its own, after a delay that grows
 while it keeps failing and resets when it succeeds, and it holds up no other region meanwhile. A
 quiet node runs no passes at all.
