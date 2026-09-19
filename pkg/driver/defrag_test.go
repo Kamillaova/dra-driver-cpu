@@ -1641,6 +1641,37 @@ func TestDefragPassRunsADependentChainOneStepPerRound(t *testing.T) {
 	d.applyMu.Unlock()
 }
 
+func TestDefragPassNeverPlansARepairThatEmptiesThePool(t *testing.T) {
+	// The same floor the greedy planner is held to, for the exact search that
+	// repairs a claim asking to be made whole. The repair needs the default
+	// partition's last free CPU, and the claimless containers run there, so a
+	// plan that takes it is one the round would have to abandon at the container
+	// updates -- deterministically, on every pass, having reserved the CPUs and
+	// rewritten the claim's spec first.
+	d := newDefragTestDriverTopo(t, 1, 2, 2)
+	d.describe(t, devattr.Partition{
+		Name: "other", Role: devattr.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(3),
+	})
+	d.placeRepairableClaim(t, "claim-1", cpuset.New(0, 2))
+	d.runContainer(t, "pod-1", "ctr-1", "ctr-uid-1", "claim-1")
+	d.runContainer(t, "pod-2", "shared-ctr", "shared-uid")
+	writes := d.cdi.addCalls
+
+	d.defragPass(context.Background())
+
+	require.Empty(t, d.updater.allCalls(), "the repair would have left the pool empty")
+	cpus, _ := d.cpuAllocationStore.GetResourceClaimAllocation("claim-1")
+	require.Equal(t, cpuset.New(0, 2), cpus)
+	require.Equal(t, cpuset.New(0, 2), d.recordedPlacement(t, "claim-1"))
+	require.Equal(t, writes, d.cdi.addCalls,
+		"a plan that cannot run must not reach the spec a restart rebuilds from, even to be undone again")
+
+	d.applyMu.Lock()
+	require.False(t, d.hasActiveExactPlan(0), "and no plan is left holding the node")
+	require.True(t, d.cpuAllocationStore.ReservedClosure(0).IsEmpty())
+	d.applyMu.Unlock()
+}
+
 func TestDefragRoundCarriesOneStepSoNoContainerIsInTwo(t *testing.T) {
 	// Two claims of one scope both want to move, and a round takes one of them.
 	// A batch carrying both would carry one update for a container holding a

@@ -433,6 +433,41 @@ func TestDepthCutoffIsNotProofOfUnreachability(t *testing.T) {
 	}
 }
 
+// TestExactSearchKeepsACPUInTheSharedPool: the only repair on offer takes the
+// node's last free CPU, and while it is in flight the claim holds both that CPU
+// and the ones it is leaving, so the containers holding no claim would be given
+// an empty cpuset -- which NRI cannot express and PlanNode already refuses. The
+// exact search has to refuse it too, or it proposes a plan that is unwound at
+// CreateContainer on every pass.
+func TestExactSearchKeepsACPUInTheSharedPool(t *testing.T) {
+	topo := fakeTopology(2, 2)
+	placements := []Placement{
+		{ClaimUID: types.UID("claim-split"), CPUs: parseCPUSet("0,2")},
+		{ClaimUID: types.UID("claim-other"), CPUs: parseCPUSet("3")},
+	}
+	free := parseCPUSet("1")
+	goal := GoalMakeClaimWhole{ClaimUID: types.UID("claim-split")}
+
+	plan, err := ExactSearch(topo, placements, free, cpuset.New(), goal, nil, ExactOptions{})
+	if err != nil {
+		t.Fatalf("unconstrained search: %v", err)
+	}
+	if len(plan.Moves) != 1 || !plan.Moves[0].To.Equals(parseCPUSet("0-1")) {
+		t.Fatalf("the repair this test is about is not the one the search found: %v", plan.Moves)
+	}
+
+	guarded, err := ExactSearch(topo, placements, free, cpuset.New(), goal, nil, ExactOptions{KeepFreePoolNonEmpty: true})
+	if err != nil {
+		t.Fatalf("guarded search: %v", err)
+	}
+	if len(guarded.Moves) != 0 {
+		t.Fatalf("a repair that empties the shared pool was planned anyway: %v", guarded.Moves)
+	}
+	if guarded.Status != SearchUnreachable {
+		t.Fatalf("the repair is genuinely out of reach under the floor, not %v", guarded.Status)
+	}
+}
+
 // TestStateKeyTellsOneSplitClaimFromTwoWholeOnes: both states put two CPUs in
 // each of two caches, so every cache looks identical between them. They are not
 // the same state -- one claim split across two caches is one move from whole,

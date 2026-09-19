@@ -124,6 +124,7 @@ type mockCdiMgr struct {
 	getError     error
 	removeError  error
 	refreshCalls int
+	addCalls     int
 }
 
 func newMockCdiMgr() *mockCdiMgr {
@@ -145,6 +146,7 @@ func (m *mockCdiMgr) AddDevice(_ logr.Logger, deviceName string, envVar string, 
 	if m.addError != nil {
 		return m.addError
 	}
+	m.addCalls++
 	m.devices[deviceName] = envVar
 	m.placements[deviceName] = record
 	return nil

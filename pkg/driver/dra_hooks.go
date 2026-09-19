@@ -1001,8 +1001,9 @@ func (cp *CPUDriver) secureRepairWitness(ctx context.Context, logger logr.Logger
 	goal := defrag.GoalMakeClaimWhole{ClaimUID: claim.UID}
 	sel := cp.defragSelector(logger, view.threadsPerCore)
 	opts := defrag.ExactOptions{
-		Eligible:   cp.claimMovableForExact,
-		AllowSwaps: cp.defrag.allowTransientOverlap,
+		Eligible:             cp.claimMovableForExact,
+		AllowSwaps:           cp.defrag.allowTransientOverlap,
+		KeepFreePoolNonEmpty: view.keepFreePoolNonEmpty,
 	}
 	inFlight := cp.allocatedUnpreparedCPUs(numaNodeID)
 	plan, err := defrag.ExactSearch(view.topology, view.placements, view.free, inFlight, goal, sel, opts)

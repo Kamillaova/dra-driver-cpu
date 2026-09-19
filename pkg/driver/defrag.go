@@ -653,8 +653,9 @@ func (cp *CPUDriver) beginDefragRound(ctx context.Context, logger logr.Logger, s
 				goal := defrag.GoalFreeCache{CacheID: target.cacheID}
 				sel := cp.defragSelector(logger, view.threadsPerCore)
 				opts := defrag.ExactOptions{
-					Eligible:   cp.claimMovableForExact,
-					AllowSwaps: cp.defrag.allowTransientOverlap,
+					Eligible:             cp.claimMovableForExact,
+					AllowSwaps:           cp.defrag.allowTransientOverlap,
+					KeepFreePoolNonEmpty: view.keepFreePoolNonEmpty,
 				}
 				inFlight := cp.allocatedUnpreparedCPUs(scope.numaNodeID)
 				plan, err := defrag.ExactSearch(view.topology, view.placements, view.free, inFlight, goal, sel, opts)
@@ -681,8 +682,9 @@ func (cp *CPUDriver) beginDefragRound(ctx context.Context, logger logr.Logger, s
 					goal := defrag.GoalMakeClaimWhole{ClaimUID: p.ClaimUID}
 					sel := cp.defragSelector(logger, view.threadsPerCore)
 					opts := defrag.ExactOptions{
-						Eligible:   cp.claimMovableForExact,
-						AllowSwaps: cp.defrag.allowTransientOverlap,
+						Eligible:             cp.claimMovableForExact,
+						AllowSwaps:           cp.defrag.allowTransientOverlap,
+						KeepFreePoolNonEmpty: view.keepFreePoolNonEmpty,
 					}
 					inFlight := cp.allocatedUnpreparedCPUs(scope.numaNodeID)
 					plan, err := defrag.ExactSearch(view.topology, view.placements, view.free, inFlight, goal, sel, opts)

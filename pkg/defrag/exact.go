@@ -146,6 +146,14 @@ type ExactOptions struct {
 	// CanonicaliseCaches controls whether states are canonicalised under cache permutations.
 	// Defaults to true. Setting false enables the uncanonicalised oracle comparison.
 	CanonicaliseCaches bool
+	// KeepFreePoolNonEmpty refuses a move that would take the last free CPU, the
+	// same rule PlanNode is held to. While a move is in flight its claim holds
+	// both its old and its new CPUs, so the CPUs it takes leave the pool before
+	// the ones it leaves return to it, and NRI cannot express the empty cpuset
+	// the containers holding no claim would be given meanwhile. An exchange is
+	// exempt by construction: it divides the CPUs its own participants hold and
+	// takes none from the pool.
+	KeepFreePoolNonEmpty bool
 }
 
 func (o ExactOptions) eligible(claimUID types.UID) bool {
@@ -521,6 +529,9 @@ func exactSearchInternal(topo *Topology, placements []Placement, free, inFlight 
 					picked = p
 				} else {
 					picked = cpuset.New(freeInC.List()[:needed]...)
+				}
+				if opts.KeepFreePoolNonEmpty && curr.free.Difference(picked).IsEmpty() {
+					continue
 				}
 
 				target := inC.Union(picked)
