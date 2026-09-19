@@ -369,6 +369,29 @@ func TestGetDeviceAllocationsRoundTripsTheReservation(t *testing.T) {
 	require.Empty(t, got.ReservedFor)
 }
 
+// TestGetDeviceAllocationsRoundTripsAPodGroupReservation: a claim reserved for a
+// pod group names no pod at all, so a record keeping only the pod UIDs reads
+// back as reserved for nobody -- and the fallback a runtime reporting no CDI
+// devices leaves the driver with then refuses every container holding it.
+func TestGetDeviceAllocationsRoundTripsAPodGroupReservation(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+
+	deviceName := "claim-grouped"
+	record := store.ClaimRecord{
+		Requests:          []store.RequestAllocation{{Request: "req", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive}},
+		ReservedForGroups: []string{"training-run-7"},
+	}
+	require.NoError(t, mgr.AddDevice(logger, deviceName, "DRA_CPUSET_claim-grouped=0-1", record))
+	require.NoError(t, mgr.Refresh())
+
+	got, err := mgr.GetDeviceAllocations(deviceName)
+	require.NoError(t, err)
+	require.Equal(t, []string{"training-run-7"}, got.ReservedForGroups)
+	require.Empty(t, got.ReservedFor, "a group reservation names no pod")
+}
+
 func TestGetDeviceAllocationsRoundTripsTheProjectionWatermark(t *testing.T) {
 	logger := testr.New(t)
 	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())

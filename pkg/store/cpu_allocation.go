@@ -130,6 +130,10 @@ type ClaimRecord struct {
 	// the driver prepared it. It is the API server's record of who may hold the
 	// claim, which a pod spec cannot forge the way it can a DRA_CPUSET_* value.
 	ReservedFor []types.UID
+	// ReservedForGroups is the pod groups that same reservation named. A claim
+	// reserved for a group names no pod at all, so a driver keeping only the pod
+	// UIDs would read such a claim as reserved for nobody.
+	ReservedForGroups []string
 	// Round is the defragmentation round in flight when this record was written
 	// to disk, or nil when no round is active for the claim.
 	Round *RoundProvenance
@@ -199,6 +203,9 @@ type claimAllocation struct {
 	projection  *ProjectionWatermark
 	correlation ClaimCorrelation
 	reservedFor []types.UID
+	// reservedForGroups is the pod groups that reservation named, kept beside the
+	// pod UIDs for the reason ClaimRecord.ReservedForGroups gives.
+	reservedForGroups []string
 }
 
 func newClaimAllocation(record ClaimRecord) *claimAllocation {
@@ -207,12 +214,13 @@ func newClaimAllocation(record ClaimRecord) *claimAllocation {
 		byRequest[request.Request] = request
 	}
 	allocation := &claimAllocation{
-		byRequest:   byRequest,
-		relocatable: record.Relocatable,
-		alignment:   record.Alignment,
-		recorded:    maps.Clone(record.Recorded),
-		reservedFor: slices.Clone(record.ReservedFor),
-		correlation: record.Correlation,
+		byRequest:         byRequest,
+		relocatable:       record.Relocatable,
+		alignment:         record.Alignment,
+		recorded:          maps.Clone(record.Recorded),
+		reservedFor:       slices.Clone(record.ReservedFor),
+		reservedForGroups: slices.Clone(record.ReservedForGroups),
+		correlation:       record.Correlation,
 	}
 	if record.Projection != nil {
 		mark := *record.Projection
@@ -949,12 +957,13 @@ func (s *CPUAllocation) GetClaimRecord(claimUID types.UID) (ClaimRecord, bool) {
 		return ClaimRecord{}, false
 	}
 	record := ClaimRecord{
-		Requests:    allocation.requests(),
-		Relocatable: allocation.relocatable,
-		Alignment:   allocation.alignment,
-		Recorded:    maps.Clone(allocation.recorded),
-		ReservedFor: slices.Clone(allocation.reservedFor),
-		Correlation: allocation.correlation,
+		Requests:          allocation.requests(),
+		Relocatable:       allocation.relocatable,
+		Alignment:         allocation.alignment,
+		Recorded:          maps.Clone(allocation.recorded),
+		ReservedFor:       slices.Clone(allocation.reservedFor),
+		ReservedForGroups: slices.Clone(allocation.reservedForGroups),
+		Correlation:       allocation.correlation,
 	}
 	if allocation.projection != nil {
 		mark := *allocation.projection

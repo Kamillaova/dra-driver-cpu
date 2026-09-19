@@ -134,12 +134,14 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `buildClaimCorrelation`, `admissionEventMessage`, `claimNameAndNamespace`,
   `claimUIDFromDeviceName`, `placedCPUs`, `refreshMirrorMetrics`, `refreshObligationMetrics`,
   `publishResources`, `republishStaleSlices`, `rehomeCandidate`, `rehomeShare`,
-  `getCDIRequestDeviceName`, `claimRequestFromDeviceName`, `prepareRequestDevices`, `cdiRequestEnvValue`
+  `getCDIRequestDeviceName`, `claimRequestFromDeviceName`, `prepareRequestDevices`, `cdiRequestEnvValue`,
+  `claimReservation`, `reservedForPodGroups`, `schedulingGroupName`
 
 - `cmd/dracpu/app.go`: the profile lookup between client creation and the carve-out parses, and the
   namespace lookup from POD_NAMESPACE
 
 - `pkg/driver/nri_hooks.go`: `draEnvEntry` and its `ref` method, `parseDRAEnv`, `exclusiveClaimUIDs`, `sharedContainerCPUs`,
+  `recordedReservation`, `podHoldsReservation`,
   `containerClassification`, `classifyContainer`, `reconcileActiveRounds`, `revertRoundOrigin`,
   `nonExclusiveCPUs`, `cpusetUpdate`, `observedContainer`, `reportForeignCPUs`,
   `allocatedClaimsByUID`, `restoreUnstartedClaims`, `roundOriginByRequest`, `PostStartContainer`,
@@ -161,7 +163,8 @@ to an upstreamable piece (see below) are not repeated here: they leave with thei
   `ReleaseClosure`, `ReservedClosures`, `ReservedClosure`, `HoldsExclusiveCPUsOf`,
   `ExclusiveClaimAllocations`, `ClaimHolding` and `ClaimHoldings`, `SetClaimlessCPUs` and `claimlessPoolLocked`
 
-- `pkg/store/claim_tracker.go`: `Owner`
+- `pkg/store/claim_tracker.go`: `Owner`, `ClaimReservation` with its `HasPod`, `HasGroup` and `IsEmpty`
+  methods
 
 - `pkg/store/pod_config.go`: `ContainerState.ContainerUID`, `ContainerState.ClaimUIDs`,
   `ContainerState.WithCgroup`, `ContainerState.CgroupPath`, `ContainerState.WithClaimRequests`,

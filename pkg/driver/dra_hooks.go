@@ -147,7 +147,7 @@ func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resour
 			// The API server's reservation cannot be forged by a pod spec the
 			// way a DRA_CPUSET_* env var can; CreateContainer falls back to
 			// this when the runtime reports no CDI devices at all.
-			cp.claimTracker.SetReservedFor(claim.UID, reservedForPodUIDs(claim))
+			cp.claimTracker.SetReservedFor(claim.UID, claimReservation(claim))
 			cp.publishClaimPlacementStatus(ctx, cLogger, claim.UID, types.NamespacedName{Namespace: claim.Namespace, Name: claim.Name})
 		}
 		cp.metrics.RecordPrepare(prepareResult, time.Since(start))
@@ -255,18 +255,42 @@ func claimOffersSplitAlternatives(claim *resourceapi.ResourceClaim) bool {
 	return false
 }
 
-// reservedForPodUIDs returns the pod UIDs claim.Status.ReservedFor names,
-// ignoring any non-pod consumer reference: this driver only ever compares
-// against a requesting pod's own UID.
-func reservedForPodUIDs(claim *resourceapi.ResourceClaim) []types.UID {
-	var podUIDs []types.UID
+// claimReservation is what a claim's status.reservedFor names, in the two shapes
+// this driver can check a pod against.
+//
+// A pod consumer is checked by UID. A pod group is checked by name, because that
+// is what a pod carries: its spec names the group and never its UID, which is
+// how the upstream helper compares them too
+// (k8s.io/dynamic-resource-allocation/resourceclaim.IsReservedForPod). Keeping
+// only the pod consumers, as this driver once did, reads a claim reserved for a
+// group as reserved for nobody and refuses every container holding it.
+func claimReservation(claim *resourceapi.ResourceClaim) store.ClaimReservation {
+	var reservation store.ClaimReservation
 	for _, consumer := range claim.Status.ReservedFor {
-		if consumer.Resource != "pods" {
-			continue
+		switch {
+		case consumer.APIGroup == "" && consumer.Resource == "pods":
+			reservation.PodUIDs = append(reservation.PodUIDs, consumer.UID)
+		case consumer.APIGroup == schedulingGroupName && consumer.Resource == "podgroups":
+			reservation.PodGroups = append(reservation.PodGroups, consumer.Name)
 		}
-		podUIDs = append(podUIDs, consumer.UID)
 	}
-	return podUIDs
+	return reservation
+}
+
+// schedulingGroupName is the API group a PodGroup consumer reference carries,
+// k8s.io/api/scheduling/v1beta1.GroupName. It is written out rather than
+// imported so that the driver does not take a dependency on an API it never
+// reads.
+const schedulingGroupName = "scheduling.k8s.io"
+
+// reservedForPodUIDs returns the pod UIDs claim.Status.ReservedFor names.
+func reservedForPodUIDs(claim *resourceapi.ResourceClaim) []types.UID {
+	return claimReservation(claim).PodUIDs
+}
+
+// reservedForPodGroups returns the pod groups claim.Status.ReservedFor names.
+func reservedForPodGroups(claim *resourceapi.ResourceClaim) []string {
+	return claimReservation(claim).PodGroups
 }
 
 func getCDIDeviceName(uid types.UID) string {
@@ -553,12 +577,13 @@ func (cp *CPUDriver) prepareGroupedResourceClaim(ctx context.Context, logger log
 	}
 
 	record := store.ClaimRecord{
-		Requests:    requestAllocations(byRequest),
-		Relocatable: placement.Relocatable,
-		Alignment:   placement.Alignment,
-		Recorded:    cp.recordedDevices(claim),
-		ReservedFor: reservedForPodUIDs(claim),
-		Projection:  cp.projectionWatermark(claim.UID),
+		Requests:          requestAllocations(byRequest),
+		Relocatable:       placement.Relocatable,
+		Alignment:         placement.Alignment,
+		Recorded:          cp.recordedDevices(claim),
+		ReservedFor:       reservedForPodUIDs(claim),
+		ReservedForGroups: reservedForPodGroups(claim),
+		Projection:        cp.projectionWatermark(claim.UID),
 	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
@@ -890,11 +915,12 @@ func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logge
 	}
 
 	record := store.ClaimRecord{
-		Requests:    requestAllocations(byRequest),
-		Relocatable: placement.Relocatable,
-		Alignment:   placement.Alignment,
-		ReservedFor: reservedForPodUIDs(claim),
-		Projection:  cp.projectionWatermark(claim.UID),
+		Requests:          requestAllocations(byRequest),
+		Relocatable:       placement.Relocatable,
+		Alignment:         placement.Alignment,
+		ReservedFor:       reservedForPodUIDs(claim),
+		ReservedForGroups: reservedForPodGroups(claim),
+		Projection:        cp.projectionWatermark(claim.UID),
 	}
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {

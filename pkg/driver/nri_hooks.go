@@ -31,6 +31,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
@@ -146,8 +147,8 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				// A spec written before the driver recorded it leaves the
 				// reservation unknown, which that fallback refuses. The
 				// projection cannot stand in: it carries no reservation.
-				if len(recorded.ReservedFor) > 0 {
-					claimTracker.SetReservedFor(uid, recorded.ReservedFor)
+				if reservation := recordedReservation(recorded); !reservation.IsEmpty() {
+					claimTracker.SetReservedFor(uid, reservation)
 				}
 				if !slices.Contains(claimUIDs, uid) {
 					claimUIDs = append(claimUIDs, uid)
@@ -358,8 +359,8 @@ func (cp *CPUDriver) restoreUnstartedClaims(logger logr.Logger, allocations *sto
 		// prepared for has yet to be created, and CreateContainer refuses a
 		// claim whose reservation it cannot read on a runtime that reports no
 		// CDI devices of its own.
-		if len(record.ReservedFor) > 0 {
-			tracker.SetReservedFor(claim.UID, record.ReservedFor)
+		if reservation := recordedReservation(record); !reservation.IsEmpty() {
+			tracker.SetReservedFor(claim.UID, reservation)
 		}
 		logger.Info("restored a prepared claim no running container holds",
 			"claimUID", claim.UID, "cpus", store.UnionOf(record.Requests).String())
@@ -772,6 +773,45 @@ func (cp *CPUDriver) getSharedContainerUpdates(logger logr.Logger, excludeID typ
 	return updates, nil
 }
 
+// recordedReservation is the reservation a claim's record on disk carries.
+func recordedReservation(record store.ClaimRecord) store.ClaimReservation {
+	return store.ClaimReservation{PodUIDs: record.ReservedFor, PodGroups: record.ReservedForGroups}
+}
+
+// podHoldsReservation reports whether this pod is one the claim was reserved
+// for. It is the check behind the fallback a runtime reporting no CDI devices
+// leaves the driver with, so it answers no wherever it cannot answer yes.
+//
+// A pod named outright is the whole answer. A pod group is not: the reservation
+// names the group and the pod carries that name in its spec, which NRI does not
+// report and no label mirrors, so the pod itself has to be read. That read
+// happens only here -- on a runtime that reports its CDI devices the question is
+// never asked -- and only for a claim whose reservation names a group at all.
+func (cp *CPUDriver) podHoldsReservation(ctx context.Context, logger logr.Logger, pod *api.PodSandbox, podUID types.UID, reservation store.ClaimReservation) bool {
+	if reservation.HasPod(podUID) {
+		return true
+	}
+	if len(reservation.PodGroups) == 0 || cp.kubeClient == nil {
+		return false
+	}
+	live, err := cp.kubeClient.CoreV1().Pods(pod.GetNamespace()).Get(ctx, pod.GetName(), metav1.GetOptions{})
+	if err != nil {
+		logger.Error(err, "cannot read the pod to check a claim reserved for a pod group")
+		return false
+	}
+	if live.UID != podUID {
+		// The sandbox and the pod of that name are not the same object: a pod
+		// deleted and recreated between the two reads. Nothing follows about
+		// this sandbox's membership.
+		logger.Info("the pod of this sandbox's name is a different object", "sandboxUID", podUID, "podUID", live.UID)
+		return false
+	}
+	if live.Spec.SchedulingGroup == nil || live.Spec.SchedulingGroup.PodGroupName == nil {
+		return false
+	}
+	return reservation.HasGroup(*live.Spec.SchedulingGroup.PodGroupName)
+}
+
 // CreateContainer handles container creation requests from the NRI.
 func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) (radjust *api.ContainerAdjustment, rupdates []*api.ContainerUpdate, rerr error) {
 	startTime := time.Now()
@@ -834,7 +874,11 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 				// spec cannot forge the way it can a DRA_CPUSET_* env value.
 				// It answers for the claim, so a container there is trusted
 				// about which of its requests it holds.
-				if reserved, recorded := cp.claimTracker.ReservedFor(entry.claimUID, podUID); !reserved || !recorded {
+				reservation, recorded := cp.claimTracker.ReservedFor(entry.claimUID)
+				if !recorded {
+					return nil, nil, fmt.Errorf("container claims %q but its reservation was never recorded", entry.claimUID)
+				}
+				if !cp.podHoldsReservation(ctx, logger, pod, podUID, reservation) {
 					return nil, nil, fmt.Errorf("container claims %q but the pod is not in its reservation", entry.claimUID)
 				}
 			}

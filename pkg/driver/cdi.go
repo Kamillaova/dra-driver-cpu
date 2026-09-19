@@ -68,6 +68,12 @@ const (
 	// before the driver recorded it.
 	cdiRelocatableAnnotation = "dra.cpu/relocatable"
 
+	// cdiReservedForGroupsAnnotation records the pod groups that same reservation
+	// named. A claim reserved for a group names no pod, so a spec carrying only
+	// the pod UIDs reads back as reserved for nobody and every container holding
+	// it is refused on a runtime that reports no CDI devices.
+	cdiReservedForGroupsAnnotation = "dra.cpu/reserved-for-groups"
+
 	// cdiReservedForAnnotation records the pod UIDs the claim's own
 	// status.reservedFor named at Prepare. After a restart the driver has no
 	// claim objects, and this is where a container's right to the claim is
@@ -189,6 +195,13 @@ func (c *CdiManager) AddDevice(logger logr.Logger, deviceName string, envVar str
 			return fmt.Errorf("failed to record the reservation of CDI device %q: %w", deviceName, err)
 		}
 		annotations[cdiReservedForAnnotation] = string(reservedFor)
+	}
+	if len(record.ReservedForGroups) > 0 {
+		groups, err := json.Marshal(record.ReservedForGroups)
+		if err != nil {
+			return fmt.Errorf("failed to record the pod groups of CDI device %q: %w", deviceName, err)
+		}
+		annotations[cdiReservedForGroupsAnnotation] = string(groups)
 	}
 	// A claim that charged nothing writes no annotation, so a spec is not made to
 	// carry the word for an empty answer. It reads back the same as one written
@@ -396,6 +409,13 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 		}
 	}
 
+	var reservedForGroups []string
+	if groupsStr, ok := device.Annotations[cdiReservedForGroupsAnnotation]; ok && groupsStr != "" {
+		if err := json.Unmarshal([]byte(groupsStr), &reservedForGroups); err != nil {
+			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiReservedForGroupsAnnotation, groupsStr, deviceName, err)
+		}
+	}
+
 	var roundProv *store.RoundProvenance
 	if roundID, ok := device.Annotations[cdiRoundIDAnnotation]; ok && roundID != "" {
 		origin, err := cpuset.Parse(device.Annotations[cdiRoundOriginAnnotation])
@@ -442,14 +462,15 @@ func (c *CdiManager) GetDeviceAllocations(deviceName string) (store.ClaimRecord,
 			return store.ClaimRecord{}, fmt.Errorf("failed to parse %s annotation %q of CDI device %q: %w", cdiPlacementsAnnotation, recorded, deviceName, err)
 		}
 		return store.ClaimRecord{
-			Requests:    requests,
-			Relocatable: relocatable,
-			Alignment:   alignment,
-			Recorded:    charged,
-			Round:       roundProv,
-			Projection:  projection,
-			Correlation: correlation,
-			ReservedFor: reservedFor,
+			Requests:          requests,
+			Relocatable:       relocatable,
+			Alignment:         alignment,
+			Recorded:          charged,
+			Round:             roundProv,
+			Projection:        projection,
+			Correlation:       correlation,
+			ReservedFor:       reservedFor,
+			ReservedForGroups: reservedForGroups,
 		}, nil
 	}
 

@@ -58,13 +58,40 @@ type ClaimTracker struct {
 	// reservedForByClaimUID records, for a prepared claim, the pod UIDs its own
 	// status.reservedFor names at Prepare -- the API server's record of intent,
 	// which a pod spec cannot forge the way it can a DRA_CPUSET_* env value.
-	reservedForByClaimUID map[k8stypes.UID][]k8stypes.UID
+	reservedForByClaimUID map[k8stypes.UID]ClaimReservation
+}
+
+// ClaimReservation is what a claim's status.reservedFor names: the pods it was
+// reserved for, and the pod groups.
+//
+// A group is named rather than identified, because that is all a pod can check
+// itself against: a pod carries the name of its group in its spec and never its
+// UID, which is why the upstream helper compares the name too.
+type ClaimReservation struct {
+	PodUIDs   []k8stypes.UID
+	PodGroups []string
+}
+
+// HasPod reports whether the reservation names this pod outright, which is the
+// whole answer for a claim reserved for pods alone.
+func (r ClaimReservation) HasPod(podUID k8stypes.UID) bool {
+	return slices.Contains(r.PodUIDs, podUID)
+}
+
+// HasGroup reports whether the reservation names this pod group.
+func (r ClaimReservation) HasGroup(name string) bool {
+	return name != "" && slices.Contains(r.PodGroups, name)
+}
+
+// IsEmpty reports whether the reservation names nothing at all.
+func (r ClaimReservation) IsEmpty() bool {
+	return len(r.PodUIDs) == 0 && len(r.PodGroups) == 0
 }
 
 func NewClaimTracker() *ClaimTracker {
 	return &ClaimTracker{
 		ownersByClaimUID:      make(map[k8stypes.UID][]OwnerIdent),
-		reservedForByClaimUID: make(map[k8stypes.UID][]k8stypes.UID),
+		reservedForByClaimUID: make(map[k8stypes.UID]ClaimReservation),
 	}
 }
 
@@ -145,31 +172,26 @@ func (ctk *ClaimTracker) ReleaseOwner(podUID k8stypes.UID, containerName string,
 	}
 }
 
-// SetReservedFor records the pod UIDs a claim's own reservation names at
-// Prepare, replacing any previously recorded reservation for it.
-func (ctk *ClaimTracker) SetReservedFor(claimUID k8stypes.UID, podUIDs []k8stypes.UID) {
+// SetReservedFor records what a claim's own reservation names at Prepare,
+// replacing any previously recorded reservation for it.
+func (ctk *ClaimTracker) SetReservedFor(claimUID k8stypes.UID, reservation ClaimReservation) {
 	ctk.mu.Lock()
 	defer ctk.mu.Unlock()
-	ctk.reservedForByClaimUID[claimUID] = append([]k8stypes.UID(nil), podUIDs...)
+	ctk.reservedForByClaimUID[claimUID] = ClaimReservation{
+		PodUIDs:   append([]k8stypes.UID(nil), reservation.PodUIDs...),
+		PodGroups: append([]string(nil), reservation.PodGroups...),
+	}
 }
 
-// ReservedFor reports whether podUID is one of a claim's reserved consumers.
-// recorded is false when the claim's reservation was never recorded at all
-// (never prepared, or prepared before this driver started tracking it), which
-// callers must not treat the same as an empty reservation.
-func (ctk *ClaimTracker) ReservedFor(claimUID, podUID k8stypes.UID) (reserved, recorded bool) {
+// ReservedFor returns a claim's recorded reservation. recorded is false when the
+// reservation was never recorded at all (never prepared, or prepared before this
+// driver started tracking it), which callers must not treat the same as a
+// reservation that names nothing.
+func (ctk *ClaimTracker) ReservedFor(claimUID k8stypes.UID) (reservation ClaimReservation, recorded bool) {
 	ctk.mu.Lock()
 	defer ctk.mu.Unlock()
-	podUIDs, ok := ctk.reservedForByClaimUID[claimUID]
-	if !ok {
-		return false, false
-	}
-	for _, p := range podUIDs {
-		if p == podUID {
-			return true, true
-		}
-	}
-	return false, true
+	reservation, ok := ctk.reservedForByClaimUID[claimUID]
+	return reservation, ok
 }
 
 func (ctk *ClaimTracker) Cleanup(claimUIDs ...k8stypes.UID) {

@@ -32,8 +32,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -142,7 +144,7 @@ func TestCreateContainer(t *testing.T) {
 	reservedForPod := func(claimUIDs ...string) *store.ClaimTracker {
 		ct := store.NewClaimTracker()
 		for _, claimUID := range claimUIDs {
-			ct.SetReservedFor(types.UID(claimUID), []types.UID{types.UID(pod.Uid)})
+			ct.SetReservedFor(types.UID(claimUID), store.ClaimReservation{PodUIDs: []types.UID{types.UID(pod.Uid)}})
 		}
 		return ct
 	}
@@ -293,7 +295,7 @@ func TestCreateContainer(t *testing.T) {
 			claimTracker:       store.NewClaimTracker(),
 			container:          newTestContainer(claimUID, "0-3"),
 			expectedErrorContains: fmt.Sprintf(
-				"container claims %q but the pod is not in its reservation",
+				"container claims %q but its reservation was never recorded",
 				claimUID,
 			),
 		},
@@ -436,9 +438,12 @@ func TestCreateContainerRuntimeCDIDeviceAuthentication(t *testing.T) {
 			reservedFor: types.UID(pod.Uid),
 		},
 		{
-			name:                  "runtime reports nothing and the claim's reservation was never recorded",
-			container:             forgingContainer(nil),
-			expectedErrorContains: "the pod is not in its reservation",
+			name:      "runtime reports nothing and the claim's reservation was never recorded",
+			container: forgingContainer(nil),
+			// Distinct from the refusal above on purpose: a claim prepared by a
+			// driver too old to record its reservation is a different thing to
+			// explain than a pod that is not in one.
+			expectedErrorContains: "its reservation was never recorded",
 		},
 	}
 
@@ -449,7 +454,7 @@ func TestCreateContainerRuntimeCDIDeviceAuthentication(t *testing.T) {
 
 			claimTracker := store.NewClaimTracker()
 			if tc.reservedFor != "" {
-				claimTracker.SetReservedFor(victimClaim, []types.UID{tc.reservedFor})
+				claimTracker.SetReservedFor(victimClaim, store.ClaimReservation{PodUIDs: []types.UID{tc.reservedFor}})
 			}
 			plugin := &CPUDriver{
 				podConfigStore:     store.NewPodConfig(),
@@ -462,6 +467,91 @@ func TestCreateContainerRuntimeCDIDeviceAuthentication(t *testing.T) {
 			if tc.expectedErrorContains != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tc.expectedErrorContains)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestCreateContainerAcceptsAPodGroupReservation: a claim may be reserved for a
+// PodGroup rather than for pods, and then it names no pod UID at all. The pod
+// carries its group's name in its spec and nowhere the runtime reports, so on a
+// runtime that reports no CDI devices the driver has to read the pod to answer
+// whether it is entitled to the claim -- and answer no whenever it cannot.
+func TestCreateContainerAcceptsAPodGroupReservation(t *testing.T) {
+	allCPUs := cpuset.New(0, 1, 2, 3)
+	claimUID := types.UID("claim-grouped")
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-uid-1", Name: "member", Namespace: "ns"}
+
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range allCPUs.UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	logger := testr.New(t)
+	topo, _ := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+
+	group := func(name string) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: types.UID(pod.Uid)},
+			Spec:       v1.PodSpec{SchedulingGroup: &v1.PodSchedulingGroup{PodGroupName: &name}},
+		}
+	}
+
+	for _, tc := range []struct {
+		name        string
+		live        *v1.Pod
+		wantRefusal bool
+	}{
+		{name: "the pod is in the reserved group", live: group("training-run-7")},
+		{
+			name:        "the pod is in another group",
+			live:        group("someone-elses-run"),
+			wantRefusal: true,
+		},
+		{
+			name: "the pod is in no group at all",
+			live: &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: pod.Name, Namespace: pod.Namespace, UID: types.UID(pod.Uid),
+			}},
+			wantRefusal: true,
+		},
+		{
+			name:        "the pod cannot be read",
+			live:        nil,
+			wantRefusal: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allocation := store.NewCPUAllocation(topo, cpuset.New())
+			requirePreparedResourceClaim(t, logger, allocation, claimUID, cpuset.New(0, 1, 2, 3))
+			claimTracker := store.NewClaimTracker()
+			claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodGroups: []string{"training-run-7"}})
+
+			objects := []runtime.Object{}
+			if tc.live != nil {
+				objects = append(objects, tc.live)
+			}
+			plugin := &CPUDriver{
+				podConfigStore:     store.NewPodConfig(),
+				cpuAllocationStore: allocation,
+				claimTracker:       claimTracker,
+				kubeClient:         k8sfake.NewSimpleClientset(objects...),
+				metrics:            cpumetrics.Noop(),
+			}
+
+			// The runtime reports no CDI devices, which is the only path that
+			// asks the question at all.
+			ctr := &api.Container{
+				Id:           "ctr-1",
+				PodSandboxId: pod.Id,
+				Name:         "ctr",
+				Env:          []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-3")},
+			}
+			_, _, err := plugin.CreateContainer(context.Background(), pod, ctr)
+			if tc.wantRefusal {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "the pod is not in its reservation")
 				return
 			}
 			require.NoError(t, err)
@@ -589,7 +679,7 @@ func TestGuaranteedContainerRestartWithoutReprepare(t *testing.T) {
 	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
 	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, exclusiveOn(claimCPUs), false))
 	claimTracker := store.NewClaimTracker()
-	claimTracker.SetReservedFor(claimUID, []types.UID{"pod"})
+	claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{"pod"}})
 	driver := &CPUDriver{
 		podConfigStore:     store.NewPodConfig(),
 		cpuAllocationStore: cpuStore,
@@ -668,7 +758,7 @@ func TestGuaranteedContainerRestartNotBlockedByEmptySharedPool(t *testing.T) {
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "ns"}
 	_, err = claimTracker.SetOwner(logger, types.UID(pod.Uid), "app", claimUID)
 	require.NoError(t, err)
-	claimTracker.SetReservedFor(claimUID, []types.UID{types.UID(pod.Uid)})
+	claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{types.UID(pod.Uid)}})
 
 	driver := &CPUDriver{
 		podConfigStore:     store.NewPodConfig(),
@@ -1108,15 +1198,17 @@ func TestSynchronizeRestoresClaimReservationsForCreateContainer(t *testing.T) {
 	// This is what CreateContainer's CRI-O fallback (nil reportedCDIDevices)
 	// reads, on a container recreated after a driver restart with no fresh
 	// Prepare in between.
-	reserved, recorded := driver.claimTracker.ReservedFor("claim-A", types.UID(pod.Uid))
+	reservation, recorded := driver.claimTracker.ReservedFor("claim-A")
+	reserved := reservation.HasPod(types.UID(pod.Uid))
 	require.True(t, recorded)
 	require.True(t, reserved)
 
-	reserved, recorded = driver.claimTracker.ReservedFor("claim-A", types.UID("some-other-pod"))
+	reservation, recorded = driver.claimTracker.ReservedFor("claim-A")
+	reserved = reservation.HasPod(types.UID("some-other-pod"))
 	require.True(t, recorded)
 	require.False(t, reserved)
 
-	_, recorded = driver.claimTracker.ReservedFor("claim-never-seen", types.UID(pod.Uid))
+	_, recorded = driver.claimTracker.ReservedFor("claim-never-seen")
 	require.False(t, recorded)
 }
 
@@ -1155,11 +1247,13 @@ func TestSynchronizeTakesTheReservationFromTheRecord(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	reserved, recorded := driver.claimTracker.ReservedFor("claim-A", types.UID(forger.Uid))
+	reservation, recorded := driver.claimTracker.ReservedFor("claim-A")
+	reserved := reservation.HasPod(types.UID(forger.Uid))
 	require.True(t, recorded, "the claim's reservation is known, so the fallback has an answer")
 	require.False(t, reserved, "the container named the claim; the claim did not name the pod")
 
-	reserved, _ = driver.claimTracker.ReservedFor("claim-A", victim)
+	reservation, _ = driver.claimTracker.ReservedFor("claim-A")
+	reserved = reservation.HasPod(victim)
 	require.True(t, reserved, "the pod the claim itself names keeps its reservation")
 }
 
@@ -1199,7 +1293,8 @@ func TestSynchronizeKeepsEveryPodOfAPoolClaimsReservation(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, podUID := range []types.UID{types.UID(pod1.Uid), types.UID(pod2.Uid)} {
-		reserved, recorded := driver.claimTracker.ReservedFor("claim-pool", podUID)
+		reservation, recorded := driver.claimTracker.ReservedFor("claim-pool")
+		reserved := reservation.HasPod(podUID)
 		require.True(t, recorded)
 		require.True(t, reserved, "both pods the claim names keep their reservation")
 	}
@@ -1239,14 +1334,16 @@ func TestSynchronizeDoesNotReserveForAContainerThatLosesTheOwnershipRace(t *test
 	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod1, pod2}, runtimeCtrs)
 	require.NoError(t, err)
 
-	reserved, recorded := driver.claimTracker.ReservedFor("claim-A", types.UID(pod1.Uid))
+	reservation, recorded := driver.claimTracker.ReservedFor("claim-A")
+	reserved := reservation.HasPod(types.UID(pod1.Uid))
 	require.True(t, recorded)
 	require.True(t, reserved)
 
 	// pod2's container named the same claim, and the claim's own reservation does
 	// not name pod2 -- so a runtime that reports no CDI devices at all cannot let
 	// it authenticate against a claim it never legitimately held.
-	reserved, recorded = driver.claimTracker.ReservedFor("claim-A", types.UID(pod2.Uid))
+	reservation, recorded = driver.claimTracker.ReservedFor("claim-A")
+	reserved = reservation.HasPod(types.UID(pod2.Uid))
 	require.True(t, recorded)
 	require.False(t, reserved)
 }
@@ -1441,7 +1538,7 @@ func TestCreateContainerSharesAClaimHoldingNoExclusiveCPUs(t *testing.T) {
 		{Request: "helpers", CPUs: poolCPUs, Role: store.Role("shared")},
 	}}, false))
 	claimTracker := store.NewClaimTracker()
-	claimTracker.SetReservedFor(claimUID, []types.UID{"pod-a", "pod-b"})
+	claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{"pod-a", "pod-b"}})
 	driver := &CPUDriver{
 		podConfigStore:     store.NewPodConfig(),
 		cpuAllocationStore: cpuStore,
@@ -1513,7 +1610,8 @@ func TestSynchronizeRecordsAReservationForAClaimHoldingNoExclusiveCPUs(t *testin
 	// CreateContainer's CRI-O fallback checks every claim a container names, so
 	// a pool claim without a reservation would refuse the container after a
 	// driver restart.
-	reserved, recorded := d.claimTracker.ReservedFor(claimUID, types.UID(pod.Uid))
+	reservation, recorded := d.claimTracker.ReservedFor(claimUID)
+	reserved := reservation.HasPod(types.UID(pod.Uid))
 	require.True(t, recorded)
 	require.True(t, reserved)
 }
@@ -1543,7 +1641,7 @@ func TestCreateContainerBindsEveryContainerOfOnePod(t *testing.T) {
 		cdiMgr:             newMockCdiMgr(),
 		metrics:            cpumetrics.Noop(),
 	}
-	d.claimTracker.SetReservedFor(claimUID, []types.UID{"pod-uid", "pod-uid-2"})
+	d.claimTracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{"pod-uid", "pod-uid-2"}})
 
 	pod := &api.PodSandbox{Id: "pod-id", Uid: "pod-uid", Name: "doca", Namespace: "volta"}
 	env := []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, claimedCPUs.String())}
@@ -1652,7 +1750,8 @@ func TestSynchronizeRestoresAClaimNoContainerHolds(t *testing.T) {
 	// created is refused for the pod's life on a runtime that reports no CDI
 	// devices of its own. The projection cannot supply it: it carries no
 	// reservation at all, which is why this reads the record.
-	reserved, recorded := driver.claimTracker.ReservedFor(stuck, types.UID("pod-uid-stuck"))
+	reservation, recorded := driver.claimTracker.ReservedFor(stuck)
+	reserved := reservation.HasPod(types.UID("pod-uid-stuck"))
 	require.True(t, recorded, "a restored claim's reservation must be known")
 	require.True(t, reserved)
 }
@@ -1791,7 +1890,7 @@ func twoRequestClaimDriver(t *testing.T, claimUID types.UID) *CPUDriver {
 		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive},
 	}}, false))
 	tracker := store.NewClaimTracker()
-	tracker.SetReservedFor(claimUID, []types.UID{"pod-1"})
+	tracker.SetReservedFor(claimUID, store.ClaimReservation{PodUIDs: []types.UID{"pod-1"}})
 	return &CPUDriver{
 		podConfigStore:     store.NewPodConfig(),
 		cpuAllocationStore: cpuStore,

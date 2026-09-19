@@ -309,7 +309,7 @@ func TestSetOwnerBindsEveryContainerOfOnePod(t *testing.T) {
 func TestReleaseOwnerKeepsTheOtherContainersAndTheReservation(t *testing.T) {
 	logger := testr.New(t)
 	tracker := NewClaimTracker()
-	tracker.SetReservedFor("claim-1", []k8stypes.UID{"pod-1"})
+	tracker.SetReservedFor("claim-1", ClaimReservation{PodUIDs: []k8stypes.UID{"pod-1"}})
 	_, err := tracker.SetOwner(logger, "pod-1", "setup-host", "claim-1")
 	require.NoError(t, err)
 	_, err = tracker.SetOwner(logger, "pod-1", "app", "claim-1")
@@ -320,14 +320,14 @@ func TestReleaseOwnerKeepsTheOtherContainersAndTheReservation(t *testing.T) {
 	owners, ok := tracker.Owners("claim-1")
 	require.True(t, ok)
 	require.Equal(t, []OwnerIdent{{PodUID: "pod-1", ContainerName: "setup-host"}}, owners)
-	reserved, recorded := tracker.ReservedFor("claim-1", "pod-1")
+	reservation, recorded := tracker.ReservedFor("claim-1")
 	require.True(t, recorded, "a rollback must not erase the reservation recorded at Prepare")
-	require.True(t, reserved)
+	require.True(t, reservation.HasPod("pod-1"))
 
 	tracker.ReleaseOwner("pod-1", "setup-host", "claim-1")
 	_, ok = tracker.Owners("claim-1")
 	require.False(t, ok, "releasing the last container unbinds the claim")
-	reserved, recorded = tracker.ReservedFor("claim-1", "pod-1")
+	reservation, recorded = tracker.ReservedFor("claim-1")
 	require.True(t, recorded)
-	require.True(t, reserved)
+	require.True(t, reservation.HasPod("pod-1"))
 }

@@ -723,7 +723,7 @@ func TestPrepareResourceClaimsSucceedsBeforePublishResources(t *testing.T) {
 			_, ok := driver.cpuAllocationStore.GetResourceClaimAllocation(claimUID)
 			require.True(t, ok)
 
-			_, recorded := driver.claimTracker.ReservedFor(claimUID, "any-pod")
+			_, recorded := driver.claimTracker.ReservedFor(claimUID)
 			require.True(t, recorded, "a successfully prepared claim must record its reservation")
 		})
 	}
@@ -1159,7 +1159,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 			}
 			require.True(t, tc.expectedSharedCPUs.Equals(tc.driver.cpuAllocationStore.GetSharedCPUs()), "shared cpus: got %s, want %s", tc.driver.cpuAllocationStore.GetSharedCPUs(), tc.expectedSharedCPUs)
 
-			_, recorded := tc.driver.claimTracker.ReservedFor(claimUID, "irrelevant-pod")
+			_, recorded := tc.driver.claimTracker.ReservedFor(claimUID)
 			require.False(t, recorded, "a claim whose prepare failed must not leak a reservedFor record")
 		})
 	}
