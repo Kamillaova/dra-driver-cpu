@@ -280,6 +280,18 @@ func DerivedBudget(topo *Topology, placements []Placement, m int, eligible func(
 }
 
 type claimOccupant struct {
+	// claim is which claim this piece belongs to, as its position in the sorted
+	// claim list rather than its UID: an alias stable for the length of a search
+	// and short enough to put in every key.
+	//
+	// Without it a cache is a bag of piece sizes, and two states in which the
+	// same sizes sit in the same caches but belong to different claims share a
+	// key. They are not the same state: an exchange re-cuts the CPUs of two
+	// claims between them, so which claim holds the piece next door decides
+	// whether the exchange leaves both of them no worse spread than they are,
+	// which is the condition it is legal under. The search then prunes the state
+	// that admits the exchange and reports a repair it has as unreachable.
+	claim       int
 	size        int
 	relocatable bool
 	isTarget    bool
@@ -303,7 +315,7 @@ func (cs cacheSignature) string(canonical bool) string {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		fmt.Fprintf(&b, "%d:%t:%t", occ.size, occ.relocatable, occ.isTarget)
+		fmt.Fprintf(&b, "%d:%d:%t:%t", occ.claim, occ.size, occ.relocatable, occ.isTarget)
 	}
 	return b.String()
 }
@@ -311,6 +323,7 @@ func (cs cacheSignature) string(canonical bool) string {
 func stateKey(topo *Topology, placements map[types.UID]cpuset.CPUSet, free cpuset.CPUSet, goal Goal, opts ExactOptions, canonical bool) string {
 	targetClaim, hasTargetClaim := goal.TargetClaim()
 	targetCache, hasTargetCache := goal.TargetCache()
+	indexOfClaim := claimIndices(placements)
 
 	cacheSignatures := make([]cacheSignature, 0, len(topo.Caches()))
 	for _, cacheID := range topo.Caches() {
@@ -325,6 +338,7 @@ func stateKey(topo *Topology, placements map[types.UID]cpuset.CPUSet, free cpuse
 			}
 			isTarget := hasTargetClaim && uid == targetClaim
 			occupants = append(occupants, claimOccupant{
+				claim:       indexOfClaim[uid],
 				size:        inC.Size(),
 				relocatable: opts.eligible(uid),
 				isTarget:    isTarget,
@@ -337,7 +351,10 @@ func stateKey(topo *Topology, placements map[types.UID]cpuset.CPUSet, free cpuse
 			if occupants[i].relocatable != occupants[j].relocatable {
 				return !occupants[i].relocatable && occupants[j].relocatable
 			}
-			return !occupants[i].isTarget && occupants[j].isTarget
+			if occupants[i].isTarget != occupants[j].isTarget {
+				return !occupants[i].isTarget && occupants[j].isTarget
+			}
+			return occupants[i].claim < occupants[j].claim
 		})
 
 		cacheSignatures = append(cacheSignatures, cacheSignature{
@@ -365,6 +382,24 @@ func stateKey(topo *Topology, placements map[types.UID]cpuset.CPUSet, free cpuse
 	sb.WriteString("#")
 	sb.WriteString(claimSpreadSignature(topo, placements, goal, opts))
 	return sb.String()
+}
+
+// claimIndices numbers the claims by their sorted UID order, which is the alias
+// the cache signatures name a piece's owner by. It depends on the claim set
+// alone, and a search never gains or loses a claim, so the same claim keeps the
+// same number in every state of one search -- including under the cache
+// relabelling canonicalisation collapses.
+func claimIndices(placements map[types.UID]cpuset.CPUSet) map[types.UID]int {
+	order := make([]types.UID, 0, len(placements))
+	for uid := range placements {
+		order = append(order, uid)
+	}
+	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
+	indices := make(map[types.UID]int, len(order))
+	for i, uid := range order {
+		indices[uid] = i
+	}
+	return indices
 }
 
 // claimSpreadSignature is how each claim is split between caches, without

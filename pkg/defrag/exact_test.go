@@ -433,6 +433,78 @@ func TestDepthCutoffIsNotProofOfUnreachability(t *testing.T) {
 	}
 }
 
+// TestStateKeyTellsWhoseFragmentSitsWhere: the two states below put the same
+// piece sizes in the same caches and differ only in whose pieces they are. That
+// difference decides an exchange: re-cutting the target's CPUs together with the
+// claim beside it leaves both no worse spread in one state and makes the
+// neighbour worse in the other, so one of them is a repair away and the other is
+// not. Sharing a key, the search prunes the one that works.
+func TestStateKeyTellsWhoseFragmentSitsWhere(t *testing.T) {
+	topo := fakeTopology(3, 4)
+	opts := ExactOptions{AllowSwaps: true}
+	goal := GoalMakeClaimWhole{ClaimUID: types.UID("claim-0")}
+
+	kept := map[types.UID]cpuset.CPUSet{
+		"claim-0": parseCPUSet("0,3,8"),
+		"claim-1": parseCPUSet("4-5,9"),
+		"claim-2": parseCPUSet("10-11"),
+		"claim-3": parseCPUSet("1-2,7"),
+	}
+	cut := map[types.UID]cpuset.CPUSet{
+		"claim-0": parseCPUSet("0,3,6"),
+		"claim-1": parseCPUSet("4-5,9"),
+		"claim-2": parseCPUSet("8,11"),
+		"claim-3": parseCPUSet("1-2,7"),
+	}
+
+	for _, canonical := range []bool{true, false} {
+		keptKey := stateKey(topo, kept, parseCPUSet("6"), goal, opts, canonical)
+		cutKey := stateKey(topo, cut, parseCPUSet("10"), goal, opts, canonical)
+		if keptKey == cutKey {
+			t.Fatalf("canonical=%t: two states one exchange apart share the key %q", canonical, keptKey)
+		}
+	}
+}
+
+// TestExactSearchFindsARepairBehindAnExchange is that collision end to end: the
+// repair takes two exchanges, and the state the first of them reaches is the one
+// the key used to merge away.
+func TestExactSearchFindsARepairBehindAnExchange(t *testing.T) {
+	topo := fakeTopology(3, 4)
+	placements := []Placement{
+		{ClaimUID: types.UID("claim-0"), CPUs: parseCPUSet("0,3,8")},
+		{ClaimUID: types.UID("claim-1"), CPUs: parseCPUSet("4-5,9")},
+		{ClaimUID: types.UID("claim-2"), CPUs: parseCPUSet("6,11")},
+		{ClaimUID: types.UID("claim-3"), CPUs: parseCPUSet("1-2,7")},
+	}
+	free := parseCPUSet("10")
+	goal := GoalMakeClaimWhole{ClaimUID: types.UID("claim-0")}
+	sel := func(available cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
+		list := available.List()
+		if len(list) < numCPUs {
+			return cpuset.New(), fmt.Errorf("only %d CPUs in %q", len(list), available.String())
+		}
+		return cpuset.New(list[:numCPUs]...), nil
+	}
+
+	plan, err := ExactSearch(topo, placements, free, cpuset.New(), goal, sel, ExactOptions{AllowSwaps: true, MaxDepth: 3})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if plan.Status != SearchReachable {
+		t.Fatalf("a repair two exchanges away was reported %v", plan.Status)
+	}
+	var landed cpuset.CPUSet
+	for _, move := range plan.Moves {
+		if move.ClaimUID == "claim-0" {
+			landed = move.To
+		}
+	}
+	if topo.ExcessSpread(landed) != 0 {
+		t.Fatalf("the plan leaves the claim it was for split: %v", plan.Moves)
+	}
+}
+
 // TestExactSearchAnswersWithTheRepairASpentBudgetFound: the budget bounds the
 // work, not the answer. A search that found a repair and then ran out while
 // looking for a cheaper one of the same length has a plan to give, and throwing
