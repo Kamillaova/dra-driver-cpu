@@ -39,7 +39,7 @@ The two components in detail:
 
   - A CDI JSON spec file is created or updated for the allocated claim.
   - This spec instructs the runtime to inject an environment variable (e.g., `DRA_CPUSET_<claimUID>=<cpuset>`) into the container. What the driver needs from it is the **claim UID in the name**: only the kubelet knows which container consumes which claim, and the per-container CDI device it routes is the only channel that carries that mapping to the driver.
-  - The **value is a snapshot taken when the container was created**, not the live placement. A container's environment cannot be rewritten while it runs, so once the driver moves a claim's CPUs the value is out of date by construction. The current placement is recorded in the spec's `dra.cpu/cpuset` annotation, which CDI keeps to itself and never injects into a container, and which the driver rewrites whenever the claim's placement changes. A workload that needs its live CPUs must read them from the kernel — `sched_getaffinity(2)`, or its own `cpuset.cpus.effective` — never from the environment.
+  - The **value is a snapshot taken when the container was created**, not the live placement. A container's environment cannot be rewritten while it runs, so once the driver moves a claim's CPUs the value is out of date by construction. The current placement is recorded, one entry per request of the claim, in the spec's `dra.cpu/placements` annotation, which CDI keeps to itself and never injects into a container, and which the driver rewrites whenever the claim's placement changes. A workload that needs its live CPUs must read them from the kernel — `sched_getaffinity(2)`, or its own `cpuset.cpus.effective` — never from the environment.
   - With [`defragEnabled`](defragmentation.md) the value is the literal string `dynamic` rather than a cpuset, since a claim whose placement may change has no cpuset to name for the life of its container. A workload that parsed the value now fails loudly instead of quietly pinning itself to CPUs its claim has left.
   - The `DRA_CPUSET_*` environment variable prefix is reserved for the driver. Containers with malformed `DRA_CPUSET_*` values are rejected during creation.
   - The driver includes mechanisms for thread-safe and atomic updates to the CDI spec files.
@@ -49,6 +49,11 @@ The two components in detail:
   - For containers with **guaranteed CPUs** (those with a DRA ResourceClaim), the plugin takes the claim UIDs from the environment variables injected via CDI, looks up where those claims are currently placed, and pins the container to the union of their CPUs using the cgroup cpuset controller.
   - For all other containers, it confines them to a **shared pool** of CPUs, which consists of all allocatable CPUs not exclusively assigned to any guaranteed container.
   - It dynamically updates the shared pool cpuset for all shared containers whenever guaranteed allocations change (containers are created or removed).
+  - While shared containers are running, a claim that would take the pool's last CPU is refused at
+    preparation rather than granted: NRI has no way to express an empty cpuset, so the shared
+    containers would silently keep the CPUs instead. The claim fails with `would exhaust the shared
+    CPU pool while shared containers are running`; give the node a `reservedCPUs` the claims cannot
+    reach, or leave it a spare CPU.
   - When a claim is *released*, its CPUs return to the pool immediately but the shared containers
     entitled to them still hold the narrower cpuset. With
     [`assumeUnsolicitedUpdatesSafe`](configuration.md#driver-configuration) and
