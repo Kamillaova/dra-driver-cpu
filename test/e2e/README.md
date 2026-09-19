@@ -72,10 +72,55 @@ honor these settings, where applicable.
   gate; the stock kind configs enable it (they require a 1.37+ node image, which is the
   Makefile default).
 
+- `DRACPU_E2E_DEFRAG`: (optional, default `false`): when `true`, *the Makefile* `ci-kind-setup` target
+  deploys the driver with `driverConfig.defragEnabled: true` and the
+  `driverConfig.assumeUnsolicitedUpdatesSafe: true` it requires, and the defragmentation tests run
+  instead of skipping. Only set this on a runtime whose vendored NRI carries
+  [containerd/nri#301](https://github.com/containerd/nri/pull/301), first released as NRI v0.12.1 in
+  containerd v2.4.0-beta.0; anything older can deadlock on the container updates a move issues. **A
+  stock kind cluster does not qualify**: `kindest/node:v1.37.0` ships containerd v2.3.4, which vendors
+  NRI v0.12.0. Verify a runtime rather than trusting its version string -- copy the binary out and run
+  `go version -m containerd | grep containerd/nri`. To run these tests, replace each node's
+  `/usr/local/bin/containerd` and `containerd-shim-runc-v2` with a build that qualifies, then
+  `systemctl restart containerd` inside the node. The tests skip themselves anyway on a node whose CPUs the driver sees as one
+  uncore cache, since there is no spread to recover there.
+
+  The spec that repairs a node with no free CPUs at all rides on the same switch, and skips in
+  addition when the deployed `driverConfig.defragAllowTransientOverlap` is `false`: exchanging the
+  CPUs of two claims is the only repair such a node has, and that option is what permits it. It
+  measures how long the two containers held the same CPUs, which they sample themselves — a report
+  interval is orders of magnitude coarser than the window between the runtime's two writes.
+
+- `DRACPU_E2E_FULL_PCPUS_ONLY`: (optional, default `false`): when `true`, *the Makefile*
+  `ci-kind-setup` target deploys the driver with `driverConfig.fullPhysicalCPUsOnly: true`, and the
+  whole-core tests run instead of skipping. They skip themselves on a node with SMT disabled, where
+  every core is a single thread and the option has no observable effect.
+
+- The **cross-node scheduling** specs need no knob: they run whenever at least two nodes publish
+  `dra.cpu` devices and skip themselves otherwise. On a heterogeneous fleet they exercise capacity
+  routing, geometry CEL selectors, burst races, and the scheduler's fragmentation blind spot.
+
+- `DRACPU_E2E_NOSMT_PARTITION_CPUS`: (optional, default empty): when set to a cpuset, *the Makefile*
+  `ci-kind-setup` target deploys the driver with an exclusive CPU partition named `nosmt` declaring
+  one online thread per core on those CPUs, and the single-thread partition tests run instead of
+  skipping. The SMT siblings of those CPUs must already be offline on the node: the suite verifies
+  that state and never changes a machine, so the driver withholds the partition and the tests report
+  themselves as not run where the node was not prepared.
+
+- `DRACPU_E2E_POOL_PARTITION_CPUS`: (optional, default empty): when set to a cpuset, *the Makefile*
+  `ci-kind-setup` target deploys the driver with a CPU partition named `helpers` of role `shared` on
+  those CPUs, and the claimed-pool tests run instead of skipping. The CPUs must exist on every node
+  and must not overlap `DRACPU_E2E_RESERVED_CPUS` or `DRACPU_E2E_NOSMT_PARTITION_CPUS`. Setting it
+  together with `DRACPU_E2E_NOSMT_PARTITION_CPUS` declares both partitions.
+
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.
   NOTE: setting this value will make the test output significantly larger.
+
+- `DRACPU_E2E_RELEASE_GATE`: (optional, default empty): when set (e.g. `1`), turns scenario skips
+  in defragmentation and scheduling into test failures, asserting that the expected fragmented topology
+  was created and exercised rather than silently skipped.
 
 ## how to run
 

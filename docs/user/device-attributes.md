@@ -15,17 +15,48 @@ Which attributes a device carries depends on the driver's device mode
 (`cpuDeviceMode` in [Configuration](configuration.md)): `grouped` exposes one device per
 CPU group, `individual` one device per CPU.
 
+A container also receives these attributes at runtime, per request, in a
+[device metadata file](device-metadata.md), together with a few that exist only there.
+
 ### Grouped mode (default)
 
 #### Currently supported attributes
 
 | Attribute                         | Type    | Description                                                                                                    |
 | --------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `resource.kubernetes.io/numaNode` | int     | Standard NUMA node of the group (published when grouping by NUMA node)                                         |
-| `dra.cpu/socketID`                | int     | CPU socket of the group (published when grouping by NUMA node or socket)                                       |
+| `resource.kubernetes.io/numaNode` | int     | Standard NUMA node of the group (published when grouping by NUMA node or uncore cache)                         |
+| `dra.cpu/socketID`                | int     | CPU socket of the group (published when grouping by NUMA node, socket or uncore cache)                         |
+| `dra.cpu/cacheL3ID`               | int     | The uncore (L3/CCX) cache the group is (published when grouping by uncore cache)                               |
 | `dra.cpu/numCPUs`                 | int     | CPUs available in the group                                                                                    |
-| `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                             |
+| `dra.cpu/partition`               | string  | The CPU partition the group's CPUs belong to, `default` on a node with no `cpuPartitions`                      |
+| `dra.cpu/role`                    | string  | That partition's role: `default` or `exclusive` for a group of exclusive devices, `shared` for a pool device   |
+| `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled for this group's own cores                                              |
+| `dra.cpu/threadsPerCore`          | int     | This group's own uniform thread count per core (0 when its cores do not all agree); `smtEnabled` is `threadsPerCore > 1` |
+| `dra.cpu/largestUncoreCacheCPUs`  | int     | Allocatable CPUs in the group's largest uncore (L3/CCX) cache — the biggest claim it can align to one cache    |
+| `dra.cpu/uncoreCachesInGroup`     | int     | How many uncore caches contribute allocatable CPUs to the group                                                |
 | `resource.kubernetes.io/pcieRoot` | strings | PCIe roots local to the group's CPUs; needs `--expose-pcie-roots` and the `DRAListTypeAttributes` feature gate |
+
+The two uncore cache attributes describe the group's cache geometry, which the driver cannot
+change and a claim cannot otherwise discover. They matter on heterogeneous clusters: the driver
+picks which CPUs back a grouped claim and prefers to keep them within one cache, but it cannot
+align a claim larger than any single cache, and that limit varies by node type. A claim that
+needs cache-aligned CPUs can therefore restrict itself to nodes where alignment is possible:
+
+```yaml
+selectors:
+- cel:
+    expression: device.attributes["dra.cpu"].largestUncoreCacheCPUs >= 8
+```
+
+Both are counts of *allocatable* CPUs, so CPUs excluded by `reservedCPUs` are not included — a
+cache half-consumed by the reservation cannot host a full-size claim. Both are omitted entirely
+when the node reports no uncore cache information.
+
+Under `groupBy: uncorecache` the group is a single cache, so `uncoreCachesInGroup` is always 1 and
+`largestUncoreCacheCPUs` equals `numCPUs`: what the allocator can hand out from that device and what
+fits in one cache are then the same number, and the selector above becomes a capacity request. The
+cache itself is named by `dra.cpu/cacheL3ID`, the same identifier the individual-mode devices of
+that cache carry.
 
 #### Legacy attributes (deprecated)
 
@@ -36,9 +67,25 @@ These compatibility attributes will be removed in a future version:
 | `dra.cpu/numaNodeID` | int  | Driver-specific NUMA node attribute (NUMA grouping)   |
 | `dra.net/numaNode`   | int  | Cross-driver NUMA alignment attribute (NUMA grouping) |
 
+A **pool device** is the other shape grouped mode publishes: one device per NUMA node of a partition
+whose role is `shared`, named `cpudevpool<node>-<partition>`. It carries the partition attributes,
+`resource.kubernetes.io/numaNode`, `dra.cpu/socketID` and `dra.cpu/numCPUs`, and nothing about cores
+or caches — `smtEnabled`, `threadsPerCore` and the uncore cache attributes are all absent, because a
+pool grants a share of CPU time rather than CPUs a claim holds alone, and none of those questions has
+an answer for it. Its `dra.cpu/cpu` capacity is requested in milli-CPUs, and every claim that asks
+for the pool holds it at the same time.
+
 Grouped devices also expose the consumable capacity `dra.cpu/cpu` — the number of CPUs
-claimable from the group. With `groupBy: machine`, only `numCPUs`, `smtEnabled`, and — when
+claimable from the group. With `groupBy: machine`, only `numCPUs`, `smtEnabled`,
+`threadsPerCore`, `partition`, `role`, the uncore cache attributes, and — when
 `--expose-pcie-roots` is enabled — `resource.kubernetes.io/pcieRoot` are published.
+
+A group is published per partition, so a NUMA node or socket split between partitions yields one
+device per partition with disjoint CPUs, named `<group device>-<partition>`. Every device of a
+declared partition carries the `NoSchedule` device taint `dra.cpu/partition=<name>`, so reaching it
+takes a request that tolerates that partition by name; the implicit `default` partition is
+untainted, which is where a claim that names no partition is allocated. See
+[Configuration](configuration.md) for the partition list itself.
 
 ### Individual mode
 
@@ -52,6 +99,8 @@ claimable from the group. With `groupBy: machine`, only `numCPUs`, `smtEnabled`,
 | `dra.cpu/cacheL3ID`               | int     | L3 (last-level/uncore) cache group                                                                    |
 | `resource.kubernetes.io/numaNode` | int     | Standard NUMA node                                                                                    |
 | `dra.cpu/socketID`                | int     | CPU socket                                                                                            |
+| `dra.cpu/partition`               | string  | Always `default`: `cpuPartitions` requires grouped mode, so every CPU is in the implicit partition    |
+| `dra.cpu/role`                    | string  | Always `default`, that partition's role                                                               |
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                    |
 | `resource.kubernetes.io/pcieRoot` | strings | PCIe roots local to the CPU; needs `--expose-pcie-roots` and the `DRAListTypeAttributes` feature gate |
 

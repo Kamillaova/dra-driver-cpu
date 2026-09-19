@@ -30,6 +30,13 @@ type ContainerState struct {
 	containerUID types.UID
 	// resourceClaimUIDs is a list of resource claims associated with this container.
 	resourceClaimUIDs []types.UID
+	// claimRequests is which requests of each of those claims the container
+	// named, and is empty for a container that named none. A claim absent from it
+	// is held whole, which is what a container that names no request is given.
+	claimRequests map[types.UID][]string
+	// cgroupPath is where the runtime put the container's cgroup, as it reported
+	// it. Empty until a caller records it.
+	cgroupPath string
 }
 
 // NewContainerState creates a new ContainerState.
@@ -39,6 +46,23 @@ func NewContainerState(containerName string, containerUID types.UID, claimUIDs .
 		containerUID:      containerUID,
 		resourceClaimUIDs: claimUIDs,
 	}
+}
+
+// WithCgroup records where the runtime placed the container's cgroup, which is
+// the only way to read back the CPUs it is really running on.
+//
+// A setter rather than a constructor argument: every caller that has the path
+// has it from the same NRI field, and the ones that do not are not asking the
+// kernel anything.
+func (cs *ContainerState) WithCgroup(path string) *ContainerState {
+	cs.cgroupPath = path
+	return cs
+}
+
+// CgroupPath returns what the runtime reported, or the empty string when nothing
+// recorded it.
+func (cs *ContainerState) CgroupPath() string {
+	return cs.cgroupPath
 }
 
 // PodCPUAssignments maps a container name to its state.
@@ -142,4 +166,46 @@ func (s *PodConfig) Len() int {
 // HasExclusiveCPUAllocation returns true if the container has associated resource claims.
 func (cs *ContainerState) HasExclusiveCPUAllocation() bool {
 	return len(cs.resourceClaimUIDs) > 0
+}
+
+// ContainerUID returns the runtime's identifier for this container, which is what
+// addresses it in an NRI update.
+func (cs *ContainerState) ContainerUID() types.UID {
+	return cs.containerUID
+}
+
+// ClaimUIDs returns the claims this container holds. A container pinned from its
+// claims must be pinned to all of them at once, so a caller changing one still
+// needs the rest.
+func (cs *ContainerState) ClaimUIDs() []types.UID {
+	return append([]types.UID(nil), cs.resourceClaimUIDs...)
+}
+
+// WithClaimRequests records which requests of each claim the container named.
+//
+// A setter rather than a constructor argument, so that the callers which have no
+// request to record -- every test of claim-grained behaviour, and a container
+// that named no request -- keep saying what they mean by saying nothing.
+func (cs *ContainerState) WithClaimRequests(requests map[types.UID][]string) *ContainerState {
+	cs.claimRequests = requests
+	return cs
+}
+
+// ClaimRequests returns what this container holds, request by request. A claim
+// whose requests were not recorded yields one reference to the whole claim,
+// which is both what a container naming no request is given and what every
+// container was given before the driver recorded requests at all.
+func (cs *ContainerState) ClaimRequests() []ClaimRequestRef {
+	refs := make([]ClaimRequestRef, 0, len(cs.resourceClaimUIDs))
+	for _, claimUID := range cs.resourceClaimUIDs {
+		names := cs.claimRequests[claimUID]
+		if len(names) == 0 {
+			refs = append(refs, ClaimRequestRef{ClaimUID: claimUID})
+			continue
+		}
+		for _, name := range names {
+			refs = append(refs, ClaimRequestRef{ClaimUID: claimUID, Request: name})
+		}
+	}
+	return refs
 }

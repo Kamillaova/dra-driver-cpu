@@ -15,7 +15,7 @@ How to configure your workloads depends on whether KEP-5517 accounting is active
 
 To check which mode is active, inspect the driver's ResourceSlices (`kubectl get resourceslice -o yaml`): the devices include a `nodeAllocatableResources` entry only when the mapping is enabled.
 
-**1-to-1 Claim to Container:** in both modes, this driver enforces that a specific CPU `ResourceClaim` can only be used by *one* container within or across pods. See [Sharing resource claims](feature-support.md#sharing-resource-claims).
+**One claim, one pod:** in both modes, a CPU `ResourceClaim` is held by the containers of a *single* pod. Every container of that pod may reference it — an init container and the container it prepares, for instance — and each of them runs on the CPUs of what it referenced: the whole claim, or one request of it where the container's `resources.claims` entry names a `request`. A container of a second pod is refused. See [Sharing resource claims](feature-support.md#sharing-resource-claims).
 
 ## Before KEP-5517 (before 1.37 or alpha FG `DRANodeAllocatableResources` disabled)
 
@@ -24,8 +24,9 @@ The scheduler and kubelet are unaware of claim CPUs, so you MUST configure your 
 - **Option A (Preferred): Pod Level Resources (`pod.spec.resources`)**
 
   - This approach is generally preferred as it more clearly defines the pod's total CPU budget and works well for pods with a mix of containers, some needing exclusive CPUs (requested via DRA) and others using shared CPUs.
-  - Set `pod.spec.resources.requests.cpu` and `pod.spec.resources.limits.cpu` to the *sum* of all CPUs requested across all DRA claims used by containers in this pod, PLUS any additional CPUs for containers NOT using DRA claims.
-  - Containers using DRA claims may omit `cpu` from their `resources.requests` and `resources.limits`. The Pod Level Resources will govern the QoS class and set cgroup limits at the pod level.
+  - Set `pod.spec.resources.requests.cpu` to the *sum* of all CPUs requested across all DRA claims used by containers in this pod, PLUS any additional CPUs for containers NOT using DRA claims.
+  - Do not set `pod.spec.resources.limits.cpu`: a pod-level CPU limit puts a CFS quota on the whole pod, which throttles the claim containers (see [Preventing CFS Throttling on Exclusive CPUs](#preventing-cfs-throttling-on-exclusive-cpus)).
+  - Containers using DRA claims omit `cpu` from their `resources.requests` and `resources.limits`. Set `memory` requests so the pod is Burstable rather than BestEffort.
 
   A complete, runnable version of this pattern is in
   [`hack/examples/pod_with_pod_level_resources.yaml`](../../hack/examples/pod_with_pod_level_resources.yaml).
@@ -36,27 +37,25 @@ The scheduler and kubelet are unaware of claim CPUs, so you MUST configure your 
     resources: # Pod Level Resources
       requests:
         cpu: "16" # 10 (exclusive cpu's for claim1) + 4 (exclusive cpu's for claim2) + 2 (shared cpus for sidecar1 and sidecar2)
-      limits:
-        cpu: "16"
     containers:
       - name: main-app
         image: ...
         resources:
-          # Omit CPU requests/limits, or set both to 10
+          # Omit CPU requests and limits
           claims:
             - name: claim1
       - name: worker
         image: ...
         resources:
-         # Omit CPU requests/limits, or set both to 4
+         # Omit CPU requests and limits
           claims:
             - name: claim2
       - name: sidecar1
         image: ...
-        # Omit CPU resources, or ensure the combined requests/limits for sidecar1 and sidecar2 do not exceed 2.
+        # Omit CPU resources, or ensure the combined requests for sidecar1 and sidecar2 do not exceed 2.
       - name: sidecar2
         image: ...
-        # Omit CPU resources, or ensure the combined requests/limits for sidecar1 and sidecar2 do not exceed 2.
+        # Omit CPU resources, or ensure the combined requests for sidecar1 and sidecar2 do not exceed 2.
     resourceClaims:
       - name: claim1
         resourceClaimName: cpu-claim-10 # Requests 10 CPUs
@@ -66,7 +65,8 @@ The scheduler and kubelet are unaware of claim CPUs, so you MUST configure your 
 
 - **Option B: Container-Level Resources (No Pod Level Resources)**
 
-  - For each container that uses a DRA CPU claim, set `spec.containers[].resources.requests.cpu` and `spec.containers[].resources.limits.cpu` to be *exactly equal* to the number of CPUs requested in the `ResourceClaim` referenced by that container.
+  - For each container that uses a DRA CPU claim, set `spec.containers[].resources.requests.cpu` to be *exactly equal* to the number of CPUs requested in the `ResourceClaim` referenced by that container.
+  - Do not set `spec.containers[].resources.limits.cpu` on those containers, for the same reason as in Option A; set `memory` requests so the pod is Burstable.
 
   A complete, runnable version of this pattern is in
   [`hack/examples/pod_with_resource_claim_grouped_mode.yaml`](../../hack/examples/pod_with_resource_claim_grouped_mode.yaml).
@@ -80,8 +80,7 @@ The scheduler and kubelet are unaware of claim CPUs, so you MUST configure your 
         resources:
           requests:
             cpu: "10" # Must match the CPU count in "claim1"
-          limits:
-            cpu: "10" # Must match the CPU count in "claim1"
+            memory: "2Gi"
           claims:
             - name: claim1
     resourceClaims:
@@ -160,7 +159,7 @@ When exclusive CPUs are assigned via DRA claims, declaring `limits.cpu` in `pod.
 
 > For an in-depth technical explanation of Linux cgroup v2, Kubelet cgroup managers, and CFS quota mechanics, see the [Kubelet Cgroups and QoS Deep Dive](../dev/kubelet-cgroups-and-qos.md).
 
-**Reserved environment variables:** the `DRA_CPUSET_*` environment variable prefix is reserved for the driver's CDI injection — do not set variables with this prefix; containers with malformed `DRA_CPUSET_*` values are rejected during creation. See [How it Works](how-it-works.md).
+**Reserved environment variables:** the `DRA_CPUSET_*` environment variable prefix is reserved for the driver's CDI injection — do not set variables with this prefix; containers with malformed `DRA_CPUSET_*` values are rejected during creation. The variable exists to name the claim a container holds; its value is only where that claim was placed when the container started, and a container's environment cannot be rewritten afterwards — for a claim that states `cpuConfig.relocatable: true` it is the literal string `dynamic` rather than a cpuset at all. Read the current CPUs from `sched_getaffinity(2)` or from the container's own `cpuset.cpus.effective` instead. What the claim was given, and whether it may change, is in the request's [device metadata file](device-metadata.md). See [How it Works](how-it-works.md).
 
 ## Extended Resource Claim Status integrations
 

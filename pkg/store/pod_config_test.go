@@ -234,3 +234,36 @@ func BenchmarkGetContainersWithSharedCPUs(b *testing.B) {
 		})
 	}
 }
+
+func TestContainerStateAccessors(t *testing.T) {
+	state := NewContainerState("ctr-1", "ctr-uid-1", "claim-1", "claim-2")
+	require.Equal(t, types.UID("ctr-uid-1"), state.ContainerUID())
+	require.Equal(t, []types.UID{"claim-1", "claim-2"}, state.ClaimUIDs())
+
+	// The returned slice must not alias the state's own.
+	claims := state.ClaimUIDs()
+	claims[0] = "tampered"
+	require.Equal(t, []types.UID{"claim-1", "claim-2"}, state.ClaimUIDs())
+
+	shared := NewContainerState("ctr-2", "ctr-uid-2")
+	require.Empty(t, shared.ClaimUIDs())
+	require.Equal(t, types.UID("ctr-uid-2"), shared.ContainerUID())
+}
+
+func TestClaimRequestsDefaultToTheWholeClaim(t *testing.T) {
+	state := NewContainerState("ctr-1", "ctr-uid-1", "claim-1", "claim-2")
+	require.Equal(t, []ClaimRequestRef{
+		{ClaimUID: "claim-1"},
+		{ClaimUID: "claim-2"},
+	}, state.ClaimRequests(), "a container that named no request holds every claim whole")
+
+	state.WithClaimRequests(map[types.UID][]string{"claim-1": {"vcpus", "helpers"}})
+	require.Equal(t, []ClaimRequestRef{
+		{ClaimUID: "claim-1", Request: "vcpus"},
+		{ClaimUID: "claim-1", Request: "helpers"},
+		{ClaimUID: "claim-2"},
+	}, state.ClaimRequests(), "a claim with no requests recorded stays whole beside one that has them")
+
+	require.Equal(t, []types.UID{"claim-1", "claim-2"}, state.ClaimUIDs(), "which claims are held does not change")
+	require.True(t, state.HasExclusiveCPUAllocation())
+}

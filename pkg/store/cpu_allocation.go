@@ -18,21 +18,377 @@ package store
 
 import (
 	"fmt"
+	"maps"
+	"slices"
+	"sort"
 	"sync"
 
 	"github.com/go-logr/logr"
+	v1alpha1 "github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
 )
 
+// Role is what a request was given: CPUs its claim holds alone, or CPUs of a
+// pool other claims may hold too.
+type Role string
+
+const (
+	// RoleExclusive marks CPUs no other claim may be given.
+	RoleExclusive Role = "exclusive"
+	// RoleShared marks CPUs of a claimed pool, which every claim that asks for
+	// that pool holds at the same time.
+	RoleShared Role = "shared"
+)
+
+// RequestAllocation is the CPUs one request of a claim was given.
+type RequestAllocation struct {
+	Request string
+	CPUs    cpuset.CPUSet
+	Role    Role
+}
+
+// UnionOf returns the CPUs a set of requests grants together.
+func UnionOf(requests []RequestAllocation) cpuset.CPUSet {
+	union := cpuset.New()
+	for _, request := range requests {
+		union = union.Union(request.CPUs)
+	}
+	return union
+}
+
+// ClaimRequestRef is what a container holds of one claim: one of its requests,
+// or with Request empty every request it has.
+//
+// Empty means everything for the same reason it does in a pod's own
+// resources.claims entry, which is where these come from: a container that names
+// no request is given the whole claim.
+type ClaimRequestRef struct {
+	ClaimUID types.UID
+	Request  string
+}
+
+// RoundProvenance records a defragmentation round in flight when the claim's
+// placement was written.
+type RoundProvenance struct {
+	RoundID  string
+	Origin   cpuset.CPUSet
+	Target   cpuset.CPUSet
+	Partners []types.UID
+}
+
+type ClaimCorrelation struct {
+	NUMANode         *int
+	Partition        string
+	FrontierSnapshot string
+	WitnessRounds    *int
+	WitnessPlan      string
+	InitialCPUSet    string
+	RuntimeOutcome   string
+}
+
+// ClaimRecord is everything the driver records for one prepared claim: what each
+// of its requests holds, and whether the claim permits those CPUs to change
+// while its containers run.
+//
+// Mobility is recorded beside the placement because it outlives the claim object
+// as far as this driver is concerned: the driver does not watch ResourceClaims,
+// so after a restart the CDI specs on disk are all it has, and a claim whose
+// mobility it could not recover would stop being movable for the life of its
+// pod.
+type ClaimRecord struct {
+	Requests    []RequestAllocation
+	Relocatable bool
+	Alignment   v1alpha1.Alignment
+	// Recorded is how many CPUs the claim's allocation charged to each device it
+	// names, which is what a scheduler subtracts from that device's capacity. It
+	// is empty for a claim that was given no CPUs of its own, and for one whose
+	// record on disk was written before the driver kept this.
+	Recorded map[string]int
+	// ReservedFor is the pod UIDs the claim's own status.reservedFor named when
+	// the driver prepared it. It is the API server's record of who may hold the
+	// claim, which a pod spec cannot forge the way it can a DRA_CPUSET_* value.
+	ReservedFor []types.UID
+	// Round is the defragmentation round in flight when this record was written
+	// to disk, or nil when no round is active for the claim.
+	Round       *RoundProvenance
+	Correlation ClaimCorrelation
+}
+
 // CPUAllocation is the single source of truth for CPU allocations.
 type CPUAllocation struct {
-	mu                       sync.RWMutex
-	availableCPUs            cpuset.CPUSet
-	reservedCPUs             cpuset.CPUSet
-	resourceClaimAllocations map[types.UID]cpuset.CPUSet
-	preparedCPUs             cpuset.CPUSet
+	mu sync.RWMutex
+	// CCX-FORK: kept rather than read once, because a move has to divide its
+	// target between a claim's requests along physical cores.
+	cpuTopology   *cpuinfo.CPUTopology
+	availableCPUs cpuset.CPUSet
+	reservedCPUs  cpuset.CPUSet
+	// CCX-FORK: claimlessCPUs is where a container holding no claim can actually
+	// run, which on a partitioned node is narrower than availableCPUs by every
+	// unclaimed CPU of every exclusive partition. Empty means the node declares
+	// no partitions, and then the two are the same.
+	claimlessCPUs cpuset.CPUSet
+	// CCX-FORK: upstream holds one cpuset per claim, keyed by claim UID alone.
+	claims       map[types.UID]*claimAllocation
+	preparedCPUs cpuset.CPUSet
+	// lastSwapGroup numbers the exchanges this store has begun, so that the
+	// participants of one can be told from the participants of another.
+	lastSwapGroup int
+	// closureReservations holds, per NUMA node, the reserved CPU closure of an
+	// in-flight exact repair plan.
+	closureReservations map[int]cpuset.CPUSet
+}
+
+type claimAllocation struct {
+	byRequest map[string]RequestAllocation
+	// cpuTopology is how a move divides its target between this claim's
+	// requests: along physical cores rather than along CPU ids.
+	cpuTopology *cpuinfo.CPUTopology
+	// rebindOrigin is the exclusive CPUs of each request before the move in
+	// flight, and is nil when none is.
+	rebindOrigin map[string]cpuset.CPUSet
+	// recoveredOrigin is where a round that was in flight when the driver went
+	// down had moved this claim from, as its record on disk kept it. It is a flat
+	// set rather than a map because that is how the round recorded it, and
+	// splitting it back across the requests would be a guess: the record says
+	// what the claim left, not which request held which part of it.
+	//
+	// The claim occupies it as surely as it occupies its target -- a container is
+	// still running on one of the two and only a read-back says which -- so it is
+	// held against every other claim until the round is settled.
+	recoveredOrigin cpuset.CPUSet
+	// roundID names that round, which is what tells the other participants of it
+	// from a claim arriving later: a partner may be given CPUs this claim is
+	// holding as its origin, and a newcomer may not.
+	roundID string
+	// swapGroup identifies the exchange this claim is part of, and is zero for a
+	// claim moving into free CPUs on its own. The group is recorded rather than
+	// inferred from which CPUs the movers hold, because it has to survive one of
+	// its members being unprepared while the batch is out.
+	swapGroup   int
+	relocatable bool
+	alignment   v1alpha1.Alignment
+	// recorded is what the claim's allocation charged each device it names.
+	recorded    map[string]int
+	correlation ClaimCorrelation
+	reservedFor []types.UID
+}
+
+func newClaimAllocation(record ClaimRecord) *claimAllocation {
+	byRequest := make(map[string]RequestAllocation, len(record.Requests))
+	for _, request := range record.Requests {
+		byRequest[request.Request] = request
+	}
+	allocation := &claimAllocation{
+		byRequest:   byRequest,
+		relocatable: record.Relocatable,
+		alignment:   record.Alignment,
+		recorded:    maps.Clone(record.Recorded),
+		reservedFor: slices.Clone(record.ReservedFor),
+		correlation: record.Correlation,
+	}
+	// CCX-FORK: a record read back from disk may carry a round that was in
+	// flight when the driver went down. Dropping it would leave the claim
+	// holding its target alone, and the CPUs its container may still be running
+	// on free for the next claim to be given.
+	if record.Round != nil && record.Round.RoundID != "" && !record.Round.Origin.IsEmpty() {
+		allocation.recoveredOrigin = record.Round.Origin
+		allocation.roundID = record.Round.RoundID
+	}
+	return allocation
+}
+
+// requests returns the claim's allocations ordered by request name, so callers
+// and records do not depend on map iteration order.
+func (c *claimAllocation) requests() []RequestAllocation {
+	requests := make([]RequestAllocation, 0, len(c.byRequest))
+	for _, request := range c.byRequest {
+		requests = append(requests, request)
+	}
+	sort.Slice(requests, func(i, j int) bool { return requests[i].Request < requests[j].Request })
+	return requests
+}
+
+func (c *claimAllocation) cpus() cpuset.CPUSet {
+	cpus := cpuset.New()
+	for _, request := range c.byRequest {
+		cpus = cpus.Union(request.CPUs)
+	}
+	return cpus
+}
+
+func (c *claimAllocation) exclusiveCPUs() cpuset.CPUSet {
+	cpus := cpuset.New()
+	for _, request := range c.byRequest {
+		if request.Role == RoleExclusive {
+			cpus = cpus.Union(request.CPUs)
+		}
+	}
+	return cpus
+}
+
+func (c *claimAllocation) originCPUs() cpuset.CPUSet {
+	cpus := c.recoveredOrigin
+	if cpus.IsEmpty() {
+		cpus = cpuset.New()
+	}
+	for _, origin := range c.rebindOrigin {
+		cpus = cpus.Union(origin)
+	}
+	return cpus
+}
+
+// movingFromRecoveredRound reports whether this claim is mid-round because the
+// driver restarted into one, rather than because this driver began it.
+func (c *claimAllocation) movingFromRecoveredRound() bool {
+	return c.rebindOrigin == nil && !c.recoveredOrigin.IsEmpty()
+}
+
+// exclusiveOverlap is the CPUs more than one exclusive request of the claim was
+// given. A claim that holds a CPU twice cannot be moved as a whole, since its
+// requests then have more CPUs between them than the claim occupies.
+func (c *claimAllocation) exclusiveOverlap() cpuset.CPUSet {
+	seen, overlap := cpuset.New(), cpuset.New()
+	for _, name := range c.exclusiveRequestNames() {
+		cpus := c.byRequest[name].CPUs
+		overlap = overlap.Union(seen.Intersection(cpus))
+		seen = seen.Union(cpus)
+	}
+	return overlap
+}
+
+func (c *claimAllocation) exclusiveRequestNames() []string {
+	var names []string
+	for name, request := range c.byRequest {
+		if request.Role == RoleExclusive {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// placeExclusive spreads target over the claim's exclusive requests, each
+// keeping the number of CPUs it already had.
+func (c *claimAllocation) placeExclusive(target cpuset.CPUSet) {
+	names := c.exclusiveRequestNames()
+	sizes := make([]int, len(names))
+	for i, name := range names {
+		sizes[i] = c.byRequest[name].CPUs.Size()
+	}
+	for i, cpus := range SpreadExclusive(c.cpuTopology, target, sizes) {
+		request := c.byRequest[names[i]]
+		request.CPUs = cpus
+		c.byRequest[names[i]] = request
+	}
+}
+
+// SpreadExclusive divides target between requests of the given sizes, in order,
+// giving each of them whole physical cores wherever target is made of whole
+// cores.
+//
+// A move is planned for a claim as a whole and within one NUMA node, so which of
+// its own requests ends up on which of the target's CPUs is mostly not a
+// distinction anything outside the claim can make. There is one exception, and
+// it is why this does not simply divide the target's sorted CPU ids: a core's
+// threads sit far apart in the numbering, so slicing by id hands the first
+// request one thread of every core and the next request the other. The claim
+// still holds whole cores and every check that asks the claim is satisfied,
+// while the containers pinned to those requests share every core between them --
+// which is what whole-core allocation exists to prevent.
+//
+// Dividing by CPU id is the answer where there is no core-aligned one: a target
+// that is not made of whole cores, or a request whose size is not a whole number
+// of them. Nothing is lost by it, because there was no core to keep whole.
+func SpreadExclusive(topo *cpuinfo.CPUTopology, target cpuset.CPUSet, sizes []int) []cpuset.CPUSet {
+	if byCore := spreadWholeCores(topo, target, sizes); byCore != nil {
+		return byCore
+	}
+	return spreadByCPUID(target, sizes)
+}
+
+func spreadByCPUID(target cpuset.CPUSet, sizes []int) []cpuset.CPUSet {
+	cpuIDs := target.List()
+	spread := make([]cpuset.CPUSet, 0, len(sizes))
+	for _, size := range sizes {
+		spread = append(spread, cpuset.New(cpuIDs[:size]...))
+		cpuIDs = cpuIDs[size:]
+	}
+	return spread
+}
+
+// spreadWholeCores gives each size whole cores of target, in the order the
+// cores appear, or nil where that cannot be done exactly.
+func spreadWholeCores(topo *cpuinfo.CPUTopology, target cpuset.CPUSet, sizes []int) []cpuset.CPUSet {
+	if topo == nil {
+		return nil
+	}
+	details := topo.CPUDetails
+	if !details.CompleteCores(target).Equals(target) {
+		return nil
+	}
+	var cores []cpuset.CPUSet
+	seen := make(map[cpuinfo.CoreLocation]bool)
+	for _, cpuID := range target.List() {
+		location, ok := details.CoreOf(cpuID)
+		if !ok {
+			return nil
+		}
+		if seen[location] {
+			continue
+		}
+		seen[location] = true
+		cores = append(cores, details.CPUsInCoreLocations(location))
+	}
+
+	spread := make([]cpuset.CPUSet, 0, len(sizes))
+	for _, size := range sizes {
+		cpus := cpuset.New()
+		for cpus.Size() < size {
+			if len(cores) == 0 {
+				return nil
+			}
+			cpus = cpus.Union(cores[0])
+			cores = cores[1:]
+		}
+		if cpus.Size() != size {
+			return nil
+		}
+		spread = append(spread, cpus)
+	}
+	return spread
+}
+
+func (c *claimAllocation) restoreExclusive(origin map[string]cpuset.CPUSet) {
+	for name, cpus := range origin {
+		request := c.byRequest[name]
+		request.CPUs = cpus
+		c.byRequest[name] = request
+	}
+}
+
+func (c *claimAllocation) exclusiveByRequest() map[string]cpuset.CPUSet {
+	byRequest := make(map[string]cpuset.CPUSet)
+	for name, request := range c.byRequest {
+		if request.Role == RoleExclusive {
+			byRequest[name] = request.CPUs
+		}
+	}
+	return byRequest
+}
+
+func (c *claimAllocation) equals(requests []RequestAllocation) bool {
+	if len(c.byRequest) != len(requests) {
+		return false
+	}
+	for _, request := range requests {
+		existing, ok := c.byRequest[request.Request]
+		if !ok || existing.Role != request.Role || !existing.CPUs.Equals(request.CPUs) {
+			return false
+		}
+	}
+	return true
 }
 
 // AllocationSnapshot is a point-in-time summary of CPU allocation state.
@@ -53,73 +409,460 @@ func NewCPUAllocation(cpuTopology *cpuinfo.CPUTopology, reservedCPUs cpuset.CPUS
 	availableCPUs := allCPUsSet.Difference(reservedCPUs)
 
 	return &CPUAllocation{
-		availableCPUs:            availableCPUs,
-		reservedCPUs:             reservedCPUs,
-		resourceClaimAllocations: make(map[types.UID]cpuset.CPUSet),
-		preparedCPUs:             cpuset.New(),
+		cpuTopology:         cpuTopology,
+		availableCPUs:       availableCPUs,
+		reservedCPUs:        reservedCPUs,
+		claims:              make(map[types.UID]*claimAllocation),
+		preparedCPUs:        cpuset.New(),
+		closureReservations: make(map[int]cpuset.CPUSet),
 	}
 }
 
-// ReserveResourceClaimAllocation records a prepared claim. Its CPUs remain unavailable
-// to shared containers and other exclusive claims until Unprepare. When shared
-// containers are present, the reservation must leave at least one CPU in the
-// shared pool because NRI cannot represent an empty CPUSet.
-func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet, hasSharedContainers bool) error {
+// ReserveResourceClaimAllocation records what each request of a prepared claim
+// was given, and whether the claim allows its CPUs to change. Its exclusive CPUs
+// remain unavailable to shared containers and to other claims until Unprepare;
+// the CPUs of a request with any other role are recorded for the container's
+// cpuset alone. When shared containers are present, the reservation must leave at
+// least one CPU in the shared pool because NRI cannot represent an empty CPUSet.
+//
+// CCX-FORK: upstream records one cpuset per claim, since to it every request
+// grants CPUs the claim holds alone and no claim ever moves.
+func (s *CPUAllocation) ReserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, record ClaimRecord, hasSharedContainers bool) error {
+	if len(record.Requests) == 0 {
+		return fmt.Errorf("claim %q was given no requests to reserve", claimUID)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if allocation, ok := s.resourceClaimAllocations[claimUID]; ok {
-		if allocation.Equals(cpus) {
+	if allocation, ok := s.claims[claimUID]; ok {
+		if allocation.equals(record.Requests) {
 			return nil
 		}
-		return fmt.Errorf("claim %q is already prepared with CPUs %q (requested %q)", claimUID, allocation.String(), cpus.String())
+		return fmt.Errorf("claim %q is already prepared with CPUs %q (requested %q)", claimUID, allocation.cpus().String(), UnionOf(record.Requests).String())
 	}
-	sharedCPUs := s.availableCPUs.Difference(s.preparedCPUs)
-	if !cpus.IsSubsetOf(sharedCPUs) {
-		return fmt.Errorf("claim %q has overlapping CPU assignment %q", claimUID, cpus.String())
+	allocation := newClaimAllocation(record)
+	allocation.cpuTopology = s.cpuTopology
+	if overlap := allocation.exclusiveOverlap(); !overlap.IsEmpty() {
+		return fmt.Errorf("claim %q was given CPUs %q for more than one of its exclusive requests", claimUID, overlap.String())
 	}
-	if hasSharedContainers && !cpus.IsEmpty() && sharedCPUs.Difference(cpus).IsEmpty() {
+	exclusive := allocation.exclusiveCPUs()
+	// CCX-FORK: a claim recovered into a round the driver restarted through may
+	// be given CPUs another participant of that same round is holding as its
+	// origin. That is what a swap looks like from disk -- each claim's target is
+	// the other's origin -- and refusing it would lose one of the two, leaving
+	// its CPUs available while its container runs on them. Only the round's own
+	// participants are let through; to anything else those CPUs are held.
+	sharedCPUs := s.availableCPUs.Difference(s.preparedCPUs).Union(s.recoveredOriginsOfRoundLocked(allocation.roundID))
+	if !exclusive.IsSubsetOf(sharedCPUs) {
+		return fmt.Errorf("claim %q has overlapping CPU assignment %q", claimUID, exclusive.String())
+	}
+	// CCX-FORK: against the pool a claimless container can reach rather than
+	// against every unreserved CPU. Upstream has no partitions, so the two agree
+	// there; here they differ by the unclaimed CPUs of every exclusive partition,
+	// and measuring the wrong one lets a claim empty the default partition while
+	// the guard is still looking at a hundred idle CPUs no claimless container
+	// may run on.
+	claimlessCPUs := s.claimlessPoolLocked()
+	if hasSharedContainers && !exclusive.IsEmpty() && claimlessCPUs.Difference(exclusive).IsEmpty() {
 		return fmt.Errorf("claim %q would exhaust the shared CPU pool while shared containers are running", claimUID)
 	}
-	s.resourceClaimAllocations[claimUID] = cpus
-	s.preparedCPUs = s.preparedCPUs.Union(cpus)
-	logger.Info("reserved allocation for resource claim", "cpus", cpus.String())
+	s.claims[claimUID] = allocation
+	s.preparedCPUs = s.preparedCPUs.Union(exclusive).Union(allocation.recoveredOrigin)
+	if allocation.movingFromRecoveredRound() {
+		logger.Info("reserved a claim the driver restarted mid-round, holding both cpusets until it settles",
+			"cpus", allocation.cpus().String(), "recoveredOrigin", allocation.recoveredOrigin.String(), "roundID", allocation.roundID)
+		return nil
+	}
+	logger.Info("reserved allocation for resource claim", "cpus", allocation.cpus().String())
 	return nil
 }
 
-// ValidateResourceClaimAllocations verifies that a container's claims match prepared allocations.
-func (s *CPUAllocation) ValidateResourceClaimAllocations(expected map[types.UID]cpuset.CPUSet) error {
+// recoveredOriginsOfRoundLocked is what the other participants of one round are
+// holding as their origins, which is the only set a claim of that same round may
+// be reserved onto while they hold it.
+func (s *CPUAllocation) recoveredOriginsOfRoundLocked(roundID string) cpuset.CPUSet {
+	origins := cpuset.New()
+	if roundID == "" {
+		return origins
+	}
+	for _, allocation := range s.claims {
+		if allocation.roundID == roundID {
+			origins = origins.Union(allocation.recoveredOrigin)
+		}
+	}
+	return origins
+}
+
+// SettleRecoveredRound releases the origin a claim was recovered holding, once
+// its container has been placed on one of the two cpusets and the round is no
+// longer in flight. A claim this driver moved itself is untouched: its round is
+// settled by CommitRebind or AbortRebind, which know which way it went.
+func (s *CPUAllocation) SettleRecoveredRound(logger logr.Logger, claimUID types.UID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	allocation, ok := s.claims[claimUID]
+	if !ok || !allocation.movingFromRecoveredRound() {
+		return
+	}
+	released := allocation.recoveredOrigin
+	allocation.recoveredOrigin = cpuset.New()
+	allocation.roundID = ""
+	s.preparedCPUs = s.heldByClaimsLocked()
+	logger.Info("settled a claim recovered mid-round", "released", released.Difference(allocation.exclusiveCPUs()).String())
+}
+
+// GetRequestAllocationUnion returns the CPUs the named requests grant together,
+// which is what a container naming them is pinned to. A ref carrying no request
+// name takes the claim whole, so a container that names none is this same call.
+//
+// A request the claim does not hold is an error rather than an empty set. It is
+// either an environment value a pod spec forged or a record from a claim that
+// has since been prepared differently, and a container pinned to nothing is a
+// guaranteed workload running unconstrained.
+//
+// CCX-FORK: upstream has no request granularity; a claim is one cpuset.
+func (s *CPUAllocation) GetRequestAllocationUnion(refs ...ClaimRequestRef) (cpuset.CPUSet, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	for claimUID, cpus := range expected {
-		allocation, ok := s.resourceClaimAllocations[claimUID]
+	union := cpuset.New()
+	for _, ref := range refs {
+		allocation, ok := s.claims[ref.ClaimUID]
+		if !ok {
+			return cpuset.New(), fmt.Errorf("claim %q is not prepared by this driver", ref.ClaimUID)
+		}
+		if ref.Request == "" {
+			union = union.Union(allocation.cpus())
+			continue
+		}
+		request, ok := allocation.byRequest[ref.Request]
+		if !ok {
+			return cpuset.New(), fmt.Errorf("claim %q holds no request %q", ref.ClaimUID, ref.Request)
+		}
+		union = union.Union(request.CPUs)
+	}
+	return union, nil
+}
+
+// GetRequestOriginUnion is GetRequestAllocationUnion as it was before the moves
+// in flight, which for a request that is not moving is what it holds now. Only
+// exclusive requests ever move, so a share of a pool reads the same either way.
+func (s *CPUAllocation) GetRequestOriginUnion(refs ...ClaimRequestRef) (cpuset.CPUSet, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	union := cpuset.New()
+	for _, ref := range refs {
+		allocation, ok := s.claims[ref.ClaimUID]
+		if !ok {
+			return cpuset.New(), fmt.Errorf("claim %q is not prepared by this driver", ref.ClaimUID)
+		}
+		if ref.Request == "" {
+			if allocation.rebindOrigin == nil {
+				union = union.Union(allocation.cpus())
+				continue
+			}
+			union = union.Union(allocation.cpus().Difference(allocation.exclusiveCPUs())).Union(allocation.originCPUs())
+			continue
+		}
+		request, ok := allocation.byRequest[ref.Request]
+		if !ok {
+			return cpuset.New(), fmt.Errorf("claim %q holds no request %q", ref.ClaimUID, ref.Request)
+		}
+		if origin, moving := allocation.rebindOrigin[ref.Request]; moving {
+			union = union.Union(origin)
+			continue
+		}
+		union = union.Union(request.CPUs)
+	}
+	return union, nil
+}
+
+// HoldsExclusiveCPUsOf reports whether the named requests were given CPUs of the
+// claim's own. It is what binds a claim to a container: a container holding only
+// a share of a pool takes nothing away from anything else, whatever the claim's
+// other requests hold.
+func (s *CPUAllocation) HoldsExclusiveCPUsOf(ref ClaimRequestRef) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocation, ok := s.claims[ref.ClaimUID]
+	if !ok {
+		return false
+	}
+	if ref.Request == "" {
+		return !allocation.exclusiveCPUs().IsEmpty()
+	}
+	request, ok := allocation.byRequest[ref.Request]
+	return ok && request.Role == RoleExclusive && !request.CPUs.IsEmpty()
+}
+
+// BeginRebind starts moving a prepared claim's exclusive CPUs onto target,
+// holding both its current and its target CPUs until the move is committed or
+// aborted. Neither half is offered to a shared container or to another claim in
+// the meantime, so an abort always has valid CPUs to fall back to: the ones the
+// claim already held were never released.
+//
+// Only the claim's CPU count is checked. What else makes a target valid, namely
+// preserving the claim's per-NUMA-node footprint and taking whole physical cores
+// where those are required, is for the caller that chose it from the topology.
+func (s *CPUAllocation) BeginRebind(logger logr.Logger, claimUID types.UID, target cpuset.CPUSet) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	allocation, ok := s.claims[claimUID]
+	if !ok {
+		return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
+	}
+	current := allocation.exclusiveCPUs()
+	if allocation.rebindOrigin != nil {
+		return fmt.Errorf("claim %q is already rebinding from %q to %q", claimUID, allocation.originCPUs().String(), current.String())
+	}
+	if target.Size() != current.Size() {
+		return fmt.Errorf("rebind of claim %q would change its CPU count from %d to %d", claimUID, current.Size(), target.Size())
+	}
+	free := s.availableCPUs.Difference(s.preparedCPUs).Union(current)
+	if !target.IsSubsetOf(free) {
+		return fmt.Errorf("rebind target %q for claim %q is not free (claim may move within %q)", target.String(), claimUID, free.String())
+	}
+
+	allocation.rebindOrigin = allocation.exclusiveByRequest()
+	allocation.placeExclusive(target)
+	s.preparedCPUs = s.preparedCPUs.Union(target)
+	logger.Info("began rebind of resource claim", "from", current.String(), "to", target.String())
+	return nil
+}
+
+// BeginSwap starts an exchange between prepared claims: each is placed on the
+// CPUs targets names for it, and every one of them holds both its current and
+// its target CPUs until the exchange is committed or aborted. That transit set
+// is what keeps a Prepare arriving mid-batch from handing a newcomer CPUs a
+// half-swapped claim is still running on, and it is what an abort falls back
+// to, since no participant ever released anything.
+//
+// The targets divide up exactly the CPUs the claims already hold between them,
+// each keeping its own count, so the set the group occupies is the same before,
+// during and after. Nothing here touches the CPUs available to anything else,
+// whichever way the exchange ends. An exchange that also took free CPUs would
+// be a move and an exchange at once; the caller plans that as two steps.
+func (s *CPUAllocation) BeginSwap(logger logr.Logger, targets map[types.UID]cpuset.CPUSet) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(targets) < 2 {
+		return fmt.Errorf("an exchange needs at least two claims, got %d", len(targets))
+	}
+	claimUIDs := sortedUIDs(targets)
+	held, wanted := cpuset.New(), cpuset.New()
+	for _, claimUID := range claimUIDs {
+		allocation, ok := s.claims[claimUID]
 		if !ok {
 			return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
 		}
-		if !allocation.Equals(cpus) {
-			return fmt.Errorf("validation failed for claim %q: cpuset mismatch (expected %q, got %q)", claimUID, allocation.String(), cpus.String())
+		if allocation.rebindOrigin != nil {
+			return fmt.Errorf("claim %q is already rebinding from %q to %q", claimUID, allocation.originCPUs().String(), allocation.exclusiveCPUs().String())
+		}
+		current := allocation.exclusiveCPUs()
+		target := targets[claimUID]
+		if target.Size() != current.Size() {
+			return fmt.Errorf("exchange would change claim %q from %d CPUs to %d", claimUID, current.Size(), target.Size())
+		}
+		if overlap := wanted.Intersection(target); !overlap.IsEmpty() {
+			return fmt.Errorf("exchange gives CPUs %q to more than one claim", overlap.String())
+		}
+		held, wanted = held.Union(current), wanted.Union(target)
+	}
+	if !held.Equals(wanted) {
+		return fmt.Errorf("exchange of claims %v would move them from %q onto %q, which is not the same set of CPUs", claimUIDs, held.String(), wanted.String())
+	}
+
+	s.lastSwapGroup++
+	for _, claimUID := range claimUIDs {
+		allocation := s.claims[claimUID]
+		allocation.rebindOrigin = allocation.exclusiveByRequest()
+		allocation.swapGroup = s.lastSwapGroup
+		allocation.placeExclusive(targets[claimUID])
+	}
+	logger.Info("began exchange of resource claims", "claims", claimUIDs, "cpus", held.String())
+	return nil
+}
+
+// CommitSwap ends an exchange with every participant still prepared on its
+// target.
+func (s *CPUAllocation) CommitSwap(logger logr.Logger, claimUIDs ...types.UID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	present, err := s.swapInFlight(claimUIDs)
+	if err != nil {
+		return err
+	}
+	for _, claimUID := range present {
+		allocation := s.claims[claimUID]
+		allocation.rebindOrigin, allocation.swapGroup = nil, 0
+	}
+	s.preparedCPUs = s.heldByClaimsLocked()
+	logger.Info("committed exchange of resource claims", "claims", present)
+	return nil
+}
+
+// AbortSwap ends an exchange with every participant still prepared back where it
+// started.
+func (s *CPUAllocation) AbortSwap(logger logr.Logger, claimUIDs ...types.UID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	present, err := s.swapInFlight(claimUIDs)
+	if err != nil {
+		return err
+	}
+	for _, claimUID := range present {
+		allocation := s.claims[claimUID]
+		allocation.restoreExclusive(allocation.rebindOrigin)
+		allocation.rebindOrigin, allocation.swapGroup = nil, 0
+	}
+	s.preparedCPUs = s.heldByClaimsLocked()
+	logger.Info("aborted exchange of resource claims", "claims", present)
+	return nil
+}
+
+// swapInFlight returns the participants of one exchange that are still prepared.
+//
+// A participant unprepared while the batch was out is skipped rather than
+// refused. It released nothing its partner is taking -- removing it recomputed
+// what the survivors hold -- and refusing the whole group over it would leave the
+// rest holding two cpusets with nothing able to settle them, which on a fenced
+// NUMA node means fenced for as long as the driver runs.
+//
+// Everything else is refused, and the group id is what makes that exact: a claim
+// moving on its own, a claim not moving at all, two exchanges named together, and
+// an exchange named without one of its still-prepared members are each a caller
+// settling something it did not begin.
+func (s *CPUAllocation) swapInFlight(claimUIDs []types.UID) ([]types.UID, error) {
+	if len(claimUIDs) < 2 {
+		return nil, fmt.Errorf("an exchange needs at least two claims, got %d", len(claimUIDs))
+	}
+	group := 0
+	present := make([]types.UID, 0, len(claimUIDs))
+	for _, claimUID := range claimUIDs {
+		allocation, ok := s.claims[claimUID]
+		if !ok {
+			continue
+		}
+		if allocation.swapGroup == 0 {
+			return nil, fmt.Errorf("claim %q has no exchange in flight", claimUID)
+		}
+		if group != 0 && allocation.swapGroup != group {
+			return nil, fmt.Errorf("claims %v are not one exchange", claimUIDs)
+		}
+		group = allocation.swapGroup
+		present = append(present, claimUID)
+	}
+	if len(present) == 0 {
+		return nil, fmt.Errorf("no claim of the exchange %v is prepared any more", claimUIDs)
+	}
+	for claimUID, allocation := range s.claims {
+		if allocation.swapGroup == group && !slices.Contains(present, claimUID) {
+			return nil, fmt.Errorf("claim %q belongs to the same exchange and was not named", claimUID)
 		}
 	}
+	return present, nil
+}
+
+func sortedUIDs(targets map[types.UID]cpuset.CPUSet) []types.UID {
+	claimUIDs := make([]types.UID, 0, len(targets))
+	for claimUID := range targets {
+		claimUIDs = append(claimUIDs, claimUID)
+	}
+	sort.Slice(claimUIDs, func(i, j int) bool { return claimUIDs[i] < claimUIDs[j] })
+	return claimUIDs
+}
+
+// CommitRebind releases the CPUs a claim moved away from, keeping the target.
+func (s *CPUAllocation) CommitRebind(logger logr.Logger, claimUID types.UID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	allocation, ok := s.claims[claimUID]
+	if !ok || allocation.rebindOrigin == nil {
+		return fmt.Errorf("claim %q has no rebind in flight", claimUID)
+	}
+	origin := allocation.originCPUs()
+	target := allocation.exclusiveCPUs()
+	allocation.rebindOrigin = nil
+	s.preparedCPUs = s.preparedCPUs.Difference(origin.Difference(target))
+	logger.Info("committed rebind of resource claim", "cpus", target.String())
 	return nil
+}
+
+// AbortRebind returns a claim to the CPUs it was moving away from and releases
+// the target.
+func (s *CPUAllocation) AbortRebind(logger logr.Logger, claimUID types.UID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	allocation, ok := s.claims[claimUID]
+	if !ok || allocation.rebindOrigin == nil {
+		return fmt.Errorf("claim %q has no rebind in flight", claimUID)
+	}
+	origin := allocation.originCPUs()
+	target := allocation.exclusiveCPUs()
+	allocation.restoreExclusive(allocation.rebindOrigin)
+	allocation.rebindOrigin = nil
+	s.preparedCPUs = s.preparedCPUs.Difference(target.Difference(origin))
+	logger.Info("aborted rebind of resource claim", "cpus", origin.String())
+	return nil
+}
+
+// GetRebindOrigin returns the CPUs a claim is moving away from, and whether a
+// rebind is in flight for it at all.
+func (s *CPUAllocation) GetRebindOrigin(claimUID types.UID) (cpuset.CPUSet, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocation, ok := s.claims[claimUID]
+	if !ok {
+		return cpuset.CPUSet{}, false
+	}
+	// CCX-FORK: a claim recovered into a round this driver did not begin is
+	// moving just as surely as one it did, and nothing may plan a second move
+	// for it while the first is unsettled.
+	if allocation.rebindOrigin == nil && allocation.recoveredOrigin.IsEmpty() {
+		return cpuset.CPUSet{}, false
+	}
+	return allocation.originCPUs(), true
 }
 
 // RemoveResourceClaimAllocation removes a resource claim allocation from the store.
 func (s *CPUAllocation) RemoveResourceClaimAllocation(logger logr.Logger, claimUID types.UID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.resourceClaimAllocations[claimUID]; ok {
+	if _, ok := s.claims[claimUID]; ok {
 		s.removeLocked(claimUID)
 		logger.Info("removed allocation for resource claim")
 	}
 }
 
+// CCX-FORK: upstream releases only the claim's own cpuset; here a claim may hold
+// two, the CPUs it runs on and the ones it is moving onto.
 func (s *CPUAllocation) removeLocked(claimUID types.UID) {
-	allocation, ok := s.resourceClaimAllocations[claimUID]
-	if !ok {
+	if _, ok := s.claims[claimUID]; !ok {
 		return
 	}
-	delete(s.resourceClaimAllocations, claimUID)
-	s.preparedCPUs = s.preparedCPUs.Difference(allocation)
+	delete(s.claims, claimUID)
+	s.preparedCPUs = s.heldByClaimsLocked()
+}
+
+// heldByClaimsLocked is every CPU the prepared claims hold between them, both
+// halves of a move in flight included.
+//
+// Recomputed rather than adjusted claim by claim, because a CPU one claim is
+// leaving is a CPU another may be taking: the two sides of an exchange hold each
+// other's, so subtracting a departing claim's own would release a CPU its partner
+// is still running on.
+func (s *CPUAllocation) heldByClaimsLocked() cpuset.CPUSet {
+	held := cpuset.New()
+	for _, allocation := range s.claims {
+		held = held.Union(allocation.exclusiveCPUs()).Union(allocation.originCPUs())
+	}
+	return held
 }
 
 // GetSharedCPUs returns CPUs available to shared containers.
@@ -129,12 +872,212 @@ func (s *CPUAllocation) GetSharedCPUs() cpuset.CPUSet {
 	return s.availableCPUs.Difference(s.preparedCPUs)
 }
 
-// GetResourceClaimAllocation returns the cpuset for a given resource claim.
+// SetClaimlessCPUs records where a container holding no claim may run.
+//
+// CCX-FORK: a caller that never sets it leaves the store measuring its
+// exhaustion guard against every unreserved CPU, which is upstream's behaviour
+// and the right one for a node that declares no partitions.
+func (s *CPUAllocation) SetClaimlessCPUs(cpus cpuset.CPUSet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claimlessCPUs = cpus
+}
+
+// claimlessPoolLocked is what a claimless container has left to run on.
+func (s *CPUAllocation) claimlessPoolLocked() cpuset.CPUSet {
+	pool := s.availableCPUs
+	if !s.claimlessCPUs.IsEmpty() {
+		pool = s.claimlessCPUs
+	}
+
+	return pool.Difference(s.preparedCPUs)
+}
+
+// GetResourceClaimAllocation returns every CPU a claim was given, whatever the
+// role of the request that granted it.
+//
+// CCX-FORK: while a rebind is in flight this is the claim's target, not the CPUs
+// its container is still running on. A caller that needs both takes the other
+// half from GetRebindOrigin.
 func (s *CPUAllocation) GetResourceClaimAllocation(claimUID types.UID) (cpuset.CPUSet, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	allocation, ok := s.resourceClaimAllocations[claimUID]
-	return allocation, ok
+	allocation, ok := s.claims[claimUID]
+	if !ok {
+		return cpuset.CPUSet{}, false
+	}
+	return allocation.cpus(), true
+}
+
+// GetClaimRecord returns everything recorded for a claim: what each of its
+// requests was given, ordered by request name, and whether its CPUs may change.
+func (s *CPUAllocation) GetClaimRecord(claimUID types.UID) (ClaimRecord, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocation, ok := s.claims[claimUID]
+	if !ok {
+		return ClaimRecord{}, false
+	}
+	return ClaimRecord{
+		Requests:    allocation.requests(),
+		Relocatable: allocation.relocatable,
+		Alignment:   allocation.alignment,
+		Recorded:    maps.Clone(allocation.recorded),
+		ReservedFor: slices.Clone(allocation.reservedFor),
+		Correlation: allocation.correlation,
+	}, true
+}
+
+func (s *CPUAllocation) SetClaimCorrelation(claimUID types.UID, corr ClaimCorrelation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if alloc, ok := s.claims[claimUID]; ok {
+		alloc.correlation = corr
+	}
+}
+
+func (s *CPUAllocation) UpdateClaimRuntimeOutcome(claimUID types.UID, outcome string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if alloc, ok := s.claims[claimUID]; ok {
+		alloc.correlation.RuntimeOutcome = outcome
+	}
+}
+
+// Alignment returns a claim's alignment policy. Defaults to AlignmentBestEffort.
+func (s *CPUAllocation) Alignment(claimUID types.UID) v1alpha1.Alignment {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocation, ok := s.claims[claimUID]
+	if !ok || allocation.alignment == "" {
+		return v1alpha1.AlignmentBestEffort
+	}
+	return allocation.alignment
+}
+
+// IsRepairable reports whether a claim asked to be made whole by the driver when landing split.
+func (s *CPUAllocation) IsRepairable(claimUID types.UID) bool {
+	return s.Alignment(claimUID) == v1alpha1.AlignmentRepairable
+}
+
+// ReserveClosure holds an exact repair plan's closure for a NUMA node.
+func (s *CPUAllocation) ReserveClosure(numaNodeID int, closure cpuset.CPUSet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closureReservations == nil {
+		s.closureReservations = make(map[int]cpuset.CPUSet)
+	}
+	s.closureReservations[numaNodeID] = closure
+}
+
+// ReleaseClosure clears the reserved closure for a NUMA node.
+func (s *CPUAllocation) ReleaseClosure(numaNodeID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closureReservations != nil {
+		delete(s.closureReservations, numaNodeID)
+	}
+}
+
+// ReservedClosures returns the union of all currently reserved plan closures across NUMA nodes.
+func (s *CPUAllocation) ReservedClosures() cpuset.CPUSet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	all := cpuset.New()
+	for _, c := range s.closureReservations {
+		all = all.Union(c)
+	}
+	return all
+}
+
+// ReservedClosure returns the reserved closure for a specific NUMA node.
+func (s *CPUAllocation) ReservedClosure(numaNodeID int) cpuset.CPUSet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closureReservations == nil {
+		return cpuset.New()
+	}
+	return s.closureReservations[numaNodeID]
+}
+
+// SetRecordedDevices records what a claim's allocation charged each device,
+// which a caller supplies when the claim's own record could not carry it: a
+// spec written before the driver kept this names no device, and the claim
+// object a replayed Prepare hands over is where the answer comes back from.
+//
+// It refuses to overwrite an answer the store already has, since the
+// allocation is immutable and two answers about it cannot both be right.
+func (s *CPUAllocation) SetRecordedDevices(logger logr.Logger, claimUID types.UID, recorded map[string]int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	allocation, ok := s.claims[claimUID]
+	if !ok {
+		return fmt.Errorf("claim %q is not prepared by this driver", claimUID)
+	}
+	if len(allocation.recorded) > 0 {
+		return fmt.Errorf("claim %q already records the devices its allocation charged", claimUID)
+	}
+	allocation.recorded = maps.Clone(recorded)
+	logger.V(2).Info("recovered the devices a claim's allocation charged", "recorded", recorded)
+	return nil
+}
+
+// IsRelocatable reports whether a claim permits the driver to change its CPUs
+// while its containers run.
+func (s *CPUAllocation) IsRelocatable(claimUID types.UID) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocation, ok := s.claims[claimUID]
+	return ok && allocation.relocatable
+}
+
+// ClaimHolding is one prepared claim as the capacity published for a device is
+// computed from.
+//
+// Held is the claim's exclusive CPUs together with the ones it is moving away
+// from, because a claim with a move in flight occupies both: its container is on
+// one of the two and the driver does not know which until the runtime answers.
+// A device the claim is moving onto is therefore shrunk from the moment the move
+// is reserved, and the one it is leaving grows only once the move is committed.
+type ClaimHolding struct {
+	Held     cpuset.CPUSet
+	Recorded map[string]int
+}
+
+// ClaimHoldings returns every prepared claim that holds CPUs of its own, in one
+// snapshot.
+//
+// One snapshot rather than a reader per quantity: a caller that took the CPUs
+// and the charged amounts in two calls could catch a move between them and
+// publish a device as both emptied and never filled.
+func (s *CPUAllocation) ClaimHoldings() map[types.UID]ClaimHolding {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	holdings := make(map[types.UID]ClaimHolding, len(s.claims))
+	for claimUID, allocation := range s.claims {
+		held := allocation.exclusiveCPUs().Union(allocation.originCPUs())
+		if held.IsEmpty() {
+			continue
+		}
+		holdings[claimUID] = ClaimHolding{Held: held, Recorded: maps.Clone(allocation.recorded)}
+	}
+	return holdings
+}
+
+// ExclusiveClaimAllocations returns every prepared claim that holds exclusive
+// CPUs, and which CPUs those are. A claim with a rebind in flight reads as being
+// on its target, as it does through GetResourceClaimAllocation.
+func (s *CPUAllocation) ExclusiveClaimAllocations() map[types.UID]cpuset.CPUSet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocations := make(map[types.UID]cpuset.CPUSet, len(s.claims))
+	for claimUID, allocation := range s.claims {
+		if cpus := allocation.exclusiveCPUs(); !cpus.IsEmpty() {
+			allocations[claimUID] = cpus
+		}
+	}
+	return allocations
 }
 
 // GetReservedCPUs returns the set of reserved CPUs.
@@ -159,6 +1102,6 @@ func (s *CPUAllocation) Snapshot() AllocationSnapshot {
 		AllocatedCPUs:        s.preparedCPUs.Size(),
 		AvailableCPUs:        s.availableCPUs.Difference(s.preparedCPUs).Size(),
 		ReservedCPUs:         s.reservedCPUs.Size(),
-		ActiveResourceClaims: len(s.resourceClaimAllocations),
+		ActiveResourceClaims: len(s.claims),
 	}
 }

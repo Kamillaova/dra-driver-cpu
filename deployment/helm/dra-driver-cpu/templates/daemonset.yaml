@@ -63,6 +63,11 @@ spec:
       {{- end }}
       containers:
       - name: dracpu
+        env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
         args:
           - /dracpu
           - --v={{ .Values.args.logLevel }}
@@ -107,6 +112,13 @@ spec:
           mountPath: /var/run/nri
         - name: cdi-dir
           mountPath: /var/run/cdi
+        # The host's, not this container's: a container's own /sys/fs/cgroup is
+        # its cgroup namespace's view and shows nothing about anyone else. The
+        # driver reads cpuset.cpus.effective through it to find out which CPUs a
+        # container is really running on when it cannot tell from its own records.
+        - name: host-cgroup
+          mountPath: /sys/fs/cgroup
+          readOnly: true
         {{- with .Values.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -129,6 +141,10 @@ spec:
         hostPath:
           path: /var/run/cdi
           type: DirectoryOrCreate
+      - name: host-cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+          type: Directory
       {{- with .Values.extraVolumes }}
       {{- toYaml . | nindent 6 }}
       {{- end }}

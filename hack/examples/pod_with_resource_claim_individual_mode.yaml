@@ -5,6 +5,7 @@
 #
 # Note: The CPU requests specified in the ResourceClaim must be replicated in the container's
 # standard resource requests (resources.requests.cpu) to ensure proper scheduling accounting and avoid double-booking.
+# It is not replicated into resources.limits.cpu: a CPU limit sets a CFS quota that throttles the container.
 # This replication is NOT needed when the driver publishes node allocatable mappings
 # (driverConfig.publishNodeAllocatableResourceMapping) - see pod_with_resource_claim_node_allocatable.yaml.
 #
@@ -45,7 +46,6 @@ spec:
           cpu: "4" # Replicates the 4 CPUs requested in "container1-claim"
           memory: "2Gi"
         limits:
-          cpu: "4" # Replicates the 4 CPUs requested in "container1-claim"
           memory: "2Gi"
         claims:
           - name: "container1-claim"
@@ -56,7 +56,6 @@ spec:
           cpu: "6" # Replicates the 6 CPUs requested in "container2-claim"
           memory: "2Gi"
         limits:
-          cpu: "6" # Replicates the 6 CPUs requested in "container2-claim"
           memory: "2Gi"
         claims:
           - name: "container2-claim"

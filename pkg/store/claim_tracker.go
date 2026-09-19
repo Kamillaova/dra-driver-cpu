@@ -19,6 +19,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -45,20 +46,35 @@ func (oi OwnerIdent) Equal(x OwnerIdent) bool {
 
 type ClaimTracker struct {
 	mu sync.Mutex
-	// claimUID => podUID(+containerName) mapping.
-	// No claims can be shared by containers or pods
-	// But a container can have more than a claim.
-	ownerByClaimUID map[k8stypes.UID]OwnerIdent
+	// claimUID => the containers holding it, in the order they took it.
+	//
+	// CCX-FORK: upstream binds a claim to one container and refuses every other.
+	// A claim binds to one pod here, and every container of that pod may hold it:
+	// the shape a workload needs when an init container reads the claim's device
+	// metadata to render the configuration the long-running container then uses,
+	// which upstream's rule makes impossible because the init container takes the
+	// binding first and never gives it back.
+	ownersByClaimUID map[k8stypes.UID][]OwnerIdent
+	// reservedForByClaimUID records, for a prepared claim, the pod UIDs its own
+	// status.reservedFor names at Prepare -- the API server's record of intent,
+	// which a pod spec cannot forge the way it can a DRA_CPUSET_* env value.
+	reservedForByClaimUID map[k8stypes.UID][]k8stypes.UID
 }
 
 func NewClaimTracker() *ClaimTracker {
 	return &ClaimTracker{
-		ownerByClaimUID: make(map[k8stypes.UID]OwnerIdent),
+		ownersByClaimUID:      make(map[k8stypes.UID][]OwnerIdent),
+		reservedForByClaimUID: make(map[k8stypes.UID][]k8stypes.UID),
 	}
 }
 
-// SetOwner atomically binds claims to a single container. It returns the claims
-// which were newly bound so callers can roll them back if a later operation fails.
+// SetOwner atomically binds claims to a container. It returns the claims this
+// container newly took, so callers can roll them back if a later operation
+// fails.
+//
+// A claim already held by a container of another pod is refused: its CPUs are
+// the first pod's, and handing them to a second pod would put two workloads on
+// cores each was promised alone.
 func (ctk *ClaimTracker) SetOwner(logger logr.Logger, podUID k8stypes.UID, containerName string, claimUIDs ...k8stypes.UID) ([]k8stypes.UID, error) {
 	if len(claimUIDs) == 0 {
 		return nil, errors.New("no claims to bind")
@@ -71,39 +87,102 @@ func (ctk *ClaimTracker) SetOwner(logger logr.Logger, podUID k8stypes.UID, conta
 	defer ctk.mu.Unlock()
 
 	for _, claimUID := range claimUIDs {
-		owner, ok := ctk.ownerByClaimUID[claimUID]
-		if !ok || owner.Equal(curIdent) {
+		owners := ctk.ownersByClaimUID[claimUID]
+		if len(owners) == 0 || owners[0].PodUID == podUID {
 			continue
 		}
 		return nil, AlreadyOwned{
 			ClaimUID: claimUID,
-			Owner:    owner,
+			Owner:    owners[0],
 		}
 	}
 
 	newlyBound := make([]k8stypes.UID, 0, len(claimUIDs))
 	for _, claimUID := range claimUIDs {
-		if _, ok := ctk.ownerByClaimUID[claimUID]; ok {
-			logger.V(2).Info("claim bound again to the same owner", "claimUID", claimUID)
+		if slices.ContainsFunc(ctk.ownersByClaimUID[claimUID], curIdent.Equal) {
+			logger.V(2).Info("claim bound again to the same container", "claimUID", claimUID)
 			continue
 		}
-		ctk.ownerByClaimUID[claimUID] = curIdent
+		ctk.ownersByClaimUID[claimUID] = append(ctk.ownersByClaimUID[claimUID], curIdent)
 		newlyBound = append(newlyBound, claimUID)
 		logger.V(4).Info("claim bound", "claimUID", claimUID)
 	}
 	return newlyBound, nil
 }
 
+// Owners returns the containers a claim is bound to, in the order they took it,
+// and whether it is bound at all. A claim with no owner is one whose container
+// has not been created yet, or one the driver prepared for a pod that never
+// started.
+func (ctk *ClaimTracker) Owners(claimUID k8stypes.UID) ([]OwnerIdent, bool) {
+	ctk.mu.Lock()
+	defer ctk.mu.Unlock()
+	owners := ctk.ownersByClaimUID[claimUID]
+	if len(owners) == 0 {
+		return nil, false
+	}
+	return slices.Clone(owners), true
+}
+
+// ReleaseOwner undoes one container's binding and leaves everything else in
+// place: the claim's other containers keep theirs, and the reservation recorded
+// at Prepare stays recorded. It is what a CreateContainer that fails after
+// binding rolls back with; Cleanup is Unprepare's, and takes the whole claim.
+func (ctk *ClaimTracker) ReleaseOwner(podUID k8stypes.UID, containerName string, claimUIDs ...k8stypes.UID) {
+	ident := OwnerIdent{
+		PodUID:        podUID,
+		ContainerName: containerName,
+	}
+	ctk.mu.Lock()
+	defer ctk.mu.Unlock()
+	for _, claimUID := range claimUIDs {
+		kept := slices.DeleteFunc(ctk.ownersByClaimUID[claimUID], ident.Equal)
+		if len(kept) == 0 {
+			delete(ctk.ownersByClaimUID, claimUID)
+			continue
+		}
+		ctk.ownersByClaimUID[claimUID] = kept
+	}
+}
+
+// SetReservedFor records the pod UIDs a claim's own reservation names at
+// Prepare, replacing any previously recorded reservation for it.
+func (ctk *ClaimTracker) SetReservedFor(claimUID k8stypes.UID, podUIDs []k8stypes.UID) {
+	ctk.mu.Lock()
+	defer ctk.mu.Unlock()
+	ctk.reservedForByClaimUID[claimUID] = append([]k8stypes.UID(nil), podUIDs...)
+}
+
+// ReservedFor reports whether podUID is one of a claim's reserved consumers.
+// recorded is false when the claim's reservation was never recorded at all
+// (never prepared, or prepared before this driver started tracking it), which
+// callers must not treat the same as an empty reservation.
+func (ctk *ClaimTracker) ReservedFor(claimUID, podUID k8stypes.UID) (reserved, recorded bool) {
+	ctk.mu.Lock()
+	defer ctk.mu.Unlock()
+	podUIDs, ok := ctk.reservedForByClaimUID[claimUID]
+	if !ok {
+		return false, false
+	}
+	for _, p := range podUIDs {
+		if p == podUID {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 func (ctk *ClaimTracker) Cleanup(claimUIDs ...k8stypes.UID) {
 	ctk.mu.Lock()
 	defer ctk.mu.Unlock()
 	for _, claimUID := range claimUIDs {
-		delete(ctk.ownerByClaimUID, claimUID)
+		delete(ctk.ownersByClaimUID, claimUID)
+		delete(ctk.reservedForByClaimUID, claimUID)
 	}
 }
 
 func (ctk *ClaimTracker) Len() int {
 	ctk.mu.Lock()
 	defer ctk.mu.Unlock()
-	return len(ctk.ownerByClaimUID)
+	return len(ctk.ownersByClaimUID)
 }

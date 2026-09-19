@@ -58,6 +58,9 @@ spec:
           mountPath: /var/run/nri
         - name: cdi-dir
           mountPath: /var/run/cdi
+        - name: host-cgroup
+          mountPath: /sys/fs/cgroup
+          readOnly: true
       volumes:
       - name: device-plugin
         hostPath:
@@ -72,3 +75,7 @@ spec:
         hostPath:
           path: /var/run/cdi
           type: DirectoryOrCreate
+      - name: host-cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+          type: Directory
