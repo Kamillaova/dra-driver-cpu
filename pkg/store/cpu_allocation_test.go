@@ -67,7 +67,7 @@ func TestCPUAllocationPreparedLifecycle(t *testing.T) {
 	require.True(t, store.GetSharedCPUs().Equals(cpuset.New(2, 3)))
 	require.Error(t, store.ReserveResourceClaimAllocation(logger, "claim-2", exclusiveRequest(claimCPUs), false))
 
-	union, err := store.GetResourceClaimAllocationUnion(claimUID)
+	union, err := store.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: claimUID})
 	require.NoError(t, err)
 	require.True(t, union.Equals(claimCPUs))
 	require.True(t, store.GetSharedCPUs().Equals(cpuset.New(2, 3)))
@@ -429,7 +429,7 @@ func BenchmarkGetSharedCPUs(b *testing.B) {
 	}
 }
 
-func TestGetResourceClaimAllocationUnion(t *testing.T) {
+func TestGetRequestAllocationUnionOverWholeClaims(t *testing.T) {
 	logger := testr.New(t)
 	store := newTestCPUAllocation(logger, cpuset.New(0, 1, 2, 3, 4, 5), cpuset.New())
 	requirePreparedAllocation(t, logger, store, "claim-1", cpuset.New(0, 1))
@@ -471,7 +471,11 @@ func TestGetResourceClaimAllocationUnion(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := store.GetResourceClaimAllocationUnion(tc.claimUIDs...)
+			refs := make([]ClaimRequestRef, 0, len(tc.claimUIDs))
+			for _, claimUID := range tc.claimUIDs {
+				refs = append(refs, ClaimRequestRef{ClaimUID: claimUID})
+			}
+			got, err := store.GetRequestAllocationUnion(refs...)
 			if tc.expectedError != "" {
 				require.EqualError(t, err, tc.expectedError)
 				require.True(t, got.IsEmpty())
@@ -835,13 +839,13 @@ func TestOnlyExclusiveRequestsAreWithheldFromOtherClaims(t *testing.T) {
 		"claim-2": cpuset.New(2, 3),
 	}, store.ExclusiveClaimAllocations())
 
-	union, err := store.GetResourceClaimAllocationUnion("claim-1")
+	union, err := store.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: "claim-1"})
 	require.NoError(t, err)
 	require.Equal(t, cpuset.New(0, 1, 6, 7), union, "a container gets the CPUs of every request, pools included")
 
-	require.True(t, store.HoldsExclusiveCPUs("claim-1"))
-	require.False(t, store.HoldsExclusiveCPUs("claim-3"))
-	require.False(t, store.HoldsExclusiveCPUs("claim-absent"))
+	require.True(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-1"}))
+	require.False(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-3"}))
+	require.False(t, store.HoldsExclusiveCPUsOf(ClaimRequestRef{ClaimUID: "claim-absent"}))
 
 	store.RemoveResourceClaimAllocation(logger, "claim-3")
 	require.Equal(t, cpuset.New(4, 5, 6, 7), store.GetSharedCPUs(), "a claim holding only pool CPUs releases none")

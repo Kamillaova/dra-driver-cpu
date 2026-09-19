@@ -232,12 +232,12 @@ func (cp *CPUDriver) readBackOf(logger logr.Logger, step []defrag.Move) readBack
 				logger.Error(err, "cannot read a container's CPUs back", "claimUID", move.ClaimUID)
 				return readBackUnknown
 			}
-			forward, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(state.ClaimUIDs()...)
+			forward, err := cp.cpuAllocationStore.GetRequestAllocationUnion(state.ClaimRequests()...)
 			if err != nil {
 				logger.Error(err, "cannot say where a container belongs", "claimUID", move.ClaimUID)
 				return readBackUnknown
 			}
-			origin, err := cp.cpuAllocationStore.GetResourceClaimOriginUnion(state.ClaimUIDs()...)
+			origin, err := cp.cpuAllocationStore.GetRequestOriginUnion(state.ClaimRequests()...)
 			if err != nil {
 				logger.Error(err, "cannot say where a container came from", "claimUID", move.ClaimUID)
 				return readBackUnknown

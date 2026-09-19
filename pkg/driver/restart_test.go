@@ -587,7 +587,7 @@ func TestRevertRoundOriginPicksTheRequestTheRoundMoved(t *testing.T) {
 		},
 		Round: &store.RoundProvenance{RoundID: "r", Origin: cpuset.New(0, 1), Target: cpuset.New(2, 3)},
 	}
-	require.True(t, revertRoundOrigin(&record))
+	require.True(t, revertRoundOrigin(nil, &record))
 	require.Equal(t, cpuset.New(6, 7), record.Requests[0].CPUs, "the pool share never moves")
 	require.Equal(t, cpuset.New(0, 1), record.Requests[1].CPUs)
 
@@ -599,7 +599,7 @@ func TestRevertRoundOriginPicksTheRequestTheRoundMoved(t *testing.T) {
 		},
 		Round: &store.RoundProvenance{RoundID: "r", Origin: cpuset.New(0, 1, 2), Target: cpuset.New(4, 5, 6)},
 	}
-	require.True(t, revertRoundOrigin(&split))
+	require.True(t, revertRoundOrigin(nil, &split))
 	require.Equal(t, cpuset.New(0), split.Requests[0].CPUs)
 	require.Equal(t, cpuset.New(1, 2), split.Requests[1].CPUs)
 
@@ -609,6 +609,6 @@ func TestRevertRoundOriginPicksTheRequestTheRoundMoved(t *testing.T) {
 		Requests: []store.RequestAllocation{{Request: "vcpus", CPUs: cpuset.New(8, 9), Role: store.RoleExclusive}},
 		Round:    &store.RoundProvenance{RoundID: "r", Origin: cpuset.New(0, 1), Target: cpuset.New(2, 3)},
 	}
-	require.False(t, revertRoundOrigin(&moved))
+	require.False(t, revertRoundOrigin(nil, &moved))
 	require.Equal(t, cpuset.New(8, 9), moved.Requests[0].CPUs)
 }

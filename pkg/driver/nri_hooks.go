@@ -28,6 +28,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -74,11 +75,13 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 			}
 			containerUID := types.UID(container.GetId())
 			var claimUIDs []types.UID
+			var refs []store.ClaimRequestRef
+			requestsByClaim := map[types.UID][]string{}
 			reportedCDIDevices := runtimeCDIDevices(container)
 			for _, entry := range entries {
 				uid := entry.claimUID
-				caLogger := cLogger.WithValues("claimUID", uid)
-				if !claimInjectedByRuntime(reportedCDIDevices, uid) {
+				caLogger := cLogger.WithValues("claimUID", uid, "request", entry.request)
+				if !claimInjectedByRuntime(reportedCDIDevices, entry) {
 					caLogger.Info("ignoring claim the runtime injected no CDI device for during synchronize")
 					continue
 				}
@@ -106,13 +109,24 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 					continue
 				}
 				desired := store.UnionOf(recorded.Requests)
-				if !entry.dynamic && !desired.Equals(entry.cpus) {
+				// What this container was given, which is one request of the
+				// claim where its variable named one.
+				held := desired
+				if entry.request != "" {
+					request, ok := requestOf(recorded, entry.request)
+					if !ok {
+						caLogger.Info("ignoring a request the claim's record does not hold during synchronize")
+						continue
+					}
+					held = request.CPUs
+				}
+				if !entry.dynamic && !held.Equals(entry.cpus) {
 					// Expected whenever the claim was moved after its container
 					// started. The ContainerUpdate below carries the container to
 					// the desired set, so log and converge rather than dropping
 					// the claim and leaking its CPUs into the shared pool.
 					caLogger.V(2).Info("container was created for a cpuset the claim has since left, converging",
-						"createdWithCPUs", entry.cpus.String(), "desiredCPUs", desired.String())
+						"createdWithCPUs", entry.cpus.String(), "desiredCPUs", held.String())
 				}
 				// An overlapping claim rebuilt earlier in this call must not fail
 				// the whole synchronize; skip it instead of leaving every other pod
@@ -135,25 +149,31 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				if len(recorded.ReservedFor) > 0 {
 					claimTracker.SetReservedFor(uid, recorded.ReservedFor)
 				}
-				claimUIDs = append(claimUIDs, uid)
+				if !slices.Contains(claimUIDs, uid) {
+					claimUIDs = append(claimUIDs, uid)
+				}
+				refs = append(refs, entry.ref())
+				if entry.request != "" {
+					requestsByClaim[uid] = append(requestsByClaim[uid], entry.request)
+				}
 			}
 
 			// CCX-FORK: upstream binds every claim the container names.
-			if owned := exclusiveClaimUIDs(cpuAllocationStore, claimUIDs); len(owned) > 0 {
+			if owned := exclusiveClaimUIDs(cpuAllocationStore, refs); len(owned) > 0 {
 				if _, err := claimTracker.SetOwner(cLogger, types.UID(pod.Uid), container.Name, owned...); err != nil {
 					// An inconsistency in the runtime's own reported state, not a
 					// reason to fail every other pod and container being
 					// synchronized: treat this container as unclaimed instead.
 					cLogger.Error(err, "treating container as unclaimed: its claim ownership conflicts with an earlier one during synchronize")
 					cp.metrics.RecordSynchronizeSkippedClaim()
-					claimUIDs = nil
+					claimUIDs, refs = nil, nil
 				}
 			}
 			var state *store.ContainerState
 			if len(claimUIDs) == 0 {
 				state = store.NewContainerState(container.GetName(), containerUID).WithCgroup(container.GetLinux().GetCgroupsPath())
 			} else {
-				allGuaranteedCPUs, err := cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
+				allGuaranteedCPUs, err := cpuAllocationStore.GetRequestAllocationUnion(refs...)
 				if err != nil {
 					return nil, err
 				}
@@ -162,21 +182,21 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				if linux := container.GetLinux(); linux != nil {
 					cgroupsPath = linux.GetCgroupsPath()
 				}
-				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...).WithCgroup(cgroupsPath)
+				state = store.NewContainerState(container.GetName(), containerUID, claimUIDs...).
+					WithClaimRequests(requestsByClaim).
+					WithCgroup(cgroupsPath)
 
 				originUnion := cpuset.New()
 				targetUnion := cpuset.New()
 				hadRound := false
-				for _, uid := range claimUIDs {
-					rec, err := cp.cdiMgr.GetDeviceAllocations(getCDIDeviceName(uid))
+				for _, ref := range refs {
+					rec, err := cp.cdiMgr.GetDeviceAllocations(getCDIDeviceName(ref.ClaimUID))
 					if err == nil && rec.Round != nil && rec.Round.RoundID != "" {
 						hadRound = true
-						// A round carries only the claim's exclusive CPUs; a pool share
-						// stays where it is, and the container runs on both.
-						pool := nonExclusiveCPUs(rec)
-						originUnion = originUnion.Union(rec.Round.Origin).Union(pool)
-						targetUnion = targetUnion.Union(rec.Round.Target).Union(pool)
-					} else if claimCPUs, ok := cpuAllocationStore.GetResourceClaimAllocation(uid); ok {
+						origin, target := roundCPUsOf(cp.topology.cpuTopology, rec, ref.Request)
+						originUnion = originUnion.Union(origin)
+						targetUnion = targetUnion.Union(target)
+					} else if claimCPUs, err := cpuAllocationStore.GetRequestAllocationUnion(ref); err == nil {
 						originUnion = originUnion.Union(claimCPUs)
 						targetUnion = targetUnion.Union(claimCPUs)
 					}
@@ -356,33 +376,94 @@ func (cp *CPUDriver) restoreUnstartedClaims(logger logr.Logger, allocations *sto
 // A record whose exclusive requests no longer add up to the round's target is
 // left alone: something has already rewritten it, and guessing which request the
 // origin belongs to is how a claim ends up holding CPUs twice.
-func revertRoundOrigin(record *store.ClaimRecord) bool {
-	if record.Round == nil {
+func revertRoundOrigin(topo *cpuinfo.CPUTopology, record *store.ClaimRecord) bool {
+	origin, ok := roundOriginByRequest(topo, *record)
+	if !ok {
 		return false
+	}
+	for i, request := range record.Requests {
+		if cpus, moved := origin[request.Request]; moved {
+			record.Requests[i].CPUs = cpus
+		}
+	}
+	return true
+}
+
+// roundOriginByRequest is where each exclusive request of a claim was before the
+// round in flight, and whether the record supports the question at all.
+//
+// The origin is spread over the exclusive requests exactly as the target was
+// spread over them, through the same function, so that a rollback puts a
+// container back where it started rather than somewhere the same size. A
+// request that is not exclusive is absent, since a pool never moves.
+func roundOriginByRequest(topo *cpuinfo.CPUTopology, record store.ClaimRecord) (map[string]cpuset.CPUSet, bool) {
+	if record.Round == nil {
+		return nil, false
 	}
 	origin, target := record.Round.Origin, record.Round.Target
 	if origin.IsEmpty() || origin.Size() != target.Size() {
-		return false
+		return nil, false
 	}
-	var moved []int
+	var moved []store.RequestAllocation
 	union := cpuset.New()
-	for i, request := range record.Requests {
+	for _, request := range record.Requests {
 		if request.Role != store.RoleExclusive {
 			continue
 		}
-		moved = append(moved, i)
+		moved = append(moved, request)
 		union = union.Union(request.CPUs)
 	}
 	if !union.Equals(target) {
-		return false
+		return nil, false
 	}
-	cpuIDs := origin.List()
-	for _, i := range moved {
-		size := record.Requests[i].CPUs.Size()
-		record.Requests[i].CPUs = cpuset.New(cpuIDs[:size]...)
-		cpuIDs = cpuIDs[size:]
+	sizes := make([]int, len(moved))
+	for i, request := range moved {
+		sizes[i] = request.CPUs.Size()
 	}
-	return true
+	byRequest := make(map[string]cpuset.CPUSet, len(moved))
+	for i, cpus := range store.SpreadExclusive(topo, origin, sizes) {
+		byRequest[moved[i].Request] = cpus
+	}
+	return byRequest, true
+}
+
+// roundCPUsOf is where a round moved what a container holds from, and where it
+// moved it to: the whole claim where the container named no request, and that
+// one request's share otherwise.
+//
+// A record whose requests no longer add up to the round's target answers with
+// the claim as a whole, which is what the round itself recorded. Something has
+// rewritten the placement, and guessing which request an origin belongs to is
+// how a container ends up pinned to CPUs another claim holds.
+func roundCPUsOf(topo *cpuinfo.CPUTopology, record store.ClaimRecord, request string) (cpuset.CPUSet, cpuset.CPUSet) {
+	// A round carries only the claim's exclusive CPUs; a pool share stays where
+	// it is, and the container runs on both.
+	pool := nonExclusiveCPUs(record)
+	if request == "" {
+		return record.Round.Origin.Union(pool), record.Round.Target.Union(pool)
+	}
+	held, ok := requestOf(record, request)
+	if !ok {
+		return record.Round.Origin.Union(pool), record.Round.Target.Union(pool)
+	}
+	if held.Role != store.RoleExclusive {
+		return held.CPUs, held.CPUs
+	}
+	origin, ok := roundOriginByRequest(topo, record)
+	if !ok {
+		return record.Round.Origin.Union(pool), record.Round.Target.Union(pool)
+	}
+	return origin[request], held.CPUs
+}
+
+// requestOf returns what a claim's record says one of its requests holds.
+func requestOf(record store.ClaimRecord, request string) (store.RequestAllocation, bool) {
+	for _, held := range record.Requests {
+		if held.Request == request {
+			return held, true
+		}
+	}
+	return store.RequestAllocation{}, false
 }
 
 func nonExclusiveCPUs(record store.ClaimRecord) cpuset.CPUSet {
@@ -500,11 +581,15 @@ func (cp *CPUDriver) checkClaimPartition(logger logr.Logger, cpus cpuset.CPUSet)
 
 // A claim given no CPUs of its own takes nothing away from anything else, so it
 // binds to no single container and several containers and pods may reference it.
-func exclusiveClaimUIDs(allocations *store.CPUAllocation, claimUIDs []types.UID) []types.UID {
+//
+// Asked of the requests the container was given rather than of the claim: a
+// container holding only a share of a pool binds nothing to itself, even where
+// another request of the same claim holds CPUs that claim alone may use.
+func exclusiveClaimUIDs(allocations *store.CPUAllocation, refs []store.ClaimRequestRef) []types.UID {
 	var owned []types.UID
-	for _, claimUID := range claimUIDs {
-		if allocations.HoldsExclusiveCPUs(claimUID) {
-			owned = append(owned, claimUID)
+	for _, ref := range refs {
+		if allocations.HoldsExclusiveCPUsOf(ref) && !slices.Contains(owned, ref.ClaimUID) {
+			owned = append(owned, ref.ClaimUID)
 		}
 	}
 	return owned
@@ -527,37 +612,62 @@ func runtimeCDIDevices(ctr *api.Container) map[string]struct{} {
 	return names
 }
 
-// claimInjectedByRuntime reports whether the runtime confirms this driver's CDI
-// device for claimUID was injected into the container.
+// claimInjectedByRuntime reports whether the runtime confirms that the CDI
+// device this driver wrote for what the entry names was injected into the
+// container.
 //
 // The DRA_CPUSET entry a container carries comes from its own pod spec, so a pod
 // can name another pod's claim and, by winning the race to CreateContainer, take
 // that claim's CPUs. The runtime's own record of the CDI devices kubelet asked it
 // to inject cannot be forged that way, which makes it the stronger signal.
 //
+// Asked per request rather than per claim: the kubelet injects a request's
+// device only into the containers whose pod names that request, so a container
+// given one request of a claim cannot reach the rest of it by inventing their
+// variables.
+//
 // reported must come from runtimeCDIDevices. A nil map means the runtime does not
 // report CDI devices, and this returns true so the remaining checks decide.
-func claimInjectedByRuntime(reported map[string]struct{}, claimUID types.UID) bool {
+func claimInjectedByRuntime(reported map[string]struct{}, entry draEnvEntry) bool {
 	if reported == nil {
 		return true
 	}
-	_, ok := reported[cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName(claimUID))]
+	deviceName := getCDIDeviceName(entry.claimUID)
+	if entry.request != "" {
+		deviceName = getCDIRequestDeviceName(entry.claimUID, entry.request)
+	}
+	_, ok := reported[cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName)]
 	return ok
 }
 
 // draEnvEntry is one DRA_CPUSET_* variable a container carries.
 type draEnvEntry struct {
 	claimUID types.UID
+	// request is the request of the claim this variable was injected for, and is
+	// empty for a variable naming the claim alone -- which is what a container
+	// created before the driver wrote one device per request carries.
+	request string
 	// cpus is the placement the value named, and is unset when dynamic is true:
 	// a claim whose placement may change has none to name.
 	cpus    cpuset.CPUSet
 	dynamic bool
 }
 
-// parseDRAEnv returns the claims a container's environment names.
+// ref is what the container holds of a claim, as the allocation store addresses
+// it.
+func (e draEnvEntry) ref() store.ClaimRequestRef {
+	return store.ClaimRequestRef{ClaimUID: e.claimUID, Request: e.request}
+}
+
+// parseDRAEnv returns the claims a container's environment names, and which of
+// their requests.
+//
+// The key is DRA_CPUSET_<claim UID>[_<request>]. Neither a claim UID nor a
+// request name carries an underscore, so the first one separates them.
 //
 // CCX-FORK: upstream returns only claim-to-cpuset pairs, since to it the value is
-// the placement. Here the name is what matters and the value may say "dynamic".
+// the placement and a claim is one cpuset. Here the name is what matters, the
+// value may say "dynamic", and a container may hold one request of a claim.
 func parseDRAEnv(logger logr.Logger, envs []string) ([]draEnvEntry, error) {
 	var entries []draEnvEntry
 	for _, env := range envs {
@@ -569,12 +679,13 @@ func parseDRAEnv(logger logr.Logger, envs []string) ([]draEnvEntry, error) {
 		if !found {
 			return nil, fmt.Errorf("malformed DRA env entry %q", env)
 		}
-		uidStr, ok := strings.CutPrefix(key, cdiEnvVarPrefix+"_")
+		name, ok := strings.CutPrefix(key, cdiEnvVarPrefix+"_")
 		if !ok {
 			continue
 		}
+		uidStr, request, _ := strings.Cut(name, "_")
 
-		entry := draEnvEntry{claimUID: types.UID(uidStr)}
+		entry := draEnvEntry{claimUID: types.UID(uidStr), request: request}
 		if value == cdiEnvDynamicValue {
 			entry.dynamic = true
 		} else {
@@ -706,36 +817,49 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		// applied at its current placement rather than at the stale one the
 		// container's immutable environment carries.
 		claimUIDs := []types.UID{}
+		refs := []store.ClaimRequestRef{}
+		requestsByClaim := map[types.UID][]string{}
 		reportedCDIDevices := runtimeCDIDevices(ctr)
 		for _, entry := range entries {
-			if !claimInjectedByRuntime(reportedCDIDevices, entry.claimUID) {
-				return nil, nil, fmt.Errorf("container claims %q but the runtime injected no CDI device for it", entry.claimUID)
+			if !claimInjectedByRuntime(reportedCDIDevices, entry) {
+				return nil, nil, fmt.Errorf("container claims %q request %q but the runtime injected no CDI device for it", entry.claimUID, entry.request)
 			}
 			if reportedCDIDevices == nil {
 				// The runtime reports no CDI devices at all (CRI-O today); fall
 				// back to the claim's own API-server reservation, which a pod
 				// spec cannot forge the way it can a DRA_CPUSET_* env value.
+				// It answers for the claim, so a container there is trusted
+				// about which of its requests it holds.
 				if reserved, recorded := cp.claimTracker.ReservedFor(entry.claimUID, podUID); !reserved || !recorded {
 					return nil, nil, fmt.Errorf("container claims %q but the pod is not in its reservation", entry.claimUID)
 				}
 			}
-			claimUIDs = append(claimUIDs, entry.claimUID)
+			if !slices.Contains(claimUIDs, entry.claimUID) {
+				claimUIDs = append(claimUIDs, entry.claimUID)
+			}
+			refs = append(refs, entry.ref())
+			if entry.request != "" {
+				requestsByClaim[entry.claimUID] = append(requestsByClaim[entry.claimUID], entry.request)
+			}
 		}
+		claimCount = len(claimUIDs)
 		// CCX-FORK: upstream binds every claim the container names.
 		var newOwners []types.UID
-		if owned := exclusiveClaimUIDs(cp.cpuAllocationStore, claimUIDs); len(owned) > 0 {
+		if owned := exclusiveClaimUIDs(cp.cpuAllocationStore, refs); len(owned) > 0 {
 			newOwners, err = cp.claimTracker.SetOwner(logger, podUID, ctr.Name, owned...)
 			if err != nil {
 				return nil, nil, err
 			}
 		}
-		guaranteedCPUs, err := cp.cpuAllocationStore.GetResourceClaimAllocationUnion(claimUIDs...)
+		guaranteedCPUs, err := cp.cpuAllocationStore.GetRequestAllocationUnion(refs...)
 		if err != nil {
 			cp.claimTracker.ReleaseOwner(podUID, ctr.Name, newOwners...)
 			return nil, nil, err
 		}
 		logger.V(2).Info("guaranteed CPUs found", "cpus", guaranteedCPUs.String())
-		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...).WithCgroup(ctr.GetLinux().GetCgroupsPath())
+		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...).
+			WithClaimRequests(requestsByClaim).
+			WithCgroup(ctr.GetLinux().GetCgroupsPath())
 		adjust.SetLinuxCPUSetCPUs(guaranteedCPUs.String())
 		// A container that has just taken a claim may be the first to hold it, so
 		// existing shared containers must be moved off the newly claimed CPUs.
@@ -921,7 +1045,7 @@ func (cp *CPUDriver) reconcileActiveRounds(logger logr.Logger) {
 
 		logger.Info("active defrag round is incomplete, reverting to origin", "roundID", roundID, "participants", len(participants))
 		for uid, rec := range participants {
-			if !revertRoundOrigin(&rec) {
+			if !revertRoundOrigin(cp.topology.cpuTopology, &rec) {
 				logger.Error(nil, "leaving an incomplete round's CDI spec as written: its requests do not hold the CPUs the round moved",
 					"roundID", roundID, "claimUID", uid, "target", rec.Round.Target.String(), "origin", rec.Round.Origin.String())
 				continue
@@ -929,6 +1053,9 @@ func (cp *CPUDriver) reconcileActiveRounds(logger logr.Logger) {
 			envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, uid, cp.cdiEnvValue(rec))
 			if err := cp.cdiMgr.AddDevice(logger, getCDIDeviceName(uid), envVar, rec); err != nil {
 				logger.Error(err, "failed to revert incomplete round CDI spec", "roundID", roundID, "claimUID", uid)
+			}
+			if _, err := cp.prepareRequestDevices(logger, uid, rec); err != nil {
+				logger.Error(err, "failed to revert an incomplete round's per-request CDI specs", "roundID", roundID, "claimUID", uid)
 			}
 		}
 		_ = cp.cdiMgr.Refresh()

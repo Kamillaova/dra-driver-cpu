@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
+	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
@@ -1764,4 +1765,285 @@ func TestReportForeignCPUsIsSilentWhereNothingOverlaps(t *testing.T) {
 	events, err := client.CoreV1().Events("default").List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 	require.Empty(t, events.Items)
+}
+
+// twoRequestClaimDriver is a driver holding one claim of two requests: CPUs 0-1
+// the claim holds alone, and a share of a pool on 2-3.
+func twoRequestClaimDriver(t *testing.T, claimUID types.UID) *CPUDriver {
+	t.Helper()
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for _, cpuID := range cpuset.New(0, 1, 2, 3, 4, 5).UnsortedList() {
+		infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, claimUID, store.ClaimRecord{Requests: []store.RequestAllocation{
+		{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")},
+		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive},
+	}}, false))
+	tracker := store.NewClaimTracker()
+	tracker.SetReservedFor(claimUID, []types.UID{"pod-1"})
+	return &CPUDriver{
+		podConfigStore:     store.NewPodConfig(),
+		cpuAllocationStore: cpuStore,
+		claimTracker:       tracker,
+		topology:           deviceTopology{cpuTopology: topo},
+		cdiMgr:             newMockCdiMgr(),
+		metrics:            cpumetrics.Noop(),
+	}
+}
+
+// requestEnv is the variable the kubelet injects for one request of a claim,
+// with the CDI device name the runtime reports for it.
+func requestEnv(claimUID types.UID, request, cpus string) (string, string) {
+	return fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claimUID, request, cpus),
+		cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIRequestDeviceName(claimUID, request))
+}
+
+func TestCreateContainerPinsAContainerToTheRequestsItNames(t *testing.T) {
+	claimUID := types.UID("claim-1")
+	driver := twoRequestClaimDriver(t, claimUID)
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-1", Name: "vm", Namespace: "ns"}
+
+	vcpusEnv, vcpusDevice := requestEnv(claimUID, "vcpus", "0-1")
+	helpersEnv, helpersDevice := requestEnv(claimUID, "helpers", "2-3")
+
+	create := func(name string, env []string, devices ...string) *api.ContainerAdjustment {
+		t.Helper()
+		ctr := &api.Container{Id: "ctr-" + name, PodSandboxId: pod.Id, Name: name, Env: env}
+		for _, device := range devices {
+			ctr.CDIDevices = append(ctr.CDIDevices, &api.CDIDevice{Name: device})
+		}
+		adjustment, _, err := driver.CreateContainer(context.Background(), pod, ctr)
+		require.NoError(t, err)
+		return adjustment
+	}
+
+	require.Equal(t, "0-1", create("vcpus", []string{vcpusEnv}, vcpusDevice).Linux.Resources.Cpu.Cpus,
+		"a container naming one request is pinned to that request's CPUs, not to the whole claim")
+	require.Equal(t, "2-3", create("helpers", []string{helpersEnv}, helpersDevice).Linux.Resources.Cpu.Cpus)
+	require.Equal(t, "0-3", create("both", []string{vcpusEnv, helpersEnv}, vcpusDevice, helpersDevice).Linux.Resources.Cpu.Cpus)
+
+	// A container created before the driver wrote one device per request carries
+	// the claim's own variable, and still holds the claim whole.
+	claimWide := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-1")
+	require.Equal(t, "0-3", create("legacy", []string{claimWide},
+		cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName(claimUID))).Linux.Resources.Cpu.Cpus)
+
+	owners, owned := driver.claimTracker.Owners(claimUID)
+	require.True(t, owned)
+	var names []string
+	for _, owner := range owners {
+		names = append(names, owner.ContainerName)
+	}
+	require.NotContains(t, names, "helpers",
+		"a container given only a share of a pool binds nothing to itself")
+	require.Contains(t, names, "vcpus")
+}
+
+func TestCreateContainerRefusesARequestItWasNotGiven(t *testing.T) {
+	claimUID := types.UID("claim-1")
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-1", Name: "vm", Namespace: "ns"}
+	vcpusEnv, vcpusDevice := requestEnv(claimUID, "vcpus", "0-1")
+	helpersEnv, _ := requestEnv(claimUID, "helpers", "2-3")
+	inventedEnv, inventedDevice := requestEnv(claimUID, "invented", "4-5")
+
+	t.Run("a request the runtime injected no device for", func(t *testing.T) {
+		driver := twoRequestClaimDriver(t, claimUID)
+		ctr := &api.Container{
+			Id: "ctr-1", PodSandboxId: pod.Id, Name: "helpers",
+			Env:        []string{vcpusEnv, helpersEnv},
+			CDIDevices: []*api.CDIDevice{{Name: vcpusDevice}},
+		}
+		_, _, err := driver.CreateContainer(context.Background(), pod, ctr)
+		require.ErrorContains(t, err, "helpers")
+	})
+
+	t.Run("a request the claim does not hold", func(t *testing.T) {
+		driver := twoRequestClaimDriver(t, claimUID)
+		ctr := &api.Container{
+			Id: "ctr-1", PodSandboxId: pod.Id, Name: "app",
+			Env:        []string{inventedEnv},
+			CDIDevices: []*api.CDIDevice{{Name: inventedDevice}},
+		}
+		_, _, err := driver.CreateContainer(context.Background(), pod, ctr)
+		require.ErrorContains(t, err, "invented",
+			"a request no claim holds is refused rather than answered with no CPUs at all")
+	})
+}
+
+// TestRecoveryReadsOnlyAClaimsRecordDevice: the per-request devices carry a
+// variable and no record, so a driver that read them back as claims would
+// recover a claim whose UID is a UID and a request name run together, holding
+// the CPUs of one request as if they were the whole claim's.
+func TestRecoveryReadsOnlyAClaimsRecordDevice(t *testing.T) {
+	logger := testr.New(t)
+	claimUID := types.UID("claim-1")
+	mgr := newMockCdiMgr()
+	record := store.ClaimRecord{Requests: []store.RequestAllocation{
+		{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")},
+		{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive},
+	}}
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName(claimUID),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-3"), record))
+	for _, request := range record.Requests {
+		env, _ := requestEnv(claimUID, request.Request, request.CPUs.String())
+		require.NoError(t, mgr.AddRequestDevice(logger, getCDIRequestDeviceName(claimUID, request.Request), env))
+	}
+
+	recovered := mgr.PreparedClaimAllocations(logger)
+	require.Len(t, recovered, 1)
+	require.Equal(t, record.Requests, recovered[claimUID].Requests)
+}
+
+// TestRoundOriginInvertsTheMoveItReverses: the origin a container is rolled back
+// to is read by spreading the round's origin over the same requests the target
+// was spread over, so the two have to divide a set the same way. A reverse that
+// merely gave each request the right number of CPUs would put a container back
+// on CPUs its own claim never held there.
+func TestRoundOriginInvertsTheMoveItReverses(t *testing.T) {
+	logger := testr.New(t)
+	var infos []cpuinfo.CPUInfo
+	for core := 0; core < 16; core++ {
+		infos = append(infos,
+			cpuinfo.CPUInfo{CpuID: core, CoreID: core, SocketID: 0, NUMANodeID: 0},
+			cpuinfo.CPUInfo{CpuID: core + 128, CoreID: core, SocketID: 0, NUMANodeID: 0},
+		)
+	}
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+	require.NoError(t, err)
+
+	origin := cpuset.New(0, 1, 2, 3, 128, 129, 130, 131)
+	target := cpuset.New(8, 9, 10, 11, 136, 137, 138, 139)
+	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, "claim-1", store.ClaimRecord{Requests: []store.RequestAllocation{
+		{Request: "alpha", CPUs: cpuset.New(0, 1, 128, 129), Role: store.RoleExclusive},
+		{Request: "beta", CPUs: cpuset.New(2, 3, 130, 131), Role: store.RoleExclusive},
+	}}, false))
+	require.NoError(t, cpuStore.BeginRebind(logger, "claim-1", target))
+
+	moved, ok := cpuStore.GetClaimRecord("claim-1")
+	require.True(t, ok)
+	moved.Round = &store.RoundProvenance{RoundID: "round-1", Origin: origin, Target: target}
+
+	for _, request := range []string{"alpha", "beta"} {
+		back, forward := roundCPUsOf(topo, moved, request)
+		require.Equal(t, forward, requestCPUs(t, moved, request),
+			"the target of %q is what the store placed it on", request)
+		require.Equal(t, back, requestCPUs(t, beforeTheMove(t, logger, topo, origin), request),
+			"the origin of %q is where the same spread would have put it", request)
+		require.Equal(t, back, topo.CPUDetails.CompleteCores(back),
+			"request %q rolls back onto whole cores", request)
+	}
+}
+
+// beforeTheMove is the same claim placed on origin, which is what the claim
+// looked like before the round started.
+func beforeTheMove(t *testing.T, logger logr.Logger, topo *cpuinfo.CPUTopology, origin cpuset.CPUSet) store.ClaimRecord {
+	t.Helper()
+	cpuStore := store.NewCPUAllocation(topo, cpuset.New())
+	require.NoError(t, cpuStore.ReserveResourceClaimAllocation(logger, "claim-1", store.ClaimRecord{Requests: []store.RequestAllocation{
+		{Request: "alpha", CPUs: cpuset.New(0, 1, 128, 129), Role: store.RoleExclusive},
+		{Request: "beta", CPUs: cpuset.New(2, 3, 130, 131), Role: store.RoleExclusive},
+	}}, false))
+	require.NoError(t, cpuStore.BeginRebind(logger, "claim-1", origin))
+	record, ok := cpuStore.GetClaimRecord("claim-1")
+	require.True(t, ok)
+	return record
+}
+
+func requestCPUs(t *testing.T, record store.ClaimRecord, request string) cpuset.CPUSet {
+	t.Helper()
+	held, ok := requestOf(record, request)
+	require.True(t, ok)
+	return held.CPUs
+}
+
+func TestRoundCPUsOfProjectsAMoveOntoOneRequest(t *testing.T) {
+	// The round moved the claim's exclusive CPUs from 0-3 to 8-11 as a whole, and
+	// the record spreads the target over the exclusive requests in name order,
+	// each keeping its size: dpdk two, vcpus two.
+	record := store.ClaimRecord{
+		Requests: []store.RequestAllocation{
+			{Request: "ctrl", CPUs: cpuset.New(20, 21), Role: store.Role("shared")},
+			{Request: "dpdk", CPUs: cpuset.New(8, 9), Role: store.RoleExclusive},
+			{Request: "vcpus", CPUs: cpuset.New(10, 11), Role: store.RoleExclusive},
+		},
+		Round: &store.RoundProvenance{
+			RoundID: "round-1",
+			Origin:  cpuset.New(0, 1, 2, 3),
+			Target:  cpuset.New(8, 9, 10, 11),
+		},
+	}
+
+	origin, target := roundCPUsOf(nil, record, "dpdk")
+	require.Equal(t, cpuset.New(0, 1), origin)
+	require.Equal(t, cpuset.New(8, 9), target)
+
+	origin, target = roundCPUsOf(nil, record, "vcpus")
+	require.Equal(t, cpuset.New(2, 3), origin)
+	require.Equal(t, cpuset.New(10, 11), target)
+
+	origin, target = roundCPUsOf(nil, record, "ctrl")
+	require.Equal(t, cpuset.New(20, 21), origin, "a pool share is where it always was")
+	require.Equal(t, cpuset.New(20, 21), target)
+
+	origin, target = roundCPUsOf(nil, record, "")
+	require.Equal(t, cpuset.New(0, 1, 2, 3, 20, 21), origin, "a container naming no request moves with the whole claim")
+	require.Equal(t, cpuset.New(8, 9, 10, 11, 20, 21), target)
+
+	// A record whose exclusive requests no longer add up to the target answers
+	// for the claim rather than guessing which request an origin belongs to.
+	rewritten := record
+	rewritten.Requests = []store.RequestAllocation{{Request: "dpdk", CPUs: cpuset.New(8, 9), Role: store.RoleExclusive}}
+	origin, target = roundCPUsOf(nil, rewritten, "dpdk")
+	require.Equal(t, cpuset.New(0, 1, 2, 3), origin)
+	require.Equal(t, cpuset.New(8, 9, 10, 11), target)
+}
+
+func TestSynchronizeKeepsEachContainerOnItsOwnRequest(t *testing.T) {
+	logger := testr.New(t)
+	claimUID := types.UID("claim-1")
+	driver := twoRequestClaimDriver(t, claimUID)
+	record := store.ClaimRecord{
+		Requests: []store.RequestAllocation{
+			{Request: "helpers", CPUs: cpuset.New(2, 3), Role: store.Role("shared")},
+			{Request: "vcpus", CPUs: cpuset.New(0, 1), Role: store.RoleExclusive},
+		},
+		ReservedFor: []types.UID{"pod-1"},
+	}
+	require.NoError(t, driver.cdiMgr.AddDevice(logger, getCDIDeviceName(claimUID),
+		fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, "0-3"), record))
+
+	vcpusEnv, vcpusDevice := requestEnv(claimUID, "vcpus", "0-1")
+	helpersEnv, helpersDevice := requestEnv(claimUID, "helpers", "2-3")
+	pod := &api.PodSandbox{Id: "pod-1", Uid: "pod-1", Name: "vm", Namespace: "ns"}
+	containers := []*api.Container{
+		{
+			Id: "ctr-vcpus", PodSandboxId: pod.Id, Name: "vcpus",
+			Env:        []string{vcpusEnv},
+			CDIDevices: []*api.CDIDevice{{Name: vcpusDevice}},
+			Linux:      &api.LinuxContainer{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1"}}},
+		},
+		{
+			Id: "ctr-helpers", PodSandboxId: pod.Id, Name: "helpers",
+			Env:        []string{helpersEnv},
+			CDIDevices: []*api.CDIDevice{{Name: helpersDevice}},
+			Linux:      &api.LinuxContainer{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-3"}}},
+		},
+	}
+
+	updates, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod}, containers)
+	require.NoError(t, err)
+
+	byContainer := map[string]string{}
+	for _, update := range updates {
+		byContainer[update.ContainerId] = update.Linux.Resources.Cpu.Cpus
+	}
+	require.NotContains(t, byContainer, "ctr-vcpus", "a container already on its request's CPUs is left alone")
+	require.Equal(t, "2-3", byContainer["ctr-helpers"],
+		"a container running on the whole claim is converged onto the request it was given")
 }
