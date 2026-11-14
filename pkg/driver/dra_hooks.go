@@ -121,6 +121,12 @@ func getCDIDeviceName(uid types.UID) string {
 	return fmt.Sprintf("claim-%s", uid)
 }
 
+// getCDIRequestDeviceName names the device of one request of a claim. Neither
+// a claim UID nor a request name, a DNS label, holds the underscore.
+func getCDIRequestDeviceName(uid types.UID, request string) string {
+	return fmt.Sprintf("claim-%s_%s", uid, request)
+}
+
 func (cp *CPUDriver) checkAdminAccess(claim *resourceapi.ResourceClaim) error {
 	if claim.Status.Allocation == nil {
 		return nil // nothing to do
@@ -140,13 +146,17 @@ func (cp *CPUDriver) checkAdminAccess(claim *resourceapi.ResourceClaim) error {
 // the shared-pool guard for currently running shared containers. A shared
 // container from the same pod may not have been created yet when this DRA hook
 // runs, so that case is detected later by the NRI CreateContainer check.
-func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, byRequest map[string]cpuset.CPUSet) error {
+func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID types.UID, record store.ClaimRecord) error {
 	hasSharedContainers := len(cp.podState.GetContainersWithSharedCPUs()) > 0
-	requests := make([]store.RequestAllocation, 0, len(byRequest))
+	return cp.allocationState.Reserve(logger, claimUID, record, hasSharedContainers)
+}
+
+func claimRecord(claim *resourceapi.ResourceClaim, byRequest map[string]cpuset.CPUSet) store.ClaimRecord {
+	record := store.ClaimRecord{Namespace: claim.Namespace, Name: claim.Name}
 	for _, request := range slices.Sorted(maps.Keys(byRequest)) {
-		requests = append(requests, store.RequestAllocation{Request: request, CPUs: byRequest[request]})
+		record.Requests = append(record.Requests, store.RequestAllocation{Request: request, CPUs: byRequest[request]})
 	}
-	return cp.allocationState.Reserve(logger, claimUID, requests, hasSharedContainers)
+	return record
 }
 
 // addRequestCPUs records cpus under the request a result belongs to. A pod
@@ -173,14 +183,14 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 		}
 	}
 
-	if existingCPUs, ok := cp.allocationState.GetResourceClaimAllocation(claim.UID); ok {
-		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", existingCPUs.String())
+	if existing, ok := cp.allocationState.GetClaimRecord(claim.UID); ok {
+		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "requests", existing.Requests)
 		// Even if the claim is already allocated in our in-memory store (which happens when a duplicate prepare
 		// call is invoked without an intermediate unprepare), we must call prepareDevices and return the result back to Kubelet.
 		// If the CDI file is already created on disk, the CDI manager will safely overwrite it with the same configuration.
 		// This ensures that the CDI specification file is written/recreated on disk (for example, if the driver
 		// pod restarted and synchronized its memory store from the runtime but did not recreate the CDI files on disk).
-		return cp.prepareDevices(logger, claim, existingCPUs)
+		return cp.prepareDevices(logger, claim, existing)
 	}
 
 	var assignedCPUs cpuset.CPUSet
@@ -263,10 +273,11 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 	}
 
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
-	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, byRequest); err != nil {
+	record := claimRecord(claim, byRequest)
+	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, assignedCPUs)
+	result := cp.prepareDevices(logger, claim, record)
 	if result.Err != nil {
 		cp.allocationState.Release(logger, claim.UID)
 		return result
@@ -429,7 +440,8 @@ func (cp *CPUDriver) prepareIndividualResourceClaimLocked(logger logr.Logger, cl
 	}
 
 	claimCPUSet := cpuset.New(claimCPUIDs...)
-	if existingCPUs, ok := cp.allocationState.GetResourceClaimAllocation(claim.UID); ok {
+	if existing, ok := cp.allocationState.GetClaimRecord(claim.UID); ok {
+		existingCPUs := existing.CPUs()
 		logger.V(2).Info("claim already has allocated CPUs in store, reusing assignment", "cpus", existingCPUs.String())
 		if !existingCPUs.Equals(claimCPUSet) {
 			// This should realistically never happen as the claim is immutable.
@@ -437,7 +449,7 @@ func (cp *CPUDriver) prepareIndividualResourceClaimLocked(logger logr.Logger, cl
 				Err: fmt.Errorf("claim %s/%s is already prepared with different CPUs %s (requested %s)", claim.Namespace, claim.Name, existingCPUs.String(), claimCPUSet.String()),
 			}
 		}
-		return cp.prepareDevices(logger, claim, existingCPUs)
+		return cp.prepareDevices(logger, claim, existing)
 	}
 
 	// All the CPUs allocated to a claim must not be prepared for another claim.
@@ -449,10 +461,11 @@ func (cp *CPUDriver) prepareIndividualResourceClaimLocked(logger logr.Logger, cl
 	}
 
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
-	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, byRequest); err != nil {
+	record := claimRecord(claim, byRequest)
+	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
-	result := cp.prepareDevices(logger, claim, claimCPUSet)
+	result := cp.prepareDevices(logger, claim, record)
 	if result.Err != nil {
 		cp.allocationState.Release(logger, claim.UID)
 		return result
@@ -462,15 +475,12 @@ func (cp *CPUDriver) prepareIndividualResourceClaimLocked(logger logr.Logger, cl
 	return result
 }
 
-func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, claimCPUSet cpuset.CPUSet) kubeletplugin.PrepareResult {
-	deviceName := getCDIDeviceName(claim.UID)
-	envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, claimCPUSet.String())
-	if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar); err != nil {
+func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, record store.ClaimRecord) kubeletplugin.PrepareResult {
+	deviceByRequest, err := cp.writeClaimDevices(logger, claim, record)
+	if err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
 
-	qualifiedName := cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName)
-	logger.V(6).Info("prepared CDI device", "cdiDeviceName", deviceName, "envVar", envVar, "qualifiedName", qualifiedName)
 	preparedDevices := []kubeletplugin.Device{}
 	for _, allocResult := range claim.Status.Allocation.Devices.Results {
 		if allocResult.Driver != cp.driverName {
@@ -479,7 +489,7 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 		preparedDevice := kubeletplugin.Device{
 			PoolName:     allocResult.Pool,
 			DeviceName:   allocResult.Device,
-			CDIDeviceIDs: []string{qualifiedName},
+			CDIDeviceIDs: []string{deviceByRequest[resourceclaim.BaseRequestRef(allocResult.Request)]},
 		}
 		if allocResult.Request != "" {
 			preparedDevice.Requests = []string{allocResult.Request}
@@ -507,6 +517,66 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 	return kubeletplugin.PrepareResult{
 		Devices: preparedDevices,
 	}
+}
+
+// writeClaimDevices writes the CDI spec of a claim and returns the qualified
+// name of the device each request is given. The kubelet injects a device only
+// into the containers that name its request, or name no request at all.
+func (cp *CPUDriver) writeClaimDevices(logger logr.Logger, claim *resourceapi.ResourceClaim, record store.ClaimRecord) (map[string]string, error) {
+	deviceByRequest := make(map[string]string)
+	if len(record.Requests) == 1 && record.Requests[0].Request == "" {
+		// Restored from a spec upstream's driver wrote, the claim keeps that
+		// spec, and its containers their variable, until it is unprepared.
+		deviceName := getCDIDeviceName(claim.UID)
+		envVar := fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claim.UID, record.Requests[0].CPUs.String())
+		if err := cp.cdiMgr.AddDevice(logger, deviceName, envVar); err != nil {
+			return nil, err
+		}
+		qualifiedName := cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName)
+		for _, allocResult := range claim.Status.Allocation.Devices.Results {
+			deviceByRequest[resourceclaim.BaseRequestRef(allocResult.Request)] = qualifiedName
+		}
+		logger.V(6).Info("prepared CDI device", "cdiDeviceName", deviceName, "envVar", envVar, "qualifiedName", qualifiedName)
+		return deviceByRequest, nil
+	}
+
+	envByDevice := make(map[string]string, len(record.Requests))
+	cdiRecord := cdiClaimRecord{Namespace: record.Namespace, Name: record.Name}
+	for _, request := range record.Requests {
+		deviceName := getCDIRequestDeviceName(claim.UID, request.Request)
+		envByDevice[deviceName] = fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claim.UID, request.Request, cdiEnvDynamicValue)
+		deviceByRequest[request.Request] = cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName)
+		cdiRecord.Requests = append(cdiRecord.Requests, cdiRequestRecord{
+			Request: request.Request,
+			CPUs:    request.CPUs,
+			Results: cp.resultRecords(claim, request.Request),
+		})
+	}
+	for _, allocResult := range claim.Status.Allocation.Devices.Results {
+		if request := resourceclaim.BaseRequestRef(allocResult.Request); allocResult.Driver == cp.driverName && deviceByRequest[request] == "" {
+			return nil, fmt.Errorf("claim %s/%s was prepared without request %q, which its allocation names; the claim must be unprepared before it is prepared again", claim.Namespace, claim.Name, request)
+		}
+	}
+	if err := cp.cdiMgr.AddClaimDevices(logger, claim.UID, envByDevice, cdiRecord); err != nil {
+		return nil, err
+	}
+	logger.V(6).Info("prepared CDI devices", "devices", deviceByRequest)
+	return deviceByRequest, nil
+}
+
+func (cp *CPUDriver) resultRecords(claim *resourceapi.ResourceClaim, request string) []cdiResultRecord {
+	var results []cdiResultRecord
+	for _, allocResult := range claim.Status.Allocation.Devices.Results {
+		if allocResult.Driver != cp.driverName || resourceclaim.BaseRequestRef(allocResult.Request) != request {
+			continue
+		}
+		result := cdiResultRecord{Device: allocResult.Device}
+		if quantity, ok := device.LookupConsumedCapacity(allocResult.ConsumedCapacity, cp.driverName); ok {
+			result.Consumed = &quantity
+		}
+		results = append(results, result)
+	}
+	return results
 }
 
 // UnprepareResourceClaims is called by the kubelet to unprepare the resources for a claim.
@@ -548,7 +618,7 @@ func (cp *CPUDriver) unprepareResourceClaim(ctx context.Context, logger logr.Log
 	}
 	// Remove the CDI spec first. If that fails, keep the allocation recorded so
 	// the driver does not make those CPUs available while stale CDI state remains.
-	if err := cp.cdiMgr.RemoveDevice(logger, getCDIDeviceName(claim.UID)); err != nil {
+	if err := cp.cdiMgr.RemoveClaimDevices(logger, claim.UID); err != nil {
 		return err
 	}
 	cp.allocationState.Release(logger, claim.UID)

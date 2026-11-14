@@ -32,6 +32,7 @@ type Recorder interface {
 	RecordNRIStopContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRIRemoveContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRISynchronizeRefusedClaim()
+	RecordContainerKeptUnderOlderRule(rule cpumetrics.Rule)
 	SetWatchdogStuck(stalled time.Duration)
 }
 
