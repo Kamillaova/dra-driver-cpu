@@ -116,6 +116,7 @@ See our [backward compatibility policy](docs/user/upgrade.md#backward-compatibil
 - [Custom Opaque CPUSet Allocation Overrides](docs/user/opaque-cpuset-overrides.md) - implement explicit core assignment when the external allocator integration is enabled; recommended upgrade path for users of `individual` mode.
 - [Metrics](docs/user/metrics.md) - Prometheus metrics exposed by the driver.
 - [Device Attributes and Selectors](docs/user/device-attributes.md) - selectable device attributes, CEL selector examples, and sample `ResourceSlice` output in each mode.
+- [Device Metadata Files](docs/user/device-metadata.md) - the per-request file in which a container reads its CPUs, CPU request and CPU limit.
 - [Troubleshooting & Diagnostics](docs/user/troubleshooting.md) - the `dracpu gatherinfo` diagnostic tool.
 
 ### Developer Documentation

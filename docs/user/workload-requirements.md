@@ -162,6 +162,7 @@ When exclusive CPUs are assigned via DRA claims, declaring `limits.cpu` in `pod.
 
 **Assigned CPU set:** Containers using CPU ResourceClaims receive `DRA_EXCLUSIVE_ASSIGNED_CPUSET` in Linux cpuset format (for example, `2-3,8`). It contains the union of CPUs assigned to that container across all its CPU claims.
 Containers without CPU claims do not receive it. The driver sets this variable; workloads should not set or override it.
+The CPUs of each request, its CPU request and its CPU limit are in the request's [device metadata file](device-metadata.md).
 
 ## Claims Shared Between Pods
 
