@@ -104,6 +104,15 @@ honor these settings, where applicable.
   gate; the stock kind configs enable it (they require a 1.37+ node image, which is the
   Makefile default).
 
+- `DRACPU_E2E_FULL_PCPUS_ONLY`: (optional, default `false`): when `true`, *the Makefile*
+  `ci-kind-setup` target deploys the driver with the `driverConfig.fullPhysicalCPUsOnly: true`
+  option, and the specs labeled `whole-cores` run instead of skipping; they also skip on a node
+  with no device whose cores all have two logical CPUs. `DRACPU_E2E_RESERVED_CPUS` must then be
+  empty or hold whole cores, or the driver refuses to start. On a node whose cores have two logical
+  CPUs the driver then refuses to prepare a claim for an amount that whole cores do not make up, as
+  several other specs ask for, so run the whole-core specs alone there with
+  `DRACPU_E2E_LABEL_FILTER=whole-cores`.
+
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
   before to run any actual test. Useful for troubleshooting and test fixing/tuning.
