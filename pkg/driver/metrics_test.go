@@ -223,6 +223,7 @@ func TestMetricsNRIAllocationState(t *testing.T) {
 	driver.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
 		claimUID: claimCPUs,
 	})
+	driver.seedAllocationStoreFromDisk(testr.New(t))
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod-uid"}
 	container := &api.Container{
 		Id: "container", PodSandboxId: pod.Id, Name: "app",
@@ -274,6 +275,7 @@ func TestMetricsNRISynchronizeSuccess(t *testing.T) {
 		"app-0": cpuset.New(1),
 		"app-1": cpuset.New(2, 3),
 	})
+	driver.seedAllocationStoreFromDisk(testr.New(t))
 
 	pods := []*api.PodSandbox{
 		{Id: "sandbox-0", Uid: "pod-uid-0", Name: "pod-0"},
@@ -301,22 +303,12 @@ func TestMetricsNRISynchronizeSuccess(t *testing.T) {
 func TestMetricsNRISynchronizeFailure(t *testing.T) {
 	driver, reg := newMetricsTestDriver(t)
 	// Synchronize fails only when its context is cancelled before it commits.
-	cdi := &pausedRefreshCDI{
-		mockCdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
-			"app-0": cpuset.New(0, 1),
-			"app-1": cpuset.New(2, 3),
-		}),
-		entered: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	driver.cdiMgr = cdi
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		<-cdi.entered
-		cancel()
-		close(cdi.release)
-	}()
+	driver.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{
+		"app-0": cpuset.New(0, 1),
+		"app-1": cpuset.New(2, 3),
+	})
+	driver.seedAllocationStoreFromDisk(testr.New(t))
+	ctx := cancelWhenLogged(t, syncBegins)
 
 	pods := []*api.PodSandbox{
 		{Id: "sandbox-0", Uid: "pod-uid-0", Name: "pod-0"},
@@ -343,12 +335,8 @@ func TestMetricsNRISynchronizeFailure(t *testing.T) {
 
 func TestMetricsNRISynchronizeRefusedClaims(t *testing.T) {
 	driver, reg := newMetricsTestDriver(t)
-	cdi := &pausedRefreshCDI{
-		mockCdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"app-0": cpuset.New(1)}),
-		entered:    make(chan struct{}),
-		release:    make(chan struct{}),
-	}
-	driver.cdiMgr = cdi
+	driver.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"app-0": cpuset.New(1)})
+	driver.seedAllocationStoreFromDisk(testr.New(t))
 	pod := &api.PodSandbox{Id: "sandbox-0", Uid: "pod-uid-0", Name: "pod-0"}
 	containers := []*api.Container{
 		{Id: "container-0", PodSandboxId: pod.Id, Name: "app", Env: []string{fmt.Sprintf("%s_app-0=1", cdiEnvVarPrefix)}},
@@ -359,14 +347,7 @@ func TestMetricsNRISynchronizeRefusedClaims(t *testing.T) {
 		return metricValue(t, reg, "dra_cpu_nri_synchronize_refused_claims_total", nil)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		<-cdi.entered
-		cancel()
-		close(cdi.release)
-	}()
-	_, err := driver.Synchronize(ctx, []*api.PodSandbox{pod}, containers)
+	_, err := driver.Synchronize(cancelWhenLogged(t, syncBegins), []*api.PodSandbox{pod}, containers)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, float64(0), refused(), "a Synchronize that commits nothing counts nothing")
 

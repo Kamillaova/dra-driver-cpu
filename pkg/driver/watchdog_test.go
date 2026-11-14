@@ -31,9 +31,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
-	"k8s.io/apimachinery/pkg/types"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
-	"k8s.io/utils/cpuset"
 )
 
 // watchdogTestDriver returns a driver the kubelet has registered, not yet
@@ -169,22 +167,19 @@ func TestWatchdogTimesAStalledHook(t *testing.T) {
 		d, reg, ctx := watchdogTestDriver(t)
 		var logs logLines
 		go d.runWatchdog(ctxlog.NewContext(ctx, logs.logger()))
-		cdi := &pausedRefreshCDI{
-			mockCdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"running": cpuset.New(1)}),
-			entered:    make(chan struct{}),
-			release:    make(chan struct{}),
-		}
-		d.cdiMgr = cdi
+		// Synchronize reads no CDI spec, so pause it where it publishes its metrics.
+		paused := &pausedRecorder{Recorder: d.metrics, entered: make(chan struct{}), release: make(chan struct{})}
+		d.metrics = paused
 		pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
-		container := &api.Container{Id: "ctr", Name: "app", PodSandboxId: pod.Id, Env: []string{cdiEnvVarPrefix + "_running=1"}}
-		release := sync.OnceFunc(func() { close(cdi.release) })
+		container := &api.Container{Id: "ctr", Name: "app", PodSandboxId: pod.Id}
+		release := sync.OnceFunc(func() { close(paused.release) })
 		defer release()
 		synced := make(chan error, 1)
 		go func() {
 			_, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{container})
 			synced <- err
 		}()
-		<-cdi.entered
+		<-paused.entered
 
 		time.Sleep(61 * time.Second)
 		synctest.Wait()

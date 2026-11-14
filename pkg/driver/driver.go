@@ -78,6 +78,7 @@ type cdiManager interface {
 	AddClaimDevices(logger logr.Logger, claimUID types.UID, envByDevice map[string]string, record cdiClaimRecord) error
 	Refresh() error
 	GetDeviceAllocations(claimUID types.UID) (cdiClaimRecord, error)
+	ListClaims() []types.UID
 	RemoveClaimDevices(logger logr.Logger, claimUID types.UID) error
 }
 
@@ -420,6 +421,7 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, fmt.Errorf("failed to create CDI manager: %w", err)
 	}
 	cp.cdiMgr = cdiMgr
+	cp.seedAllocationStoreFromDisk(logger)
 
 	kubeletOpts := []kubeletplugin.Option{
 		kubeletplugin.DriverName(cp.driverName),
@@ -471,6 +473,27 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	go cp.healthResendLoop(ctx)
 
 	return asyncErr, nil
+}
+
+// seedAllocationStoreFromDisk restores the record of every claim whose CDI spec
+// is on disk, before the kubelet or the runtime can call the driver: a claim
+// prepared before a restart and named by no container yet would otherwise look
+// free to the next Prepare. Restore, unlike Reserve, keeps two records that name
+// the same CPUs, and Bind refuses both claims until one is unprepared.
+func (cp *CPUDriver) seedAllocationStoreFromDisk(logger logr.Logger) {
+	if err := cp.cdiMgr.Refresh(); err != nil {
+		logger.Error(err, "failed to refresh CDI cache, continuing with available CDI devices")
+	}
+	for _, uid := range cp.cdiMgr.ListClaims() {
+		caLogger := logger.WithValues("claimUID", uid)
+		record, err := cp.cdiMgr.GetDeviceAllocations(uid)
+		if err != nil {
+			caLogger.Error(err, "not restoring claim with an unusable CDI spec")
+			continue
+		}
+		cp.allocationState.Restore(caLogger, uid, record.storeRecord())
+	}
+	cp.refreshAllocationMetrics()
 }
 
 // startNRIPlugin keeps the NRI plugin connected until Stop, not until ctx is
