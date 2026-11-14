@@ -18,7 +18,9 @@ package device_test
 
 import (
 	"fmt"
+	"maps"
 	"path"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -422,6 +424,170 @@ func TestBuildWholeCores(t *testing.T) {
 	}
 }
 
+// cacheTopology is one socket of eight cores of two threads, core c holding
+// CPUs c and c+8, cores 0-3 on NUMA node 0 and 4-7 on NUMA node 1, core c in
+// the uncore cache cacheIDs[c].
+func cacheTopology(cacheIDs ...int) *cpuinfo.CPUTopology {
+	topo := coreTopology(true, func(core int) int { return core / 4 }, twoThreadCores(8)...)
+	for cpu, info := range topo.CPUDetails {
+		info.UncoreCacheID = cacheIDs[info.CoreID]
+		topo.CPUDetails[cpu] = info
+	}
+	return topo
+}
+
+func TestBuildUncoreCacheDevices(t *testing.T) {
+	type wantPolicy struct {
+		def, min, step int64 // step 0: none
+	}
+	type wantDevice struct {
+		name     string
+		cpus     cpuset.CPUSet
+		numaNode int64
+		cacheID  int64
+		policy   *wantPolicy
+	}
+	// Cache ids out of NUMA order: NUMA node 0 holds caches 3 and 1, node 1
+	// caches 0 and 2.
+	cache1 := wantDevice{name: "cpudevcache001", cpus: cpuset.New(2, 3, 10, 11), numaNode: 0, cacheID: 1}
+	cache3 := wantDevice{name: "cpudevcache003", cpus: cpuset.New(0, 1, 8, 9), numaNode: 0, cacheID: 3}
+	cache0 := wantDevice{name: "cpudevcache000", cpus: cpuset.New(4, 5, 12, 13), numaNode: 1, cacheID: 0}
+	cache2 := wantDevice{name: "cpudevcache002", cpus: cpuset.New(6, 7, 14, 15), numaNode: 1, cacheID: 2}
+	with := func(dev wantDevice, cpus cpuset.CPUSet, policy *wantPolicy) wantDevice {
+		dev.cpus, dev.policy = cpus, policy
+		return dev
+	}
+
+	tests := []struct {
+		name                 string
+		topo                 *cpuinfo.CPUTopology
+		reserved             cpuset.CPUSet
+		fullPhysicalCPUsOnly bool
+		want                 []wantDevice
+		wantErr              string
+	}{
+		{
+			name: "one device per cache, ordered by NUMA node and then cache id",
+			topo: cacheTopology(3, 3, 1, 1, 0, 0, 2, 2),
+			want: []wantDevice{cache1, cache3, cache0, cache2},
+		},
+		{
+			name:     "a reserved CPU leaves its own cache's device only",
+			topo:     cacheTopology(3, 3, 1, 1, 0, 0, 2, 2),
+			reserved: cpuset.New(2),
+			want:     []wantDevice{with(cache1, cpuset.New(3, 10, 11), nil), cache3, cache0, cache2},
+		},
+		{
+			name:    "CPUs whose cache the kernel does not report fail the build",
+			topo:    cacheTopology(3, 3, 1, 1, 0, 0, -1, -1),
+			wantErr: "groupBy uncorecache needs each allocatable CPU in an uncore cache of one NUMA node, but the kernel reports no uncore cache for CPUs 6-7,14-15; set groupBy to numanode or socket on this node",
+		},
+		{
+			name:     "the error names no reserved CPU",
+			topo:     cacheTopology(3, 3, 1, 1, 0, 0, -1, -1),
+			reserved: cpuset.New(6, 14),
+			wantErr:  "groupBy uncorecache needs each allocatable CPU in an uncore cache of one NUMA node, but the kernel reports no uncore cache for CPUs 7,15; set groupBy to numanode or socket on this node",
+		},
+		{
+			name:     "reserved CPUs whose cache the kernel does not report do not count",
+			topo:     cacheTopology(3, 3, 1, 1, 0, 0, -1, -1),
+			reserved: cpuset.New(6, 7, 14, 15),
+			want:     []wantDevice{cache1, cache3, cache0},
+		},
+		{
+			name:    "a cache spanning NUMA nodes fails the build",
+			topo:    cacheTopology(3, 3, 1, 5, 5, 0, 2, 2),
+			wantErr: "groupBy uncorecache needs each allocatable CPU in an uncore cache of one NUMA node, but CPUs 3-4,11-12 share an uncore cache with CPUs of another NUMA node; set groupBy to numanode or socket on this node",
+		},
+		{
+			name:    "the error gives each reason that applies",
+			topo:    cacheTopology(3, 3, 1, 5, 5, 0, -1, -1),
+			wantErr: "groupBy uncorecache needs each allocatable CPU in an uncore cache of one NUMA node, but the kernel reports no uncore cache for CPUs 6-7,14-15, and CPUs 3-4,11-12 share an uncore cache with CPUs of another NUMA node; set groupBy to numanode or socket on this node",
+		},
+		{
+			name:                 "whole cores make each cache's request policy",
+			topo:                 cacheTopology(3, 3, 1, 1, 0, 0, 2, 2),
+			reserved:             cpuset.New(2, 10),
+			fullPhysicalCPUsOnly: true,
+			want: []wantDevice{
+				with(cache1, cpuset.New(3, 11), &wantPolicy{def: 2, min: 2}),
+				with(cache3, cache3.cpus, &wantPolicy{def: 4, min: 2, step: 2}),
+				with(cache0, cache0.cpus, &wantPolicy{def: 4, min: 2, step: 2}),
+				with(cache2, cache2.cpus, &wantPolicy{def: 4, min: 2, step: 2}),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := device.Build(device.BuildInput{
+				Inventory: device.Inventory{
+					CPUTopology:  tc.topo,
+					ReservedCPUs: tc.reserved,
+				},
+				Layout:               device.LayoutUncoreCache,
+				PCIeRootMapper:       store.NewPCIeRootMapper(),
+				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
+				Allocator:            "cpumanager",
+			})
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+
+			var names, wantNames []string
+			for _, dev := range res.Devices {
+				names = append(names, dev.Name)
+			}
+			for _, want := range tc.want {
+				wantNames = append(wantNames, want.name)
+			}
+			require.Equal(t, wantNames, names, "devices in published order")
+			require.Len(t, res.Mapping.NameToCPUs, len(tc.want))
+
+			for i, dev := range res.Devices {
+				want := tc.want[i]
+				require.Truef(t, want.cpus.Equals(res.Mapping.NameToCPUs[dev.Name]), "device %q CPUs: got %s, want %s", dev.Name, res.Mapping.NameToCPUs[dev.Name], want.cpus)
+				capacity := dev.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+				require.EqualValuesf(t, want.cpus.Size(), capacity.Value.Value(), "device %q capacity", dev.Name)
+				require.ElementsMatchf(t, []resourceapi.QualifiedName{
+					deviceattribute.StandardDeviceAttributeNUMANode,
+					device.AttributeSocketID,
+					device.AttributeCacheL3ID,
+					device.AttributeSMTEnabled,
+					device.AttributeNumCPUs,
+					device.AttributeThreadsPerCore,
+					"dra.net/numaNode",
+					"dra.cpu/numaNodeID",
+					device.AttributeFullPhysicalCPUsOnly,
+					device.AttributeAllocator,
+				}, slices.Collect(maps.Keys(dev.Attributes)), "device %q attributes", dev.Name)
+				require.Equalf(t, want.cacheID, *dev.Attributes[device.AttributeCacheL3ID].IntValue, "device %q cacheL3ID", dev.Name)
+				require.Equalf(t, want.numaNode, *dev.Attributes[deviceattribute.StandardDeviceAttributeNUMANode].IntValue, "device %q numaNode", dev.Name)
+				require.Equalf(t, want.numaNode, *dev.Attributes["dra.cpu/numaNodeID"].IntValue, "device %q numaNodeID", dev.Name)
+				require.Equalf(t, want.numaNode, *dev.Attributes["dra.net/numaNode"].IntValue, "device %q dra.net/numaNode", dev.Name)
+				require.EqualValuesf(t, 0, *dev.Attributes[device.AttributeSocketID].IntValue, "device %q socketID", dev.Name)
+				require.EqualValuesf(t, want.cpus.Size(), *dev.Attributes[device.AttributeNumCPUs].IntValue, "device %q numCPUs", dev.Name)
+
+				if want.policy == nil {
+					require.Nilf(t, capacity.RequestPolicy, "device %q must publish no request policy", dev.Name)
+					continue
+				}
+				policy := capacity.RequestPolicy
+				require.NotNilf(t, policy, "device %q must publish a request policy", dev.Name)
+				require.Equal(t, want.policy.def, policy.Default.Value())
+				require.Equal(t, want.policy.min, policy.ValidRange.Min.Value())
+				if want.policy.step == 0 {
+					require.Nil(t, policy.ValidRange.Step)
+				} else {
+					require.Equal(t, want.policy.step, policy.ValidRange.Step.Value())
+				}
+			}
+		})
+	}
+}
+
 func TestBuildGroupedDeviceAttributeCount(t *testing.T) {
 	for _, tc := range []struct {
 		layout device.Layout
@@ -430,6 +596,7 @@ func TestBuildGroupedDeviceAttributeCount(t *testing.T) {
 		{layout: device.LayoutNUMANode, want: 12},
 		{layout: device.LayoutSocket, want: 9},
 		{layout: device.LayoutMachine, want: 8},
+		{layout: device.LayoutUncoreCache, want: 13},
 	} {
 		res, err := device.Build(device.BuildInput{
 			Inventory: device.Inventory{
