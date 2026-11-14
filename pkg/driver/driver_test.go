@@ -26,6 +26,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/containerd/nri/pkg/stub"
 	"github.com/stretchr/testify/require"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 )
@@ -404,4 +405,63 @@ func TestStartRefusesARootWithNoRoomForTheSocket(t *testing.T) {
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Unix socket path")
+}
+
+// fakeNRIStub stands in for the NRI stub; only Run and Stop are called.
+type fakeNRIStub struct {
+	stub.Stub
+	runFunc  func(ctx context.Context) error
+	stopFunc func()
+}
+
+func (f *fakeNRIStub) Run(ctx context.Context) error { return f.runFunc(ctx) }
+
+func (f *fakeNRIStub) Stop() { f.stopFunc() }
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestStopStopsTheNRIPluginLast(t *testing.T) {
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	defer cancelRun()
+
+	var stops []string
+	var nriCtx context.Context
+	nriCtxs := make(chan context.Context, 1)
+	runReturned := make(chan struct{})
+	cp := &CPUDriver{health: newHealthTracker()}
+	cp.draPlugin = &mockKubeletPlugin{stopFunc: func() {
+		require.True(t, isClosed(cp.health.stopCh), "the health tracker stops before the DRA plugin")
+		stops = append(stops, "dra")
+	}}
+	cp.nriPlugin = &fakeNRIStub{
+		runFunc: func(ctx context.Context) error {
+			defer close(runReturned)
+			nriCtxs <- ctx
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		stopFunc: func() {
+			require.Error(t, nriCtx.Err(), "the NRI context is cancelled before the stub stops")
+			stops = append(stops, "nri")
+		},
+	}
+	go cp.healthResendLoop(runCtx)
+	asyncErr := make(chan error, 1)
+	cp.startNRIPlugin(runCtx, asyncErr)
+	nriCtx = <-nriCtxs
+
+	cancelRun()
+	require.NoError(t, nriCtx.Err(), "a cancelled run context must not stop the NRI plugin")
+
+	cp.Stop()
+	require.Equal(t, []string{"dra", "nri"}, stops)
+	<-runReturned
+	require.Empty(t, asyncErr, "stopping the NRI plugin is not a failure")
 }

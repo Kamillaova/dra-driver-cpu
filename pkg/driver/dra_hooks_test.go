@@ -78,6 +78,7 @@ type mockKubeletPlugin struct {
 	// tests that do not exercise registration.
 	statusFunc  func(call int32) *registerapi.RegistrationStatus
 	statusCalls atomic.Int32
+	stopFunc    func()
 }
 
 func (m *mockKubeletPlugin) PublishResources(ctx context.Context, resources resourceslice.DriverResources) error {
@@ -95,7 +96,11 @@ func (m *mockKubeletPlugin) RegistrationStatus() *registerapi.RegistrationStatus
 	return m.statusFunc(m.statusCalls.Add(1))
 }
 
-func (m *mockKubeletPlugin) Stop() {}
+func (m *mockKubeletPlugin) Stop() {
+	if m.stopFunc != nil {
+		m.stopFunc()
+	}
+}
 
 type mockCdiMgr struct {
 	devices      map[string]string
