@@ -133,6 +133,9 @@ type CPUInfo struct {
 	// CPU Sibling of the CpuID
 	SiblingCPUID int `json:"sibling"`
 
+	// SiblingCPUSet is every CPU the kernel lists on the CpuID's core, the CpuID included.
+	SiblingCPUSet cpuset.CPUSet `json:"siblingCPUSet"`
+
 	// Core Type (e-core or p-core)
 	CoreType CoreType `json:"coreType,omitempty"`
 
@@ -341,6 +344,22 @@ func populateTopologyInfo(sfs sysfs.FS, cpuInfo *CPUInfo, logger logr.Logger) er
 		return fmt.Errorf("could not parse core_id %q for cpu %d: %w", coreStr, cpuID, err)
 	}
 	cpuInfo.CoreID = coreID
+
+	// thread_siblings_list is the deprecated name of core_cpus_list.
+	siblingsPath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "topology", "core_cpus_list")
+	siblingsStr, err := readFile(sfs, siblingsPath)
+	if err != nil {
+		siblingsPath = path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID), "topology", "thread_siblings_list")
+		siblingsStr, err = readFile(sfs, siblingsPath)
+		if err != nil {
+			return fmt.Errorf("could not read core_cpus_list or thread_siblings_list for cpu %d from sysfs: %w", cpuID, err)
+		}
+	}
+	siblings, err := cpuset.Parse(strings.TrimSpace(siblingsStr))
+	if err != nil {
+		return fmt.Errorf("could not parse %s %q for cpu %d: %w", path.Base(siblingsPath), siblingsStr, cpuID, err)
+	}
+	cpuInfo.SiblingCPUSet = siblings
 
 	// Get NUMA Node ID from sysfs
 	nodePath := path.Join("devices", "system", "cpu", fmt.Sprintf("cpu%d", cpuID))
