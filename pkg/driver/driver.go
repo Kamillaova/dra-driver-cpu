@@ -149,6 +149,10 @@ type CPUDriver struct {
 	watchdog                watchdog
 	kubeletRootDir          string
 	cpuAllocator            CPUAllocator
+	fullPhysicalCPUsOnly    bool
+	// wholeCorePicker is set under fullPhysicalCPUsOnly where the driver picks
+	// the CPUs itself, which an external allocator's cpuset leaves it no room to.
+	wholeCorePicker bool
 }
 
 // deviceHealthEntry is the last known health of a single device.
@@ -162,7 +166,8 @@ type deviceHealthEntry struct {
 type deviceTopology struct {
 	device.Inventory
 	device.Mapping
-	deviceSlices [][]resourceapi.Device
+	deviceSlices   [][]resourceapi.Device
+	threadsPerCore map[string]int
 }
 
 // Providers group the interfaces the CPUDriver depends on
@@ -261,6 +266,13 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	managedCPUs := plugin.topology.ManagedCPUs()
 	logger.V(2).Info("detected topology-validated CPUs", "cpus", managedCPUs.String())
 
+	plugin.fullPhysicalCPUsOnly = config.FullPhysicalCPUsOnly
+	if config.FullPhysicalCPUsOnly {
+		if err := validateReservedCPUsAlignment(topo, config.ReservedCPUs); err != nil {
+			return nil, err
+		}
+	}
+
 	if config.ExposePCIeRoots {
 		if err := plugin.pcieRootMapper.Probe(logger, providers.EnsureSysFS(), managedCPUs); err != nil {
 			return nil, fmt.Errorf("failed to list PCIe domains: %w", err)
@@ -275,10 +287,15 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	logger.Info("creating CPU allocator", "method", config.Allocator)
 	switch config.Allocator {
 	case cpuallocator.ModeExternal:
-		plugin.cpuAllocator = cpuallocator.NewExternal(config.DriverName, managedCPUs, config.ReservedCPUs)
+		external := cpuallocator.NewExternal(config.DriverName, managedCPUs, config.ReservedCPUs)
+		if config.FullPhysicalCPUsOnly {
+			external.RequireWholeCores(topo)
+		}
+		plugin.cpuAllocator = external
 		exposeExtAttrs = true
 	default:
 		plugin.cpuAllocator = cpuallocator.NewCPUManager(config.DriverName, topo)
+		plugin.wholeCorePicker = config.FullPhysicalCPUsOnly
 	}
 
 	result, err := device.Build(device.BuildInput{
@@ -301,6 +318,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	}
 
 	plugin.topology.Mapping = result.Mapping
+	plugin.topology.threadsPerCore = result.ThreadsPerCore
 	if len(result.Devices) > 0 {
 		// Chunk devices into slices of at most devicesPerResourceSlice
 		plugin.topology.deviceSlices = slices.Collect(slices.Chunk(result.Devices, plugin.devicesPerResourceSlice))
@@ -317,6 +335,18 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	}
 
 	return plugin, nil
+}
+
+// validateReservedCPUsAlignment refuses a reservation that holds part of a
+// physical core: the rest of the core could back no claim under
+// fullPhysicalCPUsOnly and would share the core with the reserved threads.
+func validateReservedCPUsAlignment(topo *cpuinfo.CPUTopology, reservedCPUs cpuset.CPUSet) error {
+	reserved := reservedCPUs.Intersection(topo.CPUDetails.CPUs())
+	if split := reserved.Difference(topo.CPUDetails.CompleteCores(reserved)); !split.IsEmpty() {
+		return fmt.Errorf("reservedCPUs %q splits physical cores, which fullPhysicalCPUsOnly does not allow: reserve the sibling threads of CPUs %s too, or leave those CPUs out",
+			reservedCPUs.String(), split.String())
+	}
+	return nil
 }
 
 // registrarDir is the kubelet plugin registration directory, always
