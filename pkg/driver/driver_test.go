@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -39,6 +40,12 @@ func (m *mockNRIRunner) Run(ctx context.Context) error {
 	return m.runFunc(ctx)
 }
 
+const (
+	testRetryInitialBackoff = time.Millisecond
+	testRetryMaxBackoff     = 4 * time.Millisecond
+	testRetryHealthyRun     = time.Hour
+)
+
 func TestRunNRIPluginWithRetry_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -49,7 +56,7 @@ func TestRunNRIPluginWithRetry_ContextCancelled(t *testing.T) {
 		},
 	}
 
-	err := runNRIPluginWithRetry(ctx, runner, maxAttempts)
+	err := runNRIPluginWithRetry(ctx, runner, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
 	require.ErrorIs(t, err, context.Canceled, "should return context.Canceled when context is cancelled")
 	require.Equal(t, int32(1), runner.calls.Load(), "Run should be called exactly once before context cancel")
 }
@@ -69,7 +76,7 @@ func TestRunNRIPluginWithRetry_ContextCancelledAfterSeveralRetries(t *testing.T)
 		},
 	}
 
-	err := runNRIPluginWithRetry(ctx, runner, maxAttempts)
+	err := runNRIPluginWithRetry(ctx, runner, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
 	require.ErrorIs(t, err, context.Canceled, "should return context.Canceled when context is cancelled")
 	require.Equal(t, int32(3), calls.Load(), "Run should be called 3 times before context cancel")
 }
@@ -83,7 +90,7 @@ func TestRunNRIPluginWithRetry_ExhaustsAttempts(t *testing.T) {
 		},
 	}
 
-	err := runNRIPluginWithRetry(ctx, runner, 3)
+	err := runNRIPluginWithRetry(ctx, runner, 3, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
 	require.Error(t, err, "should return error after exhausting attempts")
 	require.Equal(t, int32(3), runner.calls.Load(), "Run should be called exactly maxAttempts times")
 }
@@ -99,9 +106,77 @@ func TestRunNRIPluginWithRetry_SuccessfulRunNoRetry(t *testing.T) {
 		},
 	}
 
-	err := runNRIPluginWithRetry(ctx, runner, maxAttempts)
+	err := runNRIPluginWithRetry(ctx, runner, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, int32(1), runner.calls.Load())
+}
+
+func gapsBetween(times []time.Time) []time.Duration {
+	gaps := make([]time.Duration, 0, len(times))
+	for i := 1; i < len(times); i++ {
+		gaps = append(gaps, times[i].Sub(times[i-1]))
+	}
+	return gaps
+}
+
+func TestRunNRIPluginWithRetry_BacksOffBetweenAttempts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var runs []time.Time
+		runner := &mockNRIRunner{
+			runFunc: func(context.Context) error {
+				runs = append(runs, time.Now())
+				return fmt.Errorf("connection refused")
+			},
+		}
+
+		err := runNRIPluginWithRetry(t.Context(), runner, maxAttempts, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration)
+		require.Error(t, err)
+		require.Equal(t, []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}, gapsBetween(runs))
+	})
+}
+
+func TestRunNRIPluginWithRetry_BackoffDoublesUpToTheCap(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var runs []time.Time
+		runner := &mockNRIRunner{
+			runFunc: func(context.Context) error {
+				runs = append(runs, time.Now())
+				return fmt.Errorf("connection refused")
+			},
+		}
+
+		err := runNRIPluginWithRetry(t.Context(), runner, 6, time.Second, 4*time.Second, time.Hour)
+		require.Error(t, err)
+		require.Equal(t, []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 4 * time.Second, 4 * time.Second}, gapsBetween(runs))
+	})
+}
+
+func TestRunNRIPluginWithRetry_HealthyRunResetsTheBudget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		var runs []time.Time
+		runner := &mockNRIRunner{
+			runFunc: func(context.Context) error {
+				runs = append(runs, time.Now())
+				switch len(runs) {
+				case 1:
+					return fmt.Errorf("crash loop")
+				case 2:
+					time.Sleep(nriRetryHealthyRunDuration)
+					return fmt.Errorf("fresh problem")
+				default:
+					cancel()
+					return context.Canceled
+				}
+			},
+		}
+
+		// With two attempts, only the reset leaves one for a third run.
+		err := runNRIPluginWithRetry(ctx, runner, 2, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Len(t, runs, 3)
+		require.Equal(t, nriRetryHealthyRunDuration+nriRetryInitialBackoff, runs[2].Sub(runs[1]), "the backoff restarts from its initial value")
+	})
 }
 
 // TestWaitForRegistration covers an unexported function, which we would normally
