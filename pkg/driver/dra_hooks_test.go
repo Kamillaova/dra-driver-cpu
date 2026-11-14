@@ -2525,7 +2525,7 @@ func TestHandleError(t *testing.T) {
 	runCtx, cancelRun := context.WithCancelCause(t.Context())
 	defer cancelRun(nil)
 	var stops []string
-	cp := &CPUDriver{health: newHealthTracker(), cancelRun: cancelRun}
+	cp := &CPUDriver{health: newHealthTracker(), cancelRun: cancelRun, eventBroadcaster: &fakeEventBroadcaster{}}
 	cp.draPlugin = &mockKubeletPlugin{stopFunc: func() { stops = append(stops, "dra") }}
 	cp.nriPlugin = &fakeNRIStub{
 		runFunc: func(ctx context.Context) error {

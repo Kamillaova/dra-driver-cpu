@@ -68,8 +68,8 @@ name is fixed, so a cluster that runs several releases of the chart (for example
 node class with a different `reservedCPUs` or `kubeletRootDir`) keeps `deviceClass.create`
 enabled in only one of them. Give each release its own `nodeSelector` or `affinity`, since
 the default selects every node and a node must run exactly one driver. Do not reuse
-`fullnameOverride` across releases: it replaces the release name in the ClusterRole and
-ClusterRoleBinding names. Uninstall the release that owns the DeviceClass last: removing it
+`fullnameOverride` across releases: it replaces the release name in the ClusterRole,
+ClusterRoleBinding and admission policy names. Uninstall the release that owns the DeviceClass last: removing it
 deletes the DeviceClass, and claims on the other releases' nodes stop allocating until it
 exists again.
 

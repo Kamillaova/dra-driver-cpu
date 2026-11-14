@@ -33,6 +33,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/tools/record"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/utils/cpuset"
 )
@@ -599,6 +600,14 @@ func (f *fakeNRIStub) Run(ctx context.Context) error { return f.runFunc(ctx) }
 
 func (f *fakeNRIStub) Stop() { f.stopFunc() }
 
+// fakeEventBroadcaster stands in for the event broadcaster; only Shutdown is called.
+type fakeEventBroadcaster struct {
+	record.EventBroadcaster
+	shutDown bool
+}
+
+func (f *fakeEventBroadcaster) Shutdown() { f.shutDown = true }
+
 func isClosed(ch <-chan struct{}) bool {
 	select {
 	case <-ch:
@@ -616,9 +625,11 @@ func TestStopStopsTheNRIPluginLast(t *testing.T) {
 	var nriCtx context.Context
 	nriCtxs := make(chan context.Context, 1)
 	runReturned := make(chan struct{})
-	cp := &CPUDriver{health: newHealthTracker()}
+	events := &fakeEventBroadcaster{}
+	cp := &CPUDriver{health: newHealthTracker(), eventBroadcaster: events}
 	cp.draPlugin = &mockKubeletPlugin{stopFunc: func() {
 		require.True(t, isClosed(cp.health.stopCh), "the health tracker stops before the DRA plugin")
+		require.True(t, events.shutDown, "the event recorder stops with the health tracker, before the DRA plugin")
 		stops = append(stops, "dra")
 	}}
 	cp.nriPlugin = &fakeNRIStub{
