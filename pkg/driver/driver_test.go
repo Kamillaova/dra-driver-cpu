@@ -29,7 +29,9 @@ import (
 
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/go-logr/logr/funcr"
+	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/stretchr/testify/require"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/utils/cpuset"
@@ -212,6 +214,99 @@ func TestNewReportsResourceSliceCountUnderExposePCIeRoots(t *testing.T) {
 	require.Contains(t, logged, `"devicesPerResourceSlice"=64`)
 	require.Contains(t, logged, `"numResourceSlices"=4`)
 	require.Contains(t, logged, `"exposePCIeRoots"=true`)
+}
+
+// mixedCoreCPUInfos is one NUMA node with cores {0,4} and {1,5} of two threads
+// and cores {2} and {3} of one, their siblings offline.
+var mixedCoreCPUInfos = []cpuinfo.CPUInfo{
+	{CpuID: 0, CoreID: 0, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 4, SiblingCPUSet: cpuset.New(0, 4), CoreType: cpuinfo.CoreTypeStandard},
+	{CpuID: 1, CoreID: 1, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 5, SiblingCPUSet: cpuset.New(1, 5), CoreType: cpuinfo.CoreTypeStandard},
+	{CpuID: 2, CoreID: 2, SocketID: 0, NUMANodeID: 0, SiblingCPUID: -1, SiblingCPUSet: cpuset.New(2), CoreType: cpuinfo.CoreTypeStandard},
+	{CpuID: 3, CoreID: 3, SocketID: 0, NUMANodeID: 0, SiblingCPUID: -1, SiblingCPUSet: cpuset.New(3), CoreType: cpuinfo.CoreTypeStandard},
+	{CpuID: 4, CoreID: 0, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 0, SiblingCPUSet: cpuset.New(0, 4), CoreType: cpuinfo.CoreTypeStandard},
+	{CpuID: 5, CoreID: 1, SocketID: 0, NUMANodeID: 0, SiblingCPUID: 1, SiblingCPUSet: cpuset.New(1, 5), CoreType: cpuinfo.CoreTypeStandard},
+}
+
+func TestNewReportsAMixedDeviceUnderFullPhysicalCPUsOnly(t *testing.T) {
+	const msg = `"msg"="fullPhysicalCPUsOnly publishes no request policy on a device whose cores differ in threads"`
+	for _, tc := range []struct {
+		name                 string
+		fullPhysicalCPUsOnly bool
+		want                 string // the line's keys, "" for no line
+	}{
+		{
+			name:                 "option on",
+			fullPhysicalCPUsOnly: true,
+			want:                 `"device"="cpudevnuma000" "coresWithTwoThreads"=2 "coresWithOneThread"=2`,
+		},
+		{name: "option off"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs strings.Builder
+			logger := funcr.New(func(prefix, args string) {
+				logs.WriteString(prefix + " " + args + "\n")
+			}, funcr.Options{})
+			prov := Providers{
+				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+				SysFS:   testSysFS(mixedCoreCPUInfos),
+			}
+			_, err := New(logger, prov, &Config{
+				DriverName:           testDriverName,
+				NodeName:             testNodeName,
+				ReservedCPUs:         cpuset.New(),
+				CPUDeviceMode:        device.CPU_DEVICE_MODE_GROUPED,
+				CPUDeviceGroupBy:     device.GROUP_BY_NUMA_NODE,
+				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
+			})
+			require.NoError(t, err)
+
+			var lines []string
+			for line := range strings.Lines(logs.String()) {
+				if strings.Contains(line, msg) {
+					lines = append(lines, line)
+				}
+			}
+			if tc.want == "" {
+				require.Empty(t, lines)
+				return
+			}
+			require.Len(t, lines, 1)
+			require.Contains(t, lines[0], tc.want)
+		})
+	}
+}
+
+func TestNewPublishesWholeCorePoliciesUnderFullPhysicalCPUsOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		fullPhysicalCPUsOnly bool
+		wantPolicy           bool
+	}{
+		{name: "option off"},
+		{name: "option on", fullPhysicalCPUsOnly: true, wantPolicy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := Providers{
+				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT},
+				SysFS:   testSysFS(mockCPUInfos_DualSocket_4CPUsPerSocket_HT),
+			}
+			d, err := New(testr.New(t), prov, &Config{
+				DriverName:           testDriverName,
+				NodeName:             testNodeName,
+				ReservedCPUs:         cpuset.New(),
+				CPUDeviceMode:        device.CPU_DEVICE_MODE_GROUPED,
+				CPUDeviceGroupBy:     device.GROUP_BY_NUMA_NODE,
+				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
+			})
+			require.NoError(t, err)
+			require.Len(t, d.topology.deviceSlices, 1)
+			require.Len(t, d.topology.deviceSlices[0], 2)
+			for _, dev := range d.topology.deviceSlices[0] {
+				policy := dev.Capacity[device.CPUResourceQualifiedName].RequestPolicy
+				require.Equalf(t, tc.wantPolicy, policy != nil, "device %q request policy", dev.Name)
+			}
+		})
+	}
 }
 
 // TestWaitForRegistration covers an unexported function, which we would normally

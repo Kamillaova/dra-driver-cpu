@@ -170,6 +170,365 @@ func TestMachineGroupedUsesTopologyValidatedCPUs(t *testing.T) {
 	require.Equal(t, int64(4), *numCPUs.IntValue)
 }
 
+// coreTopology builds a one-socket topology from cores, each the CPUs of one
+// physical core, which carry it as their sibling list; core c sits on NUMA node
+// numaOf(c).
+func coreTopology(smtEnabled bool, numaOf func(core int) int, cores ...[]int) *cpuinfo.CPUTopology {
+	details := cpuinfo.CPUDetails{}
+	numaNodes := map[int]bool{}
+	for coreID, cpus := range cores {
+		siblings := cpuset.New(cpus...)
+		for _, cpu := range cpus {
+			sibling := -1
+			if len(cpus) == 2 {
+				sibling = cpus[0] + cpus[1] - cpu
+			}
+			details[cpu] = cpuinfo.CPUInfo{
+				CpuID:         cpu,
+				CoreID:        coreID,
+				SocketID:      0,
+				NUMANodeID:    numaOf(coreID),
+				SiblingCPUID:  sibling,
+				SiblingCPUSet: siblings,
+			}
+		}
+		numaNodes[numaOf(coreID)] = true
+	}
+	return &cpuinfo.CPUTopology{
+		NumCPUs: len(details), NumCores: len(cores), NumSockets: 1, NumNUMANodes: len(numaNodes),
+		SMTEnabled: smtEnabled, CPUDetails: details,
+	}
+}
+
+func onNUMANode0(int) int { return 0 }
+
+// twoThreadCores is n cores of two threads, core c holding CPUs c and c+n.
+func twoThreadCores(n int) [][]int {
+	cores := make([][]int, n)
+	for c := range n {
+		cores[c] = []int{c, c + n}
+	}
+	return cores
+}
+
+// devFoxDefaultCores has four cores of two threads and two whose siblings are
+// offline.
+var devFoxDefaultCores = [][]int{{0, 128}, {1, 129}, {2, 130}, {3, 131}, {4}, {5}}
+
+// hybridCores is shaped like an Intel Core i7-12850HX: CPUs 0-7 are cores of one
+// thread, CPUs 8-15 cores of two whose siblings are 16-23.
+func hybridCores() [][]int {
+	var cores [][]int
+	for c := range 8 {
+		cores = append(cores, []int{c})
+	}
+	for c := 8; c < 16; c++ {
+		cores = append(cores, []int{c, c + 8})
+	}
+	return cores
+}
+
+func TestBuildWholeCores(t *testing.T) {
+	type wantPolicy struct {
+		def, min, step int64 // step 0: none
+	}
+	type wantDevice struct {
+		capacity       int64
+		threadsPerCore int
+		smtEnabled     bool
+		policy         *wantPolicy
+	}
+	twoNUMANodes := func(core int) int { return core / 2 }
+
+	tests := []struct {
+		name                 string
+		topo                 *cpuinfo.CPUTopology
+		layout               device.Layout
+		reserved             cpuset.CPUSet
+		fullPhysicalCPUsOnly bool
+		want                 map[string]wantDevice
+	}{
+		{
+			name:     "option off: a split core keeps its free thread and no policy is published",
+			topo:     coreTopology(true, onNUMANode0, twoThreadCores(4)...),
+			layout:   device.LayoutNUMANode,
+			reserved: cpuset.New(0),
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 7, threadsPerCore: 2, smtEnabled: true},
+			},
+		},
+		{
+			name:                 "option on: a split core leaves the device",
+			topo:                 coreTopology(true, onNUMANode0, twoThreadCores(4)...),
+			layout:               device.LayoutNUMANode,
+			reserved:             cpuset.New(0),
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 6, threadsPerCore: 2, smtEnabled: true, policy: &wantPolicy{def: 6, min: 2, step: 2}},
+			},
+		},
+		{
+			name:                 "option on: one core of two threads gets min without a step",
+			topo:                 coreTopology(true, onNUMANode0, twoThreadCores(1)...),
+			layout:               device.LayoutNUMANode,
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 2, threadsPerCore: 2, smtEnabled: true, policy: &wantPolicy{def: 2, min: 2}},
+			},
+		},
+		{
+			name:                 "option on: two cores of two threads get a step",
+			topo:                 coreTopology(true, onNUMANode0, twoThreadCores(2)...),
+			layout:               device.LayoutNUMANode,
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 4, threadsPerCore: 2, smtEnabled: true, policy: &wantPolicy{def: 4, min: 2, step: 2}},
+			},
+		},
+		{
+			name:                 "option on: cores of one thread get no policy",
+			topo:                 coreTopology(false, onNUMANode0, []int{0}, []int{1}, []int{2}, []int{3}),
+			layout:               device.LayoutNUMANode,
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 4, threadsPerCore: 1, smtEnabled: false},
+			},
+		},
+		{
+			name:                 "option on: dev-fox's cores of two and one thread make a mixed device",
+			topo:                 coreTopology(true, onNUMANode0, devFoxDefaultCores...),
+			layout:               device.LayoutNUMANode,
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 10, threadsPerCore: 0, smtEnabled: true},
+			},
+		},
+		{
+			name:                 "option on: a mixed device leaves out a split core too",
+			topo:                 coreTopology(true, onNUMANode0, devFoxDefaultCores...),
+			layout:               device.LayoutNUMANode,
+			reserved:             cpuset.New(128),
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 8, threadsPerCore: 0, smtEnabled: true},
+			},
+		},
+		{
+			name:                 "option on: a hybrid CPU makes a mixed device",
+			topo:                 coreTopology(true, onNUMANode0, hybridCores()...),
+			layout:               device.LayoutNUMANode,
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 24, threadsPerCore: 0, smtEnabled: true},
+			},
+		},
+		{
+			name:                 "option on: threads are counted on the cores left in the device",
+			topo:                 coreTopology(true, onNUMANode0, []int{0, 3}, []int{1}, []int{2}),
+			layout:               device.LayoutNUMANode,
+			reserved:             cpuset.New(3),
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 2, threadsPerCore: 1, smtEnabled: true},
+			},
+		},
+		{
+			name:                 "option on: each device decides for itself",
+			topo:                 coreTopology(true, twoNUMANodes, []int{0, 4}, []int{1, 5}, []int{2, 6}, []int{3}),
+			layout:               device.LayoutNUMANode,
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 4, threadsPerCore: 2, smtEnabled: true, policy: &wantPolicy{def: 4, min: 2, step: 2}},
+				"cpudevnuma001": {capacity: 3, threadsPerCore: 0, smtEnabled: true},
+			},
+		},
+		{
+			name:   "option off: smtEnabled is the node's on mixed and one-thread devices",
+			topo:   coreTopology(true, twoNUMANodes, []int{0, 4}, []int{1}, []int{2}, []int{3}),
+			layout: device.LayoutNUMANode,
+			want: map[string]wantDevice{
+				"cpudevnuma000": {capacity: 3, threadsPerCore: 0, smtEnabled: true},
+				"cpudevnuma001": {capacity: 2, threadsPerCore: 1, smtEnabled: true},
+			},
+		},
+		{
+			name:                 "option on, socket layout",
+			topo:                 coreTopology(true, onNUMANode0, twoThreadCores(2)...),
+			layout:               device.LayoutSocket,
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevsocket000": {capacity: 4, threadsPerCore: 2, smtEnabled: true, policy: &wantPolicy{def: 4, min: 2, step: 2}},
+			},
+		},
+		{
+			name:                 "option on, machine layout",
+			topo:                 coreTopology(true, onNUMANode0, twoThreadCores(2)...),
+			layout:               device.LayoutMachine,
+			reserved:             cpuset.New(3),
+			fullPhysicalCPUsOnly: true,
+			want: map[string]wantDevice{
+				"cpudevmachine": {capacity: 2, threadsPerCore: 2, smtEnabled: true, policy: &wantPolicy{def: 2, min: 2}},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := device.Build(device.BuildInput{
+				Inventory: device.Inventory{
+					CPUTopology:  tc.topo,
+					ReservedCPUs: tc.reserved,
+				},
+				Layout:               tc.layout,
+				PCIeRootMapper:       store.NewPCIeRootMapper(),
+				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
+			})
+			require.NoError(t, err)
+			require.Len(t, res.Devices, len(tc.want))
+			require.Len(t, res.ThreadsPerCore, len(tc.want))
+
+			for _, dev := range res.Devices {
+				want, found := tc.want[dev.Name]
+				require.Truef(t, found, "unexpected device %q", dev.Name)
+
+				capacity := dev.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+				require.Equalf(t, want.capacity, capacity.Value.Value(), "device %q capacity", dev.Name)
+				require.Equalf(t, want.capacity, *dev.Attributes[device.AttributeNumCPUs].IntValue, "device %q numCPUs", dev.Name)
+				require.EqualValuesf(t, want.threadsPerCore, *dev.Attributes[device.AttributeThreadsPerCore].IntValue, "device %q threadsPerCore", dev.Name)
+				require.Equalf(t, want.threadsPerCore, res.ThreadsPerCore[dev.Name], "device %q threads per core in the result", dev.Name)
+				_, mixed := res.MixedCores[dev.Name]
+				require.Equalf(t, tc.fullPhysicalCPUsOnly && want.threadsPerCore == 0, mixed, "device %q counted as mixed", dev.Name)
+				require.Equalf(t, want.smtEnabled, *dev.Attributes[device.AttributeSMTEnabled].BoolValue, "device %q smtEnabled", dev.Name)
+
+				if want.policy == nil {
+					require.Nilf(t, capacity.RequestPolicy, "device %q must publish no request policy", dev.Name)
+					continue
+				}
+				policy := capacity.RequestPolicy
+				require.NotNilf(t, policy, "device %q must publish a request policy", dev.Name)
+				require.NotNil(t, policy.Default)
+				require.Equal(t, want.policy.def, policy.Default.Value())
+				require.NotNil(t, policy.ValidRange)
+				require.Equal(t, want.policy.min, policy.ValidRange.Min.Value())
+				require.Nil(t, policy.ValidRange.Max)
+				if want.policy.step == 0 {
+					require.Nil(t, policy.ValidRange.Step, "a step past the capacity is refused by the API server")
+				} else {
+					require.NotNil(t, policy.ValidRange.Step)
+					require.Equal(t, want.policy.step, policy.ValidRange.Step.Value())
+				}
+			}
+		})
+	}
+}
+
+func TestBuildGroupedDeviceAttributeCount(t *testing.T) {
+	for _, tc := range []struct {
+		layout device.Layout
+		want   int
+	}{
+		{layout: device.LayoutNUMANode, want: 10},
+		{layout: device.LayoutSocket, want: 7},
+		{layout: device.LayoutMachine, want: 6},
+	} {
+		res, err := device.Build(device.BuildInput{
+			Inventory: device.Inventory{
+				CPUTopology:  coreTopology(true, onNUMANode0, twoThreadCores(2)...),
+				ReservedCPUs: cpuset.New(),
+			},
+			Layout:               tc.layout,
+			PCIeRootMapper:       store.NewPCIeRootMapper(),
+			ExposeExtAttrs:       true,
+			FullPhysicalCPUsOnly: true,
+		})
+		require.NoError(t, err)
+		require.Len(t, res.Devices, 1)
+		dev := res.Devices[0]
+		require.Equalf(t, tc.want, len(dev.Attributes)+len(dev.Capacity), "device %q attributes and capacities", dev.Name)
+		require.LessOrEqual(t, len(dev.Attributes)+len(dev.Capacity), resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice)
+	}
+}
+
+// threeThreadCore is one core of CPUs 0-2 by its sibling list, each CPU with a
+// core_id of its own: the shape a sysfs overlay can give past GetCPUInfos,
+// which refuses more than two CPUs per (socket, cluster, core).
+func threeThreadCore() *cpuinfo.CPUTopology {
+	details := cpuinfo.CPUDetails{}
+	for cpu := range 3 {
+		details[cpu] = cpuinfo.CPUInfo{
+			CpuID: cpu, CoreID: cpu, SocketID: 0, NUMANodeID: 0, SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0, 1, 2),
+		}
+	}
+	return &cpuinfo.CPUTopology{
+		NumCPUs: 3, NumCores: 3, NumSockets: 1, NumNUMANodes: 1, SMTEnabled: true, CPUDetails: details,
+	}
+}
+
+func TestBuildCountsCoreSizesUnderFullPhysicalCPUsOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		topo                 *cpuinfo.CPUTopology
+		reserved             cpuset.CPUSet
+		fullPhysicalCPUsOnly bool
+		want                 map[string]device.CoreCounts
+		wantErr              string
+	}{
+		{
+			name:                 "option on: dev-fox's cores",
+			topo:                 coreTopology(true, onNUMANode0, devFoxDefaultCores...),
+			fullPhysicalCPUsOnly: true,
+			want:                 map[string]device.CoreCounts{"cpudevnuma000": {TwoThreads: 4, OneThread: 2}},
+		},
+		{
+			name:                 "option on: the cores left once a split core leaves",
+			topo:                 coreTopology(true, onNUMANode0, devFoxDefaultCores...),
+			reserved:             cpuset.New(128),
+			fullPhysicalCPUsOnly: true,
+			want:                 map[string]device.CoreCounts{"cpudevnuma000": {TwoThreads: 3, OneThread: 2}},
+		},
+		{
+			name:                 "a device whose cores are alike is not counted",
+			topo:                 coreTopology(true, onNUMANode0, twoThreadCores(2)...),
+			fullPhysicalCPUsOnly: true,
+			want:                 map[string]device.CoreCounts{},
+		},
+		{
+			name: "option off: nothing is counted",
+			topo: coreTopology(true, onNUMANode0, devFoxDefaultCores...),
+			want: map[string]device.CoreCounts{},
+		},
+		{
+			name:                 "option on: a core of three threads fails the build",
+			topo:                 threeThreadCore(),
+			fullPhysicalCPUsOnly: true,
+			wantErr:              `device "cpudevnuma000" holds a core of 3 threads (CPUs 0-2), where fullPhysicalCPUsOnly supports whole cores of 1 or 2 threads`,
+		},
+		{
+			name: "option off: a core of three threads builds",
+			topo: threeThreadCore(),
+			want: map[string]device.CoreCounts{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := device.Build(device.BuildInput{
+				Inventory: device.Inventory{
+					CPUTopology:  tc.topo,
+					ReservedCPUs: tc.reserved,
+				},
+				Layout:               device.LayoutNUMANode,
+				PCIeRootMapper:       store.NewPCIeRootMapper(),
+				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
+			})
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, res.MixedCores)
+		})
+	}
+}
+
 // TestBuildPublishesScalarNUMANodeAttribute pins the shape of the standard
 // numaNode attribute published for a device bound to a single NUMA node: the
 // standard name, the scalar int type and the value. The value is built by the
