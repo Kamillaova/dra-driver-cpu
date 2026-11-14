@@ -19,6 +19,7 @@ package device
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -37,6 +38,7 @@ const (
 	CPUDeviceSocketGroupedPrefix = "cpudevsocket"
 	CPUDeviceNUMAGroupedPrefix   = "cpudevnuma"
 	CPUDeviceMachineGrouped      = "cpudevmachine"
+	CPUDeviceCacheGroupedPrefix  = "cpudevcache"
 )
 
 // Inventory holds the machine data and resource availability
@@ -68,6 +70,9 @@ type Mapping struct {
 	NameToSocketID map[string]int
 	// NameToNUMANodeID is populated for LayoutNUMANode.
 	NameToNUMANodeID map[string]int
+	// NameToCPUs is populated for LayoutUncoreCache, whose device is no
+	// socket or NUMA node: it holds the CPUs each device publishes.
+	NameToCPUs map[string]cpuset.CPUSet
 }
 
 // Layout controls how CPUs are exposed as DRA devices.
@@ -84,6 +89,8 @@ const (
 	LayoutNUMANode
 	// LayoutMachine exposes one device for all allocatable CPUs in the machine.
 	LayoutMachine
+	// LayoutUncoreCache exposes one device per uncore cache.
+	LayoutUncoreCache
 )
 
 // FindLayout converts the driver configuration into a device layout.
@@ -96,6 +103,8 @@ func FindLayout(cpuDeviceMode, cpuDeviceGroupBy string) Layout {
 		return LayoutSocket
 	case GROUP_BY_NUMA_NODE:
 		return LayoutNUMANode
+	case GROUP_BY_UNCORE_CACHE:
+		return LayoutUncoreCache
 	default:
 		return LayoutMachine
 	}
@@ -174,16 +183,23 @@ func Build(input BuildInput) (BuildResult, error) {
 		res.Mapping.NameToSocketID = make(map[string]int)
 	case LayoutNUMANode:
 		res.Mapping.NameToNUMANodeID = make(map[string]int)
+	case LayoutUncoreCache:
+		res.Mapping.NameToCPUs = make(map[string]cpuset.CPUSet)
 	}
 	res.ThreadsPerCore = make(map[string]int)
 	res.MixedCores = make(map[string]CoreCounts)
-	deviceInfos := groupedCPUDeviceInfos(input.Layout, input.Inventory, input.FullPhysicalCPUsOnly)
+	deviceInfos, err := groupedCPUDeviceInfos(input.Layout, input.Inventory, input.FullPhysicalCPUsOnly)
+	if err != nil {
+		return BuildResult{}, err
+	}
 	for _, dev := range deviceInfos {
 		switch input.Layout {
 		case LayoutSocket:
 			res.Mapping.NameToSocketID[dev.name] = dev.socketID
 		case LayoutNUMANode:
 			res.Mapping.NameToNUMANodeID[dev.name] = dev.numaNodeID
+		case LayoutUncoreCache:
+			res.Mapping.NameToCPUs[dev.name] = dev.cpus
 		}
 		res.ThreadsPerCore[dev.name] = dev.threadsPerCore
 		if !input.FullPhysicalCPUsOnly {
@@ -240,6 +256,7 @@ type groupedCPUDeviceInfo struct {
 	cpus           cpuset.CPUSet
 	socketID       int
 	numaNodeID     int
+	cacheID        int
 	threadsPerCore int
 }
 
@@ -248,7 +265,7 @@ type cpuDeviceInfo struct {
 	cpu  cpuinfo.CPUInfo
 }
 
-func groupedCPUDeviceInfos(layout Layout, machine Inventory, fullPhysicalCPUsOnly bool) []groupedCPUDeviceInfo {
+func groupedCPUDeviceInfos(layout Layout, machine Inventory, fullPhysicalCPUsOnly bool) ([]groupedCPUDeviceInfo, error) {
 	var devices []groupedCPUDeviceInfo
 
 	topo := machine.CPUTopology // shortcut
@@ -302,8 +319,80 @@ func groupedCPUDeviceInfos(layout Layout, machine Inventory, fullPhysicalCPUsOnl
 			cpus:           allocatableCPUs,
 			threadsPerCore: topo.CPUDetails.UniformThreadsPerCore(allocatableCPUs),
 		})
+	case LayoutUncoreCache:
+		caches, unreported, spanning := uncoreCaches(topo.CPUDetails)
+		var reasons []string
+		if cpus := unreported.Difference(machine.ReservedCPUs); !cpus.IsEmpty() {
+			reasons = append(reasons, "the kernel reports no uncore cache for CPUs "+cpus.String())
+		}
+		if cpus := spanning.Difference(machine.ReservedCPUs); !cpus.IsEmpty() {
+			reasons = append(reasons, "CPUs "+cpus.String()+" share an uncore cache with CPUs of another NUMA node")
+		}
+		if len(reasons) > 0 {
+			return nil, fmt.Errorf("groupBy %s needs each allocatable CPU in an uncore cache of one NUMA node, but %s; set groupBy to %s or %s on this node",
+				GROUP_BY_UNCORE_CACHE, strings.Join(reasons, ", and "), GROUP_BY_NUMA_NODE, GROUP_BY_SOCKET)
+		}
+		for _, cache := range caches {
+			allocatableCPUs := usable(cache.cpus.Difference(machine.ReservedCPUs))
+			if allocatableCPUs.Size() == 0 {
+				continue
+			}
+			// A cache listed lies in one NUMA node, so in one socket.
+			anyCPU := allocatableCPUs.UnsortedList()[0]
+			devices = append(devices, groupedCPUDeviceInfo{
+				name:           fmt.Sprintf("%s%03d", CPUDeviceCacheGroupedPrefix, cache.id),
+				cpus:           allocatableCPUs,
+				socketID:       topo.CPUDetails[anyCPU].SocketID,
+				numaNodeID:     cache.numaNodeID,
+				cacheID:        cache.id,
+				threadsPerCore: topo.CPUDetails.UniformThreadsPerCore(allocatableCPUs),
+			})
+		}
 	}
-	return devices
+	return devices, nil
+}
+
+// uncoreCache is one of the node's uncore caches: the id the kernel gives it,
+// the NUMA node it lies in, and the CPUs that share it.
+type uncoreCache struct {
+	id         int
+	numaNodeID int
+	cpus       cpuset.CPUSet
+}
+
+// uncoreCaches lists the uncore caches of details that lie in one NUMA node,
+// ordered by NUMA node and then by cache id. It returns apart the CPUs the
+// kernel reports no cache for and the CPUs of caches that span NUMA nodes, for
+// which a device could publish no NUMA node.
+func uncoreCaches(details cpuinfo.CPUDetails) ([]uncoreCache, cpuset.CPUSet, cpuset.CPUSet) {
+	cpusByCache := make(map[int][]int)
+	var unknown []int
+	for cpuID, info := range details {
+		if info.UncoreCacheID == -1 {
+			unknown = append(unknown, cpuID)
+			continue
+		}
+		cpusByCache[info.UncoreCacheID] = append(cpusByCache[info.UncoreCacheID], cpuID)
+	}
+	spanning := cpuset.New()
+
+	caches := make([]uncoreCache, 0, len(cpusByCache))
+	for cacheID, cpuIDs := range cpusByCache {
+		cpus := cpuset.New(cpuIDs...)
+		numaNodes := details.KeepOnly(cpus).NUMANodes()
+		if numaNodes.Size() != 1 {
+			spanning = spanning.Union(cpus)
+			continue
+		}
+		caches = append(caches, uncoreCache{id: cacheID, numaNodeID: numaNodes.List()[0], cpus: cpus})
+	}
+	sort.Slice(caches, func(i, j int) bool {
+		if caches[i].numaNodeID != caches[j].numaNodeID {
+			return caches[i].numaNodeID < caches[j].numaNodeID
+		}
+		return caches[i].id < caches[j].id
+	})
+	return caches, cpuset.New(unknown...), spanning
 }
 
 func countCores(details cpuinfo.CPUDetails, dev groupedCPUDeviceInfo) (CoreCounts, error) {
@@ -480,6 +569,37 @@ func createGroupedCPUDeviceSlices(layout Layout, deviceInfos []groupedCPUDeviceI
 					return nil, err
 				}
 			}
+			devices = append(devices, resourceapi.Device{
+				Name:                     deviceInfo.name,
+				Attributes:               deviceAttrs,
+				Capacity:                 deviceCapacity,
+				AllowMultipleAllocations: new(true),
+				NodeAllocatableResources: groupedCPUNodeAllocatable(nodeAllocatableResources),
+			})
+		case LayoutUncoreCache:
+			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+				AttributeSocketID:       {IntValue: new(int64(deviceInfo.socketID))},
+				AttributeCacheL3ID:      {IntValue: new(int64(deviceInfo.cacheID))},
+				AttributeSMTEnabled:     {BoolValue: new(topo.SMTEnabled)},
+				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
+				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
+			}
+			addCompatibilityAttributes(deviceAttrs, int64(deviceInfo.numaNodeID))
+			if err := addNUMANodeAttribute(deviceAttrs, deviceInfo.numaNodeID); err != nil {
+				return nil, err
+			}
+			if err := addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...); err != nil {
+				return nil, err
+			}
+			if exposeExtAttrs {
+				if err := addCPUIDsAttribute(deviceAttrs, deviceInfo.cpus); err != nil {
+					return nil, err
+				}
+				if err := addSMTLayoutAttribute(deviceAttrs, topo); err != nil {
+					return nil, err
+				}
+			}
+
 			devices = append(devices, resourceapi.Device{
 				Name:                     deviceInfo.name,
 				Attributes:               deviceAttrs,

@@ -1861,6 +1861,65 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 	}
 }
 
+func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
+	// wholeCoreCPUInfos puts cores 0-3 in uncore cache 0 and cores 4-7 in cache 1.
+	cache0 := cpuset.New(0, 1, 2, 3, 8, 9, 10, 11)
+	cache1 := cpuset.New(4, 5, 6, 7, 12, 13, 14, 15)
+	tests := []struct {
+		name                 string
+		fullPhysicalCPUsOnly bool
+		device               string
+		amount               int64
+		want                 cpuset.CPUSet
+		wantWithin           cpuset.CPUSet
+		wantErr              string
+	}{
+		{name: "an amount comes from its device's cache", device: "cpudevcache001", amount: 3, wantWithin: cache1},
+		{name: "whole cores come from its device's cache", device: "cpudevcache001", fullPhysicalCPUsOnly: true, amount: 4, want: cpuset.New(4, 5, 12, 13)},
+		{name: "the whole cache", device: "cpudevcache000", amount: 8, want: cache0},
+		{name: "a device the driver did not publish", device: "cpudevcache002", amount: 2, wantErr: "no valid uncore cache found for device cpudevcache002"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := Providers{
+				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: wholeCoreCPUInfos},
+				SysFS:   testSysFS(wholeCoreCPUInfos),
+			}
+			driver, err := New(testr.New(t), prov, &Config{
+				DriverName:           testDriverName,
+				NodeName:             testNodeName,
+				ReservedCPUs:         cpuset.New(),
+				CPUDeviceMode:        devattr.CPU_DEVICE_MODE_GROUPED,
+				CPUDeviceGroupBy:     devattr.GROUP_BY_UNCORE_CACHE,
+				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
+			})
+			require.NoError(t, err)
+			driver.cdiMgr = newMockCdiMgr()
+			driver.hasSynchronized = true
+
+			claim := testClaim("claim", testDriverName, testNodeName, map[string]int64{tc.device: tc.amount})
+			prepared, err := driver.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+			require.NoError(t, err)
+			result := prepared[claim.UID]
+			got, allocated := driver.allocationState.GetResourceClaimAllocation(claim.UID)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, result.Err, tc.wantErr)
+				require.False(t, allocated, "a refused claim holds no CPUs")
+				return
+			}
+			require.NoError(t, result.Err)
+			require.True(t, allocated)
+			if tc.want.Size() > 0 {
+				require.True(t, got.Equals(tc.want), "got CPUs %s, want %s", got, tc.want)
+				return
+			}
+			require.EqualValues(t, tc.amount, got.Size())
+			require.True(t, got.IsSubsetOf(tc.wantWithin), "got CPUs %s, outside %s", got, tc.wantWithin)
+		})
+	}
+}
+
 func TestPrepareResourceClaimsGroupedModeIgnoresAllocationsFromOtherDrivers(t *testing.T) {
 	prov := Providers{
 		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
