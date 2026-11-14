@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -2019,6 +2020,37 @@ func newDriverWithAllocatedClaim(t *testing.T, logger logr.Logger, claimUID type
 		podState:        store.NewPodState(),
 		metrics:         cpumetrics.Noop(),
 	}, mockCdiMgr
+}
+
+func TestHandleError(t *testing.T) {
+	runCtx, cancelRun := context.WithCancelCause(t.Context())
+	defer cancelRun(nil)
+	var stops []string
+	cp := &CPUDriver{health: newHealthTracker(), cancelRun: cancelRun}
+	cp.draPlugin = &mockKubeletPlugin{stopFunc: func() { stops = append(stops, "dra") }}
+	cp.nriPlugin = &fakeNRIStub{
+		runFunc: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		stopFunc: func() { stops = append(stops, "nri") },
+	}
+	go cp.healthResendLoop(runCtx)
+	cp.startNRIPlugin(runCtx, make(chan error, 1))
+
+	cp.HandleError(t.Context(), fmt.Errorf("update ResourceSlice: %w", kubeletplugin.ErrRecoverable), "publishing ResourceSlices failed")
+	require.NoError(t, runCtx.Err(), "a recoverable error must not stop the driver")
+
+	fatal := errors.New("listen unix dra.sock: bind: address already in use")
+	// The plugin library reports a failed gRPC server from that server's goroutine.
+	go cp.HandleError(t.Context(), fatal, "DRA gRPC server failed")
+	<-runCtx.Done()
+	cp.Stop()
+
+	require.Equal(t, []string{"dra", "nri"}, stops)
+	cause := context.Cause(runCtx)
+	require.ErrorIs(t, cause, ErrFatal, "the run returns a cause marked fatal, so the process exits non-zero")
+	require.ErrorIs(t, cause, fatal)
 }
 
 func testClaimWithResults(claimUID types.UID, results []resourceapi.DeviceRequestAllocationResult) *resourceapi.ResourceClaim {
