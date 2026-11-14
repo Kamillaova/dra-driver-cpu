@@ -39,6 +39,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	drametadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
@@ -73,9 +74,10 @@ type KubeletPlugin interface {
 
 type cdiManager interface {
 	AddDevice(logger logr.Logger, deviceName string, envVar string) error
+	AddClaimDevices(logger logr.Logger, claimUID types.UID, envByDevice map[string]string, record cdiClaimRecord) error
 	Refresh() error
-	GetDeviceEnv(deviceName string) ([]string, error)
-	RemoveDevice(logger logr.Logger, deviceName string) error
+	GetDeviceAllocations(claimUID types.UID) (cdiClaimRecord, error)
+	RemoveClaimDevices(logger logr.Logger, claimUID types.UID) error
 }
 
 // CPUInfoProvider is an interface for getting CPU information.

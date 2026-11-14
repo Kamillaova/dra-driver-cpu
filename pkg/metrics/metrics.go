@@ -69,6 +69,18 @@ func (c CPUAllocation) String() string {
 	}
 }
 
+// Rule is the bounded label domain for the rules on a claim's shape a running
+// container may predate.
+type Rule string
+
+const (
+	// RulePartialHolder refuses a container that names some but not all of a
+	// claim's requests.
+	RulePartialHolder Rule = "partial_holder"
+)
+
+var rules = []Rule{RulePartialHolder}
+
 // Descriptor describes a custom driver metric for programmatic introspection.
 type Descriptor struct {
 	Name      string   `json:"name"`
@@ -102,6 +114,7 @@ type Metrics struct {
 	nriStopContainerDuration   *prometheus.HistogramVec
 	nriRemoveContainerDuration *prometheus.HistogramVec
 	nriSynchronizeRefused      prometheus.Counter
+	containersKeptUnderOlder   *prometheus.CounterVec
 	watchdogStuck              prometheus.Gauge
 }
 
@@ -213,6 +226,12 @@ var (
 		kind: metricCounter,
 		help: "Total number of claims a container names that the NRI Synchronize callback did not bind to it.",
 	}
+	containersKeptUnderOlderRuleSpec = metricSpec{
+		name:   "dra_cpu_containers_kept_under_older_rule_total",
+		kind:   metricCounter,
+		help:   "Total number of running containers the NRI Synchronize callback kept bound to their claims although they break a rule on the claim's shape that came after they were created.",
+		labels: []string{"rule"},
+	}
 	watchdogStuckSpec = metricSpec{
 		name: "dra_cpu_watchdog_stuck_seconds",
 		kind: metricGauge,
@@ -235,6 +254,7 @@ var metricSpecs = []metricSpec{
 	nriStopContainerDurationSpec,
 	nriRemoveContainerDurationSpec,
 	nriSynchronizeRefusedSpec,
+	containersKeptUnderOlderRuleSpec,
 	watchdogStuckSpec,
 }
 
@@ -281,6 +301,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		nriStopContainerDuration:   newHistogramVec(nriStopContainerDurationSpec),
 		nriRemoveContainerDuration: newHistogramVec(nriRemoveContainerDurationSpec),
 		nriSynchronizeRefused:      newCounter(nriSynchronizeRefusedSpec),
+		containersKeptUnderOlder:   newCounterVec(containersKeptUnderOlderRuleSpec),
 		watchdogStuck:              newGauge(watchdogStuckSpec),
 	}
 
@@ -299,8 +320,12 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriStopContainerDuration,
 		m.nriRemoveContainerDuration,
 		m.nriSynchronizeRefused,
+		m.containersKeptUnderOlder,
 		m.watchdogStuck,
 	)
+	for _, rule := range rules {
+		m.containersKeptUnderOlder.WithLabelValues(string(rule))
+	}
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
 		m.unprepareClaims.WithLabelValues(result.String())
@@ -401,6 +426,10 @@ func (m *Metrics) RecordNRISynchronizeRefusedClaim() {
 	m.nriSynchronizeRefused.Inc()
 }
 
+func (m *Metrics) RecordContainerKeptUnderOlderRule(rule Rule) {
+	m.containersKeptUnderOlder.WithLabelValues(string(rule)).Inc()
+}
+
 func (m *Metrics) SetWatchdogStuck(stalled time.Duration) {
 	m.watchdogStuck.Set(stalled.Seconds())
 }
@@ -438,4 +467,5 @@ func (noopRecorder) RecordNRICreateContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRISynchronizeRefusedClaim()                  {}
+func (noopRecorder) RecordContainerKeptUnderOlderRule(Rule)             {}
 func (noopRecorder) SetWatchdogStuck(time.Duration)                     {}
