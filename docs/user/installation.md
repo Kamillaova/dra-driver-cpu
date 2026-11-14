@@ -222,7 +222,7 @@ The driver's Kubernetes API client sends at most 20 requests per second, with bu
 unless `driverConfig.qps` and `driverConfig.burst` set other limits; see
 [Configuration](configuration.md#driverconfig-sub-fields).
 
-## Upgrading (generic instructions)
+## Upgrading the driver
 
 Upgrade with Helm:
 
@@ -230,14 +230,48 @@ Upgrade with Helm:
 helm upgrade dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driver-cpu -n kube-system
 ```
 
+The chart sets no update strategy, so the DaemonSet takes the Kubernetes default, a rolling update
+with `maxUnavailable: 1` and `maxSurge: 0`: on each node the old driver pod stops before the new
+one starts. The kubelet plugin library the driver is built on requires `maxSurge: 0` unless the
+driver runs in the library's rolling-update mode, which needs a driver that keeps no state between
+calls. This driver keeps the CPUs of its claims in memory and does not use that mode.
+
+Each node goes without a driver from the old pod's stop until the new one is running:
+
+- The kubelet can neither prepare nor unprepare `dra.cpu` claims until the new driver registers.
+  A pod that holds one does not start, and a deleted pod whose claim no other pod uses stays
+  `Terminating`.
+- 30 seconds after the old driver stops, the kubelet deletes the node's `dra.cpu` ResourceSlices,
+  unless the new driver has connected by then. The new driver publishes them again when it starts.
+- Where containerd requires the driver's NRI plugin, it refuses containers until the new driver
+  connects to NRI; see [Requiring the driver's NRI plugin](#requiring-the-drivers-nri-plugin).
+- The new pod is created only once the old one has stopped, so pulling its image adds to the gap.
+  Pull the new image onto the nodes beforehand: with the chart's default
+  `image.pullPolicy: IfNotPresent`, the kubelet then does not pull it again.
+
 ## Uninstalling
 
-```bash
-helm uninstall dra-driver-cpu -n kube-system
-```
+Remove the pods that hold `dra.cpu` claims while the driver still runs: the kubelet finishes
+deleting the last pod that uses a claim only after the driver has unprepared the claim, and
+without a driver that pod stays `Terminating`.
+
+1. Stop whatever recreates those pods.
+
+1. Delete them and wait until they are gone.
+
+1. If containerd's `required_plugins` names `dra.cpu`, remove it and restart containerd, or
+   containerd refuses containers once the driver is gone; see
+   [Requiring the driver's NRI plugin](#requiring-the-drivers-nri-plugin).
+
+1. If Flux manages the release, suspend its HelmRelease, or Flux installs the chart again. Then
+   uninstall the chart:
+
+   ```bash
+   helm uninstall dra-driver-cpu -n kube-system
+   ```
 
 Pods that are running keep their current cpusets, but nothing manages pinning or the shared
-pool anymore; delete or reschedule claim-bearing pods afterwards.
+pool anymore.
 
 ## Installation via rendered manifest (deprecated)
 
