@@ -163,6 +163,36 @@ When exclusive CPUs are assigned via DRA claims, declaring `limits.cpu` in `pod.
 **Assigned CPU set:** Containers using CPU ResourceClaims receive `DRA_EXCLUSIVE_ASSIGNED_CPUSET` in Linux cpuset format (for example, `2-3,8`). It contains the union of CPUs assigned to that container across all its CPU claims.
 Containers without CPU claims do not receive it. The driver sets this variable; workloads should not set or override it.
 
+## Claims Shared Between Pods
+
+A `dra.cpu` claim serves one container: once a container uses it, the driver refuses every other
+container that names it until the claim is unprepared, and the kubelet unprepares a claim only once
+no pod on the node references it (see
+[Sharing resource claims](feature-support.md#sharing-resource-claims)). Give each pod its own
+claim, for example from a `ResourceClaimTemplate`. A claim that more than one pod uses keeps the
+later pods waiting:
+
+- **A standalone claim that two pods reference.** Unless the claim has a node-allocatable mapping,
+  the scheduler reserves it for both pods. The second pod's container is refused for as long as
+  that pod exists, even after the first pod is gone, since the second pod still references the
+  claim.
+- **A force-deleted pod.** A pod force-deleted while it holds a standalone claim leaves the API
+  before the kubelet has unprepared the claim, so the claim can be allocated to a new pod. If the
+  new pod lands on the same node before the kubelet starts to unprepare the claim, the kubelet
+  gives it the old preparation without asking the driver, and if the old pod's container had been
+  created, the new pod's container is refused for as long as the new pod exists. Do not
+  force-delete a pod that holds a standalone `dra.cpu` claim. If one was, delete the new pod of
+  that claim as well, and create it again once the old pod's teardown has finished.
+- **A pod group.** A claim reserved for a pod group, with the `DRAWorkloadResourceClaims` feature
+  gate, serves one container of one pod too: the driver refuses the containers of the group's
+  other pods while that binding lasts.
+
+## Preemption
+
+The scheduler's preemption frees no `dra.cpu` devices: a pending pod whose claim finds no free
+`dra.cpu` device does not preempt lower-priority pods that hold one. Free capacity by deleting or
+moving claim pods.
+
 ## Extended Resource Claim Status integrations
 
 Kubernetes `status.extendedResourceClaimStatus` is for DRA-backed extended resources. [Extended resource names](https://kubernetes.io/docs/tasks/configure-pod-container/extended-resource/) exclude standard resources such as `cpu` and `memory`, so `extendedResourceName` in a `DeviceClass` or a pod's `status.extendedResourceClaimStatus` is not expected to work with this CPU DRA driver when the container only requests native `cpu`.
