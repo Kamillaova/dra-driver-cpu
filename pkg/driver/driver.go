@@ -284,6 +284,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	plugin.podState = store.NewPodState()
 
 	exposeExtAttrs := false
+	allocator := cpuallocator.ModeCPUManager
 	logger.Info("creating CPU allocator", "method", config.Allocator)
 	switch config.Allocator {
 	case cpuallocator.ModeExternal:
@@ -293,6 +294,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		}
 		plugin.cpuAllocator = external
 		exposeExtAttrs = true
+		allocator = cpuallocator.ModeExternal
 	default:
 		plugin.cpuAllocator = cpuallocator.NewCPUManager(config.DriverName, topo)
 		plugin.wholeCorePicker = config.FullPhysicalCPUsOnly
@@ -305,6 +307,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		PublishNodeAllocatableResourceMapping: config.PublishNodeAllocatableResourceMapping,
 		ExposeExtAttrs:                        exposeExtAttrs,
 		FullPhysicalCPUsOnly:                  config.FullPhysicalCPUsOnly,
+		Allocator:                             allocator,
 	})
 	if err != nil {
 		return nil, err
