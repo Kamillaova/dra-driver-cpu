@@ -393,6 +393,51 @@ func TestDefault(t *testing.T) {
 	assert.Empty(t, d.ReservedCPUs)
 	assert.False(t, d.ExposePCIeRoots)
 	assert.False(t, d.PublishNodeAllocatableResourceMapping)
+	assert.False(t, d.FullPhysicalCPUsOnly)
+}
+
+// TestResolve_FullPhysicalCPUsOnly: the option comes from the file, a key left
+// out or null keeps the default, and individual mode refuses it.
+func TestResolve_FullPhysicalCPUsOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		file    string
+		want    bool
+		wantErr []string
+	}{
+		{name: "left out", file: "apiVersion: v1alpha1\n", want: false},
+		{name: "null", file: "apiVersion: v1alpha1\nfullPhysicalCPUsOnly: null\n", want: false},
+		{name: "false", file: "apiVersion: v1alpha1\nfullPhysicalCPUsOnly: false\n", want: false},
+		{name: "true", file: "apiVersion: v1alpha1\nfullPhysicalCPUsOnly: true\n", want: true},
+		{
+			name:    "true in individual mode",
+			file:    "apiVersion: v1alpha1\ncpuDeviceMode: individual\nfullPhysicalCPUsOnly: true\n",
+			wantErr: []string{"fullPhysicalCPUsOnly", `cpuDeviceMode "individual"`, `requires cpuDeviceMode "grouped"`},
+		},
+		{
+			name: "false in individual mode",
+			file: "apiVersion: v1alpha1\ncpuDeviceMode: individual\nfullPhysicalCPUsOnly: false\n",
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgFile := writeFile(t, t.TempDir(), "config.yaml", tc.file)
+
+			result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+				driverconfig.FromFile(cfgFile),
+			})
+
+			if len(tc.wantErr) > 0 {
+				require.Error(t, err)
+				for _, want := range tc.wantErr {
+					assert.Contains(t, err.Error(), want)
+				}
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, result.FullPhysicalCPUsOnly)
+		})
+	}
 }
 
 // TestResolve_APIClientLimits: qps and burst come from the file, and a value

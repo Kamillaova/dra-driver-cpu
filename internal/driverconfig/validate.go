@@ -47,6 +47,11 @@ func (c Config) Validate() error {
 	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED && c.GroupBy == device.GROUP_BY_MACHINE && c.Allocator != cpuallocator.ModeExternal {
 		return fmt.Errorf("invalid allocator %q with groupBy %q: must be %q", c.Allocator, device.GROUP_BY_MACHINE, cpuallocator.ModeExternal)
 	}
+	// In individual mode the scheduler, not the driver, picks every CPU a claim gets.
+	if c.FullPhysicalCPUsOnly && c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
+		return fmt.Errorf("invalid fullPhysicalCPUsOnly with cpuDeviceMode %q: requires cpuDeviceMode %q",
+			c.CPUDeviceMode, device.CPU_DEVICE_MODE_GROUPED)
+	}
 	// The kubelet root becomes socket and mount locations, so a relative path
 	// would resolve against the working directory and silently break
 	// registration.
