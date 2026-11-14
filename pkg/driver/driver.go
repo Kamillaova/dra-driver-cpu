@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/nri/pkg/stub"
@@ -121,8 +122,9 @@ type CPUDriver struct {
 	stateMu         sync.Mutex
 	hasSynchronized bool
 	// nriDisconnected is set when the NRI plugin's Run returns and cleared by
-	// Synchronize; until the first Synchronize, hasSynchronized covers it.
-	nriDisconnected bool
+	// Synchronize, both under stateMu; Ready reads it without the lock. Until
+	// the first Synchronize, hasSynchronized and initialSync cover it.
+	nriDisconnected atomic.Bool
 	// initialSync is closed when hasSynchronized first becomes true.
 	initialSync     chan struct{}
 	initialSyncWait time.Duration
@@ -441,6 +443,21 @@ func (cp *CPUDriver) Stop() {
 	cp.nriPlugin.Stop()
 }
 
+// Ready reports whether the kubelet has the plugin registered and the NRI
+// plugin is connected. It takes no lock, so a held stateMu cannot block a
+// probe. Call it only once Start has returned.
+func (cp *CPUDriver) Ready() bool {
+	if status := cp.draPlugin.RegistrationStatus(); status == nil || !status.PluginRegistered {
+		return false
+	}
+	select {
+	case <-cp.initialSync:
+	default:
+		return false
+	}
+	return !cp.nriDisconnected.Load()
+}
+
 func getDeviceAttributes(deviceSlices [][]resourceapi.Device, deviceName string) (map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, bool) {
 	for _, slice := range deviceSlices {
 		for _, dev := range slice {
@@ -508,7 +525,7 @@ type nriConnection struct {
 func (c nriConnection) Run(ctx context.Context) error {
 	err := c.plugin.Run(ctx)
 	c.driver.stateMu.Lock()
-	c.driver.nriDisconnected = true
+	c.driver.nriDisconnected.Store(true)
 	c.driver.stateMu.Unlock()
 	return err
 }

@@ -136,6 +136,20 @@ The driver needs node-level privileges: `hostNetwork: true`, and hostPath mounts
 socket (`/var/run/nri`), the CDI spec directory (`/var/run/cdi`), and the kubelet plugin
 directories.
 
+## Health probes
+
+The driver's HTTP server listens on `--bind-address`, which the chart sets from `healthzPort`,
+and serves two probe endpoints:
+
+- `/livez` answers 200 as soon as the server serves. The chart's liveness probe uses it.
+- `/healthz` answers 200 only while the driver is registered with the kubelet and connected to
+  NRI, and 503 before that and while the driver reconnects to NRI. The chart's readiness probe
+  uses it.
+
+The manifests under `manifests/base`, which the chart does not render, keep the liveness probe on
+`/healthz`, so a driver that is alive but not yet registered or connected to NRI is restarted
+there.
+
 ## Upgrading (generic instructions)
 
 Upgrade with Helm:

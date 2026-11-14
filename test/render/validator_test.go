@@ -90,15 +90,19 @@ func TestRenderedDaemonSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, probe := range map[string]*corev1.Probe{
-		"liveness":  c.LivenessProbe,
-		"readiness": c.ReadinessProbe,
+	for _, p := range []struct {
+		name  string
+		probe *corev1.Probe
+		path  string
+	}{
+		{name: "liveness", probe: c.LivenessProbe, path: "/livez"},
+		{name: "readiness", probe: c.ReadinessProbe, path: "/healthz"},
 	} {
-		if probe == nil || probe.HTTPGet == nil {
-			t.Fatalf("%s probe must use HTTP", name)
+		if p.probe == nil || p.probe.HTTPGet == nil {
+			t.Fatalf("%s probe must use HTTP", p.name)
 		}
-		if probe.HTTPGet.Path != "/healthz" {
-			t.Fatalf("%s probe path = %q, want /healthz", name, probe.HTTPGet.Path)
+		if p.probe.HTTPGet.Path != p.path {
+			t.Fatalf("%s probe path = %q, want %s", p.name, p.probe.HTTPGet.Path, p.path)
 		}
 	}
 	if *checkOverride {

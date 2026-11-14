@@ -258,7 +258,7 @@ func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logge
 	if !cp.hasSynchronized {
 		return kubeletplugin.PrepareResult{Err: fmt.Errorf("initial NRI synchronization has not completed; retry preparation")}
 	}
-	if cp.nriDisconnected {
+	if cp.nriDisconnected.Load() {
 		logger.V(2).Info("refusing to prepare claim while NRI is disconnected")
 		return kubeletplugin.PrepareResult{Err: errNRIDisconnected}
 	}
