@@ -32,6 +32,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -58,6 +59,7 @@ var (
 	expectedRoot  = flag.String("expected-root", "", "the kubelet root the mounts and the flag must derive from")
 	expectFlag    = flag.Bool("expect-root-flag", false, "whether the chart should pass "+rootFlag)
 	checkOverride = flag.Bool("check-hostname-override", false, "whether to judge how the node name reaches the driver")
+	wantStrategy  = flag.String("expected-update-strategy", "{}", "the spec.updateStrategy the chart must render, as JSON; {} for none")
 )
 
 // validated says the checks below ran to the end. `go test -run` exits 0 when
@@ -104,6 +106,9 @@ func TestRenderedDaemonSet(t *testing.T) {
 		if p.probe.HTTPGet.Path != p.path {
 			t.Fatalf("%s probe path = %q, want %s", p.name, p.probe.HTTPGet.Path, p.path)
 		}
+	}
+	if err := checkUpdateStrategy(ds, *wantStrategy); err != nil {
+		t.Fatal(err)
 	}
 	if *checkOverride {
 		if err := checkNodeName(ds); err != nil {
@@ -326,4 +331,25 @@ func checkNodeNameEnv(c *corev1.Container) error {
 		return fmt.Errorf("env %q comes from %q, want %q", nodeNameEnv, e.ValueFrom.FieldRef.FieldPath, want)
 	}
 	return nil
+}
+
+// checkUpdateStrategy compares the strategy as decoded objects, so a case may
+// list the fields in any order. The expected value is decoded strictly, since a
+// misspelled field would otherwise read as unset and pass against a chart that
+// renders none.
+func checkUpdateStrategy(ds *appsv1.DaemonSet, want string) error {
+	var expected appsv1.DaemonSetUpdateStrategy
+	dec := json.NewDecoder(strings.NewReader(want))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&expected); err != nil {
+		return fmt.Errorf("parse -expected-update-strategy %q: %w", want, err)
+	}
+	if reflect.DeepEqual(ds.Spec.UpdateStrategy, expected) {
+		return nil
+	}
+	got, err := json.Marshal(ds.Spec.UpdateStrategy)
+	if err != nil {
+		return fmt.Errorf("encode the rendered updateStrategy: %w", err)
+	}
+	return fmt.Errorf("updateStrategy = %s, want %s", got, want)
 }

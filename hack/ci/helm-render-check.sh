@@ -77,6 +77,22 @@ checkNodeName() {
 	fi
 }
 
+# checkUpdateStrategy <name> <expected-json> [helm args...]; the chart passes
+# updateStrategy through as written. Every other case expects none, the default
+# that leaves the API server's rolling update with maxSurge 0.
+checkUpdateStrategy() {
+	local name=$1 want=$2
+	shift 2
+
+	echo "update strategy render check: ${name}"
+	"${helm}" "${template_args[@]}" "$@" >"${tmp}/${name}.yaml"
+	go test -count=1 ./test/render/ -args \
+		-manifest "${tmp}/${name}.yaml" \
+		-expected-root "${default_root}" \
+		-expect-root-flag=false \
+		-expected-update-strategy "${want}"
+}
+
 # refuses <name> <message> <helm args...>; the render has to fail and name the
 # guard the case is for, so an unrelated helm failure cannot satisfy it.
 refuses() {
@@ -122,6 +138,12 @@ checkNodeName args-override mynode \
 	--set-string 'args.hostnameOverride=mynode'
 checkNodeName config-override mynode \
 	--set-string 'driverConfig.hostnameOverride=mynode'
+
+checkUpdateStrategy on-delete '{"type":"OnDelete"}' \
+	--set 'updateStrategy.type=OnDelete'
+checkUpdateStrategy rolling-update '{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":"10%"}}' \
+	--set 'updateStrategy.type=RollingUpdate' \
+	--set-string 'updateStrategy.rollingUpdate.maxUnavailable=10%'
 
 # The guard this change adds.
 refuses dollar-paren 'must not contain' \

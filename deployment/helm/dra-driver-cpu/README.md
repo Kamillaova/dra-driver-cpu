@@ -61,6 +61,7 @@ helm install dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driv
 | resources.requests.memory | string | `"50Mi"` | Memory resource request |
 | serviceAccount.annotations | object | `{}` | Annotations to add to the ServiceAccount |
 | tolerations | list | `[{"effect":"NoSchedule","operator":"Exists"}]` | Node tolerations; defaults to tolerating all NoSchedule taints |
+| updateStrategy | object | `{}` | DaemonSet update strategy, unset by default: the DaemonSet then takes the Kubernetes default, a rolling update with `maxUnavailable: 1` and `maxSurge: 0`. The driver needs `maxSurge: 0`; see [Upgrading the driver](../../../docs/user/installation.md#upgrading-the-driver) |
 
 ## Uninstallation
 
