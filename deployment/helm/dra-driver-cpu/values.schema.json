@@ -225,6 +225,10 @@
           }
         }
       }
+    },
+    "updateStrategy": {
+      "description": "DaemonSet update strategy, unset by default: the DaemonSet then takes the Kubernetes default, a rolling update with `maxUnavailable: 1` and `maxSurge: 0`. The driver needs `maxSurge: 0`; see [Upgrading the driver](../../../docs/user/installation.md#upgrading-the-driver)",
+      "type": "object"
     }
   },
   "additionalProperties": false,

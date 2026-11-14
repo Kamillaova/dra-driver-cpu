@@ -230,11 +230,12 @@ Upgrade with Helm:
 helm upgrade dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driver-cpu -n kube-system
 ```
 
-The chart sets no update strategy, so the DaemonSet takes the Kubernetes default, a rolling update
-with `maxUnavailable: 1` and `maxSurge: 0`: on each node the old driver pod stops before the new
-one starts. The kubelet plugin library the driver is built on requires `maxSurge: 0` unless the
-driver runs in the library's rolling-update mode, which needs a driver that keeps no state between
-calls. This driver keeps the CPUs of its claims in memory and does not use that mode.
+The chart's `updateStrategy` value is unset by default, so the DaemonSet takes the Kubernetes
+default, a rolling update with `maxUnavailable: 1` and `maxSurge: 0`: on each node the old driver
+pod stops before the new one starts. The kubelet plugin library the driver is built on requires
+`maxSurge: 0` unless the driver runs in the library's rolling-update mode, which needs a driver
+that keeps no state between calls. This driver keeps the CPUs of its claims in memory and does not
+use that mode.
 
 Each node goes without a driver from the old pod's stop until the new one is running:
 

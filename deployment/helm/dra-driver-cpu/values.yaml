@@ -76,6 +76,9 @@ nodeSelector: {}
 # -- Affinity rules for scheduling the DaemonSet pods
 affinity: {}
 
+# -- DaemonSet update strategy, unset by default: the DaemonSet then takes the Kubernetes default, a rolling update with `maxUnavailable: 1` and `maxSurge: 0`. The driver needs `maxSurge: 0`; see [Upgrading the driver](../../../docs/user/installation.md#upgrading-the-driver)
+updateStrategy: {}
+
 # @schema additionalProperties:false
 args:
   # -- Log verbosity level passed as `--v`
