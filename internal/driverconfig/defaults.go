@@ -27,6 +27,9 @@ const (
 	DefaultKubeletRootDir = "/var/lib/kubelet"
 
 	DefaultBindAddress = ":8080"
+
+	DefaultQPS   = 20
+	DefaultBurst = 50
 )
 
 // Default returns a Config with built-in default values.
@@ -37,5 +40,7 @@ func Default() Config {
 		GroupBy:        device.GROUP_BY_NUMA_NODE,
 		KubeletRootDir: DefaultKubeletRootDir,
 		Allocator:      cpuallocator.ModeCPUManager,
+		QPS:            DefaultQPS,
+		Burst:          DefaultBurst,
 	}
 }

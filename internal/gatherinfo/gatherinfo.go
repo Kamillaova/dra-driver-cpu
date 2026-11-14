@@ -204,6 +204,8 @@ func makeDriverConfigSnapshot(cfg driverconfig.Config) gatherinfoapi.DriverConfi
 		KubeletRootDir:                        cfg.KubeletRootDir,
 		PublishNodeAllocatableResourceMapping: cfg.PublishNodeAllocatableResourceMapping,
 		Allocator:                             cfg.Allocator,
+		QPS:                                   cfg.QPS,
+		Burst:                                 cfg.Burst,
 	}
 }
 

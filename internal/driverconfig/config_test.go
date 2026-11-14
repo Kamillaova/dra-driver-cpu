@@ -385,12 +385,48 @@ func TestDefault(t *testing.T) {
 	// The kubelet root defaults to the standard location, so behavior is
 	// unchanged unless the kubelet --root-dir is relocated.
 	assert.Equal(t, driverconfig.DefaultKubeletRootDir, d.KubeletRootDir)
+	assert.Equal(t, float32(20), d.QPS)
+	assert.Equal(t, 50, d.Burst)
 	// Fields with no built-in default must be zero/empty.
 	assert.Empty(t, d.Kubeconfig)
 	assert.Empty(t, d.HostnameOverride)
 	assert.Empty(t, d.ReservedCPUs)
 	assert.False(t, d.ExposePCIeRoots)
 	assert.False(t, d.PublishNodeAllocatableResourceMapping)
+}
+
+// TestResolve_APIClientLimits: qps and burst come from the file, and a value
+// client-go would read as its default or as no limit is refused.
+func TestResolve_APIClientLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		file      string
+		wantQPS   float32
+		wantBurst int
+		wantErr   string
+	}{
+		{name: "left out", file: "apiVersion: v1alpha1\n", wantQPS: 20, wantBurst: 50},
+		{name: "set", file: "apiVersion: v1alpha1\nqps: 2.5\nburst: 8\n", wantQPS: 2.5, wantBurst: 8},
+		{name: "zero qps", file: "apiVersion: v1alpha1\nqps: 0\n", wantErr: "invalid qps 0"},
+		{name: "negative qps", file: "apiVersion: v1alpha1\nqps: -1\n", wantErr: "invalid qps -1"},
+		{name: "zero burst", file: "apiVersion: v1alpha1\nburst: 0\n", wantErr: "invalid burst 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgFile := writeFile(t, t.TempDir(), "config.yaml", tc.file)
+
+			result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+				driverconfig.FromFile(cfgFile),
+			})
+
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantQPS, result.QPS)
+			assert.Equal(t, tc.wantBurst, result.Burst)
+		})
+	}
 }
 
 // TestResolve_InvalidCPUDeviceModeIsError: an invalid cpuDeviceMode in the file is rejected.

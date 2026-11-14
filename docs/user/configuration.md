@@ -131,6 +131,17 @@ on - is configured through other Helm values, not through this file.
 - Requires the `DRANodeAllocatableResources` feature gate (alpha, 1.37+). See
   [Workload Configuration Requirements](workload-requirements.md).
 
+`qps` (number, default: `20`)
+
+- Requests per second the driver's Kubernetes API client may send. Must be greater than 0.
+- The driver sends every API request through one client, the kubelet plugin library's claim
+  reads and ResourceSlice writes included, so `qps` and `burst` limit all of them together.
+
+`burst` (integer, default: `50`)
+
+- Requests the driver's Kubernetes API client may send at once before `qps` applies. Must be at
+  least 1.
+
 #### Example
 
 ```yaml

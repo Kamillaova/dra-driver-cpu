@@ -27,6 +27,8 @@ func TestValidate(t *testing.T) {
 		name: "error: unknown allocator",
 		conf: Config{
 			KubeletRootDir: "/var/lib/kubelet",
+			QPS:            20,
+			Burst:          50,
 			CPUDeviceMode:  "grouped",
 			GroupBy:        "numanode",
 			Allocator:      "other-allocator",
@@ -36,6 +38,8 @@ func TestValidate(t *testing.T) {
 		name: "error: non-external allocator in machine mode",
 		conf: Config{
 			KubeletRootDir: "/var/lib/kubelet",
+			QPS:            20,
+			Burst:          50,
 			CPUDeviceMode:  "grouped",
 			GroupBy:        "machine",
 			Allocator:      "cpumanager",
@@ -45,6 +49,8 @@ func TestValidate(t *testing.T) {
 		name: "valid: external allocator in machine mode",
 		conf: Config{
 			KubeletRootDir: "/var/lib/kubelet",
+			QPS:            20,
+			Burst:          50,
 			CPUDeviceMode:  "grouped",
 			GroupBy:        "machine",
 			Allocator:      "external",
@@ -54,6 +60,8 @@ func TestValidate(t *testing.T) {
 		name: "valid: allocator: cpumanager",
 		conf: Config{
 			KubeletRootDir: "/var/lib/kubelet",
+			QPS:            20,
+			Burst:          50,
 			CPUDeviceMode:  "grouped",
 			GroupBy:        "numanode",
 			Allocator:      "cpumanager",
@@ -63,9 +71,53 @@ func TestValidate(t *testing.T) {
 		name: "valid: allocator: external",
 		conf: Config{
 			KubeletRootDir: "/var/lib/kubelet",
+			QPS:            20,
+			Burst:          50,
 			CPUDeviceMode:  "grouped",
 			GroupBy:        "numanode",
 			Allocator:      "external",
+		},
+		expectedErr: false,
+	}, {
+		name: "error: zero qps",
+		conf: Config{
+			KubeletRootDir: "/var/lib/kubelet",
+			CPUDeviceMode:  "grouped",
+			GroupBy:        "numanode",
+			Allocator:      "cpumanager",
+			Burst:          50,
+		},
+		expectedErr: true,
+	}, {
+		name: "error: negative qps",
+		conf: Config{
+			KubeletRootDir: "/var/lib/kubelet",
+			CPUDeviceMode:  "grouped",
+			GroupBy:        "numanode",
+			Allocator:      "cpumanager",
+			QPS:            -1,
+			Burst:          50,
+		},
+		expectedErr: true,
+	}, {
+		name: "error: zero burst",
+		conf: Config{
+			KubeletRootDir: "/var/lib/kubelet",
+			CPUDeviceMode:  "grouped",
+			GroupBy:        "numanode",
+			Allocator:      "cpumanager",
+			QPS:            20,
+		},
+		expectedErr: true,
+	}, {
+		name: "valid: fractional qps, burst of one",
+		conf: Config{
+			KubeletRootDir: "/var/lib/kubelet",
+			CPUDeviceMode:  "grouped",
+			GroupBy:        "numanode",
+			Allocator:      "cpumanager",
+			QPS:            0.5,
+			Burst:          1,
 		},
 		expectedErr: false,
 	}} {

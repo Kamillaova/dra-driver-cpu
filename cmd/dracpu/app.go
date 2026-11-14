@@ -186,6 +186,8 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	// https://kubernetes.io/docs/reference/using-api/api-concepts/#alternate-representations-of-resources
 	restConfig.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
 	restConfig.ContentType = "application/vnd.kubernetes.protobuf"
+	restConfig.QPS = cfg.QPS
+	restConfig.Burst = cfg.Burst
 
 	// creates the clientset
 	clientset, err := kubernetes.NewForConfig(restConfig)
