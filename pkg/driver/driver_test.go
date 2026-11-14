@@ -28,8 +28,11 @@ import (
 	"time"
 
 	"github.com/containerd/nri/pkg/stub"
+	"github.com/go-logr/logr/funcr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/stretchr/testify/require"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
+	"k8s.io/utils/cpuset"
 )
 
 type mockNRIRunner struct {
@@ -179,6 +182,36 @@ func TestRunNRIPluginWithRetry_HealthyRunResetsTheBudget(t *testing.T) {
 		require.Len(t, runs, 3)
 		require.Equal(t, nriRetryHealthyRunDuration+nriRetryInitialBackoff, runs[2].Sub(runs[1]), "the backoff restarts from its initial value")
 	})
+}
+
+// exposePCIeRoots lowers devicesPerResourceSlice from 128 to 64, which the
+// configuration does not show and which can double the ResourceSlices a node
+// publishes.
+func TestNewReportsResourceSliceCountUnderExposePCIeRoots(t *testing.T) {
+	var logs strings.Builder
+	logger := funcr.New(func(prefix, args string) {
+		logs.WriteString(prefix + " " + args + "\n")
+	}, funcr.Options{})
+
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_DualSocket_120CPUsPerSocket_HT},
+		SysFS:   testSysFS(mockCPUInfos_DualSocket_120CPUsPerSocket_HT),
+	}
+	conf := Config{
+		DriverName:      testDriverName,
+		NodeName:        testNodeName,
+		ReservedCPUs:    cpuset.New(),
+		ExposePCIeRoots: true,
+	}
+	_, err := New(logger, prov, &conf)
+	require.NoError(t, err)
+
+	logged := logs.String()
+	require.Contains(t, logged, `"msg"="chunked devices into ResourceSlices"`)
+	require.Contains(t, logged, `"numDevices"=240`)
+	require.Contains(t, logged, `"devicesPerResourceSlice"=64`)
+	require.Contains(t, logged, `"numResourceSlices"=4`)
+	require.Contains(t, logged, `"exposePCIeRoots"=true`)
 }
 
 // TestWaitForRegistration covers an unexported function, which we would normally
