@@ -110,6 +110,59 @@ func (err ClaimOverlapError) Unwrap() error {
 	return ErrClaimOverlap
 }
 
+// AssignmentOverlapError refuses to reserve CPUs that prepared claims hold.
+type AssignmentOverlapError struct {
+	ClaimUID types.UID
+	CPUs     cpuset.CPUSet
+	Holders  ClaimHolders
+}
+
+func (err AssignmentOverlapError) Error() string {
+	msg := fmt.Sprintf("claim %q has overlapping CPU assignment %q", err.ClaimUID, err.CPUs.String())
+	if len(err.Holders) == 0 {
+		return msg
+	}
+	return msg + ": " + err.Holders.String()
+}
+
+func (err AssignmentOverlapError) Unwrap() error {
+	return ErrClaimOverlap
+}
+
+// ClaimHolder is a prepared claim holding some CPUs of a set.
+type ClaimHolder struct {
+	ClaimUID  types.UID
+	Namespace string
+	Name      string
+	CPUs      cpuset.CPUSet
+	Owner     OwnerIdent
+}
+
+func (h ClaimHolder) String() string {
+	claim := fmt.Sprintf("claim %s/%s (UID %q)", h.Namespace, h.Name, h.ClaimUID)
+	if h.Name == "" {
+		claim = fmt.Sprintf("claim with UID %q", h.ClaimUID)
+	}
+	owner := "bound to no container"
+	if !h.Owner.Vacant() {
+		owner = fmt.Sprintf("bound to container %q of pod %q", h.Owner.ContainerName, h.Owner.PodUID)
+	}
+	return fmt.Sprintf("%s holds CPUs %s, %s", claim, h.CPUs.String(), owner)
+}
+
+// ClaimHolders are the prepared claims holding some CPUs of a set, in order of
+// claim UID.
+type ClaimHolders []ClaimHolder
+
+func (hs ClaimHolders) String() string {
+	held := make([]string, 0, len(hs)+1)
+	for _, h := range hs {
+		held = append(held, h.String())
+	}
+	held = append(held, `see "CPUs Held by Another Claim" in the driver's troubleshooting guide`)
+	return strings.Join(held, "; ")
+}
+
 type OwnerIdent struct {
 	PodUID        types.UID
 	ContainerName string
@@ -291,7 +344,7 @@ func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, record
 	}
 	sharedCPUs := s.availableCPUs.Difference(s.preparedCPUs)
 	if !cpus.IsSubsetOf(sharedCPUs) {
-		return fmt.Errorf("claim %q has overlapping CPU assignment %q", claimUID, cpus.String())
+		return AssignmentOverlapError{ClaimUID: claimUID, CPUs: cpus, Holders: s.holdersLocked(cpus)}
 	}
 	if hasSharedContainers && !cpus.IsEmpty() && sharedCPUs.Difference(cpus).IsEmpty() {
 		return fmt.Errorf("claim %q would exhaust the shared CPU pool while shared containers are running", claimUID)
@@ -480,6 +533,25 @@ func (s *AllocationState) GetRequestAllocationUnion(refs ...ClaimRequestRef) (cp
 		union = union.Union(cpus)
 	}
 	return union, nil
+}
+
+// Holders returns the prepared claims holding any of cpus, from their records,
+// with no API call.
+func (s *AllocationState) Holders(cpus cpuset.CPUSet) ClaimHolders {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.holdersLocked(cpus)
+}
+
+func (s *AllocationState) holdersLocked(cpus cpuset.CPUSet) ClaimHolders {
+	var holders ClaimHolders
+	for _, uid := range slices.Sorted(maps.Keys(s.resourceClaimAllocations)) {
+		allocation := s.resourceClaimAllocations[uid]
+		if held := cpus.Intersection(allocation.cpus); !held.IsEmpty() {
+			holders = append(holders, ClaimHolder{ClaimUID: uid, Namespace: allocation.namespace, Name: allocation.name, CPUs: held, Owner: allocation.owner})
+		}
+	}
+	return holders
 }
 
 // GetReservedCPUs returns the set of reserved CPUs.
