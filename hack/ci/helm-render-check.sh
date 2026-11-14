@@ -93,6 +93,23 @@ checkUpdateStrategy() {
 		-expected-update-strategy "${want}"
 }
 
+# checkEventsPolicy <name> <expect-policy> <fullname> [helm args...]; the events
+# admission policy, its binding and the verbs they confine render with
+# rbac.create alone, matching the release's own service account.
+checkEventsPolicy() {
+	local name=$1 want=$2 fullname=$3
+	shift 3
+
+	echo "events policy render check: ${name}"
+	"${helm}" template test "${chart}" --kube-version "${kube_version}" \
+		--namespace dra-test "$@" >"${tmp}/${name}-chart.yaml"
+	go test -count=1 ./test/render/ -args \
+		-chart "${tmp}/${name}-chart.yaml" \
+		-expect-events-policy="${want}" \
+		-release-namespace dra-test \
+		-fullname "${fullname}"
+}
+
 # refuses <name> <message> <helm args...>; the render has to fail and name the
 # guard the case is for, so an unrelated helm failure cannot satisfy it.
 refuses() {
@@ -144,6 +161,12 @@ checkUpdateStrategy on-delete '{"type":"OnDelete"}' \
 checkUpdateStrategy rolling-update '{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":"10%"}}' \
 	--set 'updateStrategy.type=RollingUpdate' \
 	--set-string 'updateStrategy.rollingUpdate.maxUnavailable=10%'
+
+checkEventsPolicy events-policy true test-dra-driver-cpu
+checkEventsPolicy events-policy-fullname true cpu \
+	--set-string 'fullnameOverride=cpu'
+checkEventsPolicy events-policy-no-rbac false test-dra-driver-cpu \
+	--set 'rbac.create=false'
 
 # The guard this change adds.
 refuses dollar-paren 'must not contain' \

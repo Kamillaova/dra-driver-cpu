@@ -102,6 +102,16 @@ at creation, where it ran with all of the claim's CPUs before. Name the claim wi
 or give the container its own claim. Claims prepared before the upgrade keep the old behavior
 until they are unprepared.
 
+#### Events
+
+The driver posts Kubernetes events, so its ClusterRole now grants `create` and `patch` on
+`events`. With `rbac.create: true` the chart also creates a ValidatingAdmissionPolicy and its
+binding, named after the release, which admit an event from the driver's service account only
+when the event's source host is the driver's own node: the account that runs the upgrade needs
+the right to create both. With `rbac.create: false`, grant the driver's service account `create`
+and `patch` on `events` yourself; without them the API server refuses the driver's events, and
+the driver logs each refusal.
+
 ### Behavior changes
 
 #### Kubernetes API client limits
