@@ -206,6 +206,7 @@ func makeDriverConfigSnapshot(cfg driverconfig.Config) gatherinfoapi.DriverConfi
 		Allocator:                             cfg.Allocator,
 		QPS:                                   cfg.QPS,
 		Burst:                                 cfg.Burst,
+		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
 	}
 }
 
