@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -112,11 +114,10 @@ type prepareOutcome struct {
 
 func TestStartupWindowFailedSynchronizeKeepsGateClosed(t *testing.T) {
 	driver, pod, containers, claim := startupWindowFixture(t)
-	driver.cdiMgr.(*mockCdiMgr).devices[getCDIDeviceName("conflict")] = fmt.Sprintf("%s_conflict=0,2", cdiEnvVarPrefix)
-	bad := append([]*api.Container{}, containers...)
-	bad = append(bad, &api.Container{Id: "conflict-container", Name: "other", PodSandboxId: pod.Id, State: api.ContainerState_CONTAINER_RUNNING, Env: []string{fmt.Sprintf("%s_conflict=0,2", cdiEnvVarPrefix)}})
-	_, err := driver.Synchronize(t.Context(), []*api.PodSandbox{pod}, bad)
-	require.Error(t, err)
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := driver.Synchronize(cancelled, []*api.PodSandbox{pod}, containers)
+	require.ErrorIs(t, err, context.Canceled)
 	require.False(t, driver.hasSynchronized)
 	results, err := driver.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
 	require.NoError(t, err)
@@ -128,4 +129,44 @@ func TestStartupWindowFailedSynchronizeKeepsGateClosed(t *testing.T) {
 	results, err = driver.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
 	require.NoError(t, err)
 	require.NoError(t, results[claim.UID].Err)
+}
+
+// Two records naming the same CPUs cannot both be right, and nothing says which
+// one is. Neither claim is bound, their CPUs stay out of the shared pool and of
+// new claims, and the node keeps working until one of them is unprepared.
+func TestStartupWindowOverlappingRecordsBindNoContainer(t *testing.T) {
+	driver, pod, containers, _ := startupWindowFixture(t)
+	driver.cdiMgr.(*mockCdiMgr).devices[getCDIDeviceName("conflict")] = fmt.Sprintf("%s_conflict=0,2", cdiEnvVarPrefix)
+	all := append([]*api.Container{}, containers...)
+	all = append(all, &api.Container{Id: "conflict-container", Name: "other", PodSandboxId: pod.Id, State: api.ContainerState_CONTAINER_RUNNING, Env: []string{fmt.Sprintf("%s_conflict=0,2", cdiEnvVarPrefix)}})
+
+	updates, err := driver.Synchronize(t.Context(), []*api.PodSandbox{pod}, all)
+	require.NoError(t, err)
+	require.True(t, driver.hasSynchronized)
+	require.Equal(t, map[string]string{"existing-container": "1,3", "conflict-container": "1,3"}, cpusByContainer(updates))
+	require.Equal(t, "0,2", driver.allocationState.GetPreparedCPUs().String())
+	for _, uid := range []types.UID{"existing", "conflict"} {
+		_, bound := driver.allocationState.Owner(uid)
+		require.False(t, bound, "claim %q must not be bound", uid)
+	}
+
+	claim := testClaim("new-claim", testDriverName, testNodeName, map[string]int64{"cpudevnuma000": 1})
+	results, err := driver.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.NoError(t, results[claim.UID].Err)
+	allocated, ok := driver.allocationState.GetResourceClaimAllocation(claim.UID)
+	require.True(t, ok)
+	require.True(t, allocated.Intersection(cpuset.New(0, 2)).IsEmpty())
+
+	_, _, err = driver.CreateContainer(t.Context(), pod, all[0])
+	require.ErrorIs(t, err, store.ErrClaimOverlap, "a restarted container is refused while the records overlap")
+
+	unprepared, err := driver.UnprepareResourceClaims(t.Context(), []kubeletplugin.NamespacedObject{{UID: "conflict"}})
+	require.NoError(t, err)
+	require.NoError(t, unprepared["conflict"])
+	require.Equal(t, "0,2", driver.allocationState.GetPreparedCPUs().Difference(allocated).String())
+	updates, err = driver.Synchronize(t.Context(), []*api.PodSandbox{pod}, containers)
+	require.NoError(t, err)
+	require.Equal(t, "0,2", cpusByContainer(updates)["existing-container"])
+	require.True(t, driver.allocationState.IsOwner("existing", types.UID(pod.Uid), "workload"))
 }

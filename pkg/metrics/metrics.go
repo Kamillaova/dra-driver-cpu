@@ -101,6 +101,7 @@ type Metrics struct {
 	nriCreateContainerDuration *prometheus.HistogramVec
 	nriStopContainerDuration   *prometheus.HistogramVec
 	nriRemoveContainerDuration *prometheus.HistogramVec
+	nriSynchronizeRefused      prometheus.Counter
 }
 
 type metricKind string
@@ -206,6 +207,11 @@ var (
 		labels:  []string{"result", "cpu_allocation_mode"},
 		buckets: nriBuckets,
 	}
+	nriSynchronizeRefusedSpec = metricSpec{
+		name: "dra_cpu_nri_synchronize_refused_claims_total",
+		kind: metricCounter,
+		help: "Total number of claims a container names that the NRI Synchronize callback did not bind to it.",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -222,6 +228,7 @@ var metricSpecs = []metricSpec{
 	nriCreateContainerDurationSpec,
 	nriStopContainerDurationSpec,
 	nriRemoveContainerDurationSpec,
+	nriSynchronizeRefusedSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -266,6 +273,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		nriCreateContainerDuration: newHistogramVec(nriCreateContainerDurationSpec),
 		nriStopContainerDuration:   newHistogramVec(nriStopContainerDurationSpec),
 		nriRemoveContainerDuration: newHistogramVec(nriRemoveContainerDurationSpec),
+		nriSynchronizeRefused:      newCounter(nriSynchronizeRefusedSpec),
 	}
 
 	reg.MustRegister(
@@ -282,6 +290,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriCreateContainerDuration,
 		m.nriStopContainerDuration,
 		m.nriRemoveContainerDuration,
+		m.nriSynchronizeRefused,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -300,6 +309,13 @@ func New(reg prometheus.Registerer) *Metrics {
 
 func newGauge(spec metricSpec) prometheus.Gauge {
 	return prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: spec.name,
+		Help: spec.help,
+	})
+}
+
+func newCounter(spec metricSpec) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{
 		Name: spec.name,
 		Help: spec.help,
 	})
@@ -372,6 +388,10 @@ func (m *Metrics) RecordNRIRemoveContainer(err error, claimCount int, elapsed ti
 	m.nriRemoveContainerDuration.WithLabelValues(res.String(), alloc.String()).Observe(elapsed.Seconds())
 }
 
+func (m *Metrics) RecordNRISynchronizeRefusedClaim() {
+	m.nriSynchronizeRefused.Inc()
+}
+
 func determineResult(err error) Result {
 	if err != nil {
 		return ResultError
@@ -404,3 +424,4 @@ func (noopRecorder) RecordNRISynchronize(error, time.Duration)          {}
 func (noopRecorder) RecordNRICreateContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
+func (noopRecorder) RecordNRISynchronizeRefusedClaim()                  {}

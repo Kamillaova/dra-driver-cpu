@@ -378,6 +378,43 @@ func TestAllocationStateReserveSharedPoolGuard(t *testing.T) {
 	}
 }
 
+func TestAllocationStateRestoreKeepsOverlappingClaimsUnbound(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestAllocationState(logger, cpuset.New(0, 1, 2, 3, 4), cpuset.New())
+
+	store.Restore(logger, "a", cpuset.New(0, 1))
+	store.Restore(logger, "b", cpuset.New(1, 2))
+	store.Restore(logger, "c", cpuset.New(0, 3))
+	store.Restore(logger, "a", cpuset.New(4))
+	cpus, ok := store.GetResourceClaimAllocation("a")
+	require.True(t, ok)
+	require.Equal(t, "0-1", cpus.String(), "restoring a recorded claim must not change it")
+	require.Equal(t, "0-3", store.GetPreparedCPUs().String())
+	require.Equal(t, "4", store.GetSharedCPUs().String())
+	require.Error(t, store.Reserve(logger, "d", cpuset.New(2), false), "a new claim must not take a restored claim's CPU")
+
+	_, err := store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{"a": cpuset.New(0, 1)})
+	var overlapErr ClaimOverlapError
+	require.ErrorAs(t, err, &overlapErr)
+	require.Equal(t, types.UID("a"), overlapErr.ClaimUID)
+	require.Equal(t, types.UID("b"), overlapErr.Other, "of the claims a overlaps, the one with the lowest UID is named")
+	require.Equal(t, "1", overlapErr.CPUs.String())
+	_, err = store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{"b": cpuset.New(1, 2)})
+	require.ErrorIs(t, err, ErrClaimOverlap)
+	_, bound := store.Owner("b")
+	require.False(t, bound)
+
+	store.Release(logger, "a")
+	require.Equal(t, "0-3", store.GetPreparedCPUs().String(), "a CPU stays prepared while another claim names it")
+	_, err = store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{"b": cpuset.New(1, 2)})
+	require.NoError(t, err)
+	owner, bound := store.Owner("b")
+	require.True(t, bound)
+	require.Equal(t, OwnerIdent{PodUID: "pod", ContainerName: "app"}, owner)
+	_, bound = store.Owner("a")
+	require.False(t, bound, "a released claim has no owner")
+}
+
 func TestAllocationStateStoreCacheConsistency(t *testing.T) {
 	logger := testr.New(t)
 	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)

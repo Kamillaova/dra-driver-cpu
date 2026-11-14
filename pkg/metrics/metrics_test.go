@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 13)
+	require.Len(t, descriptors, 14)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -54,9 +54,11 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_nri_create_container_duration_seconds",
 		"dra_cpu_nri_stop_container_duration_seconds",
 		"dra_cpu_nri_remove_container_duration_seconds",
+		"dra_cpu_nri_synchronize_refused_claims_total",
 	}, names)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
+	require.Empty(t, descriptors[13].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -90,6 +92,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_nri_remove_container_duration_seconds",
 		"dra_cpu_nri_stop_container_duration_seconds",
 		"dra_cpu_nri_synchronize_duration_seconds",
+		"dra_cpu_nri_synchronize_refused_claims_total",
 		"dra_cpu_prepare_claim_duration_seconds",
 		"dra_cpu_prepare_claims_total",
 		"dra_cpu_reserved_cpus",
@@ -113,6 +116,8 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	m.RecordPrepare(ResultError, 250*time.Millisecond)
 	m.RecordUnprepare(ResultSuccess, 100*time.Millisecond)
 	m.RecordClaimAllocatedCPUs(2)
+	m.RecordNRISynchronizeRefusedClaim()
+	m.RecordNRISynchronizeRefusedClaim()
 
 	require.InDelta(t, 2, testutil.ToFloat64(m.allocatedCPUs), 0.01)
 	require.InDelta(t, 6, testutil.ToFloat64(m.availableCPUs), 0.01)
@@ -121,6 +126,7 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	require.InDelta(t, 1, testutil.ToFloat64(m.prepareClaims.WithLabelValues(ResultSuccess.String())), 0.01)
 	require.InDelta(t, 1, testutil.ToFloat64(m.prepareClaims.WithLabelValues(ResultError.String())), 0.01)
 	require.InDelta(t, 1, testutil.ToFloat64(m.unprepareClaims.WithLabelValues(ResultSuccess.String())), 0.01)
+	require.InDelta(t, 2, testutil.ToFloat64(m.nriSynchronizeRefused), 0.01)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -175,6 +181,7 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.RecordPrepare(ResultSuccess, time.Second)
 		recorder.RecordUnprepare(ResultError, time.Second)
 		recorder.RecordClaimAllocatedCPUs(4)
+		recorder.RecordNRISynchronizeRefusedClaim()
 	})
 }
 
