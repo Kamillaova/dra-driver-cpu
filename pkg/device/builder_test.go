@@ -427,9 +427,9 @@ func TestBuildGroupedDeviceAttributeCount(t *testing.T) {
 		layout device.Layout
 		want   int
 	}{
-		{layout: device.LayoutNUMANode, want: 10},
-		{layout: device.LayoutSocket, want: 7},
-		{layout: device.LayoutMachine, want: 6},
+		{layout: device.LayoutNUMANode, want: 12},
+		{layout: device.LayoutSocket, want: 9},
+		{layout: device.LayoutMachine, want: 8},
 	} {
 		res, err := device.Build(device.BuildInput{
 			Inventory: device.Inventory{
@@ -446,6 +446,49 @@ func TestBuildGroupedDeviceAttributeCount(t *testing.T) {
 		dev := res.Devices[0]
 		require.Equalf(t, tc.want, len(dev.Attributes)+len(dev.Capacity), "device %q attributes and capacities", dev.Name)
 		require.LessOrEqual(t, len(dev.Attributes)+len(dev.Capacity), resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice)
+	}
+}
+
+func TestBuildPublishesSettingAttributes(t *testing.T) {
+	twoNUMANodes := func(core int) int { return core / 2 }
+	for _, tc := range []struct {
+		name                 string
+		layout               device.Layout
+		fullPhysicalCPUsOnly bool
+		allocator            string
+	}{
+		{name: "individual", layout: device.LayoutIndividual, allocator: "cpumanager"},
+		{name: "individual, external allocator", layout: device.LayoutIndividual, allocator: "external"},
+		{name: "NUMA node", layout: device.LayoutNUMANode, allocator: "cpumanager"},
+		{name: "NUMA node, whole cores", layout: device.LayoutNUMANode, fullPhysicalCPUsOnly: true, allocator: "cpumanager"},
+		{name: "socket, whole cores, external allocator", layout: device.LayoutSocket, fullPhysicalCPUsOnly: true, allocator: "external"},
+		{name: "machine, external allocator", layout: device.LayoutMachine, allocator: "external"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := device.Build(device.BuildInput{
+				Inventory: device.Inventory{
+					CPUTopology:  coreTopology(true, twoNUMANodes, twoThreadCores(4)...),
+					ReservedCPUs: cpuset.New(),
+				},
+				Layout:               tc.layout,
+				PCIeRootMapper:       store.NewPCIeRootMapper(),
+				ExposeExtAttrs:       tc.allocator == "external",
+				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
+				Allocator:            tc.allocator,
+			})
+			require.NoError(t, err)
+			require.NotEmpty(t, res.Devices)
+			for _, dev := range res.Devices {
+				whole := dev.Attributes[device.AttributeFullPhysicalCPUsOnly]
+				require.NotNilf(t, whole.BoolValue, "device %q must publish fullPhysicalCPUsOnly as a bool", dev.Name)
+				require.Equalf(t, tc.fullPhysicalCPUsOnly, *whole.BoolValue, "device %q fullPhysicalCPUsOnly", dev.Name)
+				allocator := dev.Attributes[device.AttributeAllocator]
+				require.NotNilf(t, allocator.StringValue, "device %q must publish allocator as a string", dev.Name)
+				require.Equalf(t, tc.allocator, *allocator.StringValue, "device %q allocator", dev.Name)
+				require.LessOrEqualf(t, len(dev.Attributes)+len(dev.Capacity), resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice,
+					"device %q attributes and capacities", dev.Name)
+			}
+		})
 	}
 }
 

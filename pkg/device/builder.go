@@ -119,8 +119,11 @@ type BuildInput struct {
 	// FullPhysicalCPUsOnly leaves every core the reservation splits out of the
 	// grouped devices, gives a device whose cores all have two threads a request
 	// policy in whole cores, and refuses a device holding a core of more than two
-	// threads.
+	// threads. Every device publishes it.
 	FullPhysicalCPUsOnly bool
+	// Allocator is the allocator Prepare takes CPUs with, which every device
+	// publishes.
+	Allocator string
 }
 
 type BuildResult struct {
@@ -152,6 +155,7 @@ func Build(input BuildInput) (BuildResult, error) {
 		if err != nil {
 			return BuildResult{}, err
 		}
+		addSettingAttributes(devices, input.FullPhysicalCPUsOnly, input.Allocator)
 		if err := validateDeviceAttributeValueCount(devices); err != nil {
 			return BuildResult{}, err
 		}
@@ -197,6 +201,7 @@ func Build(input BuildInput) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
+	addSettingAttributes(res.Devices, input.FullPhysicalCPUsOnly, input.Allocator)
 	if err := validateDeviceAttributeValueCount(res.Devices); err != nil {
 		return BuildResult{}, err
 	}
