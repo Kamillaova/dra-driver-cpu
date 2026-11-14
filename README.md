@@ -33,7 +33,7 @@ The [Quickstart](docs/user/quickstart.md) walks through installing the driver an
 - **Shared Pool Management:** All other containers are dynamically confined to a shared pool made up of CPUs not exclusively assigned to any guaranteed container.
 - **Grouped Device Exposure:** `grouped` mode exposes NUMA node, socket, or machine aggregates as consumable capacity. The driver also implements an `individual` mode which is now **deprecated**; see [Migrating from individual mode](docs/user/opaque-cpuset-overrides.md#migrate-from-individual-mode).
 - **CPU Manager Feature Parity:** Aims to match key kubelet CPUManager static policy options (e.g. `PreferAlignByUnCoreCache`, `StrictCPUReservation`) - see [Feature Support](docs/user/feature-support.md) for the full comparison.
-- **Stateful Restarts:** Synchronizes with existing pods on restart by inspecting CDI-injected environment variables, rebuilding its allocation state without disrupting running workloads.
+- **Stateful Restarts:** Synchronizes with existing pods on restart, restoring its allocation state from the CDI specs it wrote, without disrupting running workloads.
 
 ## Use Cases
 

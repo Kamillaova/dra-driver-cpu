@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -30,6 +31,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/cpuset"
 )
 
@@ -54,8 +56,8 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	allocationState := cp.allocationState.Clone()
 	podState := store.NewPodState()
 	var containerUpdates []*api.ContainerUpdate
-	cdiCacheRefreshAttempted := false
 
+	var listed []*syncContainer
 	for _, pod := range pods {
 		pLogger := logger.WithValues("pod", ctxlog.KObj(pod), "podUID", pod.Uid)
 		pLogger.V(2).Info("synchronize pod")
@@ -82,79 +84,60 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				cLogger.Error(err, "ignoring container with malformed DRA env during synchronize")
 				continue
 			}
-			containerUID := types.UID(container.GetId())
-			allGuaranteedCPUs := cpuset.New()
-			validatedClaimAllocations := make(map[types.UID]cpuset.CPUSet)
-			for uid, cpus := range claimAllocations {
-				var prepared, owned bool
-				if cp.hasSynchronized {
-					_, prepared = cp.allocationState.GetResourceClaimAllocation(uid)
-					owned = cp.allocationState.IsOwner(uid, types.UID(pod.Uid), container.Name)
-				}
-				caLogger := cLogger.WithValues("claimUID", uid)
-				if !cdiCacheRefreshAttempted {
-					err = cp.cdiMgr.Refresh()
-					cdiCacheRefreshAttempted = true
-					if err != nil {
-						logger.Error(err, "failed to refresh CDI cache, continuing with available CDI devices")
-					}
-				}
-
-				deviceName := getCDIDeviceName(uid)
-				envs, err := cp.cdiMgr.GetDeviceEnv(deviceName)
-				if err != nil {
-					if cp.hasSynchronized && prepared && owned {
-						return nil, fmt.Errorf("CDI state missing for prepared claim %q: %w", uid, err)
-					}
-					caLogger.Error(err, "ignoring claim not prepared by this driver during synchronize")
-					continue
-				}
-				err = validateSynchronizedClaimAllocation(caLogger, uid, cpus, envs)
-				if err != nil {
-					if cp.hasSynchronized && prepared && owned {
-						return nil, fmt.Errorf("failed to validate claim allocation for container %q during synchronize: %w", container.Name, err)
-					}
-					caLogger.Error(err, "ignoring invalid claim allocation during synchronize")
-					continue
-				}
-				if cp.hasSynchronized && !prepared {
-					// Unprepare is authoritative while this process survives, so stale
-					// runtime or CDI state cannot resurrect the claim. Skip it instead of
-					// failing, so one inconsistent container cannot block recovery for
-					// every other container on the node.
-					caLogger.Error(fmt.Errorf("runtime references claim %q without a prepared allocation", uid), "ignoring unprepared claim during synchronize")
-					continue
-				}
-				// Synchronize restores an allocation that already exists in the runtime;
-				// the shared-pool guard applies only to new reservations.
-				if err := allocationState.Reserve(caLogger, uid, cpus, false); err != nil {
-					return nil, err
-				}
-
-				allGuaranteedCPUs = allGuaranteedCPUs.Union(cpus)
-				validatedClaimAllocations[uid] = cpus
-			}
-
-			var state *store.ContainerState
-			if len(validatedClaimAllocations) == 0 {
-				state = store.NewContainerState(container.GetName(), containerUID)
-			} else {
-				if _, err := allocationState.Bind(cLogger, types.UID(pod.Uid), container.Name, validatedClaimAllocations); err != nil {
-					return nil, err
-				}
-				cLogger.V(2).Info("found guaranteed CPUs", "cpus", allGuaranteedCPUs.String())
-				state = store.NewContainerState(container.GetName(), containerUID, slices.Collect(maps.Keys(validatedClaimAllocations))...)
-
-				// Reconcile guaranteed container CPU mask.
-				guaranteedUpdate := &api.ContainerUpdate{
-					ContainerId: container.GetId(),
-				}
-				guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
-				containerUpdates = append(containerUpdates, guaranteedUpdate)
-			}
-			podState.SetContainerState(types.UID(pod.GetUid()), state)
-			cLogger.V(6).Info("set container state", "claims", len(validatedClaimAllocations))
+			listed = append(listed, &syncContainer{
+				container: container,
+				owner:     store.OwnerIdent{PodUID: types.UID(pod.GetUid()), ContainerName: container.GetName()},
+				claims:    claimAllocations,
+				logger:    cLogger,
+			})
 		}
+	}
+
+	// A process that has synchronized keeps its own records, which only
+	// Unprepare removes. A fresh one has none yet: it restores the claims the
+	// containers name from the CDI specs the driver wrote, never from their env.
+	if !cp.hasSynchronized {
+		cp.restoreNamedClaims(logger, allocationState, listed)
+	}
+
+	// Containers created while the driver was not connected were never judged by
+	// CreateContainer. Judge them by its rules, claim by claim: NRI gives no way
+	// to stop a container from here, and failing would leave every other
+	// container on the node without the driver.
+	contenders := contendersForUnboundClaims(allocationState, listed)
+	refused := 0
+	for _, sc := range listed {
+		allGuaranteedCPUs := cpuset.New()
+		var claimUIDs []types.UID
+		for _, uid := range slices.Sorted(maps.Keys(sc.claims)) {
+			caLogger := sc.logger.WithValues("claimUID", uid)
+			if c, ok := contenders[uid]; ok && c.excludes(sc.owner) {
+				caLogger.Error(errContestedClaim, "not binding claim to container during synchronize", "reason", refusedContested, "containers", c.String())
+				refused++
+				continue
+			}
+			if _, err := allocationState.Bind(caLogger, sc.owner.PodUID, sc.owner.ContainerName, map[types.UID]cpuset.CPUSet{uid: sc.claims[uid]}); err != nil {
+				caLogger.Error(err, "not binding claim to container during synchronize", "reason", refusalReason(err))
+				refused++
+				continue
+			}
+			allGuaranteedCPUs = allGuaranteedCPUs.Union(sc.claims[uid])
+			claimUIDs = append(claimUIDs, uid)
+		}
+
+		state := store.NewContainerState(sc.container.GetName(), types.UID(sc.container.GetId()), claimUIDs...)
+		if len(claimUIDs) > 0 {
+			sc.logger.V(2).Info("found guaranteed CPUs", "cpus", allGuaranteedCPUs.String())
+
+			// Reconcile guaranteed container CPU mask.
+			guaranteedUpdate := &api.ContainerUpdate{
+				ContainerId: sc.container.GetId(),
+			}
+			guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
+			containerUpdates = append(containerUpdates, guaranteedUpdate)
+		}
+		podState.SetContainerState(sc.owner.PodUID, state)
+		sc.logger.V(6).Info("set container state", "claims", len(claimUIDs))
 	}
 
 	// Reconcile container CPU masks to handle cases where the NRI plugin might have crashed
@@ -162,7 +145,8 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	// See: https://github.com/containerd/nri/issues/282
 	sharedContainerUpdates, err := sharedContainerUpdatesFor(logger, allocationState, podState, types.UID(""))
 	if err != nil {
-		return nil, err
+		// NRI can neither give a container an empty cpuset nor stop it from here.
+		logger.Error(err, "leaving containers without claims on their current CPUs until a claim is unprepared", "containers", podState.GetContainersWithSharedCPUs())
 	}
 	containerUpdates = append(containerUpdates, sharedContainerUpdates...)
 	if err := ctx.Err(); err != nil {
@@ -175,6 +159,9 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	}
 	cp.hasSynchronized = true
 	cp.refreshAllocationMetrics()
+	for range refused {
+		cp.metrics.RecordNRISynchronizeRefusedClaim()
+	}
 	logger.V(6).Info("synchronization complete", "updatesCount", len(containerUpdates))
 	return containerUpdates, nil
 }
@@ -214,20 +201,135 @@ func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types
 	return allocations, nil
 }
 
-func validateSynchronizedClaimAllocation(logger logr.Logger, uid types.UID, cpus cpuset.CPUSet, envs []string) error {
+func (cp *CPUDriver) restoreNamedClaims(logger logr.Logger, allocations *store.AllocationState, listed []*syncContainer) {
+	named := sets.New[types.UID]()
+	for _, sc := range listed {
+		named.Insert(slices.Collect(maps.Keys(sc.claims))...)
+	}
+	if named.Len() == 0 {
+		return
+	}
+	if err := cp.cdiMgr.Refresh(); err != nil {
+		logger.Error(err, "failed to refresh CDI cache, continuing with available CDI devices")
+	}
+	for _, uid := range sets.List(named) {
+		caLogger := logger.WithValues("claimUID", uid)
+		envs, err := cp.cdiMgr.GetDeviceEnv(getCDIDeviceName(uid))
+		if err != nil {
+			caLogger.V(2).Info("not restoring claim without a CDI spec from this driver", "err", err)
+			continue
+		}
+		cpus, err := cdiSpecCPUs(caLogger, uid, envs)
+		if err != nil {
+			caLogger.Error(err, "not restoring claim with an unusable CDI spec")
+			continue
+		}
+		allocations.Restore(caLogger, uid, cpus)
+	}
+}
+
+func cdiSpecCPUs(logger logr.Logger, uid types.UID, envs []string) (cpuset.CPUSet, error) {
 	allocations, err := parseDRAEnvToClaimAllocations(logger, envs)
 	if err != nil {
-		return fmt.Errorf("failed to parse CDI env for claim %q: %w", uid, err)
+		return cpuset.CPUSet{}, fmt.Errorf("failed to parse CDI env for claim %q: %w", uid, err)
 	}
-
-	preparedCPUs, ok := allocations[uid]
+	cpus, ok := allocations[uid]
 	if !ok {
-		return fmt.Errorf("validation failed for claim %q: driver-owned CDI spec %q does not contain a matching DRA allocation", uid, getCDIDeviceName(uid))
+		return cpuset.CPUSet{}, fmt.Errorf("driver-owned CDI spec %q does not contain a DRA allocation for claim %q", getCDIDeviceName(uid), uid)
 	}
-	if !preparedCPUs.Equals(cpus) {
-		return fmt.Errorf("validation failed for claim %q during synchronize: cpuset mismatch (expected %q from CDI, got %q from runtime)", uid, preparedCPUs.String(), cpus.String())
+	return cpus, nil
+}
+
+type syncContainer struct {
+	container *api.Container
+	owner     store.OwnerIdent
+	claims    map[types.UID]cpuset.CPUSet
+	logger    logr.Logger
+}
+
+type syncRefusal string
+
+const (
+	refusedUnprepared     syncRefusal = "unprepared"
+	refusedCPUMismatch    syncRefusal = "cpu_mismatch"
+	refusedBoundElsewhere syncRefusal = "bound_elsewhere"
+	refusedOverlap        syncRefusal = "overlap"
+	refusedContested      syncRefusal = "contested"
+)
+
+var errContestedClaim = errors.New("several containers name the claim and the runtime does not show this one alone pinned to its CPUs: name a claim in one container only")
+
+func refusalReason(err error) syncRefusal {
+	switch {
+	case errors.Is(err, store.ErrClaimCPUMismatch):
+		return refusedCPUMismatch
+	case errors.Is(err, store.ErrClaimAlreadyBound):
+		return refusedBoundElsewhere
+	case errors.Is(err, store.ErrClaimOverlap):
+		return refusedOverlap
 	}
-	return nil
+	return refusedUnprepared
+}
+
+type contenders struct {
+	owners  []store.OwnerIdent
+	holders []store.OwnerIdent
+}
+
+func (c *contenders) excludes(owner store.OwnerIdent) bool {
+	if len(c.owners) < 2 {
+		return false
+	}
+	return len(c.holders) != 1 || !c.holders[0].Equal(owner)
+}
+
+func (c *contenders) String() string {
+	names := make([]string, 0, len(c.owners))
+	for _, owner := range c.owners {
+		names = append(names, fmt.Sprintf("%s/%s", owner.PodUID, owner.ContainerName))
+	}
+	slices.Sort(names)
+	return strings.Join(names, ",")
+}
+
+// contendersForUnboundClaims lists, for each claim nothing is bound to, the
+// owners whose containers name it with its recorded CPUs, and the holders
+// among them. containerd reports a container's cpuset from its stored spec,
+// which holds the cpuset the driver set when it admitted the container, so a
+// container pinned to exactly the CPUs of the claims it names is one the
+// driver admitted.
+func contendersForUnboundClaims(allocations *store.AllocationState, listed []*syncContainer) map[types.UID]*contenders {
+	result := make(map[types.UID]*contenders)
+	for _, sc := range listed {
+		recorded := cpuset.New()
+		var unbound []types.UID
+		for uid, cpus := range sc.claims {
+			prepared, ok := allocations.GetResourceClaimAllocation(uid)
+			if !ok || !prepared.Equals(cpus) {
+				continue
+			}
+			recorded = recorded.Union(cpus)
+			if _, bound := allocations.Owner(uid); !bound {
+				unbound = append(unbound, uid)
+			}
+		}
+		pinned, err := cpuset.Parse(sc.container.GetLinux().GetResources().GetCpu().GetCpus())
+		holds := err == nil && !recorded.IsEmpty() && pinned.Equals(recorded)
+		for _, uid := range unbound {
+			c := result[uid]
+			if c == nil {
+				c = &contenders{}
+				result[uid] = c
+			}
+			if !slices.ContainsFunc(c.owners, sc.owner.Equal) {
+				c.owners = append(c.owners, sc.owner)
+			}
+			if holds && !slices.ContainsFunc(c.holders, sc.owner.Equal) {
+				c.holders = append(c.holders, sc.owner)
+			}
+		}
+	}
+	return result
 }
 
 // sharedContainerUpdatesFor computes updates from the supplied stores. Callers

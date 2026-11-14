@@ -19,6 +19,8 @@ package store
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -31,6 +33,7 @@ var (
 	ErrClaimAlreadyBound = errors.New("claim is already bound to another container")
 	ErrClaimCPUMismatch  = errors.New("claim cpuset does not match the prepared allocation")
 	ErrUnknownClaim      = errors.New("claim is not prepared by this driver")
+	ErrClaimOverlap      = errors.New("claim shares CPUs with another prepared claim")
 	ErrEmptyClaimList    = errors.New("claim list is empty")
 )
 
@@ -71,6 +74,20 @@ func (err UnknownClaimError) Error() string {
 
 func (err UnknownClaimError) Unwrap() error {
 	return ErrUnknownClaim
+}
+
+type ClaimOverlapError struct {
+	ClaimUID types.UID
+	Other    types.UID
+	CPUs     cpuset.CPUSet
+}
+
+func (err ClaimOverlapError) Error() string {
+	return fmt.Sprintf("claim %q shares CPUs %q with prepared claim %q", err.ClaimUID, err.CPUs.String(), err.Other)
+}
+
+func (err ClaimOverlapError) Unwrap() error {
+	return ErrClaimOverlap
 }
 
 type OwnerIdent struct {
@@ -183,6 +200,24 @@ func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, cpus c
 	return nil
 }
 
+// Restore records a claim an earlier process prepared, with the CPUs that
+// process recorded for it. Unlike Reserve it keeps a claim whose CPUs overlap
+// another claim's, and Bind refuses both until one of them is released. A
+// claim already recorded is left as it is.
+func (s *AllocationState) Restore(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet) {
+	logger = logger.WithValues("claimUID", claimUID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.resourceClaimAllocations[claimUID]; ok {
+		return
+	}
+	s.resourceClaimAllocations[claimUID] = claimAllocation{
+		cpus: cpus,
+	}
+	s.preparedCPUs = s.preparedCPUs.Union(cpus)
+	logger.Info("restored allocation for resource claim", "cpus", cpus.String())
+}
+
 // Release removes a prepared claim, releasing its CPUs and ownership.
 func (s *AllocationState) Release(logger logr.Logger, claimUID types.UID) {
 	logger = logger.WithValues("claimUID", claimUID)
@@ -229,6 +264,9 @@ func (s *AllocationState) Bind(logger logr.Logger, podUID types.UID, containerNa
 				Owner:    allocation.owner,
 			}
 		}
+		if err := s.overlapLocked(claimUID, allocation.cpus); err != nil {
+			return nil, err
+		}
 	}
 
 	updatedClaims := []types.UID{}
@@ -257,6 +295,18 @@ func (s *AllocationState) Unbind(logger logr.Logger, claimUIDs ...types.UID) {
 			logger.V(4).Info("claim unbound", "claimUID", claimUID, "previousPodUID", oldOwner.PodUID, "previousContainerName", oldOwner.ContainerName)
 		}
 	}
+}
+
+// Owner returns the container a claim is bound to, and false if the claim is
+// not prepared or not bound.
+func (s *AllocationState) Owner(claimUID types.UID) (OwnerIdent, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	info, found := s.resourceClaimAllocations[claimUID]
+	if !found || info.owner.Vacant() {
+		return OwnerIdent{}, false
+	}
+	return info.owner, true
 }
 
 // IsOwner checks if a claim, identified by its UID, is owned by the given container
@@ -332,10 +382,26 @@ func (s *AllocationState) Clone() *AllocationState {
 }
 
 func (s *AllocationState) removeLocked(claimUID types.UID) {
-	allocation, ok := s.resourceClaimAllocations[claimUID]
-	if !ok {
+	if _, ok := s.resourceClaimAllocations[claimUID]; !ok {
 		return
 	}
 	delete(s.resourceClaimAllocations, claimUID)
-	s.preparedCPUs = s.preparedCPUs.Difference(allocation.cpus)
+	// Restored claims can share a CPU, which stays prepared until the last of them goes.
+	prepared := cpuset.New()
+	for _, allocation := range s.resourceClaimAllocations {
+		prepared = prepared.Union(allocation.cpus)
+	}
+	s.preparedCPUs = prepared
+}
+
+func (s *AllocationState) overlapLocked(claimUID types.UID, cpus cpuset.CPUSet) error {
+	for _, otherUID := range slices.Sorted(maps.Keys(s.resourceClaimAllocations)) {
+		if otherUID == claimUID {
+			continue
+		}
+		if shared := cpus.Intersection(s.resourceClaimAllocations[otherUID].cpus); !shared.IsEmpty() {
+			return ClaimOverlapError{ClaimUID: claimUID, Other: otherUID, CPUs: shared}
+		}
+	}
+	return nil
 }
