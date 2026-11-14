@@ -82,6 +82,22 @@ The report records:
 
 When the driver process is running in the same container, `driverConfig` is derived from the driver's actual command line and falls back to defaults only when that information is unavailable.
 
+## A Stuck Driver
+
+The driver times how long its state lock has been held and how long each NRI hook and each
+Prepare or Unprepare call has been running, and acts on two fixed thresholds:
+
+- Past 60 seconds the driver reports itself stuck: `/healthz` answers 503, so the pod turns not
+  ready, `dra_cpu_watchdog_stuck_seconds` shows how long the stall has lasted, and the log holds
+  one `driver stuck, reporting not ready` line naming what is stuck, with the stacks of all
+  goroutines. Once nothing is past 60 seconds any more, the driver logs `driver no longer stuck`,
+  the metric drops back to 0 and `/healthz` answers 200 again.
+- Past 180 seconds the driver logs `watchdog stopping the driver`, stops and exits non-zero, and
+  the kubelet restarts its container.
+
+The watchdog makes no API call, so an unreachable API server does not set it off. Attach the
+`driver stuck` line with its goroutine stacks to a bug report.
+
 ## Integration With Bug Reports
 
 1. Run `dracpu gatherinfo` on the affected node.

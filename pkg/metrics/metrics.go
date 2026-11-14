@@ -102,6 +102,7 @@ type Metrics struct {
 	nriStopContainerDuration   *prometheus.HistogramVec
 	nriRemoveContainerDuration *prometheus.HistogramVec
 	nriSynchronizeRefused      prometheus.Counter
+	watchdogStuck              prometheus.Gauge
 }
 
 type metricKind string
@@ -212,6 +213,11 @@ var (
 		kind: metricCounter,
 		help: "Total number of claims a container names that the NRI Synchronize callback did not bind to it.",
 	}
+	watchdogStuckSpec = metricSpec{
+		name: "dra_cpu_watchdog_stuck_seconds",
+		kind: metricGauge,
+		help: "Seconds the driver's state lock has been held or an NRI hook or Prepare or Unprepare call has run, while one passes 60 seconds; 0 otherwise.",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -229,6 +235,7 @@ var metricSpecs = []metricSpec{
 	nriStopContainerDurationSpec,
 	nriRemoveContainerDurationSpec,
 	nriSynchronizeRefusedSpec,
+	watchdogStuckSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -274,6 +281,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		nriStopContainerDuration:   newHistogramVec(nriStopContainerDurationSpec),
 		nriRemoveContainerDuration: newHistogramVec(nriRemoveContainerDurationSpec),
 		nriSynchronizeRefused:      newCounter(nriSynchronizeRefusedSpec),
+		watchdogStuck:              newGauge(watchdogStuckSpec),
 	}
 
 	reg.MustRegister(
@@ -291,6 +299,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriStopContainerDuration,
 		m.nriRemoveContainerDuration,
 		m.nriSynchronizeRefused,
+		m.watchdogStuck,
 	)
 	for _, result := range []Result{ResultSuccess, ResultError, ResultUnknown} {
 		m.prepareClaims.WithLabelValues(result.String())
@@ -392,6 +401,10 @@ func (m *Metrics) RecordNRISynchronizeRefusedClaim() {
 	m.nriSynchronizeRefused.Inc()
 }
 
+func (m *Metrics) SetWatchdogStuck(stalled time.Duration) {
+	m.watchdogStuck.Set(stalled.Seconds())
+}
+
 func determineResult(err error) Result {
 	if err != nil {
 		return ResultError
@@ -425,3 +438,4 @@ func (noopRecorder) RecordNRICreateContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRISynchronizeRefusedClaim()                  {}
+func (noopRecorder) SetWatchdogStuck(time.Duration)                     {}

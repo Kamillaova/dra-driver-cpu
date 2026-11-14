@@ -24,7 +24,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -119,7 +118,7 @@ type CPUAllocator interface {
 type CPUDriver struct {
 	// stateMu protects the store pointers and complete DRA/NRI state operations.
 	// Acquire it before store locks; never call into the runtime while holding it.
-	stateMu         sync.Mutex
+	stateMu         timedMutex
 	hasSynchronized bool
 	// nriDisconnected is set when the NRI plugin's Run returns and cleared by
 	// Synchronize, both under stateMu; Ready reads it without the lock. Until
@@ -146,6 +145,7 @@ type CPUDriver struct {
 	devicesPerResourceSlice int
 	metrics                 Recorder
 	health                  healthTracker
+	watchdog                watchdog
 	kubeletRootDir          string
 	cpuAllocator            CPUAllocator
 }
@@ -384,6 +384,7 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		}),
 		kubeletplugin.HealthService(true),
 	}
+	go cp.runWatchdog(ctx)
 	d, err := kubeletplugin.Start(ctx, cp, kubeletOpts...)
 	if err != nil {
 		return asyncErr, fmt.Errorf("start kubelet plugin: %w", err)
@@ -443,10 +444,13 @@ func (cp *CPUDriver) Stop() {
 	cp.nriPlugin.Stop()
 }
 
-// Ready reports whether the kubelet has the plugin registered and the NRI
-// plugin is connected. It takes no lock, so a held stateMu cannot block a
-// probe. Call it only once Start has returned.
+// Ready reports whether the kubelet has the plugin registered, the NRI plugin
+// is connected and the watchdog finds nothing stuck. It takes no lock, so a
+// held stateMu cannot block a probe. Call it only once Start has returned.
 func (cp *CPUDriver) Ready() bool {
+	if cp.watchdog.stuck.Load() {
+		return false
+	}
 	if status := cp.draPlugin.RegistrationStatus(); status == nil || !status.PluginRegistered {
 		return false
 	}
@@ -471,6 +475,7 @@ func getDeviceAttributes(deviceSlices [][]resourceapi.Device, deviceName string)
 
 // Shutdown is called when the runtime is shutting down.
 func (cp *CPUDriver) Shutdown(ctx context.Context) {
+	defer cp.watchdog.track("Shutdown")()
 	logger := ctxlog.FromContext(ctx)
 	logger.Info("runtime shutting down")
 }

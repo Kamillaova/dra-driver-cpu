@@ -37,6 +37,7 @@ import (
 
 // Synchronize is called by the NRI to synchronize the state of the driver during bootstrap.
 func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) (rupdates []*api.ContainerUpdate, rerr error) {
+	defer cp.watchdog.track("Synchronize")()
 	cp.stateMu.Lock()
 	defer cp.stateMu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -367,6 +368,7 @@ func sharedContainerUpdatesFor(logger logr.Logger, allocations *store.Allocation
 
 // CreateContainer handles container creation requests from the NRI.
 func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) (radjust *api.ContainerAdjustment, rupdates []*api.ContainerUpdate, rerr error) {
+	defer cp.watchdog.track("CreateContainer")()
 	cp.stateMu.Lock()
 	defer cp.stateMu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -452,6 +454,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 //   - Synchronize rebuilds runtime container state, retaining prepared claims and owners
 //     while this process survives. Cold recovery uses running containers and CDI.
 func (cp *CPUDriver) StopContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) ([]*api.ContainerUpdate, error) {
+	defer cp.watchdog.track("StopContainer")()
 	cp.stateMu.Lock()
 	defer cp.stateMu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -478,6 +481,7 @@ func (cp *CPUDriver) StopContainer(ctx context.Context, pod *api.PodSandbox, ctr
 
 // RemoveContainer handles container removal requests from the NRI.
 func (cp *CPUDriver) RemoveContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
+	defer cp.watchdog.track("RemoveContainer")()
 	cp.stateMu.Lock()
 	defer cp.stateMu.Unlock()
 	if err := ctx.Err(); err != nil {
