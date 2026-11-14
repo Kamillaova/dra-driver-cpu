@@ -17,10 +17,12 @@ limitations under the License.
 package store
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -33,6 +35,7 @@ var (
 	ErrClaimAlreadyBound = errors.New("claim is already bound to another container")
 	ErrClaimCPUMismatch  = errors.New("claim cpuset does not match the prepared allocation")
 	ErrUnknownClaim      = errors.New("claim is not prepared by this driver")
+	ErrUnknownRequest    = errors.New("claim was prepared without the request")
 	ErrClaimOverlap      = errors.New("claim shares CPUs with another prepared claim")
 	ErrEmptyClaimList    = errors.New("claim list is empty")
 )
@@ -52,11 +55,15 @@ func (err ClaimAlreadyBoundError) Unwrap() error {
 
 type ClaimCPUMismatchError struct {
 	ClaimUID types.UID
+	Request  string
 	Expected cpuset.CPUSet
 	Got      cpuset.CPUSet
 }
 
 func (err ClaimCPUMismatchError) Error() string {
+	if err.Request != "" {
+		return fmt.Sprintf("validation failed for claim %q request %q: cpuset mismatch (expected %q, got %q)", err.ClaimUID, err.Request, err.Expected.String(), err.Got.String())
+	}
 	return fmt.Sprintf("validation failed for claim %q: cpuset mismatch (expected %q, got %q)", err.ClaimUID, err.Expected.String(), err.Got.String())
 }
 
@@ -74,6 +81,19 @@ func (err UnknownClaimError) Error() string {
 
 func (err UnknownClaimError) Unwrap() error {
 	return ErrUnknownClaim
+}
+
+type UnknownRequestError struct {
+	ClaimUID types.UID
+	Request  string
+}
+
+func (err UnknownRequestError) Error() string {
+	return fmt.Sprintf("claim %q was prepared without request %q", err.ClaimUID, err.Request)
+}
+
+func (err UnknownRequestError) Unwrap() error {
+	return ErrUnknownRequest
 }
 
 type ClaimOverlapError struct {
@@ -103,9 +123,63 @@ func (oi OwnerIdent) Equal(ident OwnerIdent) bool {
 	return oi.PodUID == ident.PodUID && oi.ContainerName == ident.ContainerName
 }
 
+// RequestAllocation is the CPUs one request of a claim was given.
+type RequestAllocation struct {
+	Request string
+	CPUs    cpuset.CPUSet
+}
+
+// ClaimRequestRef names one request of a claim, or the whole claim where
+// Request is empty.
+type ClaimRequestRef struct {
+	ClaimUID types.UID
+	Request  string
+}
+
+func compareClaimRequestRefs(a, b ClaimRequestRef) int {
+	return cmp.Or(strings.Compare(string(a.ClaimUID), string(b.ClaimUID)), strings.Compare(a.Request, b.Request))
+}
+
 type claimAllocation struct {
-	cpus  cpuset.CPUSet
-	owner OwnerIdent
+	cpus     cpuset.CPUSet
+	requests []RequestAllocation
+	owner    OwnerIdent
+}
+
+func newClaimAllocation(requests []RequestAllocation) claimAllocation {
+	sorted := cloneRequests(requests)
+	slices.SortFunc(sorted, func(a, b RequestAllocation) int { return strings.Compare(a.Request, b.Request) })
+	cpus := cpuset.New()
+	for _, request := range sorted {
+		cpus = cpus.Union(request.CPUs)
+	}
+	return claimAllocation{cpus: cpus, requests: sorted}
+}
+
+func cloneRequests(requests []RequestAllocation) []RequestAllocation {
+	cloned := make([]RequestAllocation, len(requests))
+	for i, request := range requests {
+		cloned[i] = RequestAllocation{Request: request.Request, CPUs: request.CPUs.Clone()}
+	}
+	return cloned
+}
+
+func (ca claimAllocation) cpusOf(request string) (cpuset.CPUSet, bool) {
+	if request == "" {
+		return ca.cpus, true
+	}
+	for _, held := range ca.requests {
+		if held.Request == request {
+			return held.CPUs, true
+		}
+	}
+	return cpuset.CPUSet{}, false
+}
+
+func (ca claimAllocation) sameRequests(requests []RequestAllocation) bool {
+	return slices.EqualFunc(ca.requests, requests, func(a, b RequestAllocation) bool {
+		return a.Request == b.Request && a.CPUs.Equals(b.CPUs)
+	})
 }
 
 // Acquire returns an owned copy if the allocation has no owner.
@@ -114,22 +188,25 @@ func (ca claimAllocation) Acquire(owner OwnerIdent) (claimAllocation, bool) {
 		return claimAllocation{}, false
 	}
 	return claimAllocation{
-		cpus:  ca.cpus.Clone(),
-		owner: owner,
+		cpus:     ca.cpus.Clone(),
+		requests: cloneRequests(ca.requests),
+		owner:    owner,
 	}, true
 }
 
 // Release returns a copy without ownership, retaining its CPUs.
 func (ca claimAllocation) Release() claimAllocation {
 	return claimAllocation{
-		cpus: ca.cpus.Clone(),
+		cpus:     ca.cpus.Clone(),
+		requests: cloneRequests(ca.requests),
 		// intentional empty owner
 	}
 }
 
 func (ca claimAllocation) Clone() claimAllocation {
 	return claimAllocation{
-		cpus: ca.cpus.Clone(),
+		cpus:     ca.cpus.Clone(),
+		requests: cloneRequests(ca.requests),
 		owner: OwnerIdent{
 			PodUID:        ca.owner.PodUID,
 			ContainerName: ca.owner.ContainerName,
@@ -171,16 +248,19 @@ func NewAllocationState(cpuTopology *cpuinfo.CPUTopology, reservedCPUs cpuset.CP
 	}
 }
 
-// Reserve records a prepared claim. Its CPUs remain unavailable
-// to shared containers and other exclusive claims until Unprepare. When shared
-// containers are present, the reservation must leave at least one CPU in the
-// shared pool because NRI cannot represent an empty CPUSet.
-func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet, hasSharedContainers bool) error {
+// Reserve records a prepared claim and the CPUs each of its requests was given.
+// Its CPUs remain unavailable to shared containers and other exclusive claims
+// until Unprepare. When shared containers are present, the reservation must
+// leave at least one CPU in the shared pool because NRI cannot represent an
+// empty CPUSet.
+func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, requests []RequestAllocation, hasSharedContainers bool) error {
 	logger = logger.WithValues("claimUID", claimUID)
+	reserved := newClaimAllocation(requests)
+	cpus := reserved.cpus
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if allocation, ok := s.resourceClaimAllocations[claimUID]; ok {
-		if allocation.cpus.Equals(cpus) {
+		if allocation.sameRequests(reserved.requests) {
 			return nil
 		}
 		return fmt.Errorf("claim %q is already prepared with CPUs %q (requested %q)", claimUID, allocation.cpus.String(), cpus.String())
@@ -192,30 +272,27 @@ func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, cpus c
 	if hasSharedContainers && !cpus.IsEmpty() && sharedCPUs.Difference(cpus).IsEmpty() {
 		return fmt.Errorf("claim %q would exhaust the shared CPU pool while shared containers are running", claimUID)
 	}
-	s.resourceClaimAllocations[claimUID] = claimAllocation{
-		cpus: cpus,
-	}
+	s.resourceClaimAllocations[claimUID] = reserved
 	s.preparedCPUs = s.preparedCPUs.Union(cpus)
 	logger.Info("reserved allocation for resource claim", "cpus", cpus.String())
 	return nil
 }
 
 // Restore records a claim an earlier process prepared, with the CPUs that
-// process recorded for it. Unlike Reserve it keeps a claim whose CPUs overlap
-// another claim's, and Bind refuses both until one of them is released. A
-// claim already recorded is left as it is.
-func (s *AllocationState) Restore(logger logr.Logger, claimUID types.UID, cpus cpuset.CPUSet) {
+// process recorded for each of its requests. Unlike Reserve it keeps a claim
+// whose CPUs overlap another claim's, and Bind refuses both until one of them
+// is released. A claim already recorded is left as it is.
+func (s *AllocationState) Restore(logger logr.Logger, claimUID types.UID, requests []RequestAllocation) {
 	logger = logger.WithValues("claimUID", claimUID)
+	restored := newClaimAllocation(requests)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.resourceClaimAllocations[claimUID]; ok {
 		return
 	}
-	s.resourceClaimAllocations[claimUID] = claimAllocation{
-		cpus: cpus,
-	}
-	s.preparedCPUs = s.preparedCPUs.Union(cpus)
-	logger.Info("restored allocation for resource claim", "cpus", cpus.String())
+	s.resourceClaimAllocations[claimUID] = restored
+	s.preparedCPUs = s.preparedCPUs.Union(restored.cpus)
+	logger.Info("restored allocation for resource claim", "cpus", restored.cpus.String())
 }
 
 // Release removes a prepared claim, releasing its CPUs and ownership.
@@ -229,9 +306,10 @@ func (s *AllocationState) Release(logger logr.Logger, claimUID types.UID) {
 	}
 }
 
-// Bind validates prepared allocations and atomically binds them to a container.
-// It returns only newly bound claims so callers can roll back their ownership.
-func (s *AllocationState) Bind(logger logr.Logger, podUID types.UID, containerName string, expected map[types.UID]cpuset.CPUSet) ([]types.UID, error) {
+// Bind validates the requests of prepared claims against the CPUs expected for
+// each and atomically binds those claims to a container. It returns only newly
+// bound claims so callers can roll back their ownership.
+func (s *AllocationState) Bind(logger logr.Logger, podUID types.UID, containerName string, expected map[ClaimRequestRef]cpuset.CPUSet) ([]types.UID, error) {
 	if len(expected) == 0 {
 		return nil, ErrEmptyClaimList
 	}
@@ -244,33 +322,43 @@ func (s *AllocationState) Bind(logger logr.Logger, podUID types.UID, containerNa
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for claimUID, cpus := range expected {
-		allocation, ok := s.resourceClaimAllocations[claimUID]
+	refs := slices.SortedFunc(maps.Keys(expected), compareClaimRequestRefs)
+	var claimUIDs []types.UID
+	for _, ref := range refs {
+		allocation, ok := s.resourceClaimAllocations[ref.ClaimUID]
 		if !ok {
 			return nil, UnknownClaimError{
-				ClaimUID: claimUID,
+				ClaimUID: ref.ClaimUID,
 			}
 		}
-		if !allocation.cpus.Equals(cpus) {
+		held, ok := allocation.cpusOf(ref.Request)
+		if !ok {
+			return nil, UnknownRequestError(ref)
+		}
+		if !held.Equals(expected[ref]) {
 			return nil, ClaimCPUMismatchError{
-				ClaimUID: claimUID,
-				Expected: allocation.cpus,
-				Got:      cpus,
+				ClaimUID: ref.ClaimUID,
+				Request:  ref.Request,
+				Expected: held,
+				Got:      expected[ref],
 			}
 		}
 		if !allocation.owner.Vacant() && !allocation.owner.Equal(curIdent) {
 			return nil, ClaimAlreadyBoundError{
-				ClaimUID: claimUID,
+				ClaimUID: ref.ClaimUID,
 				Owner:    allocation.owner,
 			}
 		}
-		if err := s.overlapLocked(claimUID, allocation.cpus); err != nil {
+		if err := s.overlapLocked(ref.ClaimUID, allocation.cpus); err != nil {
 			return nil, err
+		}
+		if !slices.Contains(claimUIDs, ref.ClaimUID) {
+			claimUIDs = append(claimUIDs, ref.ClaimUID)
 		}
 	}
 
 	updatedClaims := []types.UID{}
-	for claimUID := range expected {
+	for _, claimUID := range claimUIDs {
 		allocation := s.resourceClaimAllocations[claimUID]
 		allocInfo, acquired := allocation.Acquire(curIdent)
 		if !acquired {

@@ -38,9 +38,21 @@ func newTestAllocationState(logger logr.Logger, allCPUs, reserved cpuset.CPUSet)
 	return NewAllocationState(topo, reserved)
 }
 
+func oneRequest(cpus cpuset.CPUSet) []RequestAllocation {
+	return []RequestAllocation{{Request: "cpus", CPUs: cpus}}
+}
+
+func wholeClaims(cpus map[types.UID]cpuset.CPUSet) map[ClaimRequestRef]cpuset.CPUSet {
+	expected := make(map[ClaimRequestRef]cpuset.CPUSet, len(cpus))
+	for claimUID, claimCPUs := range cpus {
+		expected[ClaimRequestRef{ClaimUID: claimUID}] = claimCPUs
+	}
+	return expected
+}
+
 func requirePreparedAllocation(t testing.TB, logger logr.Logger, store *AllocationState, claimUID types.UID, cpus cpuset.CPUSet) {
 	t.Helper()
-	require.NoError(t, store.Reserve(logger, claimUID, cpus, false))
+	require.NoError(t, store.Reserve(logger, claimUID, oneRequest(cpus), false))
 }
 
 func TestAllocationStatePreparedLifecycle(t *testing.T) {
@@ -50,11 +62,11 @@ func TestAllocationStatePreparedLifecycle(t *testing.T) {
 	claimCPUs := cpuset.New(0, 1)
 	store := newTestAllocationState(logger, allCPUs, cpuset.New())
 
-	require.NoError(t, store.Reserve(logger, claimUID, claimCPUs, false))
+	require.NoError(t, store.Reserve(logger, claimUID, oneRequest(claimCPUs), false))
 	require.True(t, store.GetSharedCPUs().Equals(cpuset.New(2, 3)))
-	require.Error(t, store.Reserve(logger, "claim-2", claimCPUs, false))
+	require.Error(t, store.Reserve(logger, "claim-2", oneRequest(claimCPUs), false))
 
-	updatedClaims, err := store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{claimUID: claimCPUs})
+	updatedClaims, err := store.Bind(logger, "pod", "app", wholeClaims(map[types.UID]cpuset.CPUSet{claimUID: claimCPUs}))
 	require.NoError(t, err)
 	require.Equal(t, []types.UID{claimUID}, updatedClaims)
 	require.True(t, store.GetSharedCPUs().Equals(cpuset.New(2, 3)))
@@ -131,11 +143,11 @@ func TestAllocationStateBind(t *testing.T) {
 				requirePreparedAllocation(t, logger, store, uid, cpus)
 			}
 			if tc.initial != nil {
-				_, err := store.Bind(logger, tc.initial.PodUID, tc.initial.ContainerName, map[types.UID]cpuset.CPUSet{"b": cpuset.New(1)})
+				_, err := store.Bind(logger, tc.initial.PodUID, tc.initial.ContainerName, wholeClaims(map[types.UID]cpuset.CPUSet{"b": cpuset.New(1)}))
 				require.NoError(t, err)
 			}
 			before := store.Clone()
-			updatedClaims, err := store.Bind(logger, owner.PodUID, owner.ContainerName, tc.expected)
+			updatedClaims, err := store.Bind(logger, owner.PodUID, owner.ContainerName, wholeClaims(tc.expected))
 			if tc.wantErrIs != nil {
 				require.ErrorIs(t, err, tc.wantErrIs)
 				require.Equal(t, before.resourceClaimAllocations, store.resourceClaimAllocations, "failed validation must not change any claim")
@@ -155,22 +167,119 @@ func TestAllocationStateBind(t *testing.T) {
 	}
 }
 
+func TestAllocationStateBindRequests(t *testing.T) {
+	vcpus := ClaimRequestRef{ClaimUID: "vm", Request: "vcpus"}
+	helpers := ClaimRequestRef{ClaimUID: "vm", Request: "helpers"}
+	tests := []struct {
+		name              string
+		expected          map[ClaimRequestRef]cpuset.CPUSet
+		wantUpdatedClaims []types.UID
+		wantErr           string
+	}{
+		{
+			name:              "one request binds its claim",
+			expected:          map[ClaimRequestRef]cpuset.CPUSet{vcpus: cpuset.New(0, 1)},
+			wantUpdatedClaims: []types.UID{"vm"},
+		},
+		{
+			name:              "every request binds the claim once",
+			expected:          map[ClaimRequestRef]cpuset.CPUSet{vcpus: cpuset.New(0, 1), helpers: cpuset.New(2)},
+			wantUpdatedClaims: []types.UID{"vm"},
+		},
+		{
+			name:              "the whole claim is the union of its requests",
+			expected:          map[ClaimRequestRef]cpuset.CPUSet{{ClaimUID: "vm"}: cpuset.New(0, 1, 2)},
+			wantUpdatedClaims: []types.UID{"vm"},
+		},
+		{
+			name:     "a request compared with another request's CPUs",
+			expected: map[ClaimRequestRef]cpuset.CPUSet{vcpus: cpuset.New(0, 1), helpers: cpuset.New(0)},
+			wantErr:  `validation failed for claim "vm" request "helpers": cpuset mismatch (expected "2", got "0")`,
+		},
+		{
+			name:     "the whole claim compared with one request's CPUs",
+			expected: map[ClaimRequestRef]cpuset.CPUSet{{ClaimUID: "vm"}: cpuset.New(0, 1)},
+			wantErr:  `validation failed for claim "vm": cpuset mismatch (expected "0-2", got "0-1")`,
+		},
+		{
+			name:     "a request the claim was prepared without",
+			expected: map[ClaimRequestRef]cpuset.CPUSet{{ClaimUID: "vm", Request: "gpus"}: cpuset.New(3)},
+			wantErr:  `claim "vm" was prepared without request "gpus"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := testr.New(t)
+			store := newTestAllocationState(logger, cpuset.New(0, 1, 2, 3), cpuset.New())
+			require.NoError(t, store.Reserve(logger, "vm", []RequestAllocation{
+				{Request: "vcpus", CPUs: cpuset.New(0, 1)},
+				{Request: "helpers", CPUs: cpuset.New(2)},
+			}, false))
+			before := store.Clone()
+			updatedClaims, err := store.Bind(logger, "pod", "app", tc.expected)
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				require.Equal(t, before.resourceClaimAllocations, store.resourceClaimAllocations, "failed validation must not change any claim")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantUpdatedClaims, updatedClaims)
+			require.True(t, store.IsOwner("vm", "pod", "app"))
+		})
+	}
+}
+
+func TestAllocationStateRequestsSurviveBindAndUnbind(t *testing.T) {
+	logger := testr.New(t)
+	store := newTestAllocationState(logger, cpuset.New(0, 1, 2, 3), cpuset.New())
+	requests := []RequestAllocation{
+		{Request: "vcpus", CPUs: cpuset.New(0, 1)},
+		{Request: "helpers", CPUs: cpuset.New(2)},
+	}
+	require.NoError(t, store.Reserve(logger, "vm", requests, false))
+	byRequest := map[ClaimRequestRef]cpuset.CPUSet{
+		{ClaimUID: "vm", Request: "vcpus"}:   cpuset.New(0, 1),
+		{ClaimUID: "vm", Request: "helpers"}: cpuset.New(2),
+	}
+	recorded := func(s *AllocationState) []RequestAllocation {
+		return s.resourceClaimAllocations["vm"].requests
+	}
+	want := []RequestAllocation{requests[1], requests[0]}
+
+	_, err := store.Bind(logger, "pod", "app", byRequest)
+	require.NoError(t, err)
+	require.Equal(t, want, recorded(store), "Acquire keeps every request")
+	require.Equal(t, want, recorded(store.Clone()), "Clone keeps every request")
+
+	store.Unbind(logger, "vm")
+	require.Equal(t, want, recorded(store), "Release keeps every request")
+	_, err = store.Bind(logger, "pod", "other", byRequest)
+	require.NoError(t, err, "each request reads back its own CPUs after an unbind")
+	require.Equal(t, "0-2", store.GetPreparedCPUs().String())
+}
+
 func TestAllocationStateBindErrorDetails(t *testing.T) {
 	logger := testr.New(t)
 	store := newTestAllocationState(logger, cpuset.New(0, 1, 2), cpuset.New())
 	requirePreparedAllocation(t, logger, store, "a", cpuset.New(0))
 
-	_, err := store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{"missing": cpuset.New(2)})
+	_, err := store.Bind(logger, "pod", "app", wholeClaims(map[types.UID]cpuset.CPUSet{"missing": cpuset.New(2)}))
 	var unknownClaimErr UnknownClaimError
 	require.ErrorAs(t, err, &unknownClaimErr)
 	require.Equal(t, types.UID("missing"), unknownClaimErr.ClaimUID)
 
-	_, err = store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{"a": cpuset.New(2)})
+	_, err = store.Bind(logger, "pod", "app", wholeClaims(map[types.UID]cpuset.CPUSet{"a": cpuset.New(2)}))
 	var mismatchErr ClaimCPUMismatchError
 	require.ErrorAs(t, err, &mismatchErr)
 	require.Equal(t, types.UID("a"), mismatchErr.ClaimUID)
 	require.True(t, mismatchErr.Expected.Equals(cpuset.New(0)))
 	require.True(t, mismatchErr.Got.Equals(cpuset.New(2)))
+
+	_, err = store.Bind(logger, "pod", "app", map[ClaimRequestRef]cpuset.CPUSet{{ClaimUID: "a", Request: "missing"}: cpuset.New(0)})
+	var unknownRequestErr UnknownRequestError
+	require.ErrorAs(t, err, &unknownRequestErr)
+	require.Equal(t, UnknownRequestError{ClaimUID: "a", Request: "missing"}, unknownRequestErr)
+	require.ErrorIs(t, err, ErrUnknownRequest)
 }
 
 func TestAllocationStateCloneRetainsOwnership(t *testing.T) {
@@ -178,7 +287,7 @@ func TestAllocationStateCloneRetainsOwnership(t *testing.T) {
 	store := newTestAllocationState(logger, cpuset.New(0, 1, 2), cpuset.New())
 	requirePreparedAllocation(t, logger, store, "a", cpuset.New(0))
 	requirePreparedAllocation(t, logger, store, "b", cpuset.New(1))
-	_, err := store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)})
+	_, err := store.Bind(logger, "pod", "app", wholeClaims(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)}))
 	require.NoError(t, err)
 	require.True(t, store.IsOwner("a", "pod", "app"))
 	require.False(t, store.IsOwner("b", "pod", "app"))
@@ -191,7 +300,7 @@ func TestAllocationStateCloneRetainsOwnership(t *testing.T) {
 	// unbind
 	clone.Unbind(logger, "a")
 	// rebind, now succeeds
-	_, err = clone.Bind(logger, "other", "app", map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)})
+	_, err = clone.Bind(logger, "other", "app", wholeClaims(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)}))
 	require.NoError(t, err)
 	clone.Release(logger, "b")
 	// rebound clone
@@ -317,8 +426,8 @@ func TestAllocationStateReserveRepeatedCalls(t *testing.T) {
 			store := newTestAllocationState(logger, allCPUs, cpuset.New())
 			claimUID := types.UID("claim-uid-1")
 
-			require.NoError(t, store.Reserve(logger, claimUID, tc.firstCPUs, false))
-			err := store.Reserve(logger, claimUID, tc.secondCPUs, false)
+			require.NoError(t, store.Reserve(logger, claimUID, oneRequest(tc.firstCPUs), false))
+			err := store.Reserve(logger, claimUID, oneRequest(tc.secondCPUs), false)
 			if tc.expectError {
 				require.Error(t, err)
 			} else {
@@ -364,7 +473,7 @@ func TestAllocationStateReserveSharedPoolGuard(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := newTestAllocationState(logger, allCPUs, cpuset.New())
-			err := store.Reserve(logger, "claim", test.cpus, test.hasSharedContainers)
+			err := store.Reserve(logger, "claim", oneRequest(test.cpus), test.hasSharedContainers)
 			if test.wantErr {
 				require.ErrorContains(t, err, "would exhaust the shared CPU pool")
 				_, ok := store.GetResourceClaimAllocation("claim")
@@ -382,31 +491,31 @@ func TestAllocationStateRestoreKeepsOverlappingClaimsUnbound(t *testing.T) {
 	logger := testr.New(t)
 	store := newTestAllocationState(logger, cpuset.New(0, 1, 2, 3, 4), cpuset.New())
 
-	store.Restore(logger, "a", cpuset.New(0, 1))
-	store.Restore(logger, "b", cpuset.New(1, 2))
-	store.Restore(logger, "c", cpuset.New(0, 3))
-	store.Restore(logger, "a", cpuset.New(4))
+	store.Restore(logger, "a", oneRequest(cpuset.New(0, 1)))
+	store.Restore(logger, "b", oneRequest(cpuset.New(1, 2)))
+	store.Restore(logger, "c", oneRequest(cpuset.New(0, 3)))
+	store.Restore(logger, "a", oneRequest(cpuset.New(4)))
 	cpus, ok := store.GetResourceClaimAllocation("a")
 	require.True(t, ok)
 	require.Equal(t, "0-1", cpus.String(), "restoring a recorded claim must not change it")
 	require.Equal(t, "0-3", store.GetPreparedCPUs().String())
 	require.Equal(t, "4", store.GetSharedCPUs().String())
-	require.Error(t, store.Reserve(logger, "d", cpuset.New(2), false), "a new claim must not take a restored claim's CPU")
+	require.Error(t, store.Reserve(logger, "d", oneRequest(cpuset.New(2)), false), "a new claim must not take a restored claim's CPU")
 
-	_, err := store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{"a": cpuset.New(0, 1)})
+	_, err := store.Bind(logger, "pod", "app", wholeClaims(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0, 1)}))
 	var overlapErr ClaimOverlapError
 	require.ErrorAs(t, err, &overlapErr)
 	require.Equal(t, types.UID("a"), overlapErr.ClaimUID)
 	require.Equal(t, types.UID("b"), overlapErr.Other, "of the claims a overlaps, the one with the lowest UID is named")
 	require.Equal(t, "1", overlapErr.CPUs.String())
-	_, err = store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{"b": cpuset.New(1, 2)})
+	_, err = store.Bind(logger, "pod", "app", wholeClaims(map[types.UID]cpuset.CPUSet{"b": cpuset.New(1, 2)}))
 	require.ErrorIs(t, err, ErrClaimOverlap)
 	_, bound := store.Owner("b")
 	require.False(t, bound)
 
 	store.Release(logger, "a")
 	require.Equal(t, "0-3", store.GetPreparedCPUs().String(), "a CPU stays prepared while another claim names it")
-	_, err = store.Bind(logger, "pod", "app", map[types.UID]cpuset.CPUSet{"b": cpuset.New(1, 2)})
+	_, err = store.Bind(logger, "pod", "app", wholeClaims(map[types.UID]cpuset.CPUSet{"b": cpuset.New(1, 2)}))
 	require.NoError(t, err)
 	owner, bound := store.Owner("b")
 	require.True(t, bound)
