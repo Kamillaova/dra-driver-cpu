@@ -114,7 +114,8 @@ metadata exposed to the container. It also adds the following metadata-only attr
 | `dra.cpu/cpuLimit`         | string | The request's CPU limit as a quantity, or `max` where the request has none, as a request that holds exclusive CPUs has none; written with `dra.cpu/cpuRequest`                                              |
 | `dra.cpu/cpuset`           | string | The CPUs the request holds on this device, in cpuset list form such as `0-1,4-5`, for a request that holds exclusive CPUs, in either device mode                                                            |
 
-These attributes are not published in a `ResourceSlice` and cannot be used to select a device.
+These attributes are not published in a `ResourceSlice` and cannot be used to select a device. A
+container reads them in the request's [device metadata file](device-metadata.md).
 
 ## Versioned attributes
 
