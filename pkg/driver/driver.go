@@ -129,6 +129,7 @@ type CPUDriver struct {
 	kubeClient              kubernetes.Interface
 	draPlugin               KubeletPlugin
 	nriPlugin               stub.Stub
+	cancelNRI               context.CancelFunc
 	podState                *store.PodState
 	allocationState         *store.AllocationState
 	cdiMgr                  cdiManager
@@ -390,13 +391,7 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, fmt.Errorf("failed to create plugin stub: %w", err)
 	}
 	cp.nriPlugin = stub
-
-	go func() {
-		if err := runNRIPluginWithRetry(ctx, cp.nriPlugin, maxAttempts, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration); err != nil && ctx.Err() == nil {
-			logger.Error(err, "NRI plugin failed to be restarted", "maxAttempts", maxAttempts)
-			asyncErr <- err
-		}
-	}()
+	cp.startNRIPlugin(ctx, asyncErr)
 
 	// publish available resources
 	go cp.PublishResources(ctx)
@@ -409,11 +404,26 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	return asyncErr, nil
 }
 
+// startNRIPlugin keeps the NRI plugin connected until Stop, not until ctx is
+// cancelled, so that containers created while the DRA plugin shuts down still
+// get their CPUs.
+func (cp *CPUDriver) startNRIPlugin(ctx context.Context, asyncErr chan<- error) {
+	logger := ctxlog.FromContext(ctx)
+	ctx, cp.cancelNRI = context.WithCancel(context.WithoutCancel(ctx))
+	go func() {
+		if err := runNRIPluginWithRetry(ctx, cp.nriPlugin, maxAttempts, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration); err != nil && ctx.Err() == nil {
+			logger.Error(err, "NRI plugin failed to be restarted", "maxAttempts", maxAttempts)
+			asyncErr <- err
+		}
+	}()
+}
+
 // Stop stops the CPUDriver.
 func (cp *CPUDriver) Stop() {
 	cp.health.Stop()
-	cp.nriPlugin.Stop()
 	cp.draPlugin.Stop()
+	cp.cancelNRI()
+	cp.nriPlugin.Stop()
 }
 
 func getDeviceAttributes(deviceSlices [][]resourceapi.Device, deviceName string) (map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, bool) {
