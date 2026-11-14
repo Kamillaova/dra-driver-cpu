@@ -65,6 +65,7 @@ func TestNUMANodeSelector(t *testing.T) {
 		want    string
 	}{
 		{name: "numanode", groupBy: "numanode", want: `device.attributes["resource.kubernetes.io"].numaNode == 1`},
+		{name: "uncorecache", groupBy: "uncorecache", want: `device.attributes["resource.kubernetes.io"].numaNode == 1`},
 		{name: "socket", groupBy: "socket"},
 		{name: "machine", groupBy: "machine"},
 		{name: "unset", groupBy: ""},
