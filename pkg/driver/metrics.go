@@ -32,6 +32,7 @@ type Recorder interface {
 	RecordNRIStopContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRIRemoveContainer(err error, claimCount int, elapsed time.Duration)
 	RecordNRISynchronizeRefusedClaim()
+	SetWatchdogStuck(stalled time.Duration)
 }
 
 // refreshAllocationMetrics requires stateMu once the driver is serving callbacks.

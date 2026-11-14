@@ -68,6 +68,7 @@ func (cp *CPUDriver) PublishResources(ctx context.Context) {
 
 // PrepareResourceClaims is called by the kubelet to prepare a resource claim.
 func (cp *CPUDriver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
+	defer cp.watchdog.track("PrepareResourceClaims")()
 	_, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen))
 
 	logger.V(4).Info("begin: preparing resource claims", "numClaims", len(claims))
@@ -382,6 +383,7 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 
 // UnprepareResourceClaims is called by the kubelet to unprepare the resources for a claim.
 func (cp *CPUDriver) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {
+	defer cp.watchdog.track("UnprepareResourceClaims")()
 	_, logger := ctxlog.WithValues(ctx, "opID", generateShortID(opIDLen))
 
 	logger.V(4).Info("begin: unpreparing resource claims", "numClaims", len(claims))

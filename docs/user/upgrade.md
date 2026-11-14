@@ -96,6 +96,14 @@ where it used client-go's defaults of 5 and 10 before. Set `driverConfig.qps` an
 `driverConfig.burst` to change the limits; see
 [configuration](configuration.md#driverconfig-sub-fields).
 
+#### Watchdog
+
+The driver now watches itself, always, with no setting to turn it off. When its state lock has
+been held, or an NRI hook or a Prepare or Unprepare call has been running, for more than 60
+seconds, `/healthz` answers 503; past 180 seconds the driver stops and exits non-zero for the
+kubelet to restart it.
+See [troubleshooting](troubleshooting.md#a-stuck-driver).
+
 ### Early warning
 
 Before the driver enters beta stage, a batch of **breaking** changes are planned.

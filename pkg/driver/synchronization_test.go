@@ -262,8 +262,8 @@ func (r *pausedRecorder) SetAllocationState(state cpumetrics.AllocationState) {
 
 func requireStateLockHeld(t *testing.T, d *CPUDriver) {
 	t.Helper()
-	if d.stateMu.TryLock() {
-		d.stateMu.Unlock()
+	if d.stateMu.mu.TryLock() {
+		d.stateMu.mu.Unlock()
 		t.Fatal("state lock is not held while Synchronize is paused")
 	}
 }
