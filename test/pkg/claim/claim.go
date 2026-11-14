@@ -43,11 +43,11 @@ func WithSelector(spec resourcev1.ResourceClaimSpec, cel string) resourcev1.Reso
 	return out
 }
 
-// NUMANodeSelector is a CEL expression selecting the device of NUMA node numaID
-// where groupBy publishes one device per NUMA node, and empty under any other
-// grouping.
+// NUMANodeSelector is a CEL expression selecting the devices of NUMA node
+// numaID where groupBy publishes devices that each lie in one NUMA node, and
+// empty under any other grouping.
 func NUMANodeSelector(groupBy string, numaID int) string {
-	if groupBy != device.GROUP_BY_NUMA_NODE {
+	if groupBy != device.GROUP_BY_NUMA_NODE && groupBy != device.GROUP_BY_UNCORE_CACHE {
 		return ""
 	}
 	return fmt.Sprintf(`device.attributes["resource.kubernetes.io"].numaNode == %d`, numaID)

@@ -28,11 +28,11 @@ from the entire node.
 > implements it today. Regular workloads should use the default `numanode`/`socket` grouping
 > instead.
 
-When using the external allocator with grouped mode (`numanode`, `socket`, or `machine`), the
-DRA driver does not perform automatic topology-aware CPU allocation. Instead, an explicit core
-assignment must be provided via the `cpuset` field in the claim's opaque configuration
-parameters. With `numanode` or `socket`, the cpuset must belong to the group selected for the
-request.
+When using the external allocator with grouped mode (`numanode`, `socket`, `uncorecache`, or
+`machine`), the DRA driver does not perform automatic topology-aware CPU allocation. Instead, an
+explicit core assignment must be provided via the `cpuset` field in the claim's opaque
+configuration parameters. With `numanode`, `socket` or `uncorecache`, the cpuset must belong to
+the group selected for the request.
 
 The Kubelet driver parses this configuration at prepare time from the claim's allocation status (`status.allocation.devices.config`). The control plane (typically scheduling plugin) is responsible for injecting this configuration block into the allocation result when binding the claim.
 
