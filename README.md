@@ -45,7 +45,7 @@ selection can be made per workload.
 
 **Example:** a claim to request CPUs on socket 0.
 
-<img alt="The Pod YAML (left) and the ResourceClaim YAML (right). The Pod mirrors the claim's 8 CPUs in its cpu requests and limits and references cpus-on-socket0 by resourceClaimName; that ResourceClaim requests 8 CPUs, with a dotted box around the selector that restricts them to socket 0." src="docs/images/topology-yaml.svg">
+<img alt="The Pod YAML (left) and the ResourceClaim YAML (right). The Pod mirrors the claim's 8 CPUs in its cpu requests, sets no cpu limit, and references cpus-on-socket0 by resourceClaimName; that ResourceClaim requests 8 CPUs, with a dotted box around the selector that restricts them to socket 0." src="docs/images/topology-yaml.svg">
 
 **Allocation:**
 
@@ -59,7 +59,7 @@ To keep scheduler accounting correct, either:
 
 - enable the driver's `publishNodeAllocatableResourceMapping` option (Kubernetes 1.37+ with the
   `DRANodeAllocatableResources` feature gate), or
-- mirror the claim's CPU count in the container's `cpu` requests and limits, as shown above.
+- mirror the claim's CPU count in the container's `cpu` requests, as shown above.
 
 See [Workload Configuration Requirements](docs/user/workload-requirements.md) for details.
 
@@ -73,7 +73,7 @@ cross-socket traffic:
 
 **Example:** one claim for CPUs, a GPU and a NIC that must share a PCIe root.
 
-<img alt="The Pod YAML (left) and the ResourceClaim YAML (right). The Pod mirrors the claim's 8 CPUs in its cpu requests and limits and references gpu-cpu-nic-claim by resourceClaimName; that ResourceClaim requests 8 CPUs, a GPU and a NIC, with a dotted box around the constraint that aligns them on one PCIe root." src="docs/images/alignment-yaml.svg">
+<img alt="The Pod YAML (left) and the ResourceClaim YAML (right). The Pod mirrors the claim's 8 CPUs in its cpu requests, sets no cpu limit, and references gpu-cpu-nic-claim by resourceClaimName; that ResourceClaim requests 8 CPUs, a GPU and a NIC, with a dotted box around the constraint that aligns them on one PCIe root." src="docs/images/alignment-yaml.svg">
 
 **Allocation:**
 
