@@ -26,9 +26,10 @@ CPU group. `individual` exposes one device per CPU, but is **deprecated**; see
 
 | Attribute                         | Type    | Description                                                                                                    |
 | --------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `resource.kubernetes.io/numaNode` | int     | Standard NUMA node of the group; published only when grouping by NUMA node                                     |
+| `resource.kubernetes.io/numaNode` | int     | Standard NUMA node of the group; published when grouping by NUMA node or uncore cache                          |
 | `resource.kubernetes.io/pcieRoot` | strings | PCIe roots local to the group's CPUs; needs `--expose-pcie-roots` and the `DRAListTypeAttributes` feature gate |
-| `dra.cpu/socketID`                | int     | CPU socket of the group; published when grouping by socket or NUMA node                                        |
+| `dra.cpu/socketID`                | int     | CPU socket of the group; published when grouping by socket, NUMA node or uncore cache                          |
+| `dra.cpu/cacheL3ID`               | int     | Uncore (L3) cache of the group, by the id the kernel gives it; published when grouping by uncore cache         |
 | `dra.cpu/numCPUs`                 | int     | Number of allocatable CPUs in the group                                                                        |
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                             |
 | `dra.cpu/threadsPerCore`          | int     | Logical CPUs on each physical core of the group; `0` when its cores differ, as on a hybrid CPU                 |
@@ -41,7 +42,7 @@ that would refuse to prepare it; see
 
 #### External allocator attributes
 
-With the external allocator in grouped mode, the driver also publishes these attributes for NUMA-node, socket, and machine groups.
+With the external allocator in grouped mode, the driver also publishes these attributes for NUMA-node, uncore-cache, socket, and machine groups.
 
 | Attribute           | Type   | Description                                                                                         |
 | ------------------- | ------ | --------------------------------------------------------------------------------------------------- |
@@ -66,10 +67,10 @@ These attributes are retained for compatibility with existing consumers and pote
 cross-driver alignment. New consumers should use the supported attributes above instead.
 These attributes will be removed in a future release.
 
-| Attribute            | Type | Replaced by                       | Description                                                                                   |
-| -------------------- | ---- | --------------------------------- | --------------------------------------------------------------------------------------------- |
-| `dra.cpu/numaNodeID` | int  | `resource.kubernetes.io/numaNode` | Driver-specific NUMA node; published only when grouping by NUMA node                          |
-| `dra.net/numaNode`   | int  | `resource.kubernetes.io/numaNode` | Experimental cross-driver NUMA-alignment attribute; published only when grouping by NUMA node |
+| Attribute            | Type | Replaced by                       | Description                                                                                              |
+| -------------------- | ---- | --------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `dra.cpu/numaNodeID` | int  | `resource.kubernetes.io/numaNode` | Driver-specific NUMA node; published when grouping by NUMA node or uncore cache                          |
+| `dra.net/numaNode`   | int  | `resource.kubernetes.io/numaNode` | Experimental cross-driver NUMA-alignment attribute; published when grouping by NUMA node or uncore cache |
 
 ### Individual mode (deprecated)
 
