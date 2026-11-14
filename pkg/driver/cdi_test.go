@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,6 +25,9 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/cpuset"
 	cdiSpec "tags.cncf.io/container-device-interface/specs-go"
 )
 
@@ -115,24 +119,171 @@ func TestAddDevice(t *testing.T) {
 	}
 }
 
-func TestRemoveDevice(t *testing.T) {
+func testClaimRecord() cdiClaimRecord {
+	four := resource.MustParse("4")
+	return cdiClaimRecord{
+		Namespace: "ns",
+		Name:      "vm-claim",
+		Requests: []cdiRequestRecord{
+			{Request: "helpers", CPUs: cpuset.New(8), Results: []cdiResultRecord{{Device: "cpudev008"}}},
+			{Request: "vcpus", CPUs: cpuset.New(0, 1, 2, 3), Results: []cdiResultRecord{{Device: "cpudevnuma000", Consumed: &four}}},
+		},
+	}
+}
+
+func testClaimDeviceEnvs(claimUID types.UID) map[string]string {
+	return map[string]string{
+		getCDIRequestDeviceName(claimUID, "vcpus"):   fmt.Sprintf("%s_%s_vcpus=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue),
+		getCDIRequestDeviceName(claimUID, "helpers"): fmt.Sprintf("%s_%s_helpers=%s", cdiEnvVarPrefix, claimUID, cdiEnvDynamicValue),
+	}
+}
+
+func TestAddClaimDevices(t *testing.T) {
+	logger := testr.New(t)
+	tempCDIDir := t.TempDir()
+	mgr, err := NewCdiManager(logger, testDriverName, tempCDIDir)
+	require.NoError(t, err)
+
+	claimUID := types.UID("vm")
+	envs := testClaimDeviceEnvs(claimUID)
+	require.NoError(t, mgr.AddClaimDevices(logger, claimUID, envs, testClaimRecord()))
+	require.NoError(t, mgr.AddClaimDevices(logger, claimUID, envs, testClaimRecord()))
+	files, err := os.ReadDir(tempCDIDir)
+	require.NoError(t, err)
+	require.Len(t, files, 1, "one spec file holds every device of a claim")
+
+	spec := getSpecFromCache(mgr, mgr.getSpecName(getCDIDeviceName(claimUID)))
+	require.NotNil(t, spec)
+	require.Equal(t, []string{getCDIRequestDeviceName(claimUID, "helpers"), getCDIRequestDeviceName(claimUID, "vcpus")},
+		[]string{spec.Devices[0].Name, spec.Devices[1].Name}, "devices in the order of their names")
+	require.Empty(t, spec.ContainerEdits, "nothing of the spec itself reaches a container")
+	require.Equal(t, map[string]string{
+		cdiRecordAnnotation: `{"namespace":"ns","name":"vm-claim","placements":[{"request":"helpers","cpus":"8","results":[{"device":"cpudev008"}]},{"request":"vcpus","cpus":"0-3","results":[{"device":"cpudevnuma000","consumed":"4"}]}]}`,
+	}, spec.Annotations, "the record is one annotation")
+
+	record, err := mgr.GetDeviceAllocations(claimUID)
+	require.NoError(t, err)
+	require.Equal(t, testClaimRecord(), record, "the record reads back as written")
+	for deviceName, env := range envs {
+		got, err := mgr.GetDeviceEnv(deviceName)
+		require.NoError(t, err)
+		require.Equal(t, []string{env}, got, "device %q resolves by name in a spec holding several", deviceName)
+	}
+}
+
+func TestGetDeviceAllocations(t *testing.T) {
+	claimUID := types.UID("vm")
+	specWith := func(annotations map[string]string, env string) *cdiSpec.Spec {
+		return &cdiSpec.Spec{
+			Version:     cdiSpecVersion,
+			Kind:        cdiVendor + "/" + cdiClass,
+			Annotations: annotations,
+			Devices: []cdiSpec.Device{{
+				Name:           getCDIDeviceName(claimUID),
+				ContainerEdits: cdiSpec.ContainerEdits{Env: []string{env}},
+			}},
+		}
+	}
+	record := func(value string) map[string]string {
+		return map[string]string{cdiRecordAnnotation: value}
+	}
+	tests := []struct {
+		name    string
+		spec    *cdiSpec.Spec
+		want    cdiClaimRecord
+		wantErr string
+	}{
+		{
+			name: "upstream's spec is one request without a name",
+			spec: specWith(nil, "DRA_CPUSET_vm=0-1"),
+			want: cdiClaimRecord{Requests: []cdiRequestRecord{{CPUs: cpuset.New(0, 1)}}},
+		},
+		{
+			name:    "no spec of the claim",
+			wantErr: "failed to find CDI spec",
+		},
+		{
+			name:    "a record without the claim's namespace",
+			spec:    specWith(record(`{"name":"vm-claim","placements":[{"request":"vcpus","cpus":"0"}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
+			wantErr: "dra.cpu/record records no namespace of the claim",
+		},
+		{
+			name:    "a record without the claim's name",
+			spec:    specWith(record(`{"namespace":"ns","name":"","placements":[{"request":"vcpus","cpus":"0"}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
+			wantErr: "dra.cpu/record records no name of the claim",
+		},
+		{
+			name:    "a record of no request",
+			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
+			wantErr: "dra.cpu/record records no request",
+		},
+		{
+			name:    "a null list of requests",
+			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":null}`), "DRA_CPUSET_vm_vcpus=dynamic"),
+			wantErr: "dra.cpu/record records no request",
+		},
+		{
+			name:    "a request recorded twice",
+			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vcpus","cpus":"0"},{"request":"vcpus","cpus":"1"}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
+			wantErr: `dra.cpu/record records request "vcpus" twice or without a name`,
+		},
+		{
+			name:    "a request without CPUs",
+			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vcpus","cpus":""}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
+			wantErr: `dra.cpu/record records no CPU for request "vcpus"`,
+		},
+		{
+			name:    "CPUs that do not parse",
+			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vcpus","cpus":"a-b"}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
+			wantErr: `failed to parse the CPUs of request "vcpus"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := testr.New(t)
+			mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+			require.NoError(t, err)
+			if tc.spec != nil {
+				require.NoError(t, mgr.cache.WriteSpec(tc.spec, mgr.getSpecName(getCDIDeviceName(claimUID))))
+			}
+			require.NoError(t, mgr.Refresh())
+
+			record, err := mgr.GetDeviceAllocations(claimUID)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, record)
+		})
+	}
+}
+
+func TestRemoveClaimDevices(t *testing.T) {
+	claimUID := types.UID("vm")
 	testcases := []struct {
 		name          string
-		deviceName    string
-		envVar        string
+		add           func(*CdiManager) error
 		simulateErr   bool
 		expectedError string
 	}{
 		{
-			name:        "successfully removes an existing device spec from disk",
-			deviceName:  "claim-cpu-remove-success",
-			envVar:      "CPU=4,5",
-			simulateErr: false,
+			name: "removes the devices and the record of a claim",
+			add: func(mgr *CdiManager) error {
+				return mgr.AddClaimDevices(testr.New(t), claimUID, testClaimDeviceEnvs(claimUID), testClaimRecord())
+			},
+		},
+		{
+			name: "removes a claim in upstream's form",
+			add: func(mgr *CdiManager) error {
+				return mgr.AddDevice(testr.New(t), getCDIDeviceName(claimUID), "DRA_CPUSET_vm=0-1")
+			},
+		},
+		{
+			name: "a missing spec counts as removed",
 		},
 		{
 			name:          "fails to remove spec when directory is actually a file",
-			deviceName:    "claim-cpu-remove-error",
-			envVar:        "CPU=4,5",
 			simulateErr:   true,
 			expectedError: "failed to remove CDI spec",
 		},
@@ -153,15 +304,14 @@ func TestRemoveDevice(t *testing.T) {
 			mgr, err := NewCdiManager(logger, testDriverName, tempCDIDir)
 			require.NoError(t, err)
 
-			expectedSpecName := mgr.getSpecName(tc.deviceName)
+			expectedSpecName := mgr.getSpecName(getCDIDeviceName(claimUID))
 			expectedFilePath := filepath.Join(tempCDIDir, expectedSpecName)
 
-			if !tc.simulateErr {
-				err = mgr.AddDevice(logger, tc.deviceName, tc.envVar)
-				require.NoError(t, err)
+			if tc.add != nil {
+				require.NoError(t, tc.add(mgr))
 			}
 
-			err = mgr.RemoveDevice(logger, tc.deviceName)
+			err = mgr.RemoveClaimDevices(logger, claimUID)
 
 			if tc.expectedError != "" {
 				require.Error(t, err)

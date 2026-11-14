@@ -155,7 +155,7 @@ func TestWarmSynchronizeContainsConflictingClaims(t *testing.T) {
 			d.cdiMgr = cdi
 			logger := testr.New(t)
 			require.NoError(t, d.allocationState.Reserve(logger, "a", oneRequest(cpuset.New(0)), false))
-			_, err = d.allocationState.Bind(logger, "pod", "app", wholeClaim("a", cpuset.New(0)))
+			_, err = d.allocationState.Bind(logger, "pod", "app", nil, wholeClaim("a", cpuset.New(0)))
 			require.NoError(t, err)
 			pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
 			app := &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0"}}
@@ -185,7 +185,7 @@ func TestWarmSynchronizeSkipsUnknownAuthenticatedClaim(t *testing.T) {
 	d.cdiMgr = cdi
 	logger := testr.New(t)
 	require.NoError(t, d.allocationState.Reserve(logger, "a", oneRequest(cpuset.New(0)), false))
-	_, err = d.allocationState.Bind(logger, "pod", "app", wholeClaim("a", cpuset.New(0)))
+	_, err = d.allocationState.Bind(logger, "pod", "app", nil, wholeClaim("a", cpuset.New(0)))
 	require.NoError(t, err)
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
 	app := &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_b=1"}}
@@ -426,7 +426,7 @@ func TestWarmSynchronizeIgnoresInvalidEnvFromNonOwner(t *testing.T) {
 			results, err := d.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
 			require.NoError(t, err)
 			require.NoError(t, results[claim.UID].Err)
-			_, err = d.allocationState.Bind(testr.New(t), "real-pod", "app", wholeClaim(claim.UID, cpuset.New(0)))
+			_, err = d.allocationState.Bind(testr.New(t), "real-pod", "app", nil, wholeClaim(claim.UID, cpuset.New(0)))
 			require.NoError(t, err)
 			if missingCDI {
 				delete(d.cdiMgr.(*mockCdiMgr).devices, getCDIDeviceName(claim.UID))
@@ -725,6 +725,88 @@ func TestSynchronizeJudgesEachClaimOfAContainer(t *testing.T) {
 	_, bound := d.allocationState.Owner("b")
 	require.False(t, bound)
 	require.Equal(t, "0-1", d.allocationState.GetPreparedCPUs().String())
+}
+
+func TestSynchronizeJudgesRequestVariables(t *testing.T) {
+	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
+	vars := func(requests ...string) []string {
+		var envs []string
+		for _, request := range requests {
+			envs = append(envs, fmt.Sprintf("%s_vm_%s=%s", cdiEnvVarPrefix, request, cdiEnvDynamicValue))
+		}
+		return envs
+	}
+	tests := []struct {
+		name        string
+		env         []string
+		pinned      string
+		wantCPUs    string
+		wantBound   bool
+		wantKept    float64
+		wantRefused float64
+	}{
+		{
+			name:      "a container naming every request binds the claim",
+			env:       vars("vcpus", "helpers"),
+			wantCPUs:  "0-2",
+			wantBound: true,
+		},
+		{
+			name:      "a partial holder pinned to the whole claim keeps it",
+			env:       vars("vcpus"),
+			pinned:    "0-2",
+			wantCPUs:  "0-2",
+			wantBound: true,
+			wantKept:  1,
+		},
+		{
+			name:        "a partial holder off the claim's CPUs runs on the shared CPUs",
+			env:         vars("vcpus"),
+			pinned:      "0,2",
+			wantCPUs:    "3",
+			wantRefused: 1,
+		},
+		{
+			name:        "a variable naming a request the record lacks is refused",
+			env:         vars("vcpus", "helpers", "gpus"),
+			pinned:      "0-2",
+			wantCPUs:    "3",
+			wantRefused: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d, reg := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
+			cdi := newMockCdiMgr()
+			cdi.records["vm"] = cdiClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []cdiRequestRecord{
+				{Request: "helpers", CPUs: cpuset.New(1)},
+				{Request: "vcpus", CPUs: cpuset.New(0, 2)},
+			}}
+			d.cdiMgr = cdi
+			app := &api.Container{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: tc.env}
+			if tc.pinned != "" {
+				app.Linux = pinnedTo(tc.pinned)
+			}
+
+			// The first attempt is a fresh process, the second a reconnect.
+			for attempt := 1; attempt <= 2; attempt++ {
+				updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{app})
+				require.NoError(t, err)
+				require.Equal(t, map[string]string{"c-app": tc.wantCPUs}, cpusByContainer(updates), "attempt %d", attempt)
+				require.Equal(t, tc.wantBound, d.allocationState.IsOwner("vm", "pod-uid", "app"), "attempt %d", attempt)
+				require.Equal(t, "0-2", d.allocationState.GetPreparedCPUs().String(), "the claim stays prepared")
+				require.Equal(t, float64(attempt)*tc.wantKept, metricValue(t, reg, "dra_cpu_containers_kept_under_older_rule_total", map[string]string{"rule": string(cpumetrics.RulePartialHolder)}))
+				require.Equal(t, float64(attempt)*tc.wantRefused, metricValue(t, reg, "dra_cpu_nri_synchronize_refused_claims_total", nil))
+			}
+
+			if tc.wantKept > 0 {
+				recreated := &api.Container{Id: "c-app-2", Name: "app", PodSandboxId: pod.Id, Env: tc.env}
+				_, _, err := d.CreateContainer(t.Context(), pod, recreated)
+				require.EqualError(t, err, `container "app": uses only request "vcpus" of claim "vm-claim", which must be used whole; use the whole claim, or give the container its own claim`,
+					"the rule applies at the container's next CreateContainer")
+			}
+		})
+	}
 }
 
 // NRI cannot give the container without claims an empty cpuset, so it stays

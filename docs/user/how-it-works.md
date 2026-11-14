@@ -24,7 +24,7 @@ sequenceDiagram
     S->>S: allocate devices to claim<br/>(CEL selectors, capacity)
     S->>K: bind pod to node
     K->>D: NodePrepareResources(claim)
-    D->>D: pick physical CPUs,<br/>write CDI spec (env DRA_CPUSET_*)
+    D->>D: pick physical CPUs,<br/>write CDI spec (env DRA_CPUSET_* per request)
     K->>R: create container (with CDI device)
     R->>D: NRI: CreateContainer hook
     D->>R: pin cgroup cpuset to allocated CPUs
@@ -47,15 +47,15 @@ The two components in detail:
 
 - **CDI (Container Device Interface)**: The driver uses CDI to communicate the allocated CPU set to the container runtime.
 
-  - A CDI JSON spec file is created or updated for the allocated claim.
-  - This spec instructs the runtime to inject an environment variable (e.g., `DRA_CPUSET_<claimUID>=<cpuset>`) into the container.
+  - A CDI JSON spec file is created or updated for the allocated claim. It holds one device for each request of the claim and, in one of its annotations, the CPUs each request was given, so that one write of the file replaces both.
+  - Each device instructs the runtime to inject the environment variable `DRA_CPUSET_<claimUID>_<request>=dynamic` into the containers that name its request, or that name the claim without a request. The value is always `dynamic`: the variable tells the driver which claim and request a container holds, and the driver takes the CPUs from its own record.
   - The `DRA_CPUSET_*` environment variable prefix is reserved for the driver. Containers with malformed `DRA_CPUSET_*` values are rejected during creation.
   - The driver includes mechanisms for thread-safe and atomic updates to the CDI spec files.
 
 - **NRI Plugin**: This component integrates with the container runtime via the Node Resource Interface (NRI).
 
-  - For containers with **guaranteed CPUs** (those with a DRA ResourceClaim), the plugin reads the environment variable injected via CDI and pins the container to its exclusive CPU set using the cgroup cpuset controller.
+  - For containers with **guaranteed CPUs** (those with a DRA ResourceClaim), the plugin takes the claims and requests a container holds from the variables injected via CDI, and pins the container to the CPUs the driver's record gives those requests using the cgroup cpuset controller. A container uses a claim whole: one that names some but not all of a claim's requests is rejected during creation.
   - For all other containers, it confines them to a **shared pool** of CPUs, which consists of all allocatable CPUs not exclusively assigned to any guaranteed container.
   - It dynamically updates the shared pool cpuset for all shared containers whenever guaranteed allocations change (containers are created or removed).
-  - On restart, the NRI plugin restores its records from the CDI specs the driver wrote, and pins a container only to the claims those records show it holds. A claim that fails that check is not given to the container, which runs on the shared CPUs if it holds no other claim, and the refusal is logged and counted.
+  - On restart, the NRI plugin restores its records from the CDI specs the driver wrote, and pins a container only to the claims those records show it holds. A claim that fails that check is not given to the container, which runs on the shared CPUs if it holds no other claim, and the refusal is logged and counted. A running container that names some but not all of a claim's requests keeps the whole claim where the runtime shows it pinned to exactly the CPUs of its claims, and is counted in `dra_cpu_containers_kept_under_older_rule_total`; it is rejected when it is created again.
   - While the NRI plugin is not connected to the container runtime, from the driver's start until its first synchronization and from a lost connection until it has reconnected and synchronized, the driver refuses to prepare claims and the kubelet retries the preparation later. Unpreparing a claim is never refused.
