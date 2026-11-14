@@ -87,6 +87,15 @@ Go consumers of the opaque allocation configuration API must update their import
 
 The serialized `v1alpha1` schema and parsing behavior are unchanged.
 
+### Behavior changes
+
+#### Kubernetes API client limits
+
+The driver's Kubernetes API client now sends up to 20 requests per second, with bursts of 50,
+where it used client-go's defaults of 5 and 10 before. Set `driverConfig.qps` and
+`driverConfig.burst` to change the limits; see
+[configuration](configuration.md#driverconfig-sub-fields).
+
 ### Early warning
 
 Before the driver enters beta stage, a batch of **breaking** changes are planned.

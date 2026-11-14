@@ -213,6 +213,34 @@ func TestRunReadsConfigFile(t *testing.T) {
 	}
 }
 
+func TestRunReportsAPIClientLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		config    string
+		wantQPS   float32
+		wantBurst int
+	}{
+		{name: "defaults", config: "groupBy: socket\n", wantQPS: 20, wantBurst: 50},
+		{name: "from the config file", config: "qps: 30\nburst: 60\n", wantQPS: 30, wantBurst: 60},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupFakeHostWithConfig(t, tc.config)
+
+			stdout, err := captureStdout(t, func() error {
+				return gatherinfo.Run([]string{"--stdout"}, gatherinfo.Options{}, logr.Discard())
+			})
+			if err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+
+			report := readReport(t, []byte(stdout))
+			if report.DriverConfig.QPS != tc.wantQPS || report.DriverConfig.Burst != tc.wantBurst {
+				t.Fatalf("qps, burst = %v, %d, want %v, %d", report.DriverConfig.QPS, report.DriverConfig.Burst, tc.wantQPS, tc.wantBurst)
+			}
+		})
+	}
+}
+
 func TestRunRejectsStdoutWithOutputDir(t *testing.T) {
 	err := gatherinfo.Run([]string{"--stdout", "--output-dir=/tmp"}, gatherinfo.Options{}, logr.Discard())
 	if err == nil {

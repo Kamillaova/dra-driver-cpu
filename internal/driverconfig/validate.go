@@ -24,9 +24,10 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 )
 
-// Validate checks that enum fields hold recognised values and that
-// kubeletRootDir is non-empty and absolute. The root is required rather than
-// optional because the hostPath mounts render from the same value.
+// Validate checks that enum fields hold recognised values, that
+// kubeletRootDir is non-empty and absolute, and that qps and burst are
+// positive. The root is required rather than optional because the hostPath
+// mounts render from the same value.
 // Config files bypass the flag.Value validators, so Resolve calls this after merging.
 func (c Config) Validate() error {
 	if c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED && c.CPUDeviceMode != device.CPU_DEVICE_MODE_INDIVIDUAL {
@@ -61,6 +62,15 @@ func (c Config) Validate() error {
 	}
 	if !filepath.IsAbs(c.KubeletRootDir) {
 		return fmt.Errorf("invalid kubeletRootDir %q: must be an absolute path", c.KubeletRootDir)
+	}
+	// client-go would read a zero qps as its default, 5, and a negative one as
+	// no rate limit, and it refuses a burst below 1 only when it builds the
+	// client.
+	if c.QPS <= 0 {
+		return fmt.Errorf("invalid qps %v: must be greater than 0", c.QPS)
+	}
+	if c.Burst < 1 {
+		return fmt.Errorf("invalid burst %d: must be at least 1", c.Burst)
 	}
 	return nil
 }

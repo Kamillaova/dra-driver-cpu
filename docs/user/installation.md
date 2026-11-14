@@ -150,6 +150,12 @@ The manifests under `manifests/base`, which the chart does not render, keep the 
 `/healthz`, so a driver that is alive but not yet registered or connected to NRI is restarted
 there.
 
+## Kubernetes API client
+
+The driver's Kubernetes API client sends at most 20 requests per second, with bursts of 50,
+unless `driverConfig.qps` and `driverConfig.burst` set other limits; see
+[Configuration](configuration.md#driverconfig-sub-fields).
+
 ## Upgrading (generic instructions)
 
 Upgrade with Helm:

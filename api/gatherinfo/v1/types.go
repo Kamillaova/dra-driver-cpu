@@ -71,15 +71,17 @@ type ToolVersion struct {
 // Future version of `gatherinfo` will just expose the serialized most recent version driverconfig data.
 // See the driverconfig API for details.
 type DriverConfig struct {
-	Kubeconfig                            string `json:"kubeconfig,omitempty"`
-	HostnameOverride                      string `json:"hostnameOverride,omitempty"`
-	BindAddress                           string `json:"bindAddress,omitempty"`
-	ReservedCPUs                          string `json:"reservedCPUs,omitempty"`
-	CPUDeviceMode                         string `json:"cpuDeviceMode,omitempty"`
-	GroupBy                               string `json:"groupBy,omitempty"`
-	ExposePCIeRoots                       bool   `json:"exposePCIeRoots,omitempty"`
-	SysFSOverlay                          string `json:"sysfsOverlay,omitempty"`
-	KubeletRootDir                        string `json:"kubeletRootDir,omitempty"`
-	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
-	Allocator                             string `json:"allocator,omitempty"`
+	Kubeconfig                            string  `json:"kubeconfig,omitempty"`
+	HostnameOverride                      string  `json:"hostnameOverride,omitempty"`
+	BindAddress                           string  `json:"bindAddress,omitempty"`
+	ReservedCPUs                          string  `json:"reservedCPUs,omitempty"`
+	CPUDeviceMode                         string  `json:"cpuDeviceMode,omitempty"`
+	GroupBy                               string  `json:"groupBy,omitempty"`
+	ExposePCIeRoots                       bool    `json:"exposePCIeRoots,omitempty"`
+	SysFSOverlay                          string  `json:"sysfsOverlay,omitempty"`
+	KubeletRootDir                        string  `json:"kubeletRootDir,omitempty"`
+	PublishNodeAllocatableResourceMapping bool    `json:"publishNodeAllocatableResourceMapping,omitempty"`
+	Allocator                             string  `json:"allocator,omitempty"`
+	QPS                                   float32 `json:"qps,omitempty"`
+	Burst                                 int     `json:"burst,omitempty"`
 }
