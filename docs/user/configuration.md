@@ -152,6 +152,50 @@ on - is configured through other Helm values, not through this file.
   to start otherwise. It also refuses to start on a node with a core of more than two logical
   CPUs, unless that core is wholly in `reservedCPUs`.
 
+#### Settings published as device attributes
+
+Every device the driver publishes carries the settings that decide whether the driver prepares a
+claim, so that a claim's selector can keep it off the nodes that would refuse it after the
+scheduler placed it there. Each attribute is named as its setting and is always present.
+
+| Attribute                      | Type   | Value                      | What the driver refuses to prepare                                                               |
+| ------------------------------ | ------ | -------------------------- | ------------------------------------------------------------------------------------------------ |
+| `dra.cpu/fullPhysicalCPUsOnly` | bool   | `fullPhysicalCPUsOnly`     | When `true`, an amount that whole cores of the device do not make up                             |
+| `dra.cpu/allocator`            | string | `cpumanager` or `external` | In grouped mode, a `cpuConfig.cpuset` under `cpumanager`, a request without one under `external` |
+
+See [Whole physical cores](feature-support.md#whole-physical-cores) and
+[Custom Opaque CPUSet Allocation Overrides](opaque-cpuset-overrides.md) for these refusals.
+
+For example, a claim whose request names a `cpuConfig.cpuset` selects the nodes that honor it:
+
+```yaml
+        selectors:
+        - cel:
+            expression: device.attributes["dra.cpu"].allocator == "external"
+```
+
+and a claim for an odd number of CPUs selects the nodes that do not ask for whole cores, or whose
+cores have one logical CPU:
+
+```yaml
+        selectors:
+        - cel:
+            expression: >-
+              !device.attributes["dra.cpu"].fullPhysicalCPUsOnly ||
+              device.attributes["dra.cpu"].threadsPerCore == 1
+```
+
+A selector that reads an attribute the device does not carry is a CEL runtime error, which fails
+the claim's allocation instead of skipping the device. While some nodes still run a driver release
+that does not publish these attributes, guard the expression with `in`:
+
+```yaml
+            expression: >-
+              !("fullPhysicalCPUsOnly" in device.attributes["dra.cpu"]) ||
+              !device.attributes["dra.cpu"].fullPhysicalCPUsOnly ||
+              device.attributes["dra.cpu"].threadsPerCore == 1
+```
+
 #### Example
 
 ```yaml
