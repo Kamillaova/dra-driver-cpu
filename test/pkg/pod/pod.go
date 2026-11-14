@@ -19,6 +19,7 @@ package pod
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -26,8 +27,10 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -51,6 +54,40 @@ func CreateSync(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) (*v1.
 
 	// Get the newest pod after it becomes running and ready, some status may change after pod created, such as pod ip.
 	return cs.CoreV1().Pods(createdPod.Namespace).Get(ctx, createdPod.Name, metav1.GetOptions{})
+}
+
+// CreateSyncWithClaimTemplate creates template and then pod, which refers to
+// the template by its name, waits for the pod to run, and returns it with the
+// UID of the claim generated for it. A pod that does not run is deleted: left
+// Pending, it would start once whatever it waits for is freed.
+func CreateSyncWithClaimTemplate(ctx context.Context, cs kubernetes.Interface, template *resourcev1.ResourceClaimTemplate, pod *v1.Pod) (*v1.Pod, types.UID, error) {
+	if _, err := cs.ResourceV1().ResourceClaimTemplates(pod.Namespace).Create(ctx, template, metav1.CreateOptions{}); err != nil {
+		return nil, "", fmt.Errorf("create resource claim template %s/%s: %w", pod.Namespace, template.Name, err)
+	}
+	created, err := cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return nil, "", fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name+pod.GenerateName, err)
+	}
+	if err := WaitToBeRunning(ctx, cs, created.Namespace, created.Name); err != nil {
+		if deleteErr := DeleteSync(ctx, cs, created); deleteErr != nil {
+			return nil, "", errors.Join(err, deleteErr)
+		}
+		return nil, "", err
+	}
+	running, err := cs.CoreV1().Pods(created.Namespace).Get(ctx, created.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, "", fmt.Errorf("get pod %s: %w", Identify(created), err)
+	}
+	claims, err := cs.ResourceV1().ResourceClaims(running.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, "", fmt.Errorf("list resource claims in %s: %w", running.Namespace, err)
+	}
+	for i := range claims.Items {
+		if metav1.IsControlledBy(&claims.Items[i], running) {
+			return running, claims.Items[i].UID, nil
+		}
+	}
+	return nil, "", fmt.Errorf("no resource claim is controlled by pod %s", Identify(running))
 }
 
 func DeleteSync(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) error {
