@@ -158,6 +158,14 @@ func (m *mockCdiMgr) RemoveDevice(_ logr.Logger, deviceName string) error {
 	return nil
 }
 
+func oneRequest(cpus cpuset.CPUSet) []store.RequestAllocation {
+	return []store.RequestAllocation{{Request: "cpus", CPUs: cpus}}
+}
+
+func wholeClaim(claimUID types.UID, cpus cpuset.CPUSet) map[store.ClaimRequestRef]cpuset.CPUSet {
+	return map[store.ClaimRequestRef]cpuset.CPUSet{{ClaimUID: claimUID}: cpus}
+}
+
 var (
 	// Sibling CPUs are non-consecutive: (0,2), (1,3)
 	mockCPUInfos_SingleSocket_4CPUS_HT = []cpuinfo.CPUInfo{
@@ -785,7 +793,7 @@ func TestPrepareResourceClaims(t *testing.T) {
 			setupDriver: func(t *testing.T) *CPUDriver {
 				t.Helper()
 				d := baseCPUDriver(t)
-				require.NoError(t, d.allocationState.Reserve(testr.New(t), "claim0", cpuset.New(0), false))
+				require.NoError(t, d.allocationState.Reserve(testr.New(t), "claim0", oneRequest(cpuset.New(0)), false))
 				return d
 			},
 			claims: []*resourceapi.ResourceClaim{
@@ -1068,7 +1076,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 			metrics:         cpumetrics.Noop(),
 		}
 		if withExistingAllocation {
-			require.NoError(t, driver.allocationState.Reserve(logger, claimUID, existingCPUs, false))
+			require.NoError(t, driver.allocationState.Reserve(logger, claimUID, oneRequest(existingCPUs), false))
 		}
 		return driver
 	}
@@ -1096,7 +1104,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 			cpuAllocator:    cpuallocator.NewCPUManager(testDriverName, topo),
 		}
 		if withExistingAllocation {
-			require.NoError(t, driver.allocationState.Reserve(logger, claimUID, existingCPUs, false))
+			require.NoError(t, driver.allocationState.Reserve(logger, claimUID, oneRequest(existingCPUs), false))
 		}
 		return driver
 	}
@@ -1207,7 +1215,7 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 		driver, err := New(testr.New(t), prov, &conf)
 		require.NoError(t, err)
 		for claimUID, cpus := range initialAllocations {
-			require.NoError(t, driver.allocationState.Reserve(testr.New(t), claimUID, cpus, false))
+			require.NoError(t, driver.allocationState.Reserve(testr.New(t), claimUID, oneRequest(cpus), false))
 		}
 		return driver
 	}
@@ -1904,6 +1912,86 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 	}
 }
 
+func TestPrepareRecordsCPUsPerRequest(t *testing.T) {
+	result := func(request, device string, amount int64) resourceapi.DeviceRequestAllocationResult {
+		return resourceapi.DeviceRequestAllocationResult{
+			Driver:           testDriverName,
+			Pool:             testNodeName,
+			Device:           device,
+			Request:          request,
+			ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: *resource.NewQuantity(amount, resource.DecimalSI)},
+		}
+	}
+	tests := []struct {
+		name          string
+		cpuInfos      []cpuinfo.CPUInfo
+		cpuDeviceMode string
+		results       []resourceapi.DeviceRequestAllocationResult
+		want          map[string]cpuset.CPUSet
+	}{
+		{
+			// Individual devices pair siblings: cpudev000 is CPU 0, cpudev001 its sibling 2, cpudev002 CPU 1.
+			name:          "each request holds the CPUs of its own devices",
+			cpuInfos:      mockCPUInfos_SingleSocket_4CPUS_HT,
+			cpuDeviceMode: devattr.CPU_DEVICE_MODE_INDIVIDUAL,
+			results: []resourceapi.DeviceRequestAllocationResult{
+				result("vcpus", "cpudev000", 1),
+				result("vcpus", "cpudev001", 1),
+				result("helpers", "cpudev002", 1),
+			},
+			want: map[string]cpuset.CPUSet{"vcpus": cpuset.New(0, 2), "helpers": cpuset.New(1)},
+		},
+		{
+			name:          "a subrequest's CPUs are recorded under its request",
+			cpuInfos:      mockCPUInfos_SingleSocket_4CPUS_HT,
+			cpuDeviceMode: devattr.CPU_DEVICE_MODE_GROUPED,
+			results:       []resourceapi.DeviceRequestAllocationResult{result("cpus/big", "cpudevnuma000", 4)},
+			want:          map[string]cpuset.CPUSet{"cpus": cpuset.New(0, 1, 2, 3)},
+		},
+		{
+			name:          "a request with two results holds both",
+			cpuInfos:      mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
+			cpuDeviceMode: devattr.CPU_DEVICE_MODE_GROUPED,
+			results: []resourceapi.DeviceRequestAllocationResult{
+				result("spread", "cpudevnuma000", 4),
+				result("spread", "cpudevnuma001", 4),
+			},
+			want: map[string]cpuset.CPUSet{"spread": cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := Providers{
+				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: tc.cpuInfos},
+				SysFS:   testSysFS(tc.cpuInfos),
+			}
+			driver, err := New(testr.New(t), prov, &Config{
+				DriverName:       testDriverName,
+				NodeName:         testNodeName,
+				ReservedCPUs:     cpuset.New(),
+				CPUDeviceMode:    tc.cpuDeviceMode,
+				CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+			})
+			require.NoError(t, err)
+			driver.cdiMgr = newMockCdiMgr()
+			driver.hasSynchronized = true
+
+			claim := testClaimWithResults("vm", tc.results)
+			prepared, err := driver.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+			require.NoError(t, err)
+			require.NoError(t, prepared[claim.UID].Err)
+
+			expected := make(map[store.ClaimRequestRef]cpuset.CPUSet, len(tc.want))
+			for request, cpus := range tc.want {
+				expected[store.ClaimRequestRef{ClaimUID: claim.UID, Request: request}] = cpus
+			}
+			_, err = driver.allocationState.Bind(testr.New(t), "pod", "app", expected)
+			require.NoError(t, err, "every request reads back its own CPUs")
+		})
+	}
+}
+
 func TestPrepareResourceClaimsGroupedModeIgnoresAllocationsFromOtherDrivers(t *testing.T) {
 	prov := Providers{
 		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
@@ -2288,8 +2376,8 @@ func newDriverWithAllocatedClaim(t *testing.T, logger logr.Logger, claimUID type
 	topo, err := mockProvider.GetCPUTopology(logger)
 	require.NoError(t, err)
 	allocationState := store.NewAllocationState(topo, cpuset.New())
-	require.NoError(t, allocationState.Reserve(logger, claimUID, allocatedCPUs, false))
-	_, err = allocationState.Bind(logger, "pod", "container", map[types.UID]cpuset.CPUSet{claimUID: allocatedCPUs})
+	require.NoError(t, allocationState.Reserve(logger, claimUID, oneRequest(allocatedCPUs), false))
+	_, err = allocationState.Bind(logger, "pod", "container", wholeClaim(claimUID, allocatedCPUs))
 	require.NoError(t, err)
 
 	return &CPUDriver{
@@ -2812,7 +2900,7 @@ func createCPUDriverExternalAllocForTest(t *testing.T, groupBy string, cpuInfos 
 	driver.podState = store.NewPodState()
 	driver.cpuAllocator = cpuallocator.NewExternal(testDriverName, driver.topology.ManagedCPUs(), reservedCPUs)
 	for claimUID, cpus := range initialAllocations {
-		require.NoError(t, driver.allocationState.Reserve(logger, claimUID, cpus, false))
+		require.NoError(t, driver.allocationState.Reserve(logger, claimUID, oneRequest(cpus), false))
 	}
 
 	topo, err := mockProvider.GetCPUTopology(logger)
