@@ -30,6 +30,7 @@ import (
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/utils/cpuset"
 )
 
@@ -173,6 +174,72 @@ func TestNRIRuntimeReconnectRetainsPreparedClaim(t *testing.T) {
 	adjustment, _, err := d.CreateContainer(ctx, pod, container)
 	require.NoError(t, err)
 	require.Equal(t, "0", adjustment.Linux.Resources.Cpu.Cpus)
+}
+
+func TestPrepareRefusedWhileNRIReconnects(t *testing.T) {
+	d, _ := newMetricsTestDriver(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	runtime := &reconnectingNRIRuntime{syncResults: make(chan error, 4)}
+	redialing := make(chan struct{})
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	dials := 0
+	plugin, err := stub.New(d,
+		stub.WithPluginName(d.driverName),
+		stub.WithPluginIdx("00"),
+		stub.WithDialer(func(path string) (net.Conn, error) {
+			dials++
+			if dials == 2 {
+				close(redialing)
+				<-release
+			}
+			return runtime.dial(path)
+		}),
+		stub.WithOnClose(func() {}),
+	)
+	require.NoError(t, err)
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runNRIPluginWithRetry(ctx, nriConnection{driver: d, plugin: plugin}, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		releaseOnce()
+		plugin.Stop()
+		runtime.disconnect()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Error("NRI plugin runner did not stop")
+		}
+	})
+	requireNoNRIError(t, runtime.syncResults)
+
+	held := individualMetricsClaim("held", "cpudev0")
+	prepared, err := d.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{held})
+	require.NoError(t, err)
+	require.NoError(t, prepared[held.UID].Err)
+
+	runtime.disconnect()
+	<-redialing
+
+	pending := individualMetricsClaim("pending", "cpudev1")
+	prepared, err = d.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{pending})
+	require.NoError(t, err)
+	require.ErrorIs(t, prepared[pending.UID].Err, errNRIDisconnected)
+	_, found := d.allocationState.GetResourceClaimAllocation(pending.UID)
+	require.False(t, found, "a refused claim must not hold CPUs")
+	require.NotContains(t, d.cdiMgr.(*mockCdiMgr).devices, getCDIDeviceName(pending.UID))
+
+	unprepared, err := d.UnprepareResourceClaims(ctx, []kubeletplugin.NamespacedObject{{UID: held.UID}})
+	require.NoError(t, err)
+	require.NoError(t, unprepared[held.UID], "Unprepare is never refused")
+
+	releaseOnce()
+	requireNoNRIError(t, runtime.syncResults)
+	prepared, err = d.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{pending})
+	require.NoError(t, err)
+	require.NoError(t, prepared[pending.UID].Err)
 }
 
 func requireNoNRIError(t *testing.T, results <-chan error) {

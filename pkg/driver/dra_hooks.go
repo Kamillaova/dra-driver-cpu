@@ -245,6 +245,8 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 	return result
 }
 
+var errNRIDisconnected = errors.New("NRI connection to the container runtime is down; retry preparation")
+
 func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	cp.stateMu.Lock()
 	defer cp.stateMu.Unlock()
@@ -255,6 +257,10 @@ func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logge
 	// the empty allocation store does not describe CPUs held by live containers.
 	if !cp.hasSynchronized {
 		return kubeletplugin.PrepareResult{Err: fmt.Errorf("initial NRI synchronization has not completed; retry preparation")}
+	}
+	if cp.nriDisconnected {
+		logger.V(2).Info("refusing to prepare claim while NRI is disconnected")
+		return kubeletplugin.PrepareResult{Err: errNRIDisconnected}
 	}
 	if err := cp.checkAdminAccess(claim); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
