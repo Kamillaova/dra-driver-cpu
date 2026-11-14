@@ -25,6 +25,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	e2eclient "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/client"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
+	cpusetmatchers "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/matchers/cpuset"
 	e2enode "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/node"
 	e2epod "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/pod"
 	"github.com/onsi/ginkgo/v2"
@@ -34,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
+	"k8s.io/utils/cpuset"
 )
 
 type metadataEntry struct {
@@ -203,8 +205,87 @@ var _ = ginkgo.Describe("Device Metadata", ginkgo.Ordered, func() {
 				}
 			}
 		})
+
+		ginkgo.It("should name each request's CPUs, CPU request and limit in its metadata", func(ctx context.Context) {
+			const numCPUs = 2
+			isConsumable := cpuDeviceMode != device.CPU_DEVICE_MODE_INDIVIDUAL
+			requestNames := []string{"request-cpus", "request-other"}
+
+			ginkgo.By("creating a resource claim of two requests")
+			spec := makeResourceClaimSpec(numCPUs, isConsumable)
+			other := spec.Devices.Requests[0].DeepCopy()
+			other.Name = requestNames[1]
+			spec.Devices.Requests = append(spec.Devices.Requests, *other)
+			claim := &resourcev1.ResourceClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: fxt.Namespace.Name,
+					Name:      "metadata-two-requests",
+				},
+				Spec: spec,
+			}
+			createdClaim, err := fxt.K8SClientset.ResourceV1().ResourceClaims(fxt.Namespace.Name).Create(ctx, claim, metav1.CreateOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+			ginkgo.By("creating a pod that references the claim")
+			pod := makeTesterPodWithNamedClaim(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, nodeAllocMapping, createdClaim)
+			pod, err = e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+			ginkgo.By("reading each request's metadata file from inside the container")
+			devicesByRequest := readMetadataDevices(ctx, restConfig, fxt, pod)
+			gomega.Expect(devicesByRequest).To(gomega.HaveLen(len(requestNames)))
+
+			ginkgo.By("verifying each request names its own CPUs, its CPU request and its limit")
+			claimCPUs := cpuset.New()
+			for _, name := range requestNames {
+				gomega.Expect(devicesByRequest).To(gomega.HaveKey(name))
+				requestCPUs := cpuset.New()
+				for _, dev := range devicesByRequest[name] {
+					expectStringAttr(dev.Attributes, "dra.cpu/cpuset")
+					cpus, err := cpuset.Parse(*dev.Attributes["dra.cpu/cpuset"].String)
+					gomega.Expect(err).ToNot(gomega.HaveOccurred(), "request %s device %s", name, dev.Name)
+					gomega.Expect(cpus).To(cpusetmatchers.HaveNoOverlapWith(requestCPUs), "request %s names a CPU on two devices", name)
+					requestCPUs = requestCPUs.Union(cpus)
+					if !isConsumable {
+						gomega.Expect(dev.Attributes).ToNot(gomega.HaveKey("dra.cpu/allocatedNumCPUs"))
+						gomega.Expect(dev.Attributes).ToNot(gomega.HaveKey("dra.cpu/cpuRequest"))
+						gomega.Expect(dev.Attributes).ToNot(gomega.HaveKey("dra.cpu/cpuLimit"))
+						continue
+					}
+					expectAllocatedNumCPUs(dev.Attributes, numCPUs)
+					expectStringAttrValue(dev.Attributes, "dra.cpu/cpuRequest", "2")
+					expectStringAttrValue(dev.Attributes, "dra.cpu/cpuLimit", "max")
+				}
+				gomega.Expect(requestCPUs).To(cpusetmatchers.HaveSize(numCPUs), "request %s", name)
+				gomega.Expect(requestCPUs).To(cpusetmatchers.HaveNoOverlapWith(claimCPUs), "request %s names CPUs of another request", name)
+				claimCPUs = claimCPUs.Union(requestCPUs)
+			}
+
+			ginkgo.By("verifying the container runs on the CPUs its requests name")
+			gomega.Eventually(observeAssignedCPUs(ctx, fxt, pod)).WithTimeout(1 * time.Minute).WithPolling(5 * time.Second).Should(cpusetmatchers.Equal(claimCPUs))
+		})
 	})
 })
+
+// readMetadataDevices returns the devices of each request's metadata file, as
+// the container reads them.
+func readMetadataDevices(ctx context.Context, restConfig *rest.Config, fxt *fixture.Fixture, pod *v1.Pod) map[string][]metadataDevice {
+	ginkgo.GinkgoHelper()
+	stdout, stderr, err := e2epod.Exec(ctx, restConfig, fxt.K8SClientset, pod, "/dracpumetadata")
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "dracpumetadata failed; stdout: %s; stderr: %s", stdout, stderr)
+	var entries []metadataEntry
+	gomega.Expect(json.Unmarshal([]byte(stdout), &entries)).To(gomega.Succeed(), "failed to parse dracpumetadata output: %s", stdout)
+	devicesByRequest := map[string][]metadataDevice{}
+	for _, entry := range entries {
+		gomega.Expect(entry.Content).ToNot(gomega.BeEmpty(), "empty metadata file %s", entry.Path)
+		var metadata metadataFile
+		gomega.Expect(json.Unmarshal(entry.Content[0], &metadata)).To(gomega.Succeed(), "failed to parse metadata JSON of %s", entry.Path)
+		for _, request := range metadata.Requests {
+			devicesByRequest[request.Name] = append(devicesByRequest[request.Name], request.Devices...)
+		}
+	}
+	return devicesByRequest
+}
 
 func expectIntAttr(attrs map[string]metadataAttr, name string) {
 	ginkgo.GinkgoHelper()
@@ -225,6 +306,12 @@ func expectStringAttr(attrs map[string]metadataAttr, name string) {
 	attr, ok := attrs[name]
 	gomega.Expect(ok).To(gomega.BeTrue(), "missing attribute %s", name)
 	gomega.Expect(attr.String).ToNot(gomega.BeNil(), "attribute %s should be string", name)
+}
+
+func expectStringAttrValue(attrs map[string]metadataAttr, name, expected string) {
+	ginkgo.GinkgoHelper()
+	expectStringAttr(attrs, name)
+	gomega.Expect(*attrs[name].String).To(gomega.Equal(expected), "attribute %s", name)
 }
 
 func expectAllocatedNumCPUs(attrs map[string]metadataAttr, expected int) {
