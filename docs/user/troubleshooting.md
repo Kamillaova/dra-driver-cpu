@@ -98,6 +98,17 @@ Prepare or Unprepare call has been running, and acts on two fixed thresholds:
 The watchdog makes no API call, so an unreachable API server does not set it off. Attach the
 `driver stuck` line with its goroutine stacks to a bug report.
 
+## A Container Kept Under an Older Rule
+
+A rule on a claim's shape that a driver release adds reaches a running container only when the
+container is created again. When the driver starts or reconnects to the container runtime, a
+running container that breaks such a rule keeps the CPUs of its claims where the runtime shows it
+pinned to exactly those CPUs. The driver then posts a `KeptUnderOlderRule` Warning event on its
+pod, which names the container, the rule and the claim and says what to change, and counts the
+container in `dra_cpu_containers_kept_under_older_rule_total`, whose entry in
+[metrics](metrics.md) lists the rules. Change the pod as the event says: when the container is
+created again, the driver refuses it.
+
 ## Integration With Bug Reports
 
 1. Run `dracpu gatherinfo` on the affected node.
