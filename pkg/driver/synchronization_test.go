@@ -20,10 +20,13 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/containerd/nri/pkg/api"
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	"github.com/go-logr/logr/testr"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -45,6 +48,21 @@ type allocationRecorder struct {
 
 func (r *allocationRecorder) SetAllocationState(state cpumetrics.AllocationState) { r.state = state }
 
+// cancelWhenLogged returns a context that is cancelled as soon as a line
+// holding msg is logged through it, so that a call is cancelled after it has
+// checked its context once.
+func cancelWhenLogged(t *testing.T, msg string) context.Context {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	return logr.NewContext(ctx, funcr.New(func(_, args string) {
+		if strings.Contains(args, msg) {
+			cancel()
+		}
+	}, funcr.Options{}))
+}
+
+const syncBegins = "begin: synchronize state with the runtime"
+
 func TestSynchronizeFailurePreservesState(t *testing.T) {
 	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
 	recorder := &allocationRecorder{Recorder: cpumetrics.Noop()}
@@ -52,19 +70,8 @@ func TestSynchronizeFailurePreservesState(t *testing.T) {
 	d.refreshAllocationMetrics()
 	oldMetrics := recorder.state
 	oldCPU, oldPods := d.allocationState, d.podState
-	cdi := &pausedRefreshCDI{
-		mockCdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"full": cpuset.New(0, 1, 2, 3)}),
-		entered:    make(chan struct{}),
-		release:    make(chan struct{}),
-	}
-	d.cdiMgr = cdi
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	go func() {
-		<-cdi.entered
-		cancel()
-		close(cdi.release)
-	}()
+	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"full": cpuset.New(0, 1, 2, 3)})
+	ctx := cancelWhenLogged(t, syncBegins)
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
 	updates, err := d.Synchronize(ctx, []*api.PodSandbox{pod}, []*api.Container{
 		{Id: "exclusive", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_full=0-3"}},
@@ -240,18 +247,6 @@ func TestWarmSynchronizeDoesNotResurrectUnpreparedClaim(t *testing.T) {
 	}
 }
 
-type pausedRefreshCDI struct {
-	*mockCdiMgr
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (m *pausedRefreshCDI) Refresh() error {
-	m.once.Do(func() { close(m.entered); <-m.release })
-	return m.mockCdiMgr.Refresh()
-}
-
 type pausedRecorder struct {
 	Recorder
 	entered chan struct{}
@@ -275,12 +270,12 @@ func requireStateLockHeld(t *testing.T, d *CPUDriver) {
 func TestSynchronizeSerializesPrepare(t *testing.T) {
 	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
 	claim := individualMetricsClaim("pending", "cpudev0")
-	cdi := &pausedRefreshCDI{
-		mockCdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"running": cpuset.New(1)}),
-		entered:    make(chan struct{}),
-		release:    make(chan struct{}),
-	}
+	cdi := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"running": cpuset.New(1)})
 	d.cdiMgr = cdi
+	d.seedAllocationStoreFromDisk(testr.New(t))
+	// Synchronize reads no CDI spec, so pause it where it publishes its metrics.
+	paused := &pausedRecorder{Recorder: d.metrics, entered: make(chan struct{}), release: make(chan struct{})}
+	d.metrics = paused
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
 	syncDone := make(chan error, 1)
 	go func() {
@@ -289,7 +284,7 @@ func TestSynchronizeSerializesPrepare(t *testing.T) {
 		})
 		syncDone <- err
 	}()
-	<-cdi.entered
+	<-paused.entered
 	requireStateLockHeld(t, d)
 
 	prepareDone := make(chan error, 1)
@@ -303,7 +298,7 @@ func TestSynchronizeSerializesPrepare(t *testing.T) {
 		prepareDone <- err
 	}()
 	<-started
-	close(cdi.release)
+	close(paused.release)
 	require.NoError(t, <-syncDone)
 	require.NoError(t, <-prepareDone)
 
@@ -361,12 +356,11 @@ func TestSynchronizeSerializesUnprepare(t *testing.T) {
 func TestSynchronizeSerializesCancelledPrepare(t *testing.T) {
 	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
 	claim := individualMetricsClaim("pending", "cpudev0")
-	cdi := &pausedRefreshCDI{
-		mockCdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"running": cpuset.New(1)}),
-		entered:    make(chan struct{}),
-		release:    make(chan struct{}),
-	}
-	d.cdiMgr = cdi
+	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"running": cpuset.New(1)})
+	d.seedAllocationStoreFromDisk(testr.New(t))
+	// Synchronize reads no CDI spec, so pause it where it publishes its metrics.
+	paused := &pausedRecorder{Recorder: d.metrics, entered: make(chan struct{}), release: make(chan struct{})}
+	d.metrics = paused
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
 	syncDone := make(chan error, 1)
 	go func() {
@@ -375,7 +369,7 @@ func TestSynchronizeSerializesCancelledPrepare(t *testing.T) {
 		})
 		syncDone <- err
 	}()
-	<-cdi.entered
+	<-paused.entered
 	requireStateLockHeld(t, d)
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -392,7 +386,7 @@ func TestSynchronizeSerializesCancelledPrepare(t *testing.T) {
 	}()
 	<-started
 	cancel()
-	close(cdi.release)
+	close(paused.release)
 	require.NoError(t, <-syncDone)
 	require.ErrorIs(t, <-prepareDone, context.Canceled)
 
@@ -402,22 +396,46 @@ func TestSynchronizeSerializesCancelledPrepare(t *testing.T) {
 
 func TestSynchronizeCancelledBeforeCommit(t *testing.T) {
 	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
-	cdi := &pausedRefreshCDI{mockCdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)}), entered: make(chan struct{}), release: make(chan struct{})}
-	d.cdiMgr = cdi
+	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)})
+	d.seedAllocationStoreFromDisk(testr.New(t))
 	old := d.allocationState
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		_, err := d.Synchronize(ctx, []*api.PodSandbox{{Id: "sandbox", Uid: "pod"}}, []*api.Container{{Id: "app", Name: "app", PodSandboxId: "sandbox", Env: []string{fmt.Sprintf("%s_a=0", cdiEnvVarPrefix)}}})
-		done <- err
-	}()
-	<-cdi.entered
-	cancel()
-	close(cdi.release)
-	require.ErrorIs(t, <-done, context.Canceled)
+	ctx := cancelWhenLogged(t, syncBegins)
+	_, err := d.Synchronize(ctx, []*api.PodSandbox{{Id: "sandbox", Uid: "pod"}}, []*api.Container{{Id: "app", Name: "app", PodSandboxId: "sandbox", Env: []string{fmt.Sprintf("%s_a=0", cdiEnvVarPrefix)}}})
+	require.ErrorIs(t, err, context.Canceled)
 	require.Same(t, old, d.allocationState)
 	require.False(t, d.hasSynchronized)
+	_, bound := d.allocationState.Owner("a")
+	require.False(t, bound, "the binding of a cancelled Synchronize is not swapped in")
+}
+
+// A claim prepared before a restart whose container does not exist yet keeps
+// its CPUs: Start seeds the store from every record on disk, and Synchronize
+// adds bindings to a copy of that store, never rebuilding it from the
+// containers the runtime lists.
+func TestSeededClaimWithoutContainerSurvivesSynchronize(t *testing.T) {
+	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
+	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"idle": cpuset.New(0), "busy": cpuset.New(1)})
+	d.seedAllocationStoreFromDisk(testr.New(t))
+	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
+	busy := &api.Container{Id: "c-busy", Name: "busy", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_busy=1"}}
+
+	// The first attempt is a fresh process, the second a reconnect.
+	for attempt := 1; attempt <= 2; attempt++ {
+		updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{busy})
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{"c-busy": "1"}, cpusByContainer(updates), "attempt %d", attempt)
+		require.True(t, d.allocationState.IsOwner("busy", "pod-uid", "busy"), "attempt %d", attempt)
+		_, idleBound := d.allocationState.Owner("idle")
+		require.False(t, idleBound, "attempt %d", attempt)
+		require.Equal(t, "0-1", d.allocationState.GetPreparedCPUs().String(), "attempt %d: the claim no container names keeps its CPUs", attempt)
+	}
+
+	taken := individualMetricsClaim("taken", "cpudev0")
+	free := individualMetricsClaim("free", "cpudev2")
+	results, err := d.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{taken, free})
+	require.NoError(t, err)
+	require.Error(t, results[taken.UID].Err, "a new claim cannot take the CPUs of a claim no container names")
+	require.NoError(t, results[free.UID].Err)
 }
 
 func TestWarmSynchronizeIgnoresInvalidEnvFromNonOwner(t *testing.T) {
@@ -647,6 +665,7 @@ func TestSynchronizeClaimNamedByTwoContainers(t *testing.T) {
 				pods := []*api.PodSandbox{pod, otherPod}
 				d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
 				d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: held})
+				d.seedAllocationStoreFromDisk(testr.New(t))
 
 				// The first attempt is a fresh process, the others are reconnects.
 				for attempt := range 3 {
@@ -676,6 +695,7 @@ func TestSynchronizeClaimNamedByTwoContainers(t *testing.T) {
 func TestSynchronizeBindsClaimOnceUncontested(t *testing.T) {
 	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
 	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)})
+	d.seedAllocationStoreFromDisk(testr.New(t))
 	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
 	app := &api.Container{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0"}}
 	sidecar := &api.Container{Id: "c-sidecar", Name: "sidecar", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0"}}
@@ -718,6 +738,7 @@ func TestWarmSynchronizeKeepsOwnerAgainstSecondContainer(t *testing.T) {
 func TestSynchronizeJudgesEachClaimOfAContainer(t *testing.T) {
 	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
 	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0), "b": cpuset.New(1)})
+	d.seedAllocationStoreFromDisk(testr.New(t))
 	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
 	app := &api.Container{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0", "DRA_CPUSET_b=1"}}
 	sidecar := &api.Container{Id: "c-sidecar", Name: "sidecar", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_b=1"}}
@@ -789,6 +810,7 @@ func TestSynchronizeJudgesRequestVariables(t *testing.T) {
 				{Request: "vcpus", CPUs: cpuset.New(0, 2)},
 			}}
 			d.cdiMgr = cdi
+			d.seedAllocationStoreFromDisk(testr.New(t))
 			events := &capturingRecorder{}
 			d.eventRecorder = events
 			app := &api.Container{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: tc.env}
@@ -882,6 +904,7 @@ func TestSynchronizeWarnsOncePerKeptContainer(t *testing.T) {
 	}}
 	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_DualSocket_120CPUsPerSocket_HT)
 	d.cdiMgr = cdi
+	d.seedAllocationStoreFromDisk(testr.New(t))
 	events := &capturingRecorder{}
 	d.eventRecorder = events
 
@@ -915,6 +938,7 @@ func TestSynchronizeWarnsOncePerKeptContainer(t *testing.T) {
 func TestSynchronizeLeavesSharedContainersWhenPoolIsExhausted(t *testing.T) {
 	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
 	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"full": cpuset.New(0, 1, 2, 3)})
+	d.seedAllocationStoreFromDisk(testr.New(t))
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
 	updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{
 		{Id: "exclusive", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_full=0-3"}},

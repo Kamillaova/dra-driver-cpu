@@ -259,6 +259,23 @@ func TestGetDeviceAllocations(t *testing.T) {
 	}
 }
 
+func TestListClaims(t *testing.T) {
+	logger := testr.New(t)
+	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, mgr.AddClaimDevices(logger, "vm", testClaimDeviceEnvs("vm"), testClaimRecord()))
+	require.NoError(t, mgr.AddDevice(logger, getCDIDeviceName("up"), "DRA_CPUSET_up=0-1"))
+	other := &cdiSpec.Spec{
+		Version: cdiSpecVersion,
+		Kind:    cdiVendor + "/" + cdiClass,
+		Devices: []cdiSpec.Device{{Name: "other", ContainerEdits: cdiSpec.ContainerEdits{Env: []string{"OTHER=1"}}}},
+	}
+	require.NoError(t, mgr.cache.WriteSpec(other, mgr.getSpecName("other")))
+	require.NoError(t, mgr.Refresh())
+
+	require.Equal(t, []types.UID{"up", "vm"}, mgr.ListClaims(), "the claims of both forms, in order, and no spec named otherwise")
+}
+
 func TestRemoveClaimDevices(t *testing.T) {
 	claimUID := types.UID("vm")
 	testcases := []struct {
