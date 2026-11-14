@@ -19,10 +19,21 @@ package driverconfig
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuallocator"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 )
+
+// groupings are the values groupBy takes. One list, since the validator and
+// the generated schema must accept the same set: a value only one of them
+// knows is a config file either the driver or the chart refuses.
+var groupings = []string{
+	device.GROUP_BY_NUMA_NODE,
+	device.GROUP_BY_SOCKET,
+	device.GROUP_BY_MACHINE,
+	device.GROUP_BY_UNCORE_CACHE,
+}
 
 // Validate checks that enum fields hold recognised values, that
 // kubeletRootDir is non-empty and absolute, and that qps and burst are
@@ -34,11 +45,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("invalid cpuDeviceMode %q: must be %q or %q",
 			c.CPUDeviceMode, device.CPU_DEVICE_MODE_GROUPED, device.CPU_DEVICE_MODE_INDIVIDUAL)
 	}
-	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED {
-		if c.GroupBy != device.GROUP_BY_SOCKET && c.GroupBy != device.GROUP_BY_NUMA_NODE && c.GroupBy != device.GROUP_BY_MACHINE {
-			return fmt.Errorf("invalid groupBy %q: must be %q, %q, or %q",
-				c.GroupBy, device.GROUP_BY_SOCKET, device.GROUP_BY_NUMA_NODE, device.GROUP_BY_MACHINE)
-		}
+	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED && !slices.Contains(groupings, c.GroupBy) {
+		return fmt.Errorf("invalid groupBy %q: must be one of %q", c.GroupBy, groupings)
 	}
 	if c.Allocator != cpuallocator.ModeExternal && c.Allocator != cpuallocator.ModeCPUManager {
 		return fmt.Errorf("invalid allocator %q: must be %q or %q",

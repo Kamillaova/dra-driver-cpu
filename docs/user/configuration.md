@@ -82,6 +82,11 @@ on - is configured through other Helm values, not through this file.
 - Grouping strategy used when `cpuDeviceMode` is `grouped`.
 - `numanode`: groups CPUs by NUMA node.
 - `socket`: groups CPUs by socket.
+- `uncorecache`: groups CPUs by the uncore (L3) cache they share, one device per cache, published
+  in order of NUMA node and then of the cache id the kernel reports. A request then takes its CPUs
+  from one cache, and the scheduler picks which. The driver does not start on a node where the
+  kernel reports no cache for an allocatable CPU, or where an allocatable CPU's cache spans NUMA
+  nodes: its error names the CPUs and the reason.
 - `machine`: groups all allocatable node CPUs into a single machine-wide capacity device.
   Use it only when that allocator must select from the entire node.
 
