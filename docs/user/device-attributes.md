@@ -32,6 +32,12 @@ CPU group. `individual` exposes one device per CPU, but is **deprecated**; see
 | `dra.cpu/numCPUs`                 | int     | Number of allocatable CPUs in the group                                                                        |
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                             |
 | `dra.cpu/threadsPerCore`          | int     | Logical CPUs on each physical core of the group; `0` when its cores differ, as on a hybrid CPU                 |
+| `dra.cpu/fullPhysicalCPUsOnly`    | bool    | The driver's `fullPhysicalCPUsOnly` setting                                                                    |
+| `dra.cpu/allocator`               | string  | The driver's `allocator` setting, `cpumanager` or `external`                                                   |
+
+`dra.cpu/fullPhysicalCPUsOnly` and `dra.cpu/allocator` let a claim's selector keep it off the nodes
+that would refuse to prepare it; see
+[Settings published as device attributes](configuration.md#settings-published-as-device-attributes).
 
 #### External allocator attributes
 
@@ -82,6 +88,8 @@ This is retained as a reference for existing deployments. For the supported repl
 | `dra.cpu/cacheL3ID`               | int     | L3 (last-level/uncore) cache group                                                                    |
 | `dra.cpu/socketID`                | int     | CPU socket                                                                                            |
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                    |
+| `dra.cpu/fullPhysicalCPUsOnly`    | bool    | The driver's `fullPhysicalCPUsOnly` setting, `false` in this mode                                     |
+| `dra.cpu/allocator`               | string  | The driver's `allocator` setting, `cpumanager` or `external`                                          |
 
 #### Compatibility / legacy attributes
 
@@ -164,6 +172,10 @@ spec:
         int: 64
       dra.cpu/threadsPerCore:
         int: 2
+      dra.cpu/fullPhysicalCPUsOnly:
+        bool: false
+      dra.cpu/allocator:
+        string: cpumanager
       resource.kubernetes.io/numaNode:
         int: 0
       dra.cpu/socketID:
@@ -189,6 +201,10 @@ spec:
         int: 64
       dra.cpu/threadsPerCore:
         int: 2
+      dra.cpu/fullPhysicalCPUsOnly:
+        bool: false
+      dra.cpu/allocator:
+        string: cpumanager
       resource.kubernetes.io/numaNode:
         int: 1
       dra.cpu/socketID:
@@ -240,6 +256,10 @@ spec:
         int: 0
       dra.cpu/smtEnabled:
         bool: true
+      dra.cpu/fullPhysicalCPUsOnly:
+        bool: false
+      dra.cpu/allocator:
+        string: cpumanager
       dra.cpu/socketID:
         int: 0
       dra.net/numaNode:
@@ -264,6 +284,10 @@ spec:
         int: 0
       dra.cpu/smtEnabled:
         bool: true
+      dra.cpu/fullPhysicalCPUsOnly:
+        bool: false
+      dra.cpu/allocator:
+        string: cpumanager
       dra.cpu/socketID:
         int: 0
       dra.net/numaNode:
