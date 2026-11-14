@@ -125,7 +125,9 @@ func TestNRIRuntimeReconnectRetainsPreparedClaim(t *testing.T) {
 	)
 	require.NoError(t, err)
 	runDone := make(chan error, 1)
-	go func() { runDone <- runNRIPluginWithRetry(ctx, plugin, maxAttempts) }()
+	go func() {
+		runDone <- runNRIPluginWithRetry(ctx, plugin, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
+	}()
 	t.Cleanup(func() {
 		cancel()
 		plugin.Stop()
