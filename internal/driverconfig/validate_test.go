@@ -120,6 +120,41 @@ func TestValidate(t *testing.T) {
 			Burst:          1,
 		},
 		expectedErr: false,
+	}, {
+		name: "valid: fullPhysicalCPUsOnly in grouped mode",
+		conf: Config{
+			KubeletRootDir:       "/var/lib/kubelet",
+			QPS:                  20,
+			Burst:                50,
+			CPUDeviceMode:        "grouped",
+			GroupBy:              "numanode",
+			Allocator:            "cpumanager",
+			FullPhysicalCPUsOnly: true,
+		},
+		expectedErr: false,
+	}, {
+		name: "valid: fullPhysicalCPUsOnly with the external allocator in machine mode",
+		conf: Config{
+			KubeletRootDir:       "/var/lib/kubelet",
+			QPS:                  20,
+			Burst:                50,
+			CPUDeviceMode:        "grouped",
+			GroupBy:              "machine",
+			Allocator:            "external",
+			FullPhysicalCPUsOnly: true,
+		},
+		expectedErr: false,
+	}, {
+		name: "error: fullPhysicalCPUsOnly in individual mode",
+		conf: Config{
+			KubeletRootDir:       "/var/lib/kubelet",
+			QPS:                  20,
+			Burst:                50,
+			CPUDeviceMode:        "individual",
+			Allocator:            "cpumanager",
+			FullPhysicalCPUsOnly: true,
+		},
+		expectedErr: true,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.conf.Validate()

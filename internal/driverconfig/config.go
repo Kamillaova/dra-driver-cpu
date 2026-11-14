@@ -48,6 +48,9 @@ type Config struct {
 	// QPS and Burst set the rate limit of the driver's Kubernetes API client.
 	QPS   float32 `json:"qps,omitempty"`
 	Burst int     `json:"burst,omitempty"`
+	// FullPhysicalCPUsOnly is the driver's counterpart of the kubelet CPU
+	// Manager's full-pcpus-only policy option. Defaults to false.
+	FullPhysicalCPUsOnly bool `json:"fullPhysicalCPUsOnly,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -66,6 +69,7 @@ func (c Config) LogValues() []any {
 		"allocator", c.Allocator,
 		"qps", c.QPS,
 		"burst", c.Burst,
+		"fullPhysicalCPUsOnly", c.FullPhysicalCPUsOnly,
 	}
 }
 
@@ -85,6 +89,7 @@ type dumpConfig struct {
 	Allocator                             string  `json:"allocator"`
 	QPS                                   float32 `json:"qps"`
 	Burst                                 int     `json:"burst"`
+	FullPhysicalCPUsOnly                  bool    `json:"fullPhysicalCPUsOnly"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
