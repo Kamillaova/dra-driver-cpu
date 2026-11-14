@@ -22,6 +22,7 @@ import (
 	"maps"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -275,6 +276,23 @@ func (c *CdiManager) GetDeviceAllocations(claimUID types.UID) (cdiClaimRecord, e
 }
 
 var errNoClaimSpec = errors.New("failed to find CDI spec")
+
+// ListClaims returns, in order, the UIDs of the claims whose spec is on disk,
+// in this driver's form or in upstream's. Call Refresh first to load the
+// latest on-disk specs.
+func (c *CdiManager) ListClaims() []types.UID {
+	prefix := strings.TrimSuffix(c.getSpecName(getCDIDeviceName("")), ".json")
+	var claims []types.UID
+	for _, spec := range c.cache.GetVendorSpecs(cdiVendor) {
+		name := filepath.Base(spec.GetPath())
+		uid := types.UID(strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".json"))
+		if uid != "" && name == c.getSpecName(getCDIDeviceName(uid)) {
+			claims = append(claims, uid)
+		}
+	}
+	slices.Sort(claims)
+	return claims
+}
 
 // RemoveClaimDevices deletes the spec of a claim, which holds every device of
 // the claim in this driver's form and in upstream's.
