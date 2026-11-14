@@ -20,12 +20,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
 
+	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
 	"github.com/google/go-cmp/cmp"
@@ -44,6 +46,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceclaim"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/utils/cpuset"
@@ -105,6 +108,7 @@ func (m *mockKubeletPlugin) Stop() {
 
 type mockCdiMgr struct {
 	devices      map[string]string
+	records      map[types.UID]cdiClaimRecord
 	addError     error
 	refreshError error
 	getError     error
@@ -115,6 +119,7 @@ type mockCdiMgr struct {
 func newMockCdiMgr() *mockCdiMgr {
 	return &mockCdiMgr{
 		devices: make(map[string]string),
+		records: make(map[types.UID]cdiClaimRecord),
 	}
 }
 
@@ -134,32 +139,58 @@ func (m *mockCdiMgr) AddDevice(_ logr.Logger, deviceName, envVar string) error {
 	return nil
 }
 
+func (m *mockCdiMgr) AddClaimDevices(_ logr.Logger, claimUID types.UID, envByDevice map[string]string, record cdiClaimRecord) error {
+	if m.addError != nil {
+		return m.addError
+	}
+	m.dropClaim(claimUID)
+	maps.Copy(m.devices, envByDevice)
+	m.records[claimUID] = record
+	return nil
+}
+
 func (m *mockCdiMgr) Refresh() error {
 	m.refreshCalls++
 	return m.refreshError
 }
 
-func (m *mockCdiMgr) GetDeviceEnv(deviceName string) ([]string, error) {
+func (m *mockCdiMgr) GetDeviceAllocations(claimUID types.UID) (cdiClaimRecord, error) {
 	if m.getError != nil {
-		return nil, m.getError
+		return cdiClaimRecord{}, m.getError
 	}
-	env, ok := m.devices[deviceName]
+	if record, ok := m.records[claimUID]; ok {
+		return record, nil
+	}
+	env, ok := m.devices[getCDIDeviceName(claimUID)]
 	if !ok {
-		return nil, fmt.Errorf("device %q not found", deviceName)
+		return cdiClaimRecord{}, fmt.Errorf("%w of claim %q", errNoClaimSpec, claimUID)
 	}
-	return []string{env}, nil
+	cpus, err := cdiSpecCPUs(logr.Discard(), claimUID, []string{env})
+	if err != nil {
+		return cdiClaimRecord{}, err
+	}
+	return cdiClaimRecord{Requests: []cdiRequestRecord{{CPUs: cpus}}}, nil
 }
 
-func (m *mockCdiMgr) RemoveDevice(_ logr.Logger, deviceName string) error {
+func (m *mockCdiMgr) RemoveClaimDevices(_ logr.Logger, claimUID types.UID) error {
 	if m.removeError != nil {
 		return m.removeError
 	}
-	delete(m.devices, deviceName)
+	m.dropClaim(claimUID)
 	return nil
 }
 
-func oneRequest(cpus cpuset.CPUSet) []store.RequestAllocation {
-	return []store.RequestAllocation{{Request: "cpus", CPUs: cpus}}
+func (m *mockCdiMgr) dropClaim(claimUID types.UID) {
+	delete(m.records, claimUID)
+	for name := range m.devices {
+		if name == getCDIDeviceName(claimUID) || strings.HasPrefix(name, getCDIDeviceName(claimUID)+"_") {
+			delete(m.devices, name)
+		}
+	}
+}
+
+func oneRequest(cpus cpuset.CPUSet) store.ClaimRecord {
+	return store.ClaimRecord{Requests: []store.RequestAllocation{{Request: "cpus", CPUs: cpus}}}
 }
 
 func wholeClaim(claimUID types.UID, cpus cpuset.CPUSet) map[store.ClaimRequestRef]cpuset.CPUSet {
@@ -1221,8 +1252,9 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 	}
 
 	claimUID := types.UID("claim-1")
-	cdiDeviceName := getCDIDeviceName(claimUID)
-	cdiQualifiedName := cdiparser.QualifiedName(cdiVendor, cdiClass, cdiDeviceName)
+	requestDevice := func(request string) string {
+		return cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIRequestDeviceName(claimUID, resourceclaim.BaseRequestRef(request)))
+	}
 
 	testCases := []struct {
 		name                    string
@@ -1517,7 +1549,7 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 							expectedPreparedDevices = append(expectedPreparedDevices, kubeletplugin.Device{
 								PoolName:     res.Pool,
 								DeviceName:   res.Device,
-								CDIDeviceIDs: []string{cdiQualifiedName},
+								CDIDeviceIDs: []string{requestDevice(res.Request)},
 								Requests:     []string{res.Request},
 								Metadata:     expectedGroupMetadata(tc.groupBy, tc.cpuInfos, tc.reservedCPUs, res.Device, smtEnabled, allocatedCPUs, tc.exposeExtAttrs),
 							})
@@ -1528,27 +1560,15 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 						t.Fatalf("prepared devices differ (-want +got):\n%s", diff)
 					}
 
-					envVar := mockCdiMgr.devices[cdiDeviceName]
-					parts := strings.SplitN(envVar, "=", 2)
-					// if expectedCPUSet is empty, parts[1] can be empty
-					if tc.expectedCPUSet.Size() > 0 {
-						require.Len(t, parts, 2, "CDI env var format error")
-					} else {
-						require.True(t, len(parts) == 2 || len(parts) == 1, "CDI env var format error")
-					}
-
-					actualCPUSet := cpuset.New()
-					if len(parts) == 2 && parts[1] != "" {
-						var err error
-						actualCPUSet, err = cpuset.Parse(parts[1])
-						require.NoError(t, err, "Failed to parse actual CPUSet from env var")
-					}
+					actualCPUSet := mockCdiMgr.records[claimUID].storeRecord().CPUs()
 					require.True(t, actualCPUSet.Equals(tc.expectedCPUSet), "Expected CPUSet %s, but got %s for test case %s", tc.expectedCPUSet.String(), actualCPUSet.String(), tc.name)
-					if tc.expectedCPUSet.Size() > 0 {
-						require.Equal(t, 1, len(mockCdiMgr.devices), "Expected 1 CDI device to be created")
-					} else {
-						require.Equal(t, 0, len(mockCdiMgr.devices), "Expected 0 CDI devices to be created")
+					wantEnvs := map[string]string{}
+					for _, res := range tc.claims[0].Status.Allocation.Devices.Results {
+						if request := resourceclaim.BaseRequestRef(res.Request); res.Driver == testDriverName && tc.expectedCPUSet.Size() > 0 {
+							wantEnvs[getCDIRequestDeviceName(claimUID, request)] = fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claimUID, request, cdiEnvDynamicValue)
+						}
 					}
+					require.Equal(t, wantEnvs, mockCdiMgr.devices, "one CDI device per request, each variable holding dynamic")
 				}
 			} else {
 				require.Len(t, preparedClaims, 0)
@@ -1986,10 +2006,108 @@ func TestPrepareRecordsCPUsPerRequest(t *testing.T) {
 			for request, cpus := range tc.want {
 				expected[store.ClaimRequestRef{ClaimUID: claim.UID, Request: request}] = cpus
 			}
-			_, err = driver.allocationState.Bind(testr.New(t), "pod", "app", expected)
+			_, err = driver.allocationState.Bind(testr.New(t), "pod", "app", nil, expected)
 			require.NoError(t, err, "every request reads back its own CPUs")
 		})
 	}
+}
+
+func newGroupedTestDriver(t *testing.T) *CPUDriver {
+	t.Helper()
+	prov := Providers{
+		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
+		SysFS:   testSysFS(mockCPUInfos_SingleSocket_4CPUS_HT),
+	}
+	driver, err := New(testr.New(t), prov, &Config{
+		DriverName:       testDriverName,
+		NodeName:         testNodeName,
+		ReservedCPUs:     cpuset.New(),
+		CPUDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
+		CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
+	})
+	require.NoError(t, err)
+	return driver
+}
+
+func TestPrepareAndUnprepareRequestDevices(t *testing.T) {
+	driver := newGroupedTestDriver(t)
+	cdi := newMockCdiMgr()
+	driver.cdiMgr = cdi
+	driver.hasSynchronized = true
+	claim := testClaimWithResults("vm", []resourceapi.DeviceRequestAllocationResult{
+		{Driver: testDriverName, Pool: testNodeName, Device: "cpudevnuma000", Request: "vcpus",
+			ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: resource.MustParse("2")}},
+		{Driver: testDriverName, Pool: testNodeName, Device: "cpudevnuma000", Request: "helpers/big",
+			ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: resource.MustParse("1")}},
+	})
+	claim.Namespace, claim.Name = "ns", "vm-claim"
+	device := func(request string) string {
+		return cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIRequestDeviceName(claim.UID, request))
+	}
+
+	prepared, err := driver.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	result := prepared[claim.UID]
+	require.NoError(t, result.Err)
+	devices := map[string][]string{}
+	for _, dev := range result.Devices {
+		devices[dev.Requests[0]] = dev.CDIDeviceIDs
+	}
+	require.Equal(t, map[string][]string{"vcpus": {device("vcpus")}, "helpers/big": {device("helpers")}}, devices,
+		"each result is given the device of its request")
+	require.Equal(t, map[string]string{
+		getCDIRequestDeviceName(claim.UID, "vcpus"):   "DRA_CPUSET_vm_vcpus=dynamic",
+		getCDIRequestDeviceName(claim.UID, "helpers"): "DRA_CPUSET_vm_helpers=dynamic",
+	}, cdi.devices)
+
+	record, ok := driver.allocationState.GetClaimRecord(claim.UID)
+	require.True(t, ok)
+	require.Equal(t, "ns", record.Namespace)
+	require.Equal(t, "vm-claim", record.Name)
+	written := cdi.records[claim.UID]
+	require.Equal(t, record, written.storeRecord(), "the spec records what the store holds")
+	for _, request := range written.Requests {
+		require.Len(t, request.Results, 1)
+		require.Equal(t, "cpudevnuma000", request.Results[0].Device)
+		require.NotNil(t, request.Results[0].Consumed)
+		require.Equal(t, int64(request.CPUs.Size()), request.Results[0].Consumed.Value(), "request %q: the result's consumed amount", request.Request)
+	}
+
+	unprepared, err := driver.UnprepareResourceClaims(context.Background(), []kubeletplugin.NamespacedObject{{UID: claim.UID}})
+	require.NoError(t, err)
+	require.NoError(t, unprepared[claim.UID])
+	require.Empty(t, cdi.devices, "every device of the claim goes")
+	require.Empty(t, cdi.records)
+	_, ok = driver.allocationState.GetClaimRecord(claim.UID)
+	require.False(t, ok)
+}
+
+func TestPrepareKeepsUpstreamFormOfARestoredClaim(t *testing.T) {
+	driver := newGroupedTestDriver(t)
+	cdi := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"up": cpuset.New(0, 2)})
+	driver.cdiMgr = cdi
+	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
+	upstreamVariable := []string{"DRA_CPUSET_up=0,2"}
+	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{
+		{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: upstreamVariable},
+	})
+	require.NoError(t, err)
+	require.True(t, driver.allocationState.IsOwner("up", "pod-uid", "app"), "a container started before the upgrade is bound")
+
+	claim := testClaim("up", testDriverName, testNodeName, map[string]int64{"cpudevnuma000": 2})
+	prepared, err := driver.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	result := prepared[claim.UID]
+	require.NoError(t, result.Err)
+	require.Len(t, result.Devices, 1)
+	require.Equal(t, []string{cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName(claim.UID))}, result.Devices[0].CDIDeviceIDs)
+	require.Equal(t, map[string]string{getCDIDeviceName(claim.UID): "DRA_CPUSET_up=0,2"}, cdi.devices, "a replayed Prepare writes upstream's spec as upstream does")
+	require.Empty(t, cdi.records)
+
+	adjust, _, err := driver.CreateContainer(context.Background(), pod, &api.Container{Id: "c-app-2", Name: "app", PodSandboxId: pod.Id, Env: upstreamVariable})
+	require.NoError(t, err)
+	require.Equal(t, "0,2", adjust.Linux.Resources.Cpu.Cpus, "its next container is pinned as before")
+	require.True(t, driver.allocationState.IsOwner("up", "pod-uid", "app"))
 }
 
 func TestPrepareResourceClaimsGroupedModeIgnoresAllocationsFromOtherDrivers(t *testing.T) {
@@ -2131,7 +2249,6 @@ func TestPrepareResourceClaimsRepeatedCalls(t *testing.T) {
 func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 	logger := testr.New(t)
 	claimUID := types.UID("claim-1")
-	cdiDeviceName := getCDIDeviceName(claimUID)
 
 	// tests should not access private data. Using fake/mocks, passing them to the driver
 	// and asserting on the fake/mock state accessed directly from test code (not through
@@ -2253,12 +2370,12 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 			require.True(t, gotCPUsAfterFirst.Equals(gotCPUs), "claim cpus must be unchanged after second prepare: got %s, want %s", gotCPUs, gotCPUsAfterFirst)
 			require.True(t, tc.expectedShared.Equals(cpuStore.GetSharedCPUs()), "shared cpus must be unchanged after second prepare: got %s, want %s", cpuStore.GetSharedCPUs(), tc.expectedShared)
 
-			envVar := cdiMgr.devices[cdiDeviceName]
-			parts := strings.SplitN(envVar, "=", 2)
-			require.Len(t, parts, 2)
-			actualCPUSet, err := cpuset.Parse(parts[1])
-			require.NoError(t, err)
-			require.True(t, tc.expectedCPUSet.Equals(actualCPUSet), "cdi env cpus: got %s, want %s", actualCPUSet, tc.expectedCPUSet)
+			// testClaim names its one request after the claim.
+			require.Equal(t, map[string]string{
+				getCDIRequestDeviceName(claimUID, string(claimUID)): fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claimUID, claimUID, cdiEnvDynamicValue),
+			}, cdiMgr.devices)
+			actualCPUSet := cdiMgr.records[claimUID].storeRecord().CPUs()
+			require.True(t, tc.expectedCPUSet.Equals(actualCPUSet), "cdi record cpus: got %s, want %s", actualCPUSet, tc.expectedCPUSet)
 		})
 	}
 }
@@ -2377,7 +2494,7 @@ func newDriverWithAllocatedClaim(t *testing.T, logger logr.Logger, claimUID type
 	require.NoError(t, err)
 	allocationState := store.NewAllocationState(topo, cpuset.New())
 	require.NoError(t, allocationState.Reserve(logger, claimUID, oneRequest(allocatedCPUs), false))
-	_, err = allocationState.Bind(logger, "pod", "container", wholeClaim(claimUID, allocatedCPUs))
+	_, err = allocationState.Bind(logger, "pod", "container", nil, wholeClaim(claimUID, allocatedCPUs))
 	require.NoError(t, err)
 
 	return &CPUDriver{
@@ -2873,9 +2990,10 @@ func TestOpaqueConfigAllocation(t *testing.T) {
 					assert.True(t, found, "Allocation not stored for claim %s", claim.UID)
 					assert.Equal(t, expectedSet, alloc)
 
-					cdiDeviceName := fmt.Sprintf("claim-%s", claim.UID)
-					expectedEnvVar := fmt.Sprintf("DRA_CPUSET_%s=%s", claim.UID, expectedSet.String())
-					assert.Equal(t, expectedEnvVar, mockCdi.devices[cdiDeviceName])
+					// testClaimWithOpaqueConfig names its one request after the claim.
+					expectedEnvVar := fmt.Sprintf("DRA_CPUSET_%s_%s=dynamic", claim.UID, claim.UID)
+					assert.Equal(t, expectedEnvVar, mockCdi.devices[getCDIRequestDeviceName(claim.UID, string(claim.UID))])
+					assert.True(t, expectedSet.Equals(mockCdi.records[claim.UID].storeRecord().CPUs()), "claim %s: recorded CPUs %s, want %s", claim.UID, mockCdi.records[claim.UID].storeRecord().CPUs(), expectedSet)
 				}
 			}
 		})

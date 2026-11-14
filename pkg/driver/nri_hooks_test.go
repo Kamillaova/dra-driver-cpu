@@ -36,17 +36,18 @@ import (
 
 func TestParseDRAEnvToClaimAllocations(t *testing.T) {
 	logger := testr.New(t)
+	upstreamForm := func(cpus cpuset.CPUSet) draEnvClaim { return draEnvClaim{cpus: cpus} }
 	testCases := []struct {
 		name                  string
 		envs                  []string
-		expectedAllocations   map[types.UID]cpuset.CPUSet
+		expectedAllocations   map[types.UID]draEnvClaim
 		expectedErrorContains string
 	}{
 		{
 			name: "single valid env",
 			envs: []string{fmt.Sprintf("%s_claim-uid-1=%s", cdiEnvVarPrefix, "0-1")},
-			expectedAllocations: map[types.UID]cpuset.CPUSet{
-				"claim-uid-1": cpuset.New(0, 1),
+			expectedAllocations: map[types.UID]draEnvClaim{
+				"claim-uid-1": upstreamForm(cpuset.New(0, 1)),
 			},
 		},
 		{
@@ -55,9 +56,21 @@ func TestParseDRAEnvToClaimAllocations(t *testing.T) {
 				fmt.Sprintf("%s_claim-uid-1=%s", cdiEnvVarPrefix, "0,1"),
 				fmt.Sprintf("%s_claim-uid-2=%s", cdiEnvVarPrefix, "2,3"),
 			},
-			expectedAllocations: map[types.UID]cpuset.CPUSet{
-				"claim-uid-1": cpuset.New(0, 1),
-				"claim-uid-2": cpuset.New(2, 3),
+			expectedAllocations: map[types.UID]draEnvClaim{
+				"claim-uid-1": upstreamForm(cpuset.New(0, 1)),
+				"claim-uid-2": upstreamForm(cpuset.New(2, 3)),
+			},
+		},
+		{
+			name: "variables naming requests hold dynamic",
+			envs: []string{
+				fmt.Sprintf("%s_claim-uid-1_vcpus=dynamic", cdiEnvVarPrefix),
+				fmt.Sprintf("%s_claim-uid-1_helpers=dynamic", cdiEnvVarPrefix),
+				fmt.Sprintf("%s_claim-uid-2=2,3", cdiEnvVarPrefix),
+			},
+			expectedAllocations: map[types.UID]draEnvClaim{
+				"claim-uid-1": {requests: []string{"helpers", "vcpus"}},
+				"claim-uid-2": upstreamForm(cpuset.New(2, 3)),
 			},
 		},
 		{
@@ -66,14 +79,14 @@ func TestParseDRAEnvToClaimAllocations(t *testing.T) {
 				fmt.Sprintf("%s_claim-uid-1=0-1", cdiEnvVarPrefix),
 				dracpuapi.EnvVarExclusiveAssignedCPUSet + "=0-1",
 			},
-			expectedAllocations: map[types.UID]cpuset.CPUSet{
-				"claim-uid-1": cpuset.New(0, 1),
+			expectedAllocations: map[types.UID]draEnvClaim{
+				"claim-uid-1": upstreamForm(cpuset.New(0, 1)),
 			},
 		},
 		{
 			name:                "no relevant envs",
 			envs:                []string{"OTHER_ENV=value"},
-			expectedAllocations: map[types.UID]cpuset.CPUSet{},
+			expectedAllocations: map[types.UID]draEnvClaim{},
 		},
 		{
 			name:                  "malformed env - no equals",
@@ -86,9 +99,32 @@ func TestParseDRAEnvToClaimAllocations(t *testing.T) {
 			expectedErrorContains: "failed to parse cpuset value",
 		},
 		{
+			name:                  "malformed env - dynamic names no request",
+			envs:                  []string{fmt.Sprintf("%s_claim-uid-1=dynamic", cdiEnvVarPrefix)},
+			expectedErrorContains: "failed to parse cpuset value",
+		},
+		{
+			name:                  "malformed env - a request's variable holds a cpuset",
+			envs:                  []string{fmt.Sprintf("%s_claim-uid-1_vcpus=0-1", cdiEnvVarPrefix)},
+			expectedErrorContains: `malformed DRA env entry "DRA_CPUSET_claim-uid-1_vcpus=0-1": a variable naming a request holds "dynamic"`,
+		},
+		{
+			name:                  "malformed env - a variable names an empty request",
+			envs:                  []string{fmt.Sprintf("%s_claim-uid-1_=dynamic", cdiEnvVarPrefix)},
+			expectedErrorContains: `malformed DRA env entry "DRA_CPUSET_claim-uid-1_=dynamic": no request after the claim UID`,
+		},
+		{
+			name: "malformed env - a claim named whole and by request",
+			envs: []string{
+				fmt.Sprintf("%s_claim-uid-1_vcpus=dynamic", cdiEnvVarPrefix),
+				fmt.Sprintf("%s_claim-uid-1=0-1", cdiEnvVarPrefix),
+			},
+			expectedErrorContains: `claim "claim-uid-1" is named both whole and by request`,
+		},
+		{
 			name:                "empty env",
 			envs:                []string{},
-			expectedAllocations: map[types.UID]cpuset.CPUSet{},
+			expectedAllocations: map[types.UID]draEnvClaim{},
 		},
 	}
 
@@ -101,10 +137,11 @@ func TestParseDRAEnvToClaimAllocations(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				require.Equal(t, len(tc.expectedAllocations), len(allocations))
-				for uid, expectedCpus := range tc.expectedAllocations {
-					actualCpus, ok := allocations[uid]
+				for uid, expected := range tc.expectedAllocations {
+					actual, ok := allocations[uid]
 					require.True(t, ok)
-					require.True(t, expectedCpus.Equals(actualCpus))
+					require.Equal(t, expected.requests, actual.requests)
+					require.True(t, expected.cpus.Equals(actual.cpus), "claim %q: got cpus %s, want %s", uid, actual.cpus, expected.cpus)
 				}
 			}
 		})
@@ -323,6 +360,90 @@ func TestCreateContainer(t *testing.T) {
 	}
 }
 
+func TestCreateContainerPinsToTheRequestsItNames(t *testing.T) {
+	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "ns"}
+	vars := func(names ...string) []string {
+		var envs []string
+		for _, name := range names {
+			envs = append(envs, fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, name, cdiEnvDynamicValue))
+		}
+		return envs
+	}
+	tests := []struct {
+		name       string
+		env        []string
+		wantCPUs   string
+		wantErr    string
+		wantOwners []types.UID
+	}{
+		{
+			name:       "every request of the claim",
+			env:        vars("vm_vcpus", "vm_helpers", "vm_io"),
+			wantCPUs:   "0-2",
+			wantOwners: []types.UID{"vm"},
+		},
+		{
+			name:    "one request of three",
+			env:     vars("vm_vcpus"),
+			wantErr: `container "app": uses only request "vcpus" of claim "vm-claim", which must be used whole; use the whole claim, or give the container its own claim`,
+		},
+		{
+			name:    "two requests of three",
+			env:     vars("vm_vcpus", "vm_io"),
+			wantErr: `container "app": uses only requests "io", "vcpus" of claim "vm-claim", which must be used whole; use the whole claim, or give the container its own claim`,
+		},
+		{
+			name:    "a request the claim was prepared without",
+			env:     vars("vm_vcpus", "vm_helpers", "vm_io", "vm_gpus"),
+			wantErr: `cannot bind claim to container "app" in pod "pod": claim "vm" was prepared without request "gpus"`,
+		},
+		{
+			name:       "a claim in upstream's form beside one in the driver's",
+			env:        append(vars("vm_vcpus", "vm_helpers", "vm_io"), fmt.Sprintf("%s_old=3", cdiEnvVarPrefix)),
+			wantCPUs:   "0-3",
+			wantOwners: []types.UID{"old", "vm"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := testr.New(t)
+			var infos []cpuinfo.CPUInfo
+			for cpuID := range 4 {
+				infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+			}
+			topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+			require.NoError(t, err)
+			allocationState := store.NewAllocationState(topo, cpuset.New())
+			require.NoError(t, allocationState.Reserve(logger, "vm", store.ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []store.RequestAllocation{
+				{Request: "vcpus", CPUs: cpuset.New(0)},
+				{Request: "helpers", CPUs: cpuset.New(1)},
+				{Request: "io", CPUs: cpuset.New(2)},
+			}}, false))
+			allocationState.Restore(logger, "old", store.ClaimRecord{Requests: []store.RequestAllocation{{CPUs: cpuset.New(3)}}})
+			driver := &CPUDriver{
+				podState:        store.NewPodState(),
+				allocationState: allocationState,
+				metrics:         cpumetrics.Noop(),
+			}
+			ctr := &api.Container{Id: "ctr", PodSandboxId: pod.Id, Name: "app", Env: tc.env}
+
+			adjust, _, err := driver.CreateContainer(context.Background(), pod, ctr)
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				require.False(t, allocationState.IsOwner("vm", types.UID(pod.Uid), ctr.Name), "a refused container binds no claim")
+				require.Nil(t, driver.podState.GetContainerState(types.UID(pod.Uid), ctr.Name))
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantCPUs, adjust.Linux.Resources.Cpu.Cpus, "pinned to the recorded CPUs of the requests named")
+			require.Equal(t, []*api.KeyValue{{Key: dracpuapi.EnvVarExclusiveAssignedCPUSet, Value: tc.wantCPUs}}, adjust.Env)
+			for _, uid := range tc.wantOwners {
+				require.True(t, allocationState.IsOwner(uid, types.UID(pod.Uid), ctr.Name), "claim %q bound", uid)
+			}
+		})
+	}
+}
+
 func TestStopContainer(t *testing.T) {
 	logger := testr.New(t)
 	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
@@ -471,7 +592,7 @@ func TestGuaranteedContainerRestartNotBlockedByEmptySharedPool(t *testing.T) {
 	allocState := store.NewAllocationState(topo, cpuset.New())
 	require.NoError(t, allocState.Reserve(logger, claimUID, oneRequest(allCPUs), false))
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "ns"}
-	_, err = allocState.Bind(logger, types.UID(pod.Uid), "app", wholeClaim(claimUID, allCPUs))
+	_, err = allocState.Bind(logger, types.UID(pod.Uid), "app", nil, wholeClaim(claimUID, allCPUs))
 	require.NoError(t, err)
 
 	driver := &CPUDriver{
@@ -822,7 +943,7 @@ func TestStopContainerKeepsClaimOutOfSharedPoolUntilUnprepare(t *testing.T) {
 		metrics:         cpumetrics.Noop(),
 	}
 	driver.cdiMgr.(*mockCdiMgr).devices[getCDIDeviceName(claimUID)] = fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, claimedCPUs.String())
-	_, err := driver.allocationState.Bind(logger, types.UID(guaranteedPod.Uid), guaranteedCtr.Name, wholeClaim(claimUID, claimedCPUs))
+	_, err := driver.allocationState.Bind(logger, types.UID(guaranteedPod.Uid), guaranteedCtr.Name, nil, wholeClaim(claimUID, claimedCPUs))
 	require.NoError(t, err)
 	driver.podState.SetContainerState(types.UID(guaranteedPod.Uid),
 		store.NewContainerState(guaranteedCtr.Name, types.UID(guaranteedCtr.Id), claimUID))

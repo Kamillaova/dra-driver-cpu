@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/go-logr/logr"
 	dracpuapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -100,6 +102,9 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	if !cp.hasSynchronized {
 		cp.restoreNamedClaims(logger, allocationState, listed)
 	}
+	for _, sc := range listed {
+		sc.recordClaims(allocationState)
+	}
 
 	// Containers created while the driver was not connected were never judged by
 	// CreateContainer. Judge them by its rules, claim by claim: NRI gives no way
@@ -107,9 +112,11 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	// container on the node without the driver.
 	contenders := contendersForUnboundClaims(allocationState, listed)
 	refused := 0
+	var kept []cpumetrics.Rule
 	for _, sc := range listed {
 		allGuaranteedCPUs := cpuset.New()
 		var claimUIDs []types.UID
+		keptUnder := sets.New[cpumetrics.Rule]()
 		for _, uid := range slices.Sorted(maps.Keys(sc.claims)) {
 			caLogger := sc.logger.WithValues("claimUID", uid)
 			if c, ok := contenders[uid]; ok && c.excludes(sc.owner) {
@@ -117,14 +124,27 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				refused++
 				continue
 			}
-			if _, err := allocationState.Bind(caLogger, sc.owner.PodUID, sc.owner.ContainerName, map[store.ClaimRequestRef]cpuset.CPUSet{{ClaimUID: uid}: sc.claims[uid]}); err != nil {
+			refs, expected, rule, err := syncBinding(allocationState, uid, sc)
+			var cpus cpuset.CPUSet
+			if err == nil {
+				cpus, err = allocationState.GetRequestAllocationUnion(refs...)
+			}
+			if err == nil {
+				_, err = allocationState.Bind(caLogger, sc.owner.PodUID, sc.owner.ContainerName, refs, expected)
+			}
+			if err != nil {
 				caLogger.Error(err, "not binding claim to container during synchronize", "reason", refusalReason(err))
 				refused++
 				continue
 			}
-			allGuaranteedCPUs = allGuaranteedCPUs.Union(sc.claims[uid])
+			if rule != "" {
+				caLogger.Info("keeping the container bound to the whole claim under an older rule: the runtime shows it pinned to its claims' CPUs", "rule", rule)
+				keptUnder.Insert(rule)
+			}
+			allGuaranteedCPUs = allGuaranteedCPUs.Union(cpus)
 			claimUIDs = append(claimUIDs, uid)
 		}
+		kept = append(kept, sets.List(keptUnder)...)
 
 		state := store.NewContainerState(sc.container.GetName(), types.UID(sc.container.GetId()), claimUIDs...)
 		if len(claimUIDs) > 0 {
@@ -164,12 +184,38 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	for range refused {
 		cp.metrics.RecordNRISynchronizeRefusedClaim()
 	}
+	for _, rule := range kept {
+		cp.metrics.RecordContainerKeptUnderOlderRule(rule)
+	}
 	logger.V(6).Info("synchronization complete", "updatesCount", len(containerUpdates))
 	return containerUpdates, nil
 }
 
-func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types.UID]cpuset.CPUSet, error) {
-	allocations := make(map[types.UID]cpuset.CPUSet)
+// draEnvClaim is what a container's DRA_CPUSET_* variables say of one claim:
+// the requests they name, or, from upstream's variable, which names none, the
+// claim's cpuset.
+type draEnvClaim struct {
+	requests []string
+	cpus     cpuset.CPUSet
+}
+
+func (c draEnvClaim) upstreamForm() bool {
+	return len(c.requests) == 0
+}
+
+func (c draEnvClaim) refs(uid types.UID) []store.ClaimRequestRef {
+	if c.upstreamForm() {
+		return []store.ClaimRequestRef{{ClaimUID: uid}}
+	}
+	refs := make([]store.ClaimRequestRef, 0, len(c.requests))
+	for _, request := range c.requests {
+		refs = append(refs, store.ClaimRequestRef{ClaimUID: uid, Request: request})
+	}
+	return refs
+}
+
+func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types.UID]draEnvClaim, error) {
+	allocations := make(map[types.UID]draEnvClaim)
 	for _, env := range envs {
 		key, value, hasValue := strings.Cut(env, "=")
 		// We won't have a conflict by constructions with the vars we inject from DRA side
@@ -185,19 +231,37 @@ func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types
 		if !hasValue {
 			return nil, fmt.Errorf("malformed DRA env entry %q", env)
 		}
-		var claimUID types.UID
-		if after, ok := strings.CutPrefix(key, cdiEnvVarPrefix+"_"); ok {
-			uidStr := after
-			claimUID = types.UID(uidStr)
-		} else {
+		name, ok := strings.CutPrefix(key, cdiEnvVarPrefix+"_")
+		if !ok {
 			continue
 		}
-
-		parsedSet, err := cpuset.Parse(value)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse cpuset value %q from env %q: %w", value, env, err)
+		uid, request, perRequest := strings.Cut(name, "_")
+		claimUID := types.UID(uid)
+		claim, named := allocations[claimUID]
+		if named && claim.upstreamForm() == perRequest {
+			return nil, fmt.Errorf("malformed DRA env entry %q: claim %q is named both whole and by request", env, claimUID)
 		}
-		allocations[claimUID] = parsedSet
+		if perRequest {
+			if request == "" {
+				return nil, fmt.Errorf("malformed DRA env entry %q: no request after the claim UID", env)
+			}
+			if value != cdiEnvDynamicValue {
+				return nil, fmt.Errorf("malformed DRA env entry %q: a variable naming a request holds %q", env, cdiEnvDynamicValue)
+			}
+			claim.requests = append(claim.requests, request)
+		} else {
+			parsedSet, err := cpuset.Parse(value)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse cpuset value %q from env %q: %w", value, env, err)
+			}
+			claim.cpus = parsedSet
+		}
+		allocations[claimUID] = claim
+	}
+	for uid, claim := range allocations {
+		slices.Sort(claim.requests)
+		claim.requests = slices.Compact(claim.requests)
+		allocations[uid] = claim
 	}
 
 	return allocations, nil
@@ -216,17 +280,16 @@ func (cp *CPUDriver) restoreNamedClaims(logger logr.Logger, allocations *store.A
 	}
 	for _, uid := range sets.List(named) {
 		caLogger := logger.WithValues("claimUID", uid)
-		envs, err := cp.cdiMgr.GetDeviceEnv(getCDIDeviceName(uid))
-		if err != nil {
+		record, err := cp.cdiMgr.GetDeviceAllocations(uid)
+		if errors.Is(err, errNoClaimSpec) {
 			caLogger.V(2).Info("not restoring claim without a CDI spec from this driver", "err", err)
 			continue
 		}
-		cpus, err := cdiSpecCPUs(caLogger, uid, envs)
 		if err != nil {
 			caLogger.Error(err, "not restoring claim with an unusable CDI spec")
 			continue
 		}
-		allocations.Restore(caLogger, uid, []store.RequestAllocation{{CPUs: cpus}})
+		allocations.Restore(caLogger, uid, record.storeRecord())
 	}
 }
 
@@ -235,40 +298,132 @@ func cdiSpecCPUs(logger logr.Logger, uid types.UID, envs []string) (cpuset.CPUSe
 	if err != nil {
 		return cpuset.CPUSet{}, fmt.Errorf("failed to parse CDI env for claim %q: %w", uid, err)
 	}
-	cpus, ok := allocations[uid]
-	if !ok {
+	claim, ok := allocations[uid]
+	if !ok || !claim.upstreamForm() {
 		return cpuset.CPUSet{}, fmt.Errorf("driver-owned CDI spec %q does not contain a DRA allocation for claim %q", getCDIDeviceName(uid), uid)
 	}
-	return cpus, nil
+	return claim.cpus, nil
 }
 
 type syncContainer struct {
 	container *api.Container
 	owner     store.OwnerIdent
-	claims    map[types.UID]cpuset.CPUSet
+	claims    map[types.UID]draEnvClaim
 	logger    logr.Logger
+	// onRecord are the claims the container names as the store records them.
+	onRecord []types.UID
+	// pinnedToRecord is whether the runtime shows the container pinned to
+	// exactly the CPUs of the claims in onRecord, whole.
+	pinnedToRecord bool
+}
+
+// recordClaims finds the claims the container names as the store records them:
+// in upstream's form with the recorded cpuset, or by requests the record holds.
+// containerd reports a container's cpuset from its stored spec, which holds the
+// cpuset the driver set when it admitted the container, so a container pinned
+// to exactly the CPUs of its claims is one a driver admitted.
+func (sc *syncContainer) recordClaims(allocations *store.AllocationState) {
+	recorded := cpuset.New()
+	for _, uid := range slices.Sorted(maps.Keys(sc.claims)) {
+		claim := sc.claims[uid]
+		record, ok := allocations.GetClaimRecord(uid)
+		if !ok || (claim.upstreamForm() && !record.CPUs().Equals(claim.cpus)) {
+			continue
+		}
+		if _, err := allocations.GetRequestAllocationUnion(claim.refs(uid)...); err != nil {
+			continue
+		}
+		recorded = recorded.Union(record.CPUs())
+		sc.onRecord = append(sc.onRecord, uid)
+	}
+	pinned, err := cpuset.Parse(sc.container.GetLinux().GetResources().GetCpu().GetCpus())
+	sc.pinnedToRecord = err == nil && !recorded.IsEmpty() && pinned.Equals(recorded)
+}
+
+// syncBinding returns the requests of a claim to bind to a running container
+// and the CPUs to compare, or why the claim is not bound to it. A container
+// that names some but not all of the claim's requests, which CreateContainer
+// refuses since this rule came, keeps the whole claim where the runtime shows
+// it pinned to exactly the CPUs of its claims: the rule then applies at its next
+// CreateContainer.
+func syncBinding(allocations *store.AllocationState, uid types.UID, sc *syncContainer) ([]store.ClaimRequestRef, map[store.ClaimRequestRef]cpuset.CPUSet, cpumetrics.Rule, error) {
+	claim := sc.claims[uid]
+	refs := claim.refs(uid)
+	if claim.upstreamForm() {
+		return refs, map[store.ClaimRequestRef]cpuset.CPUSet{refs[0]: claim.cpus}, "", nil
+	}
+	if _, err := allocations.GetRequestAllocationUnion(refs...); err != nil {
+		return nil, nil, "", err
+	}
+	if err := wholeClaimUse(allocations, uid, claim, sc.container.GetName()); err != nil {
+		if !sc.pinnedToRecord {
+			return nil, nil, "", err
+		}
+		return []store.ClaimRequestRef{{ClaimUID: uid}}, nil, cpumetrics.RulePartialHolder, nil
+	}
+	return refs, nil, "", nil
+}
+
+// wholeClaimUse refuses a container that names some but not all of a claim's
+// requests, where upstream's driver gives such a container the whole claim.
+func wholeClaimUse(allocations *store.AllocationState, uid types.UID, claim draEnvClaim, container string) error {
+	record, ok := allocations.GetClaimRecord(uid)
+	if claim.upstreamForm() || !ok || len(claim.requests) >= len(record.Requests) {
+		return nil
+	}
+	name := record.Name
+	if name == "" {
+		name = string(uid)
+	}
+	return partialHolderError{container: container, claim: name, requests: claim.requests}
+}
+
+type partialHolderError struct {
+	container string
+	claim     string
+	requests  []string
+}
+
+func (err partialHolderError) Error() string {
+	noun := "request"
+	if len(err.requests) > 1 {
+		noun = "requests"
+	}
+	quoted := make([]string, 0, len(err.requests))
+	for _, request := range err.requests {
+		quoted = append(quoted, strconv.Quote(request))
+	}
+	return fmt.Sprintf("container %q: uses only %s %s of claim %q, which must be used whole; use the whole claim, or give the container its own claim",
+		err.container, noun, strings.Join(quoted, ", "), err.claim)
 }
 
 type syncRefusal string
 
 const (
 	refusedUnprepared     syncRefusal = "unprepared"
+	refusedUnknownRequest syncRefusal = "unknown_request"
 	refusedCPUMismatch    syncRefusal = "cpu_mismatch"
 	refusedBoundElsewhere syncRefusal = "bound_elsewhere"
 	refusedOverlap        syncRefusal = "overlap"
 	refusedContested      syncRefusal = "contested"
+	refusedPartialHolder  syncRefusal = "partial_holder"
 )
 
 var errContestedClaim = errors.New("several containers name the claim and the runtime does not show this one alone pinned to its CPUs: name a claim in one container only")
 
 func refusalReason(err error) syncRefusal {
+	var partial partialHolderError
 	switch {
+	case errors.Is(err, store.ErrUnknownRequest):
+		return refusedUnknownRequest
 	case errors.Is(err, store.ErrClaimCPUMismatch):
 		return refusedCPUMismatch
 	case errors.Is(err, store.ErrClaimAlreadyBound):
 		return refusedBoundElsewhere
 	case errors.Is(err, store.ErrClaimOverlap):
 		return refusedOverlap
+	case errors.As(err, &partial):
+		return refusedPartialHolder
 	}
 	return refusedUnprepared
 }
@@ -295,29 +450,15 @@ func (c *contenders) String() string {
 }
 
 // contendersForUnboundClaims lists, for each claim nothing is bound to, the
-// owners whose containers name it with its recorded CPUs, and the holders
-// among them. containerd reports a container's cpuset from its stored spec,
-// which holds the cpuset the driver set when it admitted the container, so a
-// container pinned to exactly the CPUs of the claims it names is one the
-// driver admitted.
+// owners whose containers name it as the store records it, and the holders
+// among them: those pinned to exactly the CPUs of their claims.
 func contendersForUnboundClaims(allocations *store.AllocationState, listed []*syncContainer) map[types.UID]*contenders {
 	result := make(map[types.UID]*contenders)
 	for _, sc := range listed {
-		recorded := cpuset.New()
-		var unbound []types.UID
-		for uid, cpus := range sc.claims {
-			prepared, ok := allocations.GetResourceClaimAllocation(uid)
-			if !ok || !prepared.Equals(cpus) {
+		for _, uid := range sc.onRecord {
+			if _, bound := allocations.Owner(uid); bound {
 				continue
 			}
-			recorded = recorded.Union(cpus)
-			if _, bound := allocations.Owner(uid); !bound {
-				unbound = append(unbound, uid)
-			}
-		}
-		pinned, err := cpuset.Parse(sc.container.GetLinux().GetResources().GetCpu().GetCpus())
-		holds := err == nil && !recorded.IsEmpty() && pinned.Equals(recorded)
-		for _, uid := range unbound {
 			c := result[uid]
 			if c == nil {
 				c = &contenders{}
@@ -326,7 +467,7 @@ func contendersForUnboundClaims(allocations *store.AllocationState, listed []*sy
 			if !slices.ContainsFunc(c.owners, sc.owner.Equal) {
 				c.owners = append(c.owners, sc.owner)
 			}
-			if holds && !slices.ContainsFunc(c.holders, sc.owner.Equal) {
+			if sc.pinnedToRecord && !slices.ContainsFunc(c.holders, sc.owner.Equal) {
 				c.holders = append(c.holders, sc.owner)
 			}
 		}
@@ -411,15 +552,26 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	} else {
 		// NRI invokes CreateContainer for all containers. Only trust DRA env
 		// entries that match a claim prepared by this driver.
-		guaranteedCPUs := cpuset.New()
-		claimUIDs := []types.UID{}
-		expected := make(map[store.ClaimRequestRef]cpuset.CPUSet, len(claimAllocations))
-		for uid, cpus := range claimAllocations {
-			guaranteedCPUs = guaranteedCPUs.Union(cpus)
-			claimUIDs = append(claimUIDs, uid)
-			expected[store.ClaimRequestRef{ClaimUID: uid}] = cpus
+		claimUIDs := slices.Sorted(maps.Keys(claimAllocations))
+		var refs []store.ClaimRequestRef
+		expected := make(map[store.ClaimRequestRef]cpuset.CPUSet)
+		for _, uid := range claimUIDs {
+			claim := claimAllocations[uid]
+			if claim.upstreamForm() {
+				expected[store.ClaimRequestRef{ClaimUID: uid}] = claim.cpus
+			}
+			refs = append(refs, claim.refs(uid)...)
 		}
-		updatedClaims, err := cp.allocationState.Bind(logger, podUID, ctr.Name, expected)
+		guaranteedCPUs, err := cp.allocationState.GetRequestAllocationUnion(refs...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("cannot bind claim to container %q in pod %q: %w", ctr.Name, pod.Uid, err)
+		}
+		for _, uid := range claimUIDs {
+			if err := wholeClaimUse(cp.allocationState, uid, claimAllocations[uid], ctr.GetName()); err != nil {
+				return nil, nil, err
+			}
+		}
+		updatedClaims, err := cp.allocationState.Bind(logger, podUID, ctr.Name, refs, expected)
 		if err != nil {
 			return nil, nil, fmt.Errorf("cannot bind claim to container %q in pod %q: %w", ctr.Name, pod.Uid, err)
 		}

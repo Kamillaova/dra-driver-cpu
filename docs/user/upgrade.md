@@ -87,6 +87,21 @@ Go consumers of the opaque allocation configuration API must update their import
 
 The serialized `v1alpha1` schema and parsing behavior are unchanged.
 
+#### Per-request CDI variables
+
+A container that uses a claim now receives `DRA_CPUSET_<claimUID>_<request>=dynamic`, one
+variable for each request it holds, where it received `DRA_CPUSET_<claimUID>=<cpuset>` before.
+The value is always `dynamic`, never a cpuset. A workload that read its CPUs from
+`DRA_CPUSET_<claimUID>` reads `DRA_EXCLUSIVE_ASSIGNED_CPUSET` instead. Claims prepared before
+the upgrade keep their variable until they are unprepared.
+
+#### Containers that use part of a claim
+
+A container that names some but not all of a claim's requests in `resources.claims` is refused
+at creation, where it ran with all of the claim's CPUs before. Name the claim without a request,
+or give the container its own claim. Claims prepared before the upgrade keep the old behavior
+until they are unprepared.
+
 ### Behavior changes
 
 #### Kubernetes API client limits
