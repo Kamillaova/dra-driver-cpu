@@ -101,6 +101,7 @@ type fakeCPUTopology struct {
 	numClustersPerSocket  int // Needed for ARM support
 	hybrid                bool
 	eCores                string
+	legacySiblingList     bool // only the deprecated thread_siblings_list
 }
 
 func createFakeCPUTopology(t *testing.T, dir string, topo fakeCPUTopology) {
@@ -166,8 +167,14 @@ func createFakeCPUTopology(t *testing.T, dir string, topo fakeCPUTopology) {
 		for thread := range topo.cpusPerCore {
 			threadSiblings = append(threadSiblings, firstCPUInSocket+coreID+thread*coresPerSocket)
 		}
-		if err := os.WriteFile(filepath.Join(topologyDir, "thread_siblings_list"), []byte(cpuset.New(threadSiblings...).String()+"\n"), 0600); err != nil {
+		siblingList := []byte(cpuset.New(threadSiblings...).String() + "\n")
+		if err := os.WriteFile(filepath.Join(topologyDir, "thread_siblings_list"), siblingList, 0600); err != nil {
 			t.Fatal(err)
+		}
+		if !topo.legacySiblingList {
+			if err := os.WriteFile(filepath.Join(topologyDir, "core_cpus_list"), siblingList, 0600); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if topo.numClustersPerSocket > 1 {
 			clusterID := (i / topo.cpusPerCore) / (coresPerSocket / topo.numClustersPerSocket) % topo.numClustersPerSocket
@@ -245,10 +252,28 @@ func TestGetCPUInfos(t *testing.T) {
 				hybrid:                false,
 			},
 			expectedInfos: []CPUInfo{
-				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 2, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 3, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 2, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 0, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 3, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 2, SiblingCPUSet: cpuset.New(0, 2), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 3, SiblingCPUSet: cpuset.New(1, 3), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 2, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 0, SiblingCPUSet: cpuset.New(0, 2), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 3, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 1, SiblingCPUSet: cpuset.New(1, 3), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+			},
+		},
+		{
+			name: "non-hybrid hyper-threading, only the deprecated thread_siblings_list",
+			topology: fakeCPUTopology{
+				numSockets:            1,
+				numNumaNodesPerSocket: 1,
+				numCoresPerNumaNode:   2,
+				cpusPerCore:           2,
+				coresPerL3:            2,
+				hybrid:                false,
+				legacySiblingList:     true,
+			},
+			expectedInfos: []CPUInfo{
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 2, SiblingCPUSet: cpuset.New(0, 2), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 3, SiblingCPUSet: cpuset.New(1, 3), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 2, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 0, SiblingCPUSet: cpuset.New(0, 2), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 3, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 1, SiblingCPUSet: cpuset.New(1, 3), CoreType: CoreTypeStandard, UncoreCacheID: 0},
 			},
 		},
 		{
@@ -262,8 +287,8 @@ func TestGetCPUInfos(t *testing.T) {
 				hybrid:                false,
 			},
 			expectedInfos: []CPUInfo{
-				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1), SiblingCPUID: -1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1), SiblingCPUID: -1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(1), CoreType: CoreTypeStandard, UncoreCacheID: 0},
 			},
 		},
 		{
@@ -277,14 +302,14 @@ func TestGetCPUInfos(t *testing.T) {
 				hybrid:                false,
 			},
 			expectedInfos: []CPUInfo{
-				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 2, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 3, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 2, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 0, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 3, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 4, CoreID: 0, SocketID: 1, ClusterID: -1, NUMANodeID: 1, NumaNodeCPUSet: cpuset.New(4, 5, 6, 7), SiblingCPUID: 6, CoreType: CoreTypeStandard, UncoreCacheID: 1},
-				{CpuID: 5, CoreID: 1, SocketID: 1, ClusterID: -1, NUMANodeID: 1, NumaNodeCPUSet: cpuset.New(4, 5, 6, 7), SiblingCPUID: 7, CoreType: CoreTypeStandard, UncoreCacheID: 1},
-				{CpuID: 6, CoreID: 0, SocketID: 1, ClusterID: -1, NUMANodeID: 1, NumaNodeCPUSet: cpuset.New(4, 5, 6, 7), SiblingCPUID: 4, CoreType: CoreTypeStandard, UncoreCacheID: 1},
-				{CpuID: 7, CoreID: 1, SocketID: 1, ClusterID: -1, NUMANodeID: 1, NumaNodeCPUSet: cpuset.New(4, 5, 6, 7), SiblingCPUID: 5, CoreType: CoreTypeStandard, UncoreCacheID: 1},
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 2, SiblingCPUSet: cpuset.New(0, 2), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 3, SiblingCPUSet: cpuset.New(1, 3), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 2, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 0, SiblingCPUSet: cpuset.New(0, 2), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 3, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: 1, SiblingCPUSet: cpuset.New(1, 3), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 4, CoreID: 0, SocketID: 1, ClusterID: -1, NUMANodeID: 1, NumaNodeCPUSet: cpuset.New(4, 5, 6, 7), SiblingCPUID: 6, SiblingCPUSet: cpuset.New(4, 6), CoreType: CoreTypeStandard, UncoreCacheID: 1},
+				{CpuID: 5, CoreID: 1, SocketID: 1, ClusterID: -1, NUMANodeID: 1, NumaNodeCPUSet: cpuset.New(4, 5, 6, 7), SiblingCPUID: 7, SiblingCPUSet: cpuset.New(5, 7), CoreType: CoreTypeStandard, UncoreCacheID: 1},
+				{CpuID: 6, CoreID: 0, SocketID: 1, ClusterID: -1, NUMANodeID: 1, NumaNodeCPUSet: cpuset.New(4, 5, 6, 7), SiblingCPUID: 4, SiblingCPUSet: cpuset.New(4, 6), CoreType: CoreTypeStandard, UncoreCacheID: 1},
+				{CpuID: 7, CoreID: 1, SocketID: 1, ClusterID: -1, NUMANodeID: 1, NumaNodeCPUSet: cpuset.New(4, 5, 6, 7), SiblingCPUID: 5, SiblingCPUSet: cpuset.New(5, 7), CoreType: CoreTypeStandard, UncoreCacheID: 1},
 			},
 		},
 		{
@@ -299,10 +324,10 @@ func TestGetCPUInfos(t *testing.T) {
 				eCores:                "2,3",
 			},
 			expectedInfos: []CPUInfo{
-				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, CoreType: CoreTypePerformance, UncoreCacheID: 0},
-				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, CoreType: CoreTypePerformance, UncoreCacheID: 0},
-				{CpuID: 2, CoreID: 2, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, CoreType: CoreTypeEfficiency, UncoreCacheID: 0},
-				{CpuID: 3, CoreID: 3, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, CoreType: CoreTypeEfficiency, UncoreCacheID: 0},
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0), CoreType: CoreTypePerformance, UncoreCacheID: 0},
+				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(1), CoreType: CoreTypePerformance, UncoreCacheID: 0},
+				{CpuID: 2, CoreID: 2, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(2), CoreType: CoreTypeEfficiency, UncoreCacheID: 0},
+				{CpuID: 3, CoreID: 3, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(3), CoreType: CoreTypeEfficiency, UncoreCacheID: 0},
 			},
 		},
 		{
@@ -317,8 +342,8 @@ func TestGetCPUInfos(t *testing.T) {
 				eCores:                "",
 			},
 			expectedInfos: []CPUInfo{
-				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1), SiblingCPUID: -1, CoreType: CoreTypePerformance, UncoreCacheID: 0},
-				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1), SiblingCPUID: -1, CoreType: CoreTypePerformance, UncoreCacheID: 0},
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0), CoreType: CoreTypePerformance, UncoreCacheID: 0},
+				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(1), CoreType: CoreTypePerformance, UncoreCacheID: 0},
 			},
 		},
 		{
@@ -333,10 +358,10 @@ func TestGetCPUInfos(t *testing.T) {
 				hybrid:                false,
 			},
 			expectedInfos: []CPUInfo{
-				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: 0, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: 0, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 2, CoreID: 2, SocketID: 0, ClusterID: 1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
-				{CpuID: 3, CoreID: 3, SocketID: 0, ClusterID: 1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: 0, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 1, CoreID: 1, SocketID: 0, ClusterID: 0, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(1), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 2, CoreID: 2, SocketID: 0, ClusterID: 1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(2), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 3, CoreID: 3, SocketID: 0, ClusterID: 1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0, 1, 2, 3), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(3), CoreType: CoreTypeStandard, UncoreCacheID: 0},
 			},
 		},
 	}
@@ -399,7 +424,7 @@ func TestGetCPUInfos_ErrorScenarios(t *testing.T) {
 			},
 			expectedErrorSubstring: "", // Should warn and continue
 			expectedInfos: []CPUInfo{
-				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(), SiblingCPUID: -1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0), CoreType: CoreTypeStandard, UncoreCacheID: 0},
 			},
 		},
 		{
@@ -425,7 +450,7 @@ func TestGetCPUInfos_ErrorScenarios(t *testing.T) {
 			},
 			expectedErrorSubstring: "", // Should succeed with synthetic ID
 			expectedInfos: []CPUInfo{
-				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0), SiblingCPUID: -1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0), CoreType: CoreTypeStandard, UncoreCacheID: 0},
 			},
 		},
 		{
@@ -435,8 +460,46 @@ func TestGetCPUInfos_ErrorScenarios(t *testing.T) {
 			},
 			expectedErrorSubstring: "", // Should succeed and map 65535 to -1
 			expectedInfos: []CPUInfo{
-				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0), SiblingCPUID: -1, CoreType: CoreTypeStandard, UncoreCacheID: 0},
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0), CoreType: CoreTypeStandard, UncoreCacheID: 0},
 			},
+		},
+		{
+			name: "missing core_cpus_list falls back to thread_siblings_list",
+			setup: func(sfs fstest.MapFS) {
+				delete(sfs, "devices/system/cpu/cpu0/topology/core_cpus_list")
+				sfs["devices/system/cpu/cpu0/topology/thread_siblings_list"] = &fstest.MapFile{Data: []byte("0\n")}
+			},
+			expectedErrorSubstring: "",
+			expectedInfos: []CPUInfo{
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+			},
+		},
+		{
+			name: "core_cpus_list is read before thread_siblings_list",
+			setup: func(sfs fstest.MapFS) {
+				sfs["devices/system/cpu/cpu0/topology/thread_siblings_list"] = &fstest.MapFile{Data: []byte("0-1\n")}
+			},
+			expectedErrorSubstring: "",
+			expectedInfos: []CPUInfo{
+				{CpuID: 0, CoreID: 0, SocketID: 0, ClusterID: -1, NUMANodeID: 0, NumaNodeCPUSet: cpuset.New(0), SiblingCPUID: -1, SiblingCPUSet: cpuset.New(0), CoreType: CoreTypeStandard, UncoreCacheID: 0},
+			},
+		},
+		{
+			name: "missing core_cpus_list and thread_siblings_list",
+			setup: func(sfs fstest.MapFS) {
+				delete(sfs, "devices/system/cpu/cpu0/topology/core_cpus_list")
+			},
+			expectedErrorSubstring: "",          // Should warn and skip CPU
+			expectedInfos:          []CPUInfo{}, // CPU gets skipped
+		},
+		{
+			name: "malformed core_cpus_list",
+			setup: func(sfs fstest.MapFS) {
+				sfs["devices/system/cpu/cpu0/topology/core_cpus_list"] = &fstest.MapFile{Data: []byte("zero\n")}
+				sfs["devices/system/cpu/cpu0/topology/thread_siblings_list"] = &fstest.MapFile{Data: []byte("0\n")}
+			},
+			expectedErrorSubstring: "",          // Should warn and skip CPU
+			expectedInfos:          []CPUInfo{}, // CPU gets skipped
 		},
 	}
 
@@ -471,6 +534,7 @@ func validSingleCPUInfoFS() fstest.MapFS {
 		"devices/system/cpu/online":                            &fstest.MapFile{Data: []byte("0\n")},
 		"devices/system/cpu/cpu0/topology/physical_package_id": &fstest.MapFile{Data: []byte("0\n")},
 		"devices/system/cpu/cpu0/topology/core_id":             &fstest.MapFile{Data: []byte("0\n")},
+		"devices/system/cpu/cpu0/topology/core_cpus_list":      &fstest.MapFile{Data: []byte("0\n")},
 		"devices/system/cpu/cpu0/node0":                        &fstest.MapFile{Mode: 0755 | os.ModeDir},
 		"devices/system/node/node0/cpulist":                    &fstest.MapFile{Data: []byte("0\n")},
 		"devices/system/cpu/cpu0/cache/index3/level":           &fstest.MapFile{Data: []byte("3\n")},
