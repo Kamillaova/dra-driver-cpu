@@ -2787,6 +2787,9 @@ func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool) *kubeletplugin.De
 		string(devattr.AttributeSMTEnabled): {BoolValue: new(smtEnabled)},
 		"dra.net/numaNode":                  {IntValue: new(int64(cpu.NUMANodeID))},
 		"dra.cpu/numaNodeID":                {IntValue: new(int64(cpu.NUMANodeID))},
+		// The settings of a driver built with the defaults.
+		string(devattr.AttributeFullPhysicalCPUsOnly): {BoolValue: new(false)},
+		string(devattr.AttributeAllocator):            {StringValue: new(cpuallocator.ModeCPUManager)},
 	}
 	return &kubeletplugin.DeviceMetadata{Attributes: attrs}
 }
@@ -2851,6 +2854,14 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(smtEnabled)}
 	}
 	attrs[string(devattr.AttributeThreadsPerCore)] = resourceapi.DeviceAttribute{IntValue: new(expectedThreadsPerCore(cpuInfos, cpuIDs))}
+	// The driver exposes the external allocator's attributes exactly when it
+	// runs that allocator.
+	allocator := cpuallocator.ModeCPUManager
+	if exposeExtAttrs {
+		allocator = cpuallocator.ModeExternal
+	}
+	attrs[string(devattr.AttributeFullPhysicalCPUsOnly)] = resourceapi.DeviceAttribute{BoolValue: new(false)}
+	attrs[string(devattr.AttributeAllocator)] = resourceapi.DeviceAttribute{StringValue: new(allocator)}
 
 	if allocatedCPUs > 0 {
 		attrs[string(devattr.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(allocatedCPUs)}
