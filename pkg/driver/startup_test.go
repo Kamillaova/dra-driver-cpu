@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"maps"
 	"testing"
 	"time"
 
@@ -34,11 +35,11 @@ import (
 	"k8s.io/utils/cpuset"
 )
 
-// Construct a fresh process with an empty allocation store, but CDI and runtime
-// inventory from an existing exclusive container. Delay the Synchronize call
+// Construct a fresh process whose store Start seeded from CDI, with the runtime
+// inventory of an existing exclusive container. Delay the Synchronize call
 // itself, not a callback already holding stateMu: this is the startup window.
 // The initial sync wait is short so specs that expect a rejection stay fast.
-func startupWindowFixture(t *testing.T) (*CPUDriver, *api.PodSandbox, []*api.Container, *resourceapi.ResourceClaim) {
+func startupWindowFixture(t *testing.T, alsoOnDisk map[types.UID]cpuset.CPUSet) (*CPUDriver, *api.PodSandbox, []*api.Container, *resourceapi.ResourceClaim) {
 	t.Helper()
 	infos := mockCPUInfos_SingleSocket_4CPUS_HT
 	driver, err := New(testr.New(t), Providers{CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}, SysFS: testSysFS(infos)}, &Config{
@@ -48,7 +49,10 @@ func startupWindowFixture(t *testing.T) (*CPUDriver, *api.PodSandbox, []*api.Con
 	require.NoError(t, err)
 	driver.initialSyncWait = 10 * time.Millisecond
 	held := cpuset.New(0, 2) // Deterministic first choice of this allocator/topology.
-	driver.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"existing": held})
+	onDisk := map[types.UID]cpuset.CPUSet{"existing": held}
+	maps.Copy(onDisk, alsoOnDisk)
+	driver.cdiMgr = newMockCdiMgrWithAllocations(onDisk)
+	driver.seedAllocationStoreFromDisk(testr.New(t))
 	pod := &api.PodSandbox{Id: "existing-pod", Uid: "existing-pod-uid"}
 	containers := []*api.Container{{Id: "existing-container", Name: "workload", PodSandboxId: pod.Id, State: api.ContainerState_CONTAINER_RUNNING, Env: []string{fmt.Sprintf("%s_existing=%s", cdiEnvVarPrefix, held.String())}}}
 	claim := testClaim("new-claim", testDriverName, testNodeName, map[string]int64{"cpudevnuma000": 2})
@@ -56,7 +60,7 @@ func startupWindowFixture(t *testing.T) (*CPUDriver, *api.PodSandbox, []*api.Con
 }
 
 func TestStartupWindowPrepareMustWaitForRecovery(t *testing.T) {
-	driver, pod, containers, claim := startupWindowFixture(t)
+	driver, pod, containers, claim := startupWindowFixture(t, nil)
 	before := len(driver.cdiMgr.(*mockCdiMgr).devices)
 	results, err := driver.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
 	require.NoError(t, err)
@@ -80,7 +84,7 @@ func TestStartupWindowPrepareMustWaitForRecovery(t *testing.T) {
 // A Prepare that arrives just before the first Synchronize waits for it and then
 // succeeds on the first attempt, instead of failing and relying on kubelet retry.
 func TestStartupWindowPrepareWaitsForInitialSynchronize(t *testing.T) {
-	driver, pod, containers, claim := startupWindowFixture(t)
+	driver, pod, containers, claim := startupWindowFixture(t, nil)
 	driver.initialSyncWait = time.Minute // Only the Synchronize below may release Prepare.
 	done := make(chan prepareOutcome, 1)
 	go func() {
@@ -113,7 +117,7 @@ type prepareOutcome struct {
 }
 
 func TestStartupWindowFailedSynchronizeKeepsGateClosed(t *testing.T) {
-	driver, pod, containers, claim := startupWindowFixture(t)
+	driver, pod, containers, claim := startupWindowFixture(t, nil)
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err := driver.Synchronize(cancelled, []*api.PodSandbox{pod}, containers)
@@ -135,8 +139,7 @@ func TestStartupWindowFailedSynchronizeKeepsGateClosed(t *testing.T) {
 // one is. Neither claim is bound, their CPUs stay out of the shared pool and of
 // new claims, and the node keeps working until one of them is unprepared.
 func TestStartupWindowOverlappingRecordsBindNoContainer(t *testing.T) {
-	driver, pod, containers, _ := startupWindowFixture(t)
-	driver.cdiMgr.(*mockCdiMgr).devices[getCDIDeviceName("conflict")] = fmt.Sprintf("%s_conflict=0,2", cdiEnvVarPrefix)
+	driver, pod, containers, _ := startupWindowFixture(t, map[types.UID]cpuset.CPUSet{"conflict": cpuset.New(0, 2)})
 	all := append([]*api.Container{}, containers...)
 	all = append(all, &api.Container{Id: "conflict-container", Name: "other", PodSandboxId: pod.Id, State: api.ContainerState_CONTAINER_RUNNING, Env: []string{fmt.Sprintf("%s_conflict=0,2", cdiEnvVarPrefix)}})
 
