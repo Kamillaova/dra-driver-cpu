@@ -120,6 +120,9 @@ type CPUDriver struct {
 	// Acquire it before store locks; never call into the runtime while holding it.
 	stateMu         sync.Mutex
 	hasSynchronized bool
+	// nriDisconnected is set when the NRI plugin's Run returns and cleared by
+	// Synchronize; until the first Synchronize, hasSynchronized covers it.
+	nriDisconnected bool
 	// initialSync is closed when hasSynchronized first becomes true.
 	initialSync     chan struct{}
 	initialSyncWait time.Duration
@@ -420,7 +423,7 @@ func (cp *CPUDriver) startNRIPlugin(ctx context.Context, asyncErr chan<- error) 
 	logger := ctxlog.FromContext(ctx)
 	ctx, cp.cancelNRI = context.WithCancel(context.WithoutCancel(ctx))
 	go func() {
-		if err := runNRIPluginWithRetry(ctx, cp.nriPlugin, maxAttempts, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration); err != nil && ctx.Err() == nil {
+		if err := runNRIPluginWithRetry(ctx, nriConnection{driver: cp, plugin: cp.nriPlugin}, maxAttempts, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration); err != nil && ctx.Err() == nil {
 			logger.Error(err, "NRI plugin failed to be restarted", "maxAttempts", maxAttempts)
 			asyncErr <- err
 		}
@@ -490,6 +493,21 @@ func waitForRegistration(ctx context.Context, p KubeletPlugin, registrarPath str
 
 type nriRunner interface {
 	Run(context.Context) error
+}
+
+type nriConnection struct {
+	driver *CPUDriver
+	plugin nriRunner
+}
+
+// Run marks NRI disconnected when the plugin's Run returns, which the NRI stub
+// does once its connection to the runtime is gone.
+func (c nriConnection) Run(ctx context.Context) error {
+	err := c.plugin.Run(ctx)
+	c.driver.stateMu.Lock()
+	c.driver.nriDisconnected = true
+	c.driver.stateMu.Unlock()
+	return err
 }
 
 const (
