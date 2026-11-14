@@ -26,7 +26,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -34,6 +33,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/buildinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/probes"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/shutdown"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/subcommands"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/driver"
@@ -58,8 +58,6 @@ const (
 var (
 	driverFlags driverconfig.Config
 	configFile  string
-
-	ready atomic.Bool
 )
 
 func init() {
@@ -150,14 +148,8 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	}
 
 	mux := http.NewServeMux()
-	// Add healthz handler
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if !ready.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		} else {
-			w.WriteHeader(http.StatusOK)
-		}
-	})
+	var probe probes.Probes
+	probe.Register(mux)
 	// Add metrics handler
 	mux.Handle("/metrics", promhttp.Handler())
 	server := &http.Server{
@@ -246,7 +238,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	})
 	defer finished()
 	defer dracpu.Stop()
-	ready.Store(true)
+	probe.SetReady(dracpu.Ready)
 	logger.Info("driver started")
 
 	var fatalErr error

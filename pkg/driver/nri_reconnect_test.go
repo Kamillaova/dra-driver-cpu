@@ -20,6 +20,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,10 +28,14 @@ import (
 	"github.com/containerd/nri/pkg/net/multiplex"
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/containerd/ttrpc"
+	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/utils/cpuset"
 )
 
@@ -240,6 +245,73 @@ func TestPrepareRefusedWhileNRIReconnects(t *testing.T) {
 	prepared, err = d.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{pending})
 	require.NoError(t, err)
 	require.NoError(t, prepared[pending.UID].Err)
+}
+
+func TestReadyNeedsRegistrationAndNRI(t *testing.T) {
+	infos := mockCPUInfos_SingleSocket_4CPUS_HT
+	d, err := New(testr.New(t), Providers{CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}, SysFS: testSysFS(infos)}, &Config{
+		DriverName: testDriverName, NodeName: testNodeName,
+		CPUDeviceMode: device.CPU_DEVICE_MODE_GROUPED, CPUDeviceGroupBy: device.GROUP_BY_NUMA_NODE,
+	})
+	require.NoError(t, err)
+	d.cdiMgr = newMockCdiMgr()
+	var registered atomic.Bool
+	d.draPlugin = &mockKubeletPlugin{statusFunc: func(int32) *registerapi.RegistrationStatus {
+		return &registerapi.RegistrationStatus{PluginRegistered: registered.Load()}
+	}}
+	require.False(t, d.Ready(), "neither registered nor connected to NRI")
+	registered.Store(true)
+	require.False(t, d.Ready(), "registered, NRI not connected yet")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	runtime := &reconnectingNRIRuntime{syncResults: make(chan error, 4)}
+	redialing := make(chan struct{})
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	dials := 0
+	plugin, err := stub.New(d,
+		stub.WithPluginName(d.driverName),
+		stub.WithPluginIdx("00"),
+		stub.WithDialer(func(path string) (net.Conn, error) {
+			dials++
+			if dials == 2 {
+				close(redialing)
+				<-release
+			}
+			return runtime.dial(path)
+		}),
+		stub.WithOnClose(func() {}),
+	)
+	require.NoError(t, err)
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runNRIPluginWithRetry(ctx, nriConnection{driver: d, plugin: plugin}, maxAttempts, testRetryInitialBackoff, testRetryMaxBackoff, testRetryHealthyRun)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		releaseOnce()
+		plugin.Stop()
+		runtime.disconnect()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Error("NRI plugin runner did not stop")
+		}
+	})
+	requireNoNRIError(t, runtime.syncResults)
+	require.True(t, d.Ready(), "registered and synchronized with NRI")
+
+	registered.Store(false)
+	require.False(t, d.Ready(), "the kubelet refused the plugin")
+	registered.Store(true)
+
+	runtime.disconnect()
+	<-redialing
+	require.False(t, d.Ready(), "NRI is reconnecting")
+
+	releaseOnce()
+	requireNoNRIError(t, runtime.syncResults)
+	require.True(t, d.Ready(), "NRI synchronized again")
 }
 
 func requireNoNRIError(t *testing.T, results <-chan error) {

@@ -158,7 +158,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 		close(cp.initialSync)
 	}
 	cp.hasSynchronized = true
-	cp.nriDisconnected = false
+	cp.nriDisconnected.Store(false)
 	cp.refreshAllocationMetrics()
 	for range refused {
 		cp.metrics.RecordNRISynchronizeRefusedClaim()
