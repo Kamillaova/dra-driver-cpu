@@ -32,10 +32,16 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
+	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/utils/cpuset"
+	cdiSpec "tags.cncf.io/container-device-interface/specs-go"
 )
 
 type mockNRIRunner struct {
@@ -587,6 +593,131 @@ func TestStartRefusesWithoutCancelRun(t *testing.T) {
 
 	require.ErrorContains(t, err, "CancelRun")
 	require.NoDirExists(t, pluginDataDir(root, cp.driverName), "Start must refuse before it writes to the node")
+}
+
+func TestSeedAllocationStoreFromDisk(t *testing.T) {
+	addUpstream := func(uid types.UID, cpus string) func(*testing.T, *CdiManager, string) {
+		return func(t *testing.T, mgr *CdiManager, _ string) {
+			require.NoError(t, mgr.AddDevice(testr.New(t), getCDIDeviceName(uid), fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, uid, cpus)))
+		}
+	}
+	addVM := func(t *testing.T, mgr *CdiManager, _ string) {
+		require.NoError(t, mgr.AddClaimDevices(testr.New(t), "vm", testClaimDeviceEnvs("vm"), testClaimRecord()))
+	}
+	vm := store.ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []store.RequestAllocation{
+		{Request: "helpers", CPUs: cpuset.New(8)},
+		{Request: "vcpus", CPUs: cpuset.New(0, 1, 2, 3)},
+	}}
+	upstream := func(cpus ...int) store.ClaimRecord {
+		return store.ClaimRecord{Requests: []store.RequestAllocation{{CPUs: cpuset.New(cpus...)}}}
+	}
+	tests := []struct {
+		name         string
+		onDisk       []func(*testing.T, *CdiManager, string)
+		want         map[types.UID]store.ClaimRecord
+		wantPrepared string
+	}{
+		{
+			name:         "every claim on disk, in this driver's form and in upstream's",
+			onDisk:       []func(*testing.T, *CdiManager, string){addVM, addUpstream("up", "4-5")},
+			want:         map[types.UID]store.ClaimRecord{"vm": vm, "up": upstream(4, 5)},
+			wantPrepared: "0-5,8",
+		},
+		{
+			name:         "two records naming the same CPUs are both kept",
+			onDisk:       []func(*testing.T, *CdiManager, string){addUpstream("a", "0-1"), addUpstream("b", "0-1")},
+			want:         map[types.UID]store.ClaimRecord{"a": upstream(0, 1), "b": upstream(0, 1)},
+			wantPrepared: "0-1",
+		},
+		{
+			name: "a spec whose record does not decode is left out",
+			onDisk: []func(*testing.T, *CdiManager, string){addVM, func(t *testing.T, mgr *CdiManager, _ string) {
+				spec := &cdiSpec.Spec{
+					Version:     cdiSpecVersion,
+					Kind:        cdiVendor + "/" + cdiClass,
+					Annotations: map[string]string{cdiRecordAnnotation: `{"namespace":"ns","placements":[{"request":"a","cpus":"6"}]}`},
+					Devices:     []cdiSpec.Device{{Name: getCDIRequestDeviceName("bad", "a"), ContainerEdits: cdiSpec.ContainerEdits{Env: []string{"DRA_CPUSET_bad_a=dynamic"}}}},
+				}
+				require.NoError(t, mgr.cache.WriteSpec(spec, mgr.getSpecName(getCDIDeviceName("bad"))))
+			}},
+			want:         map[types.UID]store.ClaimRecord{"vm": vm},
+			wantPrepared: "0-3,8",
+		},
+		{
+			name: "a spec the CDI cache cannot load leaves the others",
+			onDisk: []func(*testing.T, *CdiManager, string){addVM, func(t *testing.T, _ *CdiManager, dir string) {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "unrelated-invalid.json"), []byte("{"), 0600))
+			}},
+			want:         map[types.UID]store.ClaimRecord{"vm": vm},
+			wantPrepared: "0-3,8",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := testr.New(t)
+			dir := t.TempDir()
+			mgr, err := NewCdiManager(logger, testDriverName, dir)
+			require.NoError(t, err)
+			for _, write := range tc.onDisk {
+				write(t, mgr, dir)
+			}
+			topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_DualSocket_120CPUsPerSocket_HT}).GetCPUTopology(logger)
+			require.NoError(t, err)
+			d := &CPUDriver{allocationState: store.NewAllocationState(topo, cpuset.New()), cdiMgr: mgr, metrics: cpumetrics.Noop()}
+
+			d.seedAllocationStoreFromDisk(logger)
+
+			for uid, want := range tc.want {
+				got, ok := d.allocationState.GetClaimRecord(uid)
+				require.True(t, ok, "claim %q is restored", uid)
+				require.Equal(t, want, got, "claim %q", uid)
+			}
+			require.Equal(t, len(tc.want), d.allocationState.Snapshot().ActiveResourceClaims)
+			require.Equal(t, tc.wantPrepared, d.allocationState.GetPreparedCPUs().String())
+		})
+	}
+}
+
+// A restarted driver reads back what Prepare recorded of each allocation
+// result, its device and the amount it consumed, from the record on disk.
+func TestSeedReadsBackEachResultAfterARestart(t *testing.T) {
+	logger := testr.New(t)
+	dir := t.TempDir()
+	before := newGroupedTestDriver(t)
+	mgr, err := NewCdiManager(logger, testDriverName, dir)
+	require.NoError(t, err)
+	before.cdiMgr = mgr
+	before.hasSynchronized = true
+	cpus := func(n string) map[resourceapi.QualifiedName]resource.Quantity {
+		return map[resourceapi.QualifiedName]resource.Quantity{device.CPUResourceQualifiedName: resource.MustParse(n)}
+	}
+	claim := testClaimWithResults("vm", []resourceapi.DeviceRequestAllocationResult{
+		{Driver: testDriverName, Pool: testNodeName, Device: "cpudevnuma000", Request: "vcpus", ConsumedCapacity: cpus("2")},
+		{Driver: testDriverName, Pool: testNodeName, Device: "cpudevnuma000", Request: "helpers", ConsumedCapacity: cpus("1")},
+	})
+	claim.Namespace, claim.Name = "ns", "vm-claim"
+	prepared, err := before.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.NoError(t, prepared[claim.UID].Err)
+	want, ok := before.allocationState.GetClaimRecord(claim.UID)
+	require.True(t, ok)
+
+	after := newGroupedTestDriver(t)
+	restarted, err := NewCdiManager(logger, testDriverName, dir)
+	require.NoError(t, err)
+	after.cdiMgr = restarted
+	after.seedAllocationStoreFromDisk(logger)
+
+	got, ok := after.allocationState.GetClaimRecord(claim.UID)
+	require.True(t, ok)
+	require.Equal(t, want, got)
+	record, err := restarted.GetDeviceAllocations(claim.UID)
+	require.NoError(t, err)
+	one, two := resource.MustParse("1"), resource.MustParse("2")
+	require.Equal(t, []cdiRequestRecord{
+		{Request: "helpers", CPUs: want.Requests[0].CPUs, Results: []cdiResultRecord{{Device: "cpudevnuma000", Consumed: &one}}},
+		{Request: "vcpus", CPUs: want.Requests[1].CPUs, Results: []cdiResultRecord{{Device: "cpudevnuma000", Consumed: &two}}},
+	}, record.Requests)
 }
 
 // fakeNRIStub stands in for the NRI stub; only Run and Stop are called.

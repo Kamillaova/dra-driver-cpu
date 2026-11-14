@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -170,6 +171,17 @@ func (m *mockCdiMgr) GetDeviceAllocations(claimUID types.UID) (cdiClaimRecord, e
 		return cdiClaimRecord{}, err
 	}
 	return cdiClaimRecord{Requests: []cdiRequestRecord{{CPUs: cpus}}}, nil
+}
+
+func (m *mockCdiMgr) ListClaims() []types.UID {
+	claims := slices.Collect(maps.Keys(m.records))
+	for name := range m.devices {
+		if uid, ok := strings.CutPrefix(name, getCDIDeviceName("")); ok && !strings.Contains(uid, "_") {
+			claims = append(claims, types.UID(uid))
+		}
+	}
+	slices.Sort(claims)
+	return slices.Compact(claims)
 }
 
 func (m *mockCdiMgr) RemoveClaimDevices(_ logr.Logger, claimUID types.UID) error {
@@ -2102,6 +2114,7 @@ func TestPrepareKeepsUpstreamFormOfARestoredClaim(t *testing.T) {
 	driver := newGroupedTestDriver(t)
 	cdi := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"up": cpuset.New(0, 2)})
 	driver.cdiMgr = cdi
+	driver.seedAllocationStoreFromDisk(testr.New(t))
 	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
 	upstreamVariable := []string{"DRA_CPUSET_up=0,2"}
 	_, err := driver.Synchronize(context.Background(), []*api.PodSandbox{pod}, []*api.Container{
