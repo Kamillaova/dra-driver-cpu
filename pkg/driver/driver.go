@@ -130,6 +130,7 @@ type CPUDriver struct {
 	draPlugin               KubeletPlugin
 	nriPlugin               stub.Stub
 	cancelNRI               context.CancelFunc
+	cancelRun               context.CancelCauseFunc
 	podState                *store.PodState
 	allocationState         *store.AllocationState
 	cdiMgr                  cdiManager
@@ -197,6 +198,10 @@ type Config struct {
 	// PublishNodeAllocatableResourceMapping publishes KEP-5517 nodeAllocatableResources mappings in
 	// ResourceSlice devices. Requires the DRANodeAllocatableResources feature gate to be enabled in the cluster.
 	PublishNodeAllocatableResourceMapping bool
+	// CancelRun cancels the context given to Start, which refuses to run
+	// without it. HandleError calls it with a cause wrapping ErrFatal, so that
+	// the caller stops the driver.
+	CancelRun context.CancelCauseFunc
 }
 
 func (cfg Config) DevicesPerResourceSlice() int {
@@ -235,6 +240,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		metrics:                 metricsRecorder,
 		health:                  newHealthTracker(),
 		kubeletRootDir:          config.KubeletRootDir,
+		cancelRun:               config.CancelRun,
 	}
 	topo, err := providers.EnsureCPUInfo().GetCPUTopology(logger)
 	if err != nil {
@@ -342,6 +348,9 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 
 	if err := checkSocketPathFits(cp.kubeletRootDir, cp.driverName); err != nil {
 		return asyncErr, err
+	}
+	if cp.cancelRun == nil {
+		return asyncErr, errors.New("driver Config.CancelRun is not set: HandleError needs it to stop the driver on a fatal error")
 	}
 
 	driverPluginPath := pluginDataDir(cp.kubeletRootDir, cp.driverName)

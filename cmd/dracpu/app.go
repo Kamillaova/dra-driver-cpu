@@ -34,6 +34,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/buildinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/shutdown"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/subcommands"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/driver"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
@@ -210,6 +211,8 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	ctx := ctxlog.NewContext(context.Background(), logger)
 	ctx, stop := signal.NotifyContext(ctx, unix.SIGINT, unix.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 
 	driverConfig := driver.Config{
 		DriverName:                            dracpuapi.DriverName,
@@ -222,6 +225,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 		Allocator:                             cfg.Allocator,
+		CancelRun:                             cancel,
 	}
 	driverProviders := driver.Providers{
 		K8SClient: clientset,
@@ -235,6 +239,12 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 	if err != nil {
 		return fmt.Errorf("driver failed to start: %w", err)
 	}
+	finished := shutdown.Bound(ctx, func() {
+		logger.Error(context.Cause(ctx), "shutdown did not finish in time, exiting", "timeout", shutdown.Timeout)
+		ctxlog.Flush()
+		os.Exit(1)
+	})
+	defer finished()
 	defer dracpu.Stop()
 	ready.Store(true)
 	logger.Info("driver started")
@@ -246,7 +256,11 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		// Restore the default signal behavior as soon as we start exiting, so a
 		// second signal can force termination if graceful cleanup gets stuck.
 		stop()
-		logger.Info("exiting", "reason", "received signal")
+		if cause := context.Cause(ctx); errors.Is(cause, driver.ErrFatal) {
+			fatalErr = cause
+		} else {
+			logger.Info("exiting", "reason", "received signal")
+		}
 	case err := <-asyncErr:
 		stop()
 		fatalErr = fmt.Errorf("NRI driver error: %w", err)

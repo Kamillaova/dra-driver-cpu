@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -405,6 +406,19 @@ func TestStartRefusesARootWithNoRoomForTheSocket(t *testing.T) {
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Unix socket path")
+}
+
+func TestStartRefusesWithoutCancelRun(t *testing.T) {
+	// Not t.TempDir: its path carries the test name and could fail the socket check first.
+	root, err := os.MkdirTemp("", "kubelet")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cp := &CPUDriver{kubeletRootDir: root, driverName: "dra.cpu"}
+
+	_, err = cp.Start(t.Context())
+
+	require.ErrorContains(t, err, "CancelRun")
+	require.NoDirExists(t, pluginDataDir(root, cp.driverName), "Start must refuse before it writes to the node")
 }
 
 // fakeNRIStub stands in for the NRI stub; only Run and Stop are called.

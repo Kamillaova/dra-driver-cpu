@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -424,6 +423,9 @@ func (cp *CPUDriver) unprepareResourceClaim(ctx context.Context, logger logr.Log
 	return nil
 }
 
+// ErrFatal marks the cause with which HandleError cancels the run context.
+var ErrFatal = errors.New("fatal error in the DRA driver")
+
 // HandleError is called by the kubelet plugin framework when an error occurs in the background,
 // for example while publishing ResourceSlices.
 func (cp *CPUDriver) HandleError(ctx context.Context, err error, msg string) {
@@ -432,7 +434,7 @@ func (cp *CPUDriver) HandleError(ctx context.Context, err error, msg string) {
 	// Log the error using the standard Kubernetes error handler
 	runtime.HandleErrorWithContext(ctx, err, msg)
 
-	// For unrecoverable errors, exit immediately with a clear error message.
+	// For unrecoverable errors, shut down and exit with a clear error message.
 	// This fail-fast behavior is intentional for early project maturity to surface
 	// issues quickly rather than silently continuing in a broken state.
 	if !errors.Is(err, kubeletplugin.ErrRecoverable) {
@@ -441,8 +443,7 @@ func (cp *CPUDriver) HandleError(ctx context.Context, err error, msg string) {
 			"node", cp.nodeName,
 			"message", msg,
 		)
-		ctxlog.Flush()
-		os.Exit(1)
+		cp.cancelRun(fmt.Errorf("%w: %s: %w", ErrFatal, msg, err))
 	}
 }
 
