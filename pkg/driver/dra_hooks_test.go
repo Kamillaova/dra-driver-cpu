@@ -2123,6 +2123,106 @@ func TestPrepareKeepsUpstreamFormOfARestoredClaim(t *testing.T) {
 	require.True(t, driver.allocationState.IsOwner("up", "pod-uid", "app"))
 }
 
+// Every refusal for CPUs a prepared claim holds names the claims holding them,
+// from their records, so a device allocated twice or a record the kubelet
+// forgot can be found from the pod's event alone.
+func TestPrepareRefusalNamesTheHolders(t *testing.T) {
+	newDriver := func(infos []cpuinfo.CPUInfo, conf Config) func(t *testing.T) *CPUDriver {
+		return func(t *testing.T) *CPUDriver {
+			conf.DriverName, conf.NodeName = testDriverName, testNodeName
+			d, err := New(testr.New(t), Providers{CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}, SysFS: testSysFS(infos)}, &conf)
+			require.NoError(t, err)
+			return d
+		}
+	}
+	external := func(t *testing.T) *CPUDriver {
+		return createCPUDriverExternalAllocForTest(t, devattr.GROUP_BY_MACHINE, mockCPUInfos_DualSocket_4CPUsPerSocket_HT, nil, cpuset.New(), newMockCdiMgr())
+	}
+	record := func(name string, cpus ...int) store.ClaimRecord {
+		return store.ClaimRecord{Namespace: "ns", Name: name, Requests: []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(cpus...)}}}
+	}
+	boundHolder := func(t *testing.T, d *CPUDriver, cpus ...int) {
+		require.NoError(t, d.allocationState.Reserve(testr.New(t), "held", record("held-claim", cpus...), false))
+		_, err := d.allocationState.Bind(testr.New(t), "pod-uid", "app", []store.ClaimRequestRef{{ClaimUID: "held"}}, nil)
+		require.NoError(t, err)
+	}
+	newClaim := testClaim("new", testDriverName, testNodeName, map[string]int64{"cpudevnuma000": 2})
+	newClaim.Namespace = "ns"
+	oddClaim := testClaim("new", testDriverName, testNodeName, map[string]int64{"cpudevnuma000": 3})
+	oddClaim.Namespace = "ns"
+	const see = `; see "CPUs Held by Another Claim" in the driver's troubleshooting guide`
+	tests := []struct {
+		name    string
+		driver  func(t *testing.T) *CPUDriver
+		holders func(t *testing.T, d *CPUDriver)
+		claim   *resourceapi.ResourceClaim
+		wantErr string
+	}{
+		{
+			name:    "individual mode, a device allocated twice",
+			driver:  newDriver(mockCPUInfos_SingleSocket_4CPUS_HT, Config{}),
+			holders: func(t *testing.T, d *CPUDriver) { boundHolder(t, d, 0) },
+			claim: func() *resourceapi.ResourceClaim {
+				c := individualMetricsClaim("new", "cpudev000")
+				c.Namespace = "ns"
+				return c
+			}(),
+			wantErr: `claim ns/new has overlapping device assignment with other claims: claim ns/held-claim (UID "held") holds CPUs 0, bound to container "app" of pod "pod-uid"` + see,
+		},
+		{
+			name:    "the external allocator, preferred CPUs a claim holds",
+			driver:  external,
+			holders: func(t *testing.T, d *CPUDriver) { boundHolder(t, d, 4) },
+			claim:   testClaimWithOpaqueConfig("new", testDriverName, testNodeName, map[string]int64{devattr.CPUDeviceMachineGrouped: 2}, "4,5"),
+			wantErr: `requested CPUs 4-5 from preferred CPUs conflict with already allocated claims: claim ns/held-claim (UID "held") holds CPUs 4, bound to container "app" of pod "pod-uid"` + see,
+		},
+		{
+			name:   "a NUMA node with fewer free CPUs than the scheduler counts",
+			driver: newDriver(mockCPUInfos_SingleSocket_4CPUS_HT, Config{CPUDeviceMode: devattr.CPU_DEVICE_MODE_GROUPED, CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE}),
+			holders: func(t *testing.T, d *CPUDriver) {
+				require.NoError(t, d.allocationState.Reserve(testr.New(t), "b", record("b-claim", 1, 3), false))
+				d.allocationState.Restore(testr.New(t), "a", store.ClaimRecord{Requests: []store.RequestAllocation{{CPUs: cpuset.New(0)}}})
+			},
+			claim:   newClaim,
+			wantErr: `not enough cpus available to satisfy request: requested=2, available=1: the CPUs the scheduler counts free on device "cpudevnuma000" are held by one of these claims: claim with UID "a" holds CPUs 0, bound to no container; claim ns/b-claim (UID "b") holds CPUs 1,3, bound to no container` + see,
+		},
+		{
+			name:   "a NUMA node with fewer free whole cores than the scheduler counts CPUs",
+			driver: newDriver(mockCPUInfos_DualSocket_4CPUsPerSocket_HT, Config{CPUDeviceMode: devattr.CPU_DEVICE_MODE_GROUPED, CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE, FullPhysicalCPUsOnly: true}),
+			holders: func(t *testing.T, d *CPUDriver) {
+				require.NoError(t, d.allocationState.Reserve(testr.New(t), "a", record("a-claim", 0), false))
+				require.NoError(t, d.allocationState.Reserve(testr.New(t), "b", record("b-claim", 1), false))
+			},
+			claim:   newClaim,
+			wantErr: `not enough whole cores available to satisfy request: requested=2, available in whole cores=0: the CPUs the scheduler counts free on device "cpudevnuma000" are held by one of these claims: claim ns/a-claim (UID "a") holds CPUs 0, bound to no container; claim ns/b-claim (UID "b") holds CPUs 1, bound to no container` + see,
+		},
+		{
+			name:   "a mixed device whose cores of 1 thread are held, as on a healthy node",
+			driver: newDriver(mixedCoreCPUInfos, Config{CPUDeviceMode: devattr.CPU_DEVICE_MODE_GROUPED, CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE, FullPhysicalCPUsOnly: true}),
+			holders: func(t *testing.T, d *CPUDriver) {
+				require.NoError(t, d.allocationState.Reserve(testr.New(t), "b", record("b-claim", 3), false))
+				require.NoError(t, d.allocationState.Reserve(testr.New(t), "a", record("a-claim", 2), false))
+			},
+			claim:   oddClaim,
+			wantErr: `request "new": 3 exclusive CPUs need a free core of 1 thread on device "cpudevnuma000", which has none (2 free cores of 2 threads; fullPhysicalCPUsOnly): claims holding the device's cores of 1 thread: claim ns/a-claim (UID "a") holds CPUs 2, bound to no container; claim ns/b-claim (UID "b") holds CPUs 3, bound to no container` + see,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := tc.driver(t)
+			d.cdiMgr = newMockCdiMgr()
+			d.hasSynchronized = true
+			tc.holders(t, d)
+
+			results, err := d.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{tc.claim})
+			require.NoError(t, err)
+			require.EqualError(t, results[tc.claim.UID].Err, tc.wantErr)
+			_, recorded := d.allocationState.GetClaimRecord(tc.claim.UID)
+			require.False(t, recorded)
+		})
+	}
+}
+
 func TestPrepareResourceClaimsGroupedModeIgnoresAllocationsFromOtherDrivers(t *testing.T) {
 	prov := Providers{
 		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},

@@ -27,6 +27,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
@@ -230,7 +231,8 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			socketCPUs := topo.CPUDetails.CPUsInSockets(socketID)
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(socketCPUs)
 			logger.V(4).Info("socket CPU availability", "socketID", socketID, "socketCPUs", socketCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.takeCPUsForDevice(logger, alloc, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			cur, err = cp.takeCPUsForDevice(logger, alloc, socketCPUs, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			err = cp.shortageHeldBy(err, alloc.Device, socketCPUs, availableCPUsForDevice, claimCPUCount)
 		case device.GROUP_BY_NUMA_NODE:
 			numaNodeID, ok := cp.topology.NameToNUMANodeID[alloc.Device]
 			if !ok {
@@ -239,7 +241,8 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			numaCPUs := topo.CPUDetails.CPUsInNUMANodes(numaNodeID)
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(numaCPUs)
 			logger.V(4).Info("NUMA node CPU availability", "numaNodeID", numaNodeID, "numaCPUs", numaCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.takeCPUsForDevice(logger, alloc, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			cur, err = cp.takeCPUsForDevice(logger, alloc, numaCPUs, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			err = cp.shortageHeldBy(err, alloc.Device, numaCPUs, availableCPUsForDevice, claimCPUCount)
 		case device.GROUP_BY_UNCORE_CACHE:
 			cacheCPUs, ok := cp.topology.NameToCPUs[alloc.Device]
 			if !ok {
@@ -247,7 +250,8 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			}
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(cacheCPUs)
 			logger.V(4).Info("uncore cache CPU availability", "cacheCPUs", cacheCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.takeCPUsForDevice(logger, alloc, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			cur, err = cp.takeCPUsForDevice(logger, alloc, cacheCPUs, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			err = cp.shortageHeldBy(err, alloc.Device, cacheCPUs, availableCPUsForDevice, claimCPUCount)
 		case device.GROUP_BY_MACHINE:
 			// no mapping needed in machine mode - just one device = the whole machine
 			availableCPUs := topo.CPUDetails.CPUs().Difference(cp.topology.ReservedCPUs)
@@ -260,6 +264,9 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			return kubeletplugin.PrepareResult{Err: err}
 		}
 		if err := cp.cpuAllocator.Validate(cur, assignedCPUs, cp.allocationState.GetPreparedCPUs()); err != nil {
+			if cur.Intersection(assignedCPUs).IsEmpty() {
+				err = heldBy(err, cp.allocationState.Holders(cur))
+			}
 			return kubeletplugin.PrepareResult{Err: err}
 		}
 		assignedCPUs = assignedCPUs.Union(cur)
@@ -339,7 +346,7 @@ func capacityRequest(capacity *resourceapi.CapacityRequirements, driverName stri
 // takeCPUsForDevice takes whole cores of either size under fullPhysicalCPUsOnly
 // on a device whose cores have two threads or differ, and leaves every other
 // take to the configured allocator.
-func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, alloc resourceapi.DeviceRequestAllocationResult, available, preferred cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
+func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, alloc resourceapi.DeviceRequestAllocationResult, deviceCPUs, available, preferred cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
 	threads, ok := cp.topology.threadsPerCore[alloc.Device]
 	if !cp.wholeCorePicker || !ok || threads == 1 {
 		return cp.cpuAllocator.Allocate(logger, available, preferred, numCPUs)
@@ -347,10 +354,49 @@ func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, alloc resourceapi.Dev
 	cpus, err := coreselect.TakeWholeCores(cp.topology.CPUTopology, available, numCPUs)
 	var noSingle *coreselect.NoFreeSingleThreadCoreError
 	if errors.As(err, &noSingle) {
-		return cpuset.New(), fmt.Errorf("request %q: %d exclusive CPUs need a free core of 1 thread on device %q, which has none (%d free cores of 2 threads; fullPhysicalCPUsOnly)",
+		err = fmt.Errorf("request %q: %d exclusive CPUs need a free core of 1 thread on device %q, which has none (%d free cores of 2 threads; fullPhysicalCPUsOnly)",
 			alloc.Request, noSingle.CPUs, alloc.Device, noSingle.FreeTwoThreadCores)
+		if holders := cp.allocationState.Holders(singleThreadCPUs(cp.topology.CPUTopology.CPUDetails, deviceCPUs)); len(holders) > 0 {
+			err = fmt.Errorf("%w: claims holding the device's cores of 1 thread: %s", err, holders)
+		}
+		return cpuset.New(), err
 	}
 	return cpus, err
+}
+
+func singleThreadCPUs(details cpuinfo.CPUDetails, cpus cpuset.CPUSet) cpuset.CPUSet {
+	var single []int
+	for _, cpu := range cpus.List() {
+		if details.SiblingsOf(cpu).Size() == 1 {
+			single = append(single, cpu)
+		}
+	}
+	return cpuset.New(single...)
+}
+
+// heldBy adds to a refusal the prepared claims holding the CPUs it refused.
+func heldBy(err error, holders store.ClaimHolders) error {
+	if len(holders) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, holders)
+}
+
+// shortageHeldBy adds to a device's shortage the prepared claims holding CPUs
+// of the device. On a healthy node the scheduler leaves free the CPUs a request
+// asks of a device, so in a shortage one of these claims holds CPUs the
+// scheduler counts free: a claim the kubelet no longer prepares, or a device
+// allocated twice.
+func (cp *CPUDriver) shortageHeldBy(err error, deviceName string, deviceCPUs, available cpuset.CPUSet, numCPUs int) error {
+	var wholeCores *coreselect.NotEnoughWholeCoresError
+	if err == nil || (available.Size() >= numCPUs && !errors.As(err, &wholeCores)) {
+		return err
+	}
+	holders := cp.allocationState.Holders(deviceCPUs)
+	if len(holders) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w: the CPUs the scheduler counts free on device %q are held by one of these claims: %s", err, deviceName, holders)
 }
 
 var errNRIDisconnected = errors.New("NRI connection to the container runtime is down; retry preparation")
@@ -426,7 +472,7 @@ func (cp *CPUDriver) prepareIndividualResourceClaimLocked(logger logr.Logger, cl
 	allocatableCPUs := cp.allocationState.GetSharedCPUs()
 	if !claimCPUSet.IsSubsetOf(allocatableCPUs) {
 		return kubeletplugin.PrepareResult{
-			Err: fmt.Errorf("claim %s/%s has overlapping device assignment with other claims", claim.Namespace, claim.Name),
+			Err: heldBy(fmt.Errorf("claim %s/%s has overlapping device assignment with other claims", claim.Namespace, claim.Name), cp.allocationState.Holders(claimCPUSet)),
 		}
 	}
 
