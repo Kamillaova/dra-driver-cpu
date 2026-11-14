@@ -123,6 +123,16 @@ var _ = ginkgo.Describe("Resource Attributes", ginkgo.Ordered, ginkgo.ContinueOn
 					{device.AttributeSMTEnabled, isBool},
 					{device.AttributeNumCPUs, isInt},
 				}
+			case device.GROUP_BY_UNCORE_CACHE:
+				checks = []attrCheck{
+					// DRA standard attributes first
+					{deviceattribute.StandardDeviceAttributeNUMANode, isInt},
+					// Driver specific attributes next
+					{device.AttributeSocketID, isInt},
+					{device.AttributeCacheL3ID, isInt},
+					{device.AttributeSMTEnabled, isBool},
+					{device.AttributeNumCPUs, isInt},
+				}
 			default:
 				ginkgo.Fail("unknown CPU device group-by configuration: " + groupBy)
 			}

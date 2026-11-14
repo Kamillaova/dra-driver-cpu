@@ -19,6 +19,7 @@ limitations under the License.
 package driverconfig_test
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
@@ -506,6 +507,34 @@ groupBy: garbage
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid groupBy")
 	assert.Contains(t, err.Error(), "garbage")
+}
+
+// TestResolve_GroupByUncoreCache: a config file may group CPUs by uncore
+// cache, and the generated schema accepts the value too.
+func TestResolve_GroupByUncoreCache(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeFile(t, dir, "config.yaml", `
+apiVersion: v1alpha1
+groupBy: uncorecache
+`)
+
+	result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+		driverconfig.FromFile(cfgFile),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, device.GROUP_BY_UNCORE_CACHE, result.GroupBy)
+
+	raw, err := driverconfig.GenerateDriverConfigSchema()
+	require.NoError(t, err)
+	var schema struct {
+		Properties struct {
+			GroupBy struct {
+				Enum []string `json:"enum"`
+			} `json:"groupBy"`
+		} `json:"properties"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &schema))
+	assert.Equal(t, []string{"numanode", "socket", "machine", "uncorecache"}, schema.Properties.GroupBy.Enum)
 }
 
 // TestResolve_ExcludedFieldInFileIsError: excluded and removed fields aren't

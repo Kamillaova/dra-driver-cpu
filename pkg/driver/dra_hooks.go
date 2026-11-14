@@ -215,6 +215,14 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(numaCPUs)
 			logger.V(4).Info("NUMA node CPU availability", "numaNodeID", numaNodeID, "numaCPUs", numaCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
 			cur, err = cp.takeCPUsForDevice(logger, alloc, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+		case device.GROUP_BY_UNCORE_CACHE:
+			cacheCPUs, ok := cp.topology.NameToCPUs[alloc.Device]
+			if !ok {
+				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no valid uncore cache found for device %s", alloc.Device)}
+			}
+			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(cacheCPUs)
+			logger.V(4).Info("uncore cache CPU availability", "cacheCPUs", cacheCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
+			cur, err = cp.takeCPUsForDevice(logger, alloc, availableCPUsForDevice, preferredCPUs, claimCPUCount)
 		case device.GROUP_BY_MACHINE:
 			// no mapping needed in machine mode - just one device = the whole machine
 			availableCPUs := topo.CPUDetails.CPUs().Difference(cp.topology.ReservedCPUs)

@@ -68,6 +68,28 @@ func TestValidate(t *testing.T) {
 		},
 		expectedErr: false,
 	}, {
+		name: "valid: groupBy uncorecache",
+		conf: Config{
+			KubeletRootDir: "/var/lib/kubelet",
+			QPS:            20,
+			Burst:          50,
+			CPUDeviceMode:  "grouped",
+			GroupBy:        "uncorecache",
+			Allocator:      "cpumanager",
+		},
+		expectedErr: false,
+	}, {
+		name: "error: unknown groupBy",
+		conf: Config{
+			KubeletRootDir: "/var/lib/kubelet",
+			QPS:            20,
+			Burst:          50,
+			CPUDeviceMode:  "grouped",
+			GroupBy:        "core",
+			Allocator:      "cpumanager",
+		},
+		expectedErr: true,
+	}, {
 		name: "valid: allocator: external",
 		conf: Config{
 			KubeletRootDir: "/var/lib/kubelet",
