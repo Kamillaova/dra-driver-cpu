@@ -52,6 +52,10 @@ const (
 	AttributeAllocatedNumCPUs resourceapi.QualifiedName = "dra.cpu/allocatedNumCPUs"
 	AttributeCPUIDs           resourceapi.QualifiedName = "dra.cpu/cpuIDs"
 	AttributeSMTLayout        resourceapi.QualifiedName = "dra.cpu/smtLayout"
+	// AttributeFullPhysicalCPUsOnly and AttributeAllocator are the driver
+	// settings of the same names, published on every device.
+	AttributeFullPhysicalCPUsOnly resourceapi.QualifiedName = "dra.cpu/fullPhysicalCPUsOnly"
+	AttributeAllocator            resourceapi.QualifiedName = "dra.cpu/allocator"
 )
 
 // addCompatibilityAttributes add attributes to enable compatibility (e.g. alignment) with other
@@ -60,4 +64,14 @@ const (
 func addCompatibilityAttributes(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, numaID int64) {
 	attrs["dra.net/numaNode"] = resourceapi.DeviceAttribute{IntValue: new(numaID)}
 	attrs["dra.cpu/numaNodeID"] = resourceapi.DeviceAttribute{IntValue: new(numaID)}
+}
+
+// addSettingAttributes publishes the settings Prepare checks a claim against,
+// so that a claim's selector can keep it off a node whose Prepare would refuse
+// it after the scheduler placed it there.
+func addSettingAttributes(devices []resourceapi.Device, fullPhysicalCPUsOnly bool, allocator string) {
+	for _, dev := range devices {
+		dev.Attributes[AttributeFullPhysicalCPUsOnly] = resourceapi.DeviceAttribute{BoolValue: new(fullPhysicalCPUsOnly)}
+		dev.Attributes[AttributeAllocator] = resourceapi.DeviceAttribute{StringValue: new(allocator)}
+	}
 }
