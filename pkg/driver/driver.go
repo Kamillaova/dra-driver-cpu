@@ -42,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	drametadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
 	drametadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -147,6 +148,8 @@ type CPUDriver struct {
 	pcieRootMapper          *store.PCIeRootMapper
 	devicesPerResourceSlice int
 	metrics                 Recorder
+	eventBroadcaster        record.EventBroadcaster
+	eventRecorder           record.EventRecorder
 	health                  healthTracker
 	watchdog                watchdog
 	kubeletRootDir          string
@@ -440,6 +443,8 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, err
 	}
 
+	cp.eventBroadcaster, cp.eventRecorder = newEventRecorder(ctx, cp.kubeClient, cp.driverName, cp.nodeName)
+
 	// register the NRI plugin
 	nriOpts := []stub.Option{
 		stub.WithPluginName(cp.driverName),
@@ -485,6 +490,7 @@ func (cp *CPUDriver) startNRIPlugin(ctx context.Context, asyncErr chan<- error) 
 // Stop stops the CPUDriver.
 func (cp *CPUDriver) Stop() {
 	cp.health.Stop()
+	cp.eventBroadcaster.Shutdown()
 	cp.draPlugin.Stop()
 	cp.cancelNRI()
 	cp.nriPlugin.Stop()
