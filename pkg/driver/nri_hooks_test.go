@@ -633,13 +633,12 @@ func TestNRISynchronize(t *testing.T) {
 	pod2 := &api.PodSandbox{Id: "pod-id-2", Name: "my-pod-2", Namespace: "my-ns", Uid: "pod-uid-2"}
 
 	testCases := []struct {
-		name                 string
-		driver               *CPUDriver
-		runtimePods          []*api.PodSandbox
-		runtimeCtrs          []*api.Container
-		expectedUpdates      []*api.ContainerUpdate
-		expectedError        string
-		expectedRefreshCalls int
+		name            string
+		driver          *CPUDriver
+		runtimePods     []*api.PodSandbox
+		runtimeCtrs     []*api.Container
+		expectedUpdates []*api.ContainerUpdate
+		expectedError   string
 	}{
 		{
 			name: "empty runtime state clears the store",
@@ -689,7 +688,6 @@ func TestNRISynchronize(t *testing.T) {
 					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "2-7"}}},
 				},
 			},
-			expectedRefreshCalls: 1,
 		},
 		{
 			name: "only shared containers",
@@ -738,7 +736,6 @@ func TestNRISynchronize(t *testing.T) {
 					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: allCPUs.String()}}},
 				},
 			},
-			expectedRefreshCalls: 1,
 		},
 		{
 			name: "only guaranteed containers",
@@ -767,7 +764,6 @@ func TestNRISynchronize(t *testing.T) {
 					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "2-3"}}},
 				},
 			},
-			expectedRefreshCalls: 1,
 		},
 		{
 			name: "container with multiple claims",
@@ -791,7 +787,6 @@ func TestNRISynchronize(t *testing.T) {
 					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-3"}}},
 				},
 			},
-			expectedRefreshCalls: 1,
 		},
 		{
 			name: "malformed DRA env does not prevent other containers from synchronizing",
@@ -815,7 +810,6 @@ func TestNRISynchronize(t *testing.T) {
 					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1"}}},
 				},
 			},
-			expectedRefreshCalls: 1,
 		},
 		{
 			name: "CDI cache refresh error does not prevent valid claims from synchronizing",
@@ -843,7 +837,6 @@ func TestNRISynchronize(t *testing.T) {
 					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-3"}}},
 				},
 			},
-			expectedRefreshCalls: 1,
 		},
 		{
 			name: "invalid claim does not prevent other containers from synchronizing",
@@ -871,7 +864,6 @@ func TestNRISynchronize(t *testing.T) {
 					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1,4-7"}}},
 				},
 			},
-			expectedRefreshCalls: 1,
 		},
 		{
 			name: "runtime DRA env that mismatches driver-owned CDI spec gets none of the claim's CPUs",
@@ -894,14 +886,16 @@ func TestNRISynchronize(t *testing.T) {
 					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1,4-7"}}},
 				},
 			},
-			expectedRefreshCalls: 1,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Start seeds the store from the CDI specs, and Synchronize reads none.
+			tc.driver.seedAllocationStoreFromDisk(testr.New(t))
+			seeded := tc.driver.cdiMgr.(*mockCdiMgr).refreshCalls
 			updates, err := tc.driver.Synchronize(context.Background(), tc.runtimePods, tc.runtimeCtrs)
-			require.Equal(t, tc.expectedRefreshCalls, tc.driver.cdiMgr.(*mockCdiMgr).refreshCalls)
+			require.Equal(t, seeded, tc.driver.cdiMgr.(*mockCdiMgr).refreshCalls)
 
 			if tc.expectedError != "" {
 				require.Error(t, err)
