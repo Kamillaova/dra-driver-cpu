@@ -1,0 +1,71 @@
+# Copyright The Kubernetes Authors.
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+{{- if .Values.rbac.create }}
+---
+# The driver's service account writes events from every node, and RBAC cannot
+# tell one node's events from another's. A core v1 update leaves an event's
+# source open to change, so an update is judged by its old source too.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-cpu.fullname" . }}-events
+  labels:
+    {{- include "dra-driver-cpu.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["events"]
+  matchConditions:
+    - name: driver-service-account
+      expression: >-
+        request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:{{ include "dra-driver-cpu.fullname" . }}"
+  variables:
+    - name: nodeName
+      expression: >-
+        request.userInfo.?extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
+    - name: sourceHost
+      expression: >-
+        object.?source.?host.orValue('')
+    - name: oldSourceHost
+      expression: >-
+        oldObject.?source.?host.orValue('')
+  validations:
+    - expression: variables.nodeName != ''
+      message: >-
+        the driver's service account token names no node: run the driver in a pod, with the
+        token the kubelet mounts into it
+    - expression: variables.sourceHost == variables.nodeName
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may write only events whose source
+        host is its node, not '" + variables.sourceHost + "'"
+    - expression: >-
+        request.operation != 'UPDATE' || variables.oldSourceHost == variables.nodeName
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may update only events whose source
+        host is its node, not '" + variables.oldSourceHost + "'"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-cpu.fullname" . }}-events
+  labels:
+    {{- include "dra-driver-cpu.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-cpu.fullname" . }}-events
+  validationActions: [Deny]
+{{- end }}
