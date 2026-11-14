@@ -99,12 +99,6 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 		}
 	}
 
-	// A process that has synchronized keeps its own records, which only
-	// Unprepare removes. A fresh one has none yet: it restores the claims the
-	// containers name from the CDI specs the driver wrote, never from their env.
-	if !cp.hasSynchronized {
-		cp.restoreNamedClaims(logger, allocationState, listed)
-	}
 	for _, sc := range listed {
 		sc.recordClaims(allocationState)
 	}
@@ -277,32 +271,6 @@ func parseDRAEnvToClaimAllocations(logger logr.Logger, envs []string) (map[types
 	}
 
 	return allocations, nil
-}
-
-func (cp *CPUDriver) restoreNamedClaims(logger logr.Logger, allocations *store.AllocationState, listed []*syncContainer) {
-	named := sets.New[types.UID]()
-	for _, sc := range listed {
-		named.Insert(slices.Collect(maps.Keys(sc.claims))...)
-	}
-	if named.Len() == 0 {
-		return
-	}
-	if err := cp.cdiMgr.Refresh(); err != nil {
-		logger.Error(err, "failed to refresh CDI cache, continuing with available CDI devices")
-	}
-	for _, uid := range sets.List(named) {
-		caLogger := logger.WithValues("claimUID", uid)
-		record, err := cp.cdiMgr.GetDeviceAllocations(uid)
-		if errors.Is(err, errNoClaimSpec) {
-			caLogger.V(2).Info("not restoring claim without a CDI spec from this driver", "err", err)
-			continue
-		}
-		if err != nil {
-			caLogger.Error(err, "not restoring claim with an unusable CDI spec")
-			continue
-		}
-		allocations.Restore(caLogger, uid, record.storeRecord())
-	}
 }
 
 func cdiSpecCPUs(logger logr.Logger, uid types.UID, envs []string) (cpuset.CPUSet, error) {
