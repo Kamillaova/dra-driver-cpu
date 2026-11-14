@@ -130,6 +130,72 @@ After editing the config, restart containerd:
 systemctl restart containerd
 ```
 
+### Requiring the driver's NRI plugin
+
+While the driver is not connected to NRI, for example while its pod restarts, containerd creates
+containers without it, so they are not pinned to the CPUs of their claims. containerd's NRI
+default validator can refuse those containers instead, on a whole node or only for the pods that
+hold `dra.cpu` claims. The driver connects to NRI as `dra.cpu`.
+
+#### Every container on the node
+
+Enable the default validator with the driver as a required plugin, and name an annotation, any
+key you choose, that lets a pod start without it:
+
+```toml
+[plugins."io.containerd.nri.v1.nri".default_validator]
+  enable = true
+  required_plugins = ["dra.cpu"]
+  tolerate_missing_plugins_annotation = "example.com/tolerate-missing-nri-plugins"
+```
+
+While no driver is connected, containerd then refuses every container on the node that does not
+carry that annotation set to `true`, the driver's own included. Set it on the driver pod through
+the chart's `podAnnotations`:
+
+```yaml
+podAnnotations:
+  example.com/tolerate-missing-nri-plugins: "true"
+```
+
+Set it on the control plane's static pods too, or leave the validator off on control-plane nodes.
+The containerd configuration and the static pod manifests belong to the node's provisioning, not
+to the chart. Every other container on the node is refused until the driver connects.
+
+#### Only the pods that hold claims
+
+Enable the default validator without required plugins:
+
+```toml
+[plugins."io.containerd.nri.v1.nri".default_validator]
+  enable = true
+```
+
+and annotate each pod that holds a `dra.cpu` claim:
+
+```yaml
+metadata:
+  annotations:
+    required-plugins.noderesource.dev: '["dra.cpu"]'
+```
+
+containerd then refuses only those pods' containers while the driver is not connected. A pod
+without the annotation is not guarded. Static pods cannot hold claims, so they never wait for the
+driver.
+
+#### Limits of the check
+
+- containerd checks a container when it creates it, never when it starts it.
+- containerd counts the driver present before it calls it. So the first container created after
+  the driver's connection breaks is not refused, and neither is one whose creation the driver
+  does not answer within `plugin_request_timeout` (2 seconds unless set): containerd closes the
+  connection and creates the container without the driver.
+
+Without either setting, the driver refuses to prepare claims while it is not connected to NRI,
+and the kubelet retries the preparation later. The kubelet prepares a pod's claims only when it
+creates the pod's sandbox, so this guards a pod's first start, not a container that restarts in
+a running pod.
+
 ## Security considerations
 
 The driver needs node-level privileges: `hostNetwork: true`, and hostPath mounts for the NRI
