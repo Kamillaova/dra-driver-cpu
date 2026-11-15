@@ -247,6 +247,9 @@
             "external"
           ]
         },
+        "allowFractionalCapacityRequests": {
+          "type": "boolean"
+        },
         "apiVersion": {
           "type": "string",
           "enum": [
