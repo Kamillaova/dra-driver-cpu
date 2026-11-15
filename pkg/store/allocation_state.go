@@ -535,6 +535,20 @@ func (s *AllocationState) GetRequestAllocationUnion(refs ...ClaimRequestRef) (cp
 	return union, nil
 }
 
+// HoldsExclusiveCPUsOf reports whether the referenced request, or the whole
+// claim where Request is empty, holds CPUs that no other claim and no shared
+// container may run on.
+func (s *AllocationState) HoldsExclusiveCPUsOf(ref ClaimRequestRef) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	allocation, ok := s.resourceClaimAllocations[ref.ClaimUID]
+	if !ok {
+		return false
+	}
+	cpus, ok := allocation.cpusOf(ref.Request)
+	return ok && !cpus.IsEmpty()
+}
+
 // Holders returns the prepared claims holding any of cpus, from their records,
 // with no API call.
 func (s *AllocationState) Holders(cpus cpuset.CPUSet) ClaimHolders {
