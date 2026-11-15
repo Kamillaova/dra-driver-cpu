@@ -20,7 +20,8 @@ limitations under the License.
 // name the driver registers under has to come from the Node object, not the
 // kernel hostname, or ResourceSlice publishing fails to find the node owner.
 // It also judges a whole rendered chart for the admission policies that keep the
-// driver's service account to its own node's objects, and the verbs they confine.
+// driver's service account to its own node's objects, and the verbs they confine,
+// or for the DeviceClasses it renders.
 // Rendering and the expected values come from hack/ci/helm-render-check.sh.
 package render
 
@@ -44,6 +45,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 )
@@ -58,6 +60,7 @@ const (
 	nodeNameFieldPath = "spec.nodeName"
 	overrideFlag      = "--hostname-override"
 	overrideFlagShort = "-hostname-override"
+	defaultClass      = "dra.cpu"
 )
 
 var (
@@ -71,6 +74,8 @@ var (
 	expectPolicy  = flag.Bool("expect-admission-policies", true, "whether the chart should render the admission policies and the ClusterRole")
 	releaseNS     = flag.String("release-namespace", "", "the namespace the chart was rendered for")
 	chartFullname = flag.String("fullname", "", "the name the chart gives the release's objects")
+	checkClasses  = flag.Bool("check-device-classes", false, "whether to judge the DeviceClasses the chart renders")
+	wantClasses   = flag.String("expected-device-classes", "", "the DeviceClass names the chart must render, comma-separated in name order")
 )
 
 // validated says the checks below ran to the end. `go test -run` exits 0 when
@@ -369,7 +374,7 @@ func checkUpdateStrategy(ds *appsv1.DaemonSet, want string) error {
 	return fmt.Errorf("updateStrategy = %s, want %s", got, want)
 }
 
-// TestRenderedChart judges the admission policies. Their CEL is the API
+// TestRenderedChart judges the admission policies, or the DeviceClasses. Their CEL is the API
 // server's to check; this pins what helm decides: whether the policies, their
 // bindings and the verbs they confine render at all, and which account and
 // objects they name.
@@ -381,10 +386,49 @@ func TestRenderedChart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := checkAdmissionPolicies(docs, *expectPolicy, *releaseNS, *chartFullname); err != nil {
+	if *checkClasses {
+		if err := checkDeviceClasses(docs, *wantClasses); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := checkAdmissionPolicies(docs, *expectPolicy, *releaseNS, *chartFullname); err != nil {
 		t.Fatal(err)
 	}
 	chartValidated = true
+}
+
+// checkDeviceClasses pins each class's selector: dra.cpu matches a device of
+// the partition "default" or one without the partition attribute, as an
+// upstream driver publishes it, and dra.cpu.<name> matches <name> alone. has()
+// keeps either from failing on a device without the attribute.
+func checkDeviceClasses(docs []document, want string) error {
+	classes, err := decodeAll[resourceapi.DeviceClass](docs, resourceapi.SchemeGroupVersion.String(), "DeviceClass")
+	if err != nil {
+		return err
+	}
+	var names []string
+	for _, class := range classes {
+		names = append(names, class.Name)
+	}
+	var wantNames []string
+	if want != "" {
+		wantNames = strings.Split(want, ",")
+	}
+	if !slices.Equal(names, wantNames) {
+		return fmt.Errorf("DeviceClasses %q, want %q", names, wantNames)
+	}
+	for _, class := range classes {
+		wantExpression := `device.driver == "dra.cpu" && (!has(device.attributes["dra.cpu"].partition) || device.attributes["dra.cpu"].partition == "default")`
+		if partition, named := strings.CutPrefix(class.Name, defaultClass+"."); named {
+			wantExpression = `device.driver == "dra.cpu" && has(device.attributes["dra.cpu"].partition) && device.attributes["dra.cpu"].partition == "` + partition + `"`
+		}
+		if len(class.Spec.Selectors) != 1 || class.Spec.Selectors[0].CEL == nil {
+			return fmt.Errorf("DeviceClass %s has %d selectors, want one CEL selector", class.Name, len(class.Spec.Selectors))
+		}
+		if got := class.Spec.Selectors[0].CEL.Expression; got != wantExpression {
+			return fmt.Errorf("DeviceClass %s selects %s, want %s", class.Name, got, wantExpression)
+		}
+	}
+	return nil
 }
 
 type document struct {
