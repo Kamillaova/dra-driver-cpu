@@ -217,6 +217,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		ExposePCIeRoots:                       cfg.ExposePCIeRoots,
 		PublishNodeAllocatableResourceMapping: cfg.PublishNodeAllocatableResourceMapping,
 		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
+		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 		Allocator:                             cfg.Allocator,

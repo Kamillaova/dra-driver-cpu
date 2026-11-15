@@ -743,9 +743,7 @@ func (cp *CPUDriver) unprepareResourceClaim(ctx context.Context, logger logr.Log
 	}
 	cp.allocationState.Release(logger, claim.UID)
 	cp.refreshAllocationMetrics()
-	// TODO(#279): Update existing shared containers here once all supported runtimes can
-	// safely process unsolicited NRI UpdateContainers calls. Until then, each container
-	// picks up the expanded cpuset on its next CreateContainer or Synchronize.
+	cp.requestReconcile()
 	return nil
 }
 
