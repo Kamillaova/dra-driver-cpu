@@ -444,6 +444,103 @@ func TestCreateContainerPinsToTheRequestsItNames(t *testing.T) {
 	}
 }
 
+func TestReportsCDIDevices(t *testing.T) {
+	tests := []struct {
+		name, runtime, version string
+		want                   bool
+	}{
+		{name: "containerd's Makefile build", runtime: "containerd", version: "v2.4.0", want: true},
+		{name: "a distribution's build", runtime: "containerd", version: "2.4.0", want: true},
+		{name: "a build that sets no version", runtime: "containerd", version: "2.4.0+unknown", want: true},
+		{name: "a build of a patched tree", runtime: "containerd", version: "v2.4.0-3-g1a2b3c4d", want: true},
+		{name: "a build of a dirty tree", runtime: "containerd", version: "v2.4.0.m", want: true},
+		{name: "the first release that reports them", runtime: "containerd", version: "v2.3.0", want: true},
+		{name: "a build of a patched 2.3.0", runtime: "containerd", version: "v2.3.0-3-g1a2b3c4d", want: true},
+		{name: "a later major release", runtime: "containerd", version: "3.0.0", want: true},
+		{name: "a pre-release of 2.3.0", runtime: "containerd", version: "v2.3.0-rc.1", want: false},
+		{name: "a version below 2.3.0", runtime: "containerd", version: "v2.2.7", want: false},
+		{name: "a version that does not parse", runtime: "containerd", version: "devel", want: false},
+		{name: "no version", runtime: "containerd", version: "", want: false},
+		{name: "CRI-O", runtime: "cri-o", version: "1.37.3", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, reportsCDIDevices(tc.runtime, tc.version))
+		})
+	}
+}
+
+func TestCreateContainerChecksInjectedDevices(t *testing.T) {
+	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "ns"}
+	devices := func(names ...string) []*api.CDIDevice {
+		var list []*api.CDIDevice
+		for _, name := range names {
+			list = append(list, &api.CDIDevice{Name: "dra.k8s.io/cpu=" + name})
+		}
+		return list
+	}
+	perRequest := []string{fmt.Sprintf("%s_vm_vcpus=%s", cdiEnvVarPrefix, cdiEnvDynamicValue)}
+	upstreamForm := []string{fmt.Sprintf("%s_old=1", cdiEnvVarPrefix)}
+	const forged = `cannot bind claim to container "app" in pod "pod": the runtime did not inject its CDI device into the container: container "app" names request "vcpus" of claim "vm-claim" in DRA_CPUSET_vm_vcpus, and dra.k8s.io/cpu=claim-vm_vcpus is not among its devices; reference the claim in the pod's resourceClaims and the request in the container's resources.claims, and set no DRA_CPUSET_* variable`
+	tests := []struct {
+		name, runtime, version string
+		env                    []string
+		devices                []*api.CDIDevice
+		wantErr                string
+	}{
+		{name: "the request's device injected", runtime: "containerd", version: "v2.4.0", env: perRequest, devices: devices("claim-vm_vcpus")},
+		{name: "a forged variable", runtime: "containerd", version: "v2.4.0", env: perRequest, devices: devices("claim-other_vcpus"), wantErr: forged},
+		{name: "no device at all", runtime: "containerd", version: "v2.4.0", env: perRequest, wantErr: forged},
+		{name: "upstream's variable with upstream's device", runtime: "containerd", version: "v2.4.0", env: upstreamForm, devices: devices("claim-old")},
+		{
+			name: "upstream's variable without upstream's device", runtime: "containerd", version: "v2.4.0", env: upstreamForm, devices: devices("claim-vm_vcpus"),
+			wantErr: `cannot bind claim to container "app" in pod "pod": the runtime did not inject its CDI device into the container: container "app" names claim "old" in DRA_CPUSET_old, and dra.k8s.io/cpu=claim-old is not among its devices; reference the claim in the pod's resourceClaims and the container's resources.claims, and set no DRA_CPUSET_* variable`,
+		},
+		{name: "a build that sets no version", runtime: "containerd", version: "2.4.0+unknown", env: perRequest, wantErr: forged},
+		{name: "a distribution's build", runtime: "containerd", version: "2.4.0", env: perRequest, wantErr: forged},
+		{name: "a build of a patched tree", runtime: "containerd", version: "v2.4.0-3-g1a2b3c4d", env: perRequest, wantErr: forged},
+		{name: "a build of a dirty tree", runtime: "containerd", version: "v2.4.0.m", env: perRequest, wantErr: forged},
+		{name: "CRI-O skips the check", runtime: "cri-o", version: "1.37.3", env: perRequest},
+		{name: "a version below 2.3.0 skips the check", runtime: "containerd", version: "v2.2.7", env: perRequest},
+		{name: "a version that does not parse skips the check", runtime: "containerd", version: "devel", env: perRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := testr.New(t)
+			var infos []cpuinfo.CPUInfo
+			for cpuID := range 4 {
+				infos = append(infos, cpuinfo.CPUInfo{CpuID: cpuID, CoreID: cpuID, SocketID: 0, NUMANodeID: 0})
+			}
+			topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: infos}).GetCPUTopology(logger)
+			require.NoError(t, err)
+			allocationState := store.NewAllocationState(topo, cpuset.New())
+			require.NoError(t, allocationState.Reserve(logger, "vm", store.ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []store.RequestAllocation{
+				{Request: "vcpus", CPUs: cpuset.New(0)},
+			}}, false))
+			allocationState.Restore(logger, "old", store.ClaimRecord{Requests: []store.RequestAllocation{{CPUs: cpuset.New(1)}}})
+			driver := &CPUDriver{
+				podState:        store.NewPodState(),
+				allocationState: allocationState,
+				metrics:         cpumetrics.Noop(),
+			}
+			events, err := driver.Configure(context.Background(), "", tc.runtime, tc.version)
+			require.NoError(t, err)
+			require.Zero(t, events)
+			ctr := &api.Container{Id: "ctr", PodSandboxId: pod.Id, Name: "app", Env: tc.env, CDIDevices: tc.devices}
+
+			_, _, err = driver.CreateContainer(context.Background(), pod, ctr)
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				require.ErrorIs(t, err, errDeviceNotInjected)
+				require.Nil(t, driver.podState.GetContainerState(types.UID(pod.Uid), ctr.Name), "a refused container is not recorded")
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, driver.podState.GetContainerState(types.UID(pod.Uid), ctr.Name))
+		})
+	}
+}
+
 func TestStopContainer(t *testing.T) {
 	logger := testr.New(t)
 	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
