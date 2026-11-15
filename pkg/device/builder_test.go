@@ -1220,6 +1220,43 @@ func TestBuildSharedDevices(t *testing.T) {
 	}
 }
 
+func TestBuildMapsOnlyTheDefaultEntryWherePartitionsAreUsed(t *testing.T) {
+	topo := coreTopology(true, onNUMANode0, twoThreadCores(4)...)
+	for _, tc := range []struct {
+		name       string
+		declared   []device.Partition
+		wantMapped map[string]bool
+	}{{
+		name: "partitions: the default entry's shared device alone",
+		declared: []device.Partition{
+			{Name: device.DefaultPartitionName},
+			{Name: "infra", Role: device.PARTITION_ROLE_DEFAULT, CPUs: cpuset.New(1, 5)},
+			{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(2, 6)},
+		},
+		wantMapped: map[string]bool{"cpudevcache000": true, "cpudevcache000-infra": false, "cpudevcache000-vms": false},
+	}, {
+		name:       "no partitions: the owned devices, as upstream",
+		wantMapped: map[string]bool{"cpudevcache000": true},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := device.Build(device.BuildInput{
+				Inventory:                             device.Inventory{CPUTopology: topo, ReservedCPUs: cpuset.New()},
+				Layout:                                device.LayoutUncoreCache,
+				PCIeRootMapper:                        store.NewPCIeRootMapper(),
+				PublishNodeAllocatableResourceMapping: true,
+				Partitions:                            device.ResolvePartitions(tc.declared, topo.CPUDetails, cpuset.New()),
+				PartitionsUsed:                        len(tc.declared) > 0,
+			})
+			require.NoError(t, err)
+			got := make(map[string]bool, len(res.Devices))
+			for _, dev := range res.Devices {
+				got[dev.Name] = dev.NodeAllocatableResources != nil
+			}
+			require.Equal(t, tc.wantMapped, got)
+		})
+	}
+}
+
 func TestBuildIndividualDevicesNameTheDefaultPartition(t *testing.T) {
 	res, err := device.Build(device.BuildInput{
 		Inventory:      device.Inventory{CPUTopology: fakeTopology(), ReservedCPUs: cpuset.New(0)},
