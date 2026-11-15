@@ -268,6 +268,33 @@ func TestRunReportsFullPhysicalCPUsOnly(t *testing.T) {
 	}
 }
 
+func TestRunReportsAssumeUnsolicitedUpdatesSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config string
+		want   bool
+	}{
+		{name: "default", config: "groupBy: socket\n", want: false},
+		{name: "from the config file", config: "assumeUnsolicitedUpdatesSafe: true\n", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupFakeHostWithConfig(t, tc.config)
+
+			stdout, err := captureStdout(t, func() error {
+				return gatherinfo.Run([]string{"--stdout"}, gatherinfo.Options{}, logr.Discard())
+			})
+			if err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+
+			report := readReport(t, []byte(stdout))
+			if report.DriverConfig.AssumeUnsolicitedUpdatesSafe != tc.want {
+				t.Fatalf("assumeUnsolicitedUpdatesSafe = %v, want %v", report.DriverConfig.AssumeUnsolicitedUpdatesSafe, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunRejectsStdoutWithOutputDir(t *testing.T) {
 	err := gatherinfo.Run([]string{"--stdout", "--output-dir=/tmp"}, gatherinfo.Options{}, logr.Discard())
 	if err == nil {
