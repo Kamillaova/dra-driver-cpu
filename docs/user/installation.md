@@ -69,8 +69,11 @@ deprecated: profiles replace it. The nodes of one cluster differ only in what a 
 releases that give any other setting different values are not supported.
 
 Besides the driver DaemonSet, the chart installs the cluster-scoped `dra.cpu` `DeviceClass`
-that workload claims reference — verify it with `kubectl get deviceclass`. The DeviceClass
-name is fixed, so a cluster that runs several releases of the chart keeps `deviceClass.create`
+that workload claims reference — verify it with `kubectl get deviceclass`. It selects the
+devices of the default partition. A `cpuPartitions` list, fleet-wide or in any profile, adds
+one `dra.cpu.<name>` `DeviceClass` for each other partition that is not `reserved`, selecting
+that partition's devices alone. The DeviceClass
+names are fixed, so a cluster that runs several releases of the chart keeps `deviceClass.create`
 enabled in only one of them. Give each release its own `nodeSelector` or `affinity`, since
 the default selects every node and a node must run exactly one driver. Do not reuse
 `fullnameOverride` across releases: it replaces the release name in the ClusterRole,
