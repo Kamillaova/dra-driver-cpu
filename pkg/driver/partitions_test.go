@@ -29,6 +29,7 @@ import (
 	"github.com/go-logr/logr/testr"
 	dracpuapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
@@ -39,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/cpuset"
 )
 
@@ -354,6 +356,89 @@ func TestContainersWithoutClaimsRunOnTheDefaultPartition(t *testing.T) {
 			adjust, _, err := d.CreateContainer(ctx, pod, &api.Container{Id: "created", Name: "created", PodSandboxId: pod.Id})
 			require.NoError(t, err)
 			require.Equal(t, tc.want, adjust.GetLinux().GetResources().GetCpu().GetCpus(), "CreateContainer")
+		})
+	}
+}
+
+// On a node whose default partition holds no CPU a container without claims
+// is refused, a claim prepared or not, and a container holding a claim starts.
+func TestCreateContainerRefusesContainersWithoutClaimsWhereNoDefaultCPUIsLeft(t *testing.T) {
+	held := cpuset.New(1, 5)
+	noDefaultCPU := []device.Partition{{Name: device.DefaultPartitionName}, {Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(0, 1, 2, 3, 4, 5)}}
+	refusal := `container "app": no CPU claim, and node "` + testNodeName + `" leaves no CPUs for containers without one; add a claim on an exclusive partition, or run it elsewhere`
+	for _, tc := range []struct {
+		name       string
+		profiled   bool
+		partitions []device.Partition
+		onDisk     map[types.UID]cpuset.CPUSet
+		env        []string
+		wantCPUs   string
+		wantErr    string
+	}{{
+		name:       "no claim prepared",
+		partitions: noDefaultCPU,
+		wantErr:    refusal,
+	}, {
+		name:       "a claim prepared",
+		partitions: noDefaultCPU,
+		onDisk:     map[types.UID]cpuset.CPUSet{"vm": held},
+		wantErr:    refusal,
+	}, {
+		name:       "the node's profile named",
+		profiled:   true,
+		partitions: noDefaultCPU,
+		wantErr:    `container "app": no CPU claim, and node "` + testNodeName + `" (profile "r7625") leaves no CPUs for containers without one; add a claim on an exclusive partition, or run it elsewhere`,
+	}, {
+		name:       "a container holding a claim starts",
+		partitions: noDefaultCPU,
+		onDisk:     map[types.UID]cpuset.CPUSet{"vm": held},
+		env:        []string{fmt.Sprintf("%s_vm=%s", cdiEnvVarPrefix, held)},
+		wantCPUs:   "1,5",
+	}, {
+		name:       "a default partition holding CPUs",
+		partitions: []device.Partition{{Name: device.DefaultPartitionName}, {Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: held}},
+		wantCPUs:   "0,2-4",
+	}, {
+		name:     "no partitions",
+		wantCPUs: "0-5",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			var d *CPUDriver
+			if tc.profiled {
+				client := fake.NewClientset(labelledNode(map[string]string{driverconfig.ProfileLabel: "r7625"}))
+				d = partitionedProfiledDriver(t, client, false, tc.onDisk, tc.partitions...)
+				_, err := d.Synchronize(ctx, nil, nil)
+				require.NoError(t, err)
+				_, err = d.configureFromProfile(ctx, make(chan error))
+				require.NoError(t, err)
+			} else {
+				var err error
+				d, err = New(testr.New(t), Providers{
+					CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+					SysFS:   partitionSysFS(),
+				}, &Config{
+					DriverName:       testDriverName,
+					NodeName:         testNodeName,
+					ReservedCPUs:     cpuset.New(),
+					CPUDeviceMode:    device.CPU_DEVICE_MODE_GROUPED,
+					CPUDeviceGroupBy: device.GROUP_BY_NUMA_NODE,
+					CPUPartitions:    tc.partitions,
+				})
+				require.NoError(t, err)
+				d.cdiMgr = newMockCdiMgrWithAllocations(tc.onDisk)
+				d.seedAllocationStoreFromDisk(testr.New(t))
+			}
+
+			pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "default"}
+			adjust, _, err := d.CreateContainer(ctx, pod, &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: tc.env})
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				require.Empty(t, d.podState.GetContainersWithSharedCPUs(), "a refused container is not tracked")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantCPUs, adjust.GetLinux().GetResources().GetCpu().GetCpus())
 		})
 	}
 }

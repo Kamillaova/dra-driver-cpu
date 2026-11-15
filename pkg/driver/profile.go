@@ -132,6 +132,7 @@ func (cp *CPUDriver) configureFromProfile(ctx context.Context, nriErr <-chan err
 		return nil, err
 	}
 	logger.Info("selected the config profile the node's label names", "label", cp.profileLabel, "profile", name)
+	cp.profileName = name
 	if err := cp.configure(logger, cp.providers, config); err != nil {
 		return nil, fmt.Errorf("driver failed to initialize: %w", err)
 	}
