@@ -202,6 +202,16 @@ The driver needs node-level privileges: `hostNetwork: true`, and hostPath mounts
 socket (`/var/run/nri`), the CDI spec directory (`/var/run/cdi`), and the kubelet plugin
 directories.
 
+## RBAC and admission policies
+
+With `rbac.create: true`, the default, the chart creates the driver's ClusterRole and its
+binding, and one ValidatingAdmissionPolicy and binding for each kind of object the driver's
+service account writes. RBAC cannot keep an account that runs on every node to one node's
+objects, so the policies admit a write of that account only when it stays on the node its token
+names: events whose source host is that node, that Node's status with nothing changed but the
+driver's own conditions, that node's ResourceSlices, and the `dra.cpu` entries in the status of
+a claim allocated on that node.
+
 ## Health probes
 
 The driver's HTTP server listens on `--bind-address`, which the chart sets from `healthzPort`,
@@ -264,10 +274,15 @@ without a driver that pod stays `Terminating`.
    containerd refuses containers once the driver is gone; see
    [Requiring the driver's NRI plugin](#requiring-the-drivers-nri-plugin).
 
-1. If Flux manages the release, suspend its HelmRelease, or Flux installs the chart again. Then
-   uninstall the chart:
+1. If Flux manages the release, suspend its HelmRelease, or Flux installs the chart again.
+
+1. Delete the driver's DaemonSet and wait for its pods to end, then uninstall the chart. A
+   stopping driver writes the conditions it keeps on its Node `Unknown`. `helm uninstall` deletes
+   the DaemonSet and the driver's ClusterRole together and does not wait for the pods, so a
+   driver still stopping would no longer be allowed to:
 
    ```bash
+   kubectl delete daemonset dra-driver-cpu -n kube-system --cascade=foreground --wait
    helm uninstall dra-driver-cpu -n kube-system
    ```
 

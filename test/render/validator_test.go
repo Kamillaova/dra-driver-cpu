@@ -19,8 +19,8 @@ limitations under the License.
 // registers where the kubelet is not watching, which is issue #231. The node
 // name the driver registers under has to come from the Node object, not the
 // kernel hostname, or ResourceSlice publishing fails to find the node owner.
-// It also judges a whole rendered chart for the admission policy that keeps the
-// driver's service account to its own node's events, and the verbs it confines.
+// It also judges a whole rendered chart for the admission policies that keep the
+// driver's service account to its own node's objects, and the verbs they confine.
 // Rendering and the expected values come from hack/ci/helm-render-check.sh.
 package render
 
@@ -32,6 +32,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path"
 	"reflect"
@@ -67,7 +68,7 @@ var (
 	wantStrategy  = flag.String("expected-update-strategy", "{}", "the spec.updateStrategy the chart must render, as JSON; {} for none")
 
 	chart         = flag.String("chart", "", "path to a whole rendered chart")
-	expectPolicy  = flag.Bool("expect-events-policy", true, "whether the chart should render the events admission policy and the ClusterRole")
+	expectPolicy  = flag.Bool("expect-admission-policies", true, "whether the chart should render the admission policies and the ClusterRole")
 	releaseNS     = flag.String("release-namespace", "", "the namespace the chart was rendered for")
 	chartFullname = flag.String("fullname", "", "the name the chart gives the release's objects")
 )
@@ -368,9 +369,9 @@ func checkUpdateStrategy(ds *appsv1.DaemonSet, want string) error {
 	return fmt.Errorf("updateStrategy = %s, want %s", got, want)
 }
 
-// TestRenderedChart judges the events admission policy. Its CEL is the API
-// server's to check; this pins what helm decides: whether the policy, its
-// binding and the verbs they confine render at all, and which account and
+// TestRenderedChart judges the admission policies. Their CEL is the API
+// server's to check; this pins what helm decides: whether the policies, their
+// bindings and the verbs they confine render at all, and which account and
 // objects they name.
 func TestRenderedChart(t *testing.T) {
 	if *chart == "" {
@@ -380,7 +381,7 @@ func TestRenderedChart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := checkEventsPolicy(docs, *expectPolicy, *releaseNS, *chartFullname); err != nil {
+	if err := checkAdmissionPolicies(docs, *expectPolicy, *releaseNS, *chartFullname); err != nil {
 		t.Fatal(err)
 	}
 	chartValidated = true
@@ -442,10 +443,38 @@ func decodeAll[T any](docs []document, apiVersion, kind string) ([]T, error) {
 	return found, nil
 }
 
-// checkEventsPolicy pins the policy to the release's own service account: a
-// policy matching any other account would refuse a kubelet's or a
-// controller's events, and one matching none would confine nothing.
-func checkEventsPolicy(docs []document, want bool, namespace, fullname string) error {
+// admissionPolicies are the policies the chart renders, one per resource the
+// driver's service account writes, by the suffix each adds to the release's name.
+var admissionPolicies = map[string]admissionregistrationv1.RuleWithOperations{
+	"events": {
+		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
+		Rule:       admissionregistrationv1.Rule{APIGroups: []string{""}, APIVersions: []string{"v1"}, Resources: []string{"events"}},
+	},
+	"node-status": {
+		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
+		Rule:       admissionregistrationv1.Rule{APIGroups: []string{""}, APIVersions: []string{"v1"}, Resources: []string{"nodes/status"}},
+	},
+	"resourceslices": {
+		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update, admissionregistrationv1.Delete},
+		Rule:       admissionregistrationv1.Rule{APIGroups: []string{"resource.k8s.io"}, APIVersions: []string{"v1"}, Resources: []string{"resourceslices"}},
+	},
+	"resourceclaim-status": {
+		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
+		Rule:       admissionregistrationv1.Rule{APIGroups: []string{"resource.k8s.io"}, APIVersions: []string{"v1"}, Resources: []string{"resourceclaims/status"}},
+	},
+}
+
+// confinedVerbs are the ClusterRole's grants that only the policies keep to
+// the driver's own node.
+var confinedVerbs = map[string][]string{
+	"events":       {"create", "patch"},
+	"nodes/status": {"patch"},
+}
+
+// checkAdmissionPolicies pins each policy to the release's own service
+// account: a policy matching any other account would refuse a kubelet's or a
+// controller's writes, and one matching none would confine nothing.
+func checkAdmissionPolicies(docs []document, want bool, namespace, fullname string) error {
 	admissionVersion := admissionregistrationv1.SchemeGroupVersion.String()
 	policies, err := decodeAll[admissionregistrationv1.ValidatingAdmissionPolicy](docs, admissionVersion, "ValidatingAdmissionPolicy")
 	if err != nil {
@@ -465,59 +494,66 @@ func checkEventsPolicy(docs []document, want bool, namespace, fullname string) e
 		}
 		return nil
 	}
-	if len(policies) != 1 || len(bindings) != 1 || len(roles) != 1 {
-		return fmt.Errorf("the chart renders %d policies, %d bindings and %d ClusterRoles, want one of each", len(policies), len(bindings), len(roles))
+	if len(policies) != len(admissionPolicies) || len(bindings) != len(admissionPolicies) || len(roles) != 1 {
+		return fmt.Errorf("the chart renders %d policies, %d bindings and %d ClusterRoles, want %d, %d and 1",
+			len(policies), len(bindings), len(roles), len(admissionPolicies), len(admissionPolicies))
 	}
 
 	var errs []error
-	policy, binding, role := policies[0], bindings[0], roles[0]
-	name := fullname + "-events"
-	if policy.Name != name {
-		errs = append(errs, fmt.Errorf("the policy is named %q, want %q", policy.Name, name))
-	}
-	if fp := policy.Spec.FailurePolicy; fp == nil || *fp != admissionregistrationv1.Fail {
-		errs = append(errs, fmt.Errorf("the policy's failurePolicy is not %q", admissionregistrationv1.Fail))
-	}
-	wantRules := []admissionregistrationv1.NamedRuleWithOperations{{
-		RuleWithOperations: admissionregistrationv1.RuleWithOperations{
-			Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
-			Rule: admissionregistrationv1.Rule{
-				APIGroups:   []string{""},
-				APIVersions: []string{"v1"},
-				Resources:   []string{"events"},
-			},
-		},
-	}}
-	if mc := policy.Spec.MatchConstraints; mc == nil || !reflect.DeepEqual(mc.ResourceRules, wantRules) {
-		errs = append(errs, fmt.Errorf("the policy matches %v, want %v", policy.Spec.MatchConstraints, wantRules))
-	}
 	account := fmt.Sprintf(`request.userInfo.username == "system:serviceaccount:%s:%s"`, namespace, fullname)
-	if mcs := policy.Spec.MatchConditions; len(mcs) != 1 || mcs[0].Expression != account {
-		errs = append(errs, fmt.Errorf("the policy's match conditions are %v, want one: %s", mcs, account))
+	byName := make(map[string]admissionregistrationv1.ValidatingAdmissionPolicy, len(policies))
+	for _, p := range policies {
+		byName[p.Name] = p
 	}
-	if len(policy.Spec.Validations) == 0 {
-		errs = append(errs, errors.New("the policy has no validations"))
+	bindingByName := make(map[string]admissionregistrationv1.ValidatingAdmissionPolicyBinding, len(bindings))
+	for _, b := range bindings {
+		bindingByName[b.Name] = b
 	}
-	if binding.Name != name || binding.Spec.PolicyName != policy.Name {
-		errs = append(errs, fmt.Errorf("the binding %q binds policy %q, want %q binding %q", binding.Name, binding.Spec.PolicyName, name, policy.Name))
+	for _, suffix := range slices.Sorted(maps.Keys(admissionPolicies)) {
+		name := fullname + "-" + suffix
+		policy, ok := byName[name]
+		if !ok {
+			errs = append(errs, fmt.Errorf("no policy is named %q", name))
+			continue
+		}
+		if fp := policy.Spec.FailurePolicy; fp == nil || *fp != admissionregistrationv1.Fail {
+			errs = append(errs, fmt.Errorf("policy %q: failurePolicy is not %q", name, admissionregistrationv1.Fail))
+		}
+		wantRules := []admissionregistrationv1.NamedRuleWithOperations{{RuleWithOperations: admissionPolicies[suffix]}}
+		if mc := policy.Spec.MatchConstraints; mc == nil || !reflect.DeepEqual(mc.ResourceRules, wantRules) {
+			errs = append(errs, fmt.Errorf("policy %q matches %v, want %v", name, policy.Spec.MatchConstraints, wantRules))
+		}
+		if mcs := policy.Spec.MatchConditions; len(mcs) != 1 || mcs[0].Expression != account {
+			errs = append(errs, fmt.Errorf("policy %q: match conditions are %v, want one: %s", name, mcs, account))
+		}
+		if len(policy.Spec.Validations) == 0 {
+			errs = append(errs, fmt.Errorf("policy %q has no validations", name))
+		}
+		binding, ok := bindingByName[name]
+		if !ok || binding.Spec.PolicyName != name {
+			errs = append(errs, fmt.Errorf("no binding %q binds policy %q", name, name))
+		} else if !reflect.DeepEqual(binding.Spec.ValidationActions, []admissionregistrationv1.ValidationAction{admissionregistrationv1.Deny}) {
+			errs = append(errs, fmt.Errorf("binding %q: validationActions are %v, want [Deny]", name, binding.Spec.ValidationActions))
+		}
 	}
-	if !reflect.DeepEqual(binding.Spec.ValidationActions, []admissionregistrationv1.ValidationAction{admissionregistrationv1.Deny}) {
-		errs = append(errs, fmt.Errorf("the binding's validationActions are %v, want [Deny]", binding.Spec.ValidationActions))
-	}
+
+	role := roles[0]
 	if role.Name != fullname {
 		errs = append(errs, fmt.Errorf("the ClusterRole is named %q, want %q", role.Name, fullname))
 	}
-	var eventVerbs [][]string
-	for _, rule := range role.Rules {
-		if slices.Contains(rule.Resources, "events") {
-			eventVerbs = append(eventVerbs, rule.Verbs)
-			if !reflect.DeepEqual(rule.APIGroups, []string{""}) {
-				errs = append(errs, fmt.Errorf("the ClusterRole grants events in API groups %v, want the core group alone", rule.APIGroups))
+	for _, resource := range slices.Sorted(maps.Keys(confinedVerbs)) {
+		var verbs [][]string
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.Resources, resource) {
+				verbs = append(verbs, rule.Verbs)
+				if !reflect.DeepEqual(rule.APIGroups, []string{""}) {
+					errs = append(errs, fmt.Errorf("the ClusterRole grants %s in API groups %v, want the core group alone", resource, rule.APIGroups))
+				}
 			}
 		}
-	}
-	if !reflect.DeepEqual(eventVerbs, [][]string{{"create", "patch"}}) {
-		errs = append(errs, fmt.Errorf("the ClusterRole grants events the verbs %v, want one rule with create and patch, which the policy confines", eventVerbs))
+		if want := [][]string{confinedVerbs[resource]}; !reflect.DeepEqual(verbs, want) {
+			errs = append(errs, fmt.Errorf("the ClusterRole grants %s the verbs %v, want one rule with %v, which a policy confines", resource, verbs, want[0]))
+		}
 	}
 	return errors.Join(errs...)
 }
