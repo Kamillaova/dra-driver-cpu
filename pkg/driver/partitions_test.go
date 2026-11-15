@@ -1257,7 +1257,55 @@ func capped(name string, capMilli int64) cdiClaimRecord {
 }
 
 func kubeletQuota(quota int64) *api.LinuxContainer {
-	return &api.LinuxContainer{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Quota: &api.OptionalInt64{Value: quota}}}}
+	return &api.LinuxContainer{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Quota: &api.OptionalInt64{Value: quota}, Period: &api.OptionalUInt64{Value: 100000}}}}
+}
+
+// A container whose CPU limit gives it a kubelet quota while its claim asks for
+// a cap gets a Warning on its pod naming both, and starts under the kubelet's.
+func TestCreateContainerWarnsWhenACPULimitReplacesTheCap(t *testing.T) {
+	onDisk := map[types.UID]cdiClaimRecord{"a": capped("a", 250), "b": capped("b", 500), "uncapped": capped("uncapped", 0)}
+	for _, tc := range []struct {
+		name  string
+		vars  []string
+		linux *api.LinuxContainer
+		want  []string
+	}{{
+		name:  "a capped share with a kubelet quota",
+		vars:  []string{"a_cpus"},
+		linux: kubeletQuota(50000),
+		want:  []string{`Warning CPULimitReplacesCap container "app": the kubelet's CPU quota of 50000 µs per 100000 µs, from a CPU limit on the container or its pod, replaces the cap of 250m that request "cpus" of claim "a" asks for; remove the CPU limit for the claim's cap to apply`},
+	}, {
+		name: "a capped share without a quota",
+		vars: []string{"a_cpus"},
+	}, {
+		name:  "an uncapped share with a kubelet quota",
+		vars:  []string{"uncapped_cpus"},
+		linux: kubeletQuota(50000),
+	}, {
+		name:  "a refused container",
+		vars:  []string{"a_cpus", "b_cpus"},
+		linux: kubeletQuota(50000),
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			d := sharingDriver(t, true, onDisk, nil)
+			events := &capturingRecorder{}
+			d.eventRecorder = events
+			pod := &api.PodSandbox{Id: "sandbox", Uid: "pod-uid", Name: "vm", Namespace: "vms"}
+			var env []string
+			for _, v := range tc.vars {
+				env = append(env, fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, v, cdiEnvDynamicValue))
+			}
+			_, _, _ = d.CreateContainer(ctx, pod, &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: env, Linux: tc.linux})
+			require.Equal(t, tc.want, events.lines())
+			for _, event := range events.events {
+				object, ok := event.object.(*corev1.Pod)
+				require.True(t, ok)
+				require.Equal(t, "vms/vm", object.Namespace+"/"+object.Name)
+				require.Equal(t, types.UID("pod-uid"), object.UID)
+			}
+		})
+	}
 }
 
 // A container whose cgroup holds a capped share alone gets the cap as its CPU
@@ -1328,6 +1376,7 @@ func TestCreateContainerCapsACappedShareAlone(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
 			d := sharingDriver(t, true, onDisk, nil)
+			d.eventRecorder = &capturingRecorder{}
 			pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "vms"}
 			adjust, _, err := d.CreateContainer(ctx, pod, &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: tc.env, Linux: tc.linux})
 			if tc.wantErr != "" {

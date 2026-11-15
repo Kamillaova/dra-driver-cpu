@@ -152,7 +152,16 @@ container has no CPU limit, gets it then.
 
 To see the cap a container runs under, read `cpu.max` in its cgroup: `25000 100000` for `250m`, and
 `max 100000` for none. A container that shows another quota has a CPU limit, set in its pod or by a
-`LimitRange` or another admission controller, which replaces the cap.
+`LimitRange` or another admission controller, which replaces the cap. Such a container gets a
+`CPULimitReplacesCap` Warning event on its pod when it is created, naming the container, the
+kubelet's quota and the claim's cap:
+
+```text
+container "app": the kubelet's CPU quota of 50000 µs per 100000 µs, from a CPU limit on the container or its pod, replaces the cap of 250m that request "cpus" of claim "app-a-x7k2p" asks for; remove the CPU limit for the claim's cap to apply
+```
+
+The container runs under the kubelet's quota. Remove the CPU limit, or the `LimitRange` default or
+the admission controller that sets it, and create the pod again.
 
 ## CPUs Held by Another Claim
 

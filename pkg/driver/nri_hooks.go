@@ -745,6 +745,20 @@ func hasKubeletQuota(ctr *api.Container) bool {
 	return ctr.GetLinux().GetResources().GetCpu().GetQuota().GetValue() > 0
 }
 
+const reasonCPULimitReplacesCap = "CPULimitReplacesCap"
+
+func podObject(pod *api.PodSandbox) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: pod.GetNamespace(), Name: pod.GetName(), UID: types.UID(pod.GetUid())}}
+}
+
+// capReplacedMessage is the Warning on the pod of a container whose CPU limit
+// replaces the cap its claim asks for.
+func capReplacedMessage(ctr *api.Container, capped cgroupMember) string {
+	cpu := ctr.GetLinux().GetResources().GetCpu()
+	return fmt.Sprintf("container %q: the kubelet's CPU quota of %d µs per %d µs, from a CPU limit on the container or its pod, replaces the cap of %s that %s asks for; remove the CPU limit for the claim's cap to apply",
+		ctr.GetName(), cpu.GetQuota().GetValue(), cpu.GetPeriod().GetValue(), resource.NewMilliQuantity(capped.capMilli, resource.DecimalSI), capped)
+}
+
 var errNoDefaultPartitionCPUs = errors.New("cannot update containers without claims: the default partition holds no CPU")
 
 var errNoSharedRequestCPUs = errors.New("every CPU of the devices its shared requests use is held by an exclusive claim")
@@ -922,9 +936,13 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		if !exclusiveCPUs.IsEmpty() {
 			adjust.AddEnv(dracpuapi.EnvVarExclusiveAssignedCPUSet, exclusiveCPUs.String())
 		}
-		if capMilli := soleCap(members); capMilli > 0 && !hasKubeletQuota(ctr) {
-			adjust.SetLinuxCPUQuota(cfsQuota(capMilli))
-			adjust.SetLinuxCPUPeriod(cfsPeriodUS)
+		if capMilli := soleCap(members); capMilli > 0 {
+			if hasKubeletQuota(ctr) {
+				cp.eventRecorder.Event(podObject(pod), corev1.EventTypeWarning, reasonCPULimitReplacesCap, capReplacedMessage(ctr, members[0]))
+			} else {
+				adjust.SetLinuxCPUQuota(cfsQuota(capMilli))
+				adjust.SetLinuxCPUPeriod(cfsPeriodUS)
+			}
 		}
 		// An updated claim means this is the first CreateContainer after Prepare, so
 		// existing shared containers must be moved off the newly claimed CPUs.
