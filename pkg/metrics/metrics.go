@@ -114,6 +114,7 @@ type Metrics struct {
 	nriStopContainerDuration   *prometheus.HistogramVec
 	nriRemoveContainerDuration *prometheus.HistogramVec
 	nriSynchronizeRefused      prometheus.Counter
+	misplacedClaims            prometheus.Counter
 	containersKeptUnderOlder   *prometheus.CounterVec
 	watchdogStuck              prometheus.Gauge
 	mappingDropped             prometheus.Counter
@@ -227,6 +228,11 @@ var (
 		kind: metricCounter,
 		help: "Total number of claims a container names that the NRI Synchronize callback did not bind to it.",
 	}
+	misplacedClaimsSpec = metricSpec{
+		name: "dra_cpu_misplaced_claims_total",
+		kind: metricCounter,
+		help: "Total number of claims restored at the driver's start with a request whose CPUs lie outside the partition of its device, or whose device the node no longer publishes.",
+	}
 	containersKeptUnderOlderRuleSpec = metricSpec{
 		name:   "dra_cpu_containers_kept_under_older_rule_total",
 		kind:   metricCounter,
@@ -263,6 +269,7 @@ var metricSpecs = []metricSpec{
 	containersKeptUnderOlderRuleSpec,
 	watchdogStuckSpec,
 	mappingDroppedSpec,
+	misplacedClaimsSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -311,6 +318,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		containersKeptUnderOlder:   newCounterVec(containersKeptUnderOlderRuleSpec),
 		watchdogStuck:              newGauge(watchdogStuckSpec),
 		mappingDropped:             newCounter(mappingDroppedSpec),
+		misplacedClaims:            newCounter(misplacedClaimsSpec),
 	}
 
 	reg.MustRegister(
@@ -331,6 +339,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.containersKeptUnderOlder,
 		m.watchdogStuck,
 		m.mappingDropped,
+		m.misplacedClaims,
 	)
 	for _, rule := range rules {
 		m.containersKeptUnderOlder.WithLabelValues(string(rule))
@@ -435,6 +444,10 @@ func (m *Metrics) RecordNRISynchronizeRefusedClaim() {
 	m.nriSynchronizeRefused.Inc()
 }
 
+func (m *Metrics) RecordMisplacedClaim() {
+	m.misplacedClaims.Inc()
+}
+
 func (m *Metrics) RecordContainerKeptUnderOlderRule(rule Rule) {
 	m.containersKeptUnderOlder.WithLabelValues(string(rule)).Inc()
 }
@@ -480,6 +493,7 @@ func (noopRecorder) RecordNRICreateContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
 func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRISynchronizeRefusedClaim()                  {}
+func (noopRecorder) RecordMisplacedClaim()                              {}
 func (noopRecorder) RecordContainerKeptUnderOlderRule(Rule)             {}
 func (noopRecorder) SetWatchdogStuck(time.Duration)                     {}
 func (noopRecorder) RecordNodeAllocatableMappingDropped()               {}
