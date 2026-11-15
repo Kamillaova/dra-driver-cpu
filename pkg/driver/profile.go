@@ -25,6 +25,8 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 // unconfiguredWindow is the driver's NRI state before the node's profile is
@@ -109,29 +111,29 @@ func usesHostNetwork(pod *api.PodSandbox) bool {
 
 // configureFromProfile waits for the first Synchronize, reads the node's
 // profile label, builds the driver from the profile it names and switches the
-// NRI hooks out of the window. It returns the error of an NRI plugin that
-// failed for good before that, read from nriErr.
-func (cp *CPUDriver) configureFromProfile(ctx context.Context, nriErr <-chan error) error {
+// NRI hooks out of the window. It returns leaveWindow's updates, or the error
+// of an NRI plugin that failed for good before that, read from nriErr.
+func (cp *CPUDriver) configureFromProfile(ctx context.Context, nriErr <-chan error) ([]*api.ContainerUpdate, error) {
 	logger := ctxlog.FromContext(ctx)
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	case err := <-nriErr:
-		return fmt.Errorf("NRI plugin failed before it synchronized: %w", err)
+		return nil, fmt.Errorf("NRI plugin failed before it synchronized: %w", err)
 	case <-cp.window.synced:
 	}
 
 	name, _, err := cp.awaitProfileLabel(ctx, nriErr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	config, err := cp.selectProfile(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	logger.Info("selected the config profile the node's label names", "label", cp.profileLabel, "profile", name)
 	if err := cp.configure(logger, cp.providers, config); err != nil {
-		return fmt.Errorf("driver failed to initialize: %w", err)
+		return nil, fmt.Errorf("driver failed to initialize: %w", err)
 	}
 	cp.seedAllocationStoreFromDisk(logger)
 	cp.eventBroadcaster, cp.eventRecorder = newEventRecorder(ctx, cp.kubeClient, cp.driverName, cp.nodeName)
@@ -208,18 +210,66 @@ func (cp *CPUDriver) readProfileLabel(ctx context.Context) (string, bool, error)
 
 // leaveWindow switches the NRI hooks to the configured driver and judges the
 // containers kept in the window as the first Synchronize would, in one hold of
-// stateMu, so that no container created in between goes unjudged. The updates
-// the judgment computes are not sent: a kept container keeps the runtime's
-// cpuset until the next Synchronize.
-func (cp *CPUDriver) leaveWindow(ctx context.Context) error {
+// stateMu, so that no container created in between goes unjudged. It returns
+// the updates pinning the kept containers that hold claims; the containers
+// without claims are left to narrowWindowContainers.
+func (cp *CPUDriver) leaveWindow(ctx context.Context) ([]*api.ContainerUpdate, error) {
 	cp.stateMu.Lock()
 	defer cp.stateMu.Unlock()
 	logger := ctxlog.FromContext(ctx)
 	pods, containers := cp.window.lists()
 	cp.window = nil
 	logger.Info("judging the containers kept before the node's profile was read", "numPods", len(pods), "numContainers", len(containers))
-	if _, err := cp.judgeContainersLocked(ctx, logger, pods, containers); err != nil {
-		return fmt.Errorf("judge the containers kept before the node's profile was read: %w", err)
+	updates, err := cp.judgeContainersLocked(ctx, logger, pods, containers)
+	if err != nil {
+		return nil, fmt.Errorf("judge the containers kept before the node's profile was read: %w", err)
 	}
-	return nil
+	claimless := sets.New(cp.podState.GetContainersWithSharedCPUs()...)
+	return slices.DeleteFunc(updates, func(update *api.ContainerUpdate) bool {
+		return claimless.Has(types.UID(update.GetContainerId()))
+	}), nil
+}
+
+// narrowWindowContainers sends the kept containers the judgment's cpusets and
+// narrows every container without claims to the default partition, before the
+// driver registers. Where unsolicited updates are safe it sends them; elsewhere
+// it closes the NRI connection once, and the runtime's Synchronize on the
+// reconnect judges the containers it lists and carries the updates in its
+// reply. It returns the error of an NRI plugin that failed for good meanwhile,
+// read from nriErr.
+func (cp *CPUDriver) narrowWindowContainers(ctx context.Context, nriErr <-chan error, bound []*api.ContainerUpdate) error {
+	logger := ctxlog.FromContext(ctx)
+	if cp.containerUpdater != nil {
+		if len(bound) > 0 {
+			failed, err := cp.containerUpdater.UpdateContainers(bound)
+			if err != nil {
+				logger.Error(err, "containers holding claims keep the CPUs the runtime gave them until their next update", "numFailed", len(failed))
+			}
+			for _, update := range failed {
+				logger.V(2).Info("the runtime did not update a container holding claims", "containerID", update.GetContainerId())
+			}
+		}
+		cp.reconcileSharedContainers(logger)
+		return nil
+	}
+
+	cp.stateMu.Lock()
+	resynced := make(chan struct{})
+	cp.resynced = resynced
+	select {
+	case <-cp.nriClosed:
+	default:
+	}
+	cp.reconnecting.Store(true)
+	cp.stateMu.Unlock()
+	logger.Info("reconnecting to NRI so that the runtime's Synchronize narrows the containers without claims")
+	cp.nriPlugin.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-nriErr:
+		return fmt.Errorf("NRI plugin failed before it synchronized again: %w", err)
+	case <-resynced:
+		return nil
+	}
 }

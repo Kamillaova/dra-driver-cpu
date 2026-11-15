@@ -169,6 +169,8 @@ on - is configured through other Helm values, not through this file.
 - Set it only where every node's runtime vendors NRI v0.12.1 or later, which fixes
   [containerd/nri#301](https://github.com/containerd/nri/pull/301): an older one can deadlock on
   such an update. containerd 2.4.0 vendors it; containerd 2.3 does not. The driver does not check.
+- With profiles it also decides how the driver moves the containers that started before it read
+  the node's profile; see [Per-node profiles](#per-node-profiles).
 
 `profiles` (map of profile name to profile, default: none)
 
@@ -294,6 +296,14 @@ host-network pods start, such as kube-proxy and the CNI's agents, on the CPUs th
 them; the driver refuses every other container, and the kubelet creates it again later. The window
 lasts as long as the driver cannot read its Node, an API server outage at start included: the
 driver logs each failed read, and its readiness probe fails meanwhile.
+
+Once it has read the label, and before it registers with the kubelet, the driver pins the running
+containers that hold claims to their claims' CPUs and moves every container without claims onto
+the CPUs of the profile's `default` partition that no claim holds. With
+`assumeUnsolicitedUpdatesSafe` it sends those updates to the runtime itself. Without it the driver
+closes its connection to the runtime once, and the runtime's resynchronization on the reconnect
+carries the updates. Where the `default` partition holds no CPU, the containers without claims keep
+the CPUs the runtime gave them, and the driver logs an error naming them.
 
 Selecting a node's configuration from named configurations by a node label is what NVIDIA's device
 plugin does with `nvidia.com/device-plugin.config`, and NVIDIA's GPU Operator for MIG layouts with
