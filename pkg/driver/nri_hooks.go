@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,7 +38,92 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/cpuset"
+	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 )
+
+// Configure is called by NRI on each connection, before Synchronize.
+func (cp *CPUDriver) Configure(_ context.Context, _, runtime, version string) (api.EventMask, error) {
+	defer cp.watchdog.track("Configure")()
+	cp.stateMu.Lock()
+	defer cp.stateMu.Unlock()
+	cp.runtimeReportsCDIDevices = reportsCDIDevices(runtime, version)
+	// No events: the stub then subscribes to every event the driver handles.
+	return 0, nil
+}
+
+// containerd's version is a link-time string: v2.4.0 from its Makefile's git
+// describe, with -3-g<sha> or .m after a patched or dirty tree, or
+// 2.4.0+unknown where the build sets none.
+var (
+	containerdVersion  = regexp.MustCompile(`^v?(\d+)\.(\d+)(?:\.(\d+))?(.*)$`)
+	gitDescribeCommits = regexp.MustCompile(`^-\d+-g[0-9a-f]+`)
+)
+
+// reportsCDIDevices reports whether the runtime fills in a container's CDI
+// devices for NRI, which containerd does from 2.3.0 on. A version that does not
+// parse reads as one that does not.
+func reportsCDIDevices(runtime, version string) bool {
+	if runtime != "containerd" {
+		return false
+	}
+	parts := containerdVersion.FindStringSubmatch(version)
+	if parts == nil {
+		return false
+	}
+	major, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	minor, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return false
+	}
+	if major != 2 {
+		return major > 2
+	}
+	if minor != 3 {
+		return minor > 3
+	}
+	preRelease := (parts[3] == "" || parts[3] == "0") && strings.HasPrefix(parts[4], "-") && !gitDescribeCommits.MatchString(parts[4])
+	return !preRelease
+}
+
+var errDeviceNotInjected = errors.New("the runtime did not inject its CDI device into the container")
+
+// checkInjected refuses a DRA_CPUSET_* variable whose claim or request the
+// runtime did not inject the CDI device of. A pod spec can set the variable,
+// but only the kubelet asks the runtime for a device, for the requests the pod
+// references. Call it only where the runtime reports CDI devices: there an
+// empty list means none.
+func checkInjected(allocations *store.AllocationState, ctr *api.Container, claims map[types.UID]draEnvClaim) error {
+	injected := sets.New[string]()
+	for _, device := range ctr.GetCDIDevices() {
+		injected.Insert(device.GetName())
+	}
+	for _, uid := range slices.Sorted(maps.Keys(claims)) {
+		claim := claims[uid]
+		name := string(uid)
+		if record, ok := allocations.GetClaimRecord(uid); ok && record.Name != "" {
+			name = record.Name
+		}
+		if claim.upstreamForm() {
+			device := cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIDeviceName(uid))
+			if !injected.Has(device) {
+				return fmt.Errorf("%w: container %q names claim %q in %s_%s, and %s is not among its devices; reference the claim in the pod's resourceClaims and the container's resources.claims, and set no %s_* variable",
+					errDeviceNotInjected, ctr.GetName(), name, cdiEnvVarPrefix, uid, device, cdiEnvVarPrefix)
+			}
+			continue
+		}
+		for _, request := range claim.requests {
+			device := cdiparser.QualifiedName(cdiVendor, cdiClass, getCDIRequestDeviceName(uid, request))
+			if !injected.Has(device) {
+				return fmt.Errorf("%w: container %q names request %q of claim %q in %s_%s_%s, and %s is not among its devices; reference the claim in the pod's resourceClaims and the request in the container's resources.claims, and set no %s_* variable",
+					errDeviceNotInjected, ctr.GetName(), request, name, cdiEnvVarPrefix, uid, request, device, cdiEnvVarPrefix)
+			}
+		}
+	}
+	return nil
+}
 
 // Synchronize is called by the NRI to synchronize the state of the driver during bootstrap.
 func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) (rupdates []*api.ContainerUpdate, rerr error) {
@@ -568,6 +654,12 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		logger.V(2).Info("no guaranteed CPUs found, using shared CPUs", "sharedCPUs", sharedCPUs.String())
 		adjust.SetLinuxCPUSetCPUs(sharedCPUs.String())
 	} else {
+		if cp.runtimeReportsCDIDevices {
+			if err := checkInjected(cp.allocationState, ctr, claimAllocations); err != nil {
+				logger.Error(err, "refusing container whose DRA env names a device the runtime did not inject")
+				return nil, nil, fmt.Errorf("cannot bind claim to container %q in pod %q: %w", ctr.Name, pod.Uid, err)
+			}
+		}
 		// NRI invokes CreateContainer for all containers. Only trust DRA env
 		// entries that match a claim prepared by this driver.
 		claimUIDs := slices.Sorted(maps.Keys(claimAllocations))
