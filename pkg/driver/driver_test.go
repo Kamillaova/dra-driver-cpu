@@ -169,6 +169,30 @@ func TestRunNRIPluginWithRetry_BackoffDoublesUpToTheCap(t *testing.T) {
 	})
 }
 
+// The driver's own reconnect is no failure: it spends none of the attempts and
+// reconnects at once.
+func TestRunNRIPluginWithRetry_DeliberateReconnect(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		var runs []time.Time
+		runner := &mockNRIRunner{
+			runFunc: func(context.Context) error {
+				runs = append(runs, time.Now())
+				if len(runs) <= 3 {
+					return errNRIReconnect
+				}
+				cancel()
+				return context.Canceled
+			},
+		}
+
+		err := runNRIPluginWithRetry(ctx, runner, 1, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration)
+		require.ErrorIs(t, err, context.Canceled, "a counted return would have ended the loop after its one attempt")
+		require.Len(t, runs, 4)
+		require.Equal(t, []time.Duration{0, 0, 0}, gapsBetween(runs))
+	})
+}
+
 func TestRunNRIPluginWithRetry_HealthyRunResetsTheBudget(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
