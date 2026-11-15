@@ -217,19 +217,24 @@ func verifyOfflineAccounting(logger logr.Logger, details cpuinfo.CPUDetails, pre
 }
 
 // partitionDegradedCondition reports the partitions whose smt the kernel
-// contradicts, decided at start.
+// contradicts, decided at start, and the claims restored at start whose CPUs
+// a reserved partition holds, until each is unprepared.
 func (cp *CPUDriver) partitionDegradedCondition() nodeConditionSource {
 	return nodeConditionSource{
 		conditionType: conditionPartitionDegraded,
 		evaluate: func() nodeConditionValue {
-			if len(cp.degradedPartitions) == 0 {
-				return partitionsVerified
+			held := cp.reservedHoldsMessage()
+			switch {
+			case len(cp.degradedPartitions) > 0:
+				message := partitionDegradedMessage(cp.degradedPartitions)
+				if held != "" {
+					message += "; " + held
+				}
+				return nodeConditionValue{status: corev1.ConditionTrue, reason: "SiblingThreadsOnline", message: message}
+			case held != "":
+				return nodeConditionValue{status: corev1.ConditionTrue, reason: "ReservedHoldsClaims", message: held}
 			}
-			return nodeConditionValue{
-				status:  corev1.ConditionTrue,
-				reason:  "SiblingThreadsOnline",
-				message: partitionDegradedMessage(cp.degradedPartitions),
-			}
+			return partitionsVerified
 		},
 		stoppedMessage: "driver stopped; partitions not checked",
 	}
