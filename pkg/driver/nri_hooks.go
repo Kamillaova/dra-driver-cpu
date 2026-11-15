@@ -141,6 +141,26 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 
 	defer func() { cp.metrics.RecordNRISynchronize(rerr, time.Since(startTime)) }()
 
+	if cp.window != nil {
+		cp.window.keep(pods, containers)
+		cp.nriDisconnected.Store(false)
+		logger.Info("keeping the runtime's containers for when the node's profile is read", "label", cp.profileLabel)
+		return nil, nil
+	}
+	containerUpdates, err := cp.judgeContainersLocked(ctx, logger, pods, containers)
+	if err != nil {
+		return nil, err
+	}
+	cp.nriDisconnected.Store(false)
+	logger.V(6).Info("synchronization complete", "updatesCount", len(containerUpdates))
+	return containerUpdates, nil
+}
+
+// judgeContainersLocked binds the listed containers to the claims they name, by
+// CreateContainer's rules, and returns the updates that pin them. It works on
+// copies of the stores and swaps them in only when ctx is still live. Callers
+// hold stateMu.
+func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logger, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
 	// Runtime inventory is not the prepared-claim inventory: a claim may
 	// have no container yet, or retain its owner between container restarts.
 	// Only Unprepare releases these records while this process survives.
@@ -268,7 +288,6 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 		close(cp.initialSync)
 	}
 	cp.hasSynchronized = true
-	cp.nriDisconnected.Store(false)
 	cp.refreshAllocationMetrics()
 	for range refused {
 		cp.metrics.RecordNRISynchronizeRefusedClaim()
@@ -279,7 +298,6 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	for _, warning := range warnings {
 		cp.eventRecorder.Event(warning.object(), corev1.EventTypeWarning, reasonKeptUnderOlderRule, warning.message())
 	}
-	logger.V(6).Info("synchronization complete", "updatesCount", len(containerUpdates))
 	return containerUpdates, nil
 }
 
@@ -634,6 +652,9 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		return nil, nil, fmt.Errorf("failed to parse DRA environment for container %q in pod %q: %w", ctr.Name, pod.Uid, err)
 	}
 	claimCount = len(claimAllocations)
+	if cp.window != nil {
+		return cp.window.admit(cp.profileLabel, pod, ctr, claimCount)
+	}
 
 	containerId := types.UID(ctr.GetId())
 	podUID := types.UID(pod.GetUid())
@@ -729,6 +750,10 @@ func (cp *CPUDriver) StopContainer(ctx context.Context, pod *api.PodSandbox, ctr
 	defer logger.V(2).Info("end: StopContainer")
 
 	updates := []*api.ContainerUpdate{}
+	if cp.window != nil {
+		cp.window.drop(ctr.GetId())
+		return updates, nil
+	}
 	claimUIDs, removed := cp.podState.RemoveContainerState(types.UID(pod.GetUid()), ctr.GetName(), types.UID(ctr.GetId()))
 	if !removed {
 		logger.V(2).Info("ignoring stale or unknown StopContainer event")
@@ -755,6 +780,10 @@ func (cp *CPUDriver) RemoveContainer(ctx context.Context, pod *api.PodSandbox, c
 	logger.V(2).Info("begin: RemoveContainer")
 	defer logger.V(2).Info("end: RemoveContainer")
 
+	if cp.window != nil {
+		cp.window.drop(ctr.GetId())
+		return nil
+	}
 	claimUIDs, removed := cp.podState.RemoveContainerState(types.UID(pod.GetUid()), ctr.GetName(), types.UID(ctr.GetId()))
 	if !removed {
 		logger.V(2).Info("ignoring stale or unknown RemoveContainer event")
