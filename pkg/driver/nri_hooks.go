@@ -631,6 +631,17 @@ var errNoDefaultPartitionCPUs = errors.New("cannot update containers without cla
 
 var errNoSharedRequestCPUs = errors.New("every CPU of the devices its shared requests use is held by an exclusive claim")
 
+// noDefaultCPUsError refuses a container without claims on a node whose
+// default partition holds no CPU, where it could run on none.
+func (cp *CPUDriver) noDefaultCPUsError(container string) error {
+	node := fmt.Sprintf("node %q", cp.nodeName)
+	if cp.profileName != "" {
+		node += fmt.Sprintf(" (profile %q)", cp.profileName)
+	}
+	return fmt.Errorf("container %q: no CPU claim, and %s leaves no CPUs for containers without one; add a claim on an exclusive partition, or run it elsewhere",
+		container, node)
+}
+
 // allocationOf labels a container for the NRI metrics by the requests it
 // names: shared where they hold no CPU alone, and exclusive where they do or
 // are not prepared.
@@ -724,6 +735,9 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	podUID := types.UID(pod.GetUid())
 
 	if claimCount == 0 {
+		if defaultCPUs, confined := cp.allocationState.ConfinedClaimlessCPUs(); confined && defaultCPUs.IsEmpty() {
+			return nil, nil, cp.noDefaultCPUsError(ctr.GetName())
+		}
 		// This is a shared container.
 		sharedCPUs := cp.allocationState.GetClaimlessCPUs()
 		if sharedCPUs.IsEmpty() && !cp.allocationState.GetPreparedCPUs().IsEmpty() {
