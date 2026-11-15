@@ -121,7 +121,7 @@ func (cp *CPUDriver) configureFromProfile(ctx context.Context, nriErr <-chan err
 	case <-cp.window.synced:
 	}
 
-	name, err := cp.awaitProfileLabel(ctx, nriErr)
+	name, _, err := cp.awaitProfileLabel(ctx, nriErr)
 	if err != nil {
 		return err
 	}
@@ -138,8 +138,33 @@ func (cp *CPUDriver) configureFromProfile(ctx context.Context, nriErr <-chan err
 	return cp.leaveWindow(ctx)
 }
 
+// refuseProfileLabel waits for the first Synchronize and refuses a node whose
+// profile label names a profile the configuration does not declare, before the
+// driver registers or publishes anything.
+func (cp *CPUDriver) refuseProfileLabel(ctx context.Context, nriErr <-chan error) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-nriErr:
+		return fmt.Errorf("NRI plugin failed before it synchronized: %w", err)
+	case <-cp.initialSync:
+	}
+	if cp.profileLabel == "" {
+		return nil
+	}
+	value, labelled, err := cp.awaitProfileLabel(ctx, nriErr)
+	if err != nil {
+		return err
+	}
+	if labelled {
+		return fmt.Errorf("node label %s=%s names a profile, and the config declares no profiles: declare the profiles the nodes' labels name, or remove the label with kubectl label node %s %s-",
+			cp.profileLabel, value, cp.nodeName, cp.profileLabel)
+	}
+	return nil
+}
+
 // awaitProfileLabel reads the node's profile label, waiting for an API server
-// that does not answer yet.
+// that does not answer yet, and reports whether the node carries it.
 //
 // A DaemonSet starts before the CNI and kube-proxy are ready, so the API
 // server's ClusterIP refuses connections for the first seconds of a node's
@@ -150,19 +175,19 @@ func (cp *CPUDriver) configureFromProfile(ctx context.Context, nriErr <-chan err
 // being recreated all clear on their own. A misconfiguration that does not
 // clear is reported by the readiness probe, which stays red for as long as this
 // waits, and by a log line per attempt naming the node.
-func (cp *CPUDriver) awaitProfileLabel(ctx context.Context, nriErr <-chan error) (string, error) {
+func (cp *CPUDriver) awaitProfileLabel(ctx context.Context, nriErr <-chan error) (string, bool, error) {
 	logger := ctxlog.FromContext(ctx)
 	for {
-		name, err := cp.readProfileLabel(ctx)
+		value, labelled, err := cp.readProfileLabel(ctx)
 		if err == nil {
-			return name, nil
+			return value, labelled, nil
 		}
 		logger.Error(err, "waiting for the API server to read the node's profile label", "node", cp.nodeName, "label", cp.profileLabel)
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", false, ctx.Err()
 		case err := <-nriErr:
-			return "", fmt.Errorf("NRI plugin failed before the node's %s label was read: %w", cp.profileLabel, err)
+			return "", false, fmt.Errorf("NRI plugin failed before the node's %s label was read: %w", cp.profileLabel, err)
 		case <-time.After(cp.profileReadInterval):
 		}
 	}
@@ -170,14 +195,15 @@ func (cp *CPUDriver) awaitProfileLabel(ctx context.Context, nriErr <-chan error)
 
 // readProfileLabel reads the node's profile label with one GET of its own,
 // under its own deadline.
-func (cp *CPUDriver) readProfileLabel(ctx context.Context) (string, error) {
+func (cp *CPUDriver) readProfileLabel(ctx context.Context) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, cp.profileReadTimeout)
 	defer cancel()
 	node, err := cp.kubeClient.CoreV1().Nodes().Get(ctx, cp.nodeName, metav1.GetOptions{})
 	if err != nil {
-		return "", fmt.Errorf("read node %q for its %s label: %w", cp.nodeName, cp.profileLabel, err)
+		return "", false, fmt.Errorf("read node %q for its %s label: %w", cp.nodeName, cp.profileLabel, err)
 	}
-	return node.Labels[cp.profileLabel], nil
+	value, labelled := node.Labels[cp.profileLabel]
+	return value, labelled, nil
 }
 
 // leaveWindow switches the NRI hooks to the configured driver and judges the

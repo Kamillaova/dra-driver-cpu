@@ -128,7 +128,22 @@ the driver's service account only on the driver's own node:
 The account that runs the upgrade needs the right to create them. With `rbac.create: false` the
 chart creates no policy.
 
+#### A `dra.cpu/profile` label without profiles
+
+On a node carrying a `dra.cpu/profile` label, a driver whose configuration declares no
+[profiles](configuration.md#per-node-profiles) now stops before it registers with the kubelet. Remove
+the label, `kubectl label nodes --all dra.cpu/profile-`, or declare the profiles the labels name.
+See [troubleshooting](troubleshooting.md#a-profile-label-without-profiles).
+
 ### Behavior changes
+
+#### Start order
+
+The driver now connects to the container runtime through NRI, waits for its first synchronization
+and reads its own Node before it registers with the kubelet; it registered first before. The
+ClusterRole already grants `get` on `nodes`. Until its first synchronization the driver is not
+registered, so the kubelet prepares no claim on the node meanwhile; an API server that does not
+answer at start holds the registration back as long, the driver logging each failed read.
 
 #### Node condition for the node-allocatable mapping
 
