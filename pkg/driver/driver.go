@@ -194,6 +194,9 @@ type CPUDriver struct {
 	selectProfile       func(name string) (*Config, error)
 	profileReadTimeout  time.Duration
 	profileReadInterval time.Duration
+	// profileName is the profile the node's label names, and empty where the
+	// configuration declares no profiles.
+	profileName string
 }
 
 // deviceHealthEntry is the last known health of a single device.
