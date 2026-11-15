@@ -87,6 +87,11 @@ The scheduler and kubelet are unaware of claim CPUs, so you MUST configure your 
         resourceClaimName: cpu-claim-10 # Requests 10 CPUs
   ```
 
+On a node with `cpuPartitions`, either option counts only the amounts booked on the `default`
+partition, the amounts of the claim's shared requests on the `dra.cpu` class. Never count CPUs a claim
+holds on an exclusive partition, nor an amount booked on a named partition of role `default`: no
+container without claims runs there, so those CPUs are not the node's to give to pods.
+
 ## With KEP-5517 (1.37+ with alpha FG `DRANodeAllocatableResources` enabled)
 
 Requires the feature gate on the API server, scheduler, and kubelets, and the driver deployed
@@ -162,9 +167,11 @@ When exclusive CPUs are assigned via DRA claims, declaring `limits.cpu` in `pod.
 
 **Claim ownership:** on containerd 2.3.0 and later, which tells the driver the CDI devices it injects into a container, the driver refuses a container whose `DRA_CPUSET_*` variable names a claim or request whose device the container was not given, so a pod cannot take another pod's claim by setting the variable. On CRI-O and on containerd before 2.3.0 the driver cannot check this, and the first container that names a prepared claim gets it.
 
-**Assigned CPU set:** Containers using CPU ResourceClaims receive `DRA_EXCLUSIVE_ASSIGNED_CPUSET` in Linux cpuset format (for example, `2-3,8`). It contains the union of CPUs assigned to that container across all its CPU claims.
-Containers without CPU claims do not receive it. The driver sets this variable; workloads should not set or override it.
+**Assigned CPU set:** Containers using CPU ResourceClaims receive `DRA_EXCLUSIVE_ASSIGNED_CPUSET` in Linux cpuset format (for example, `2-3,8`). It contains the union of the exclusive CPUs assigned to that container across all its CPU claims.
+Containers without CPU claims do not receive it, and neither do containers whose claims hold only shared requests, whose CPUs can move. The driver sets this variable; workloads should not set or override it.
 The CPUs of each request, its CPU request and its CPU limit are in the request's [device metadata file](device-metadata.md).
+
+**Shared requests:** keep a shared request, such as one on the `dra.cpu` class of a node with `cpuPartitions`, out of a claim's `matchAttribute` constraints. A constraint ties every request it names to devices with the same value, so it would tie the claim's exclusive requests, a VM's cores for example, to the NUMA node of the shared device.
 
 ## Claims Shared Between Pods
 

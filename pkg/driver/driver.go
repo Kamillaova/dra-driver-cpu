@@ -164,6 +164,9 @@ type CPUDriver struct {
 	kubeletRootDir          string
 	cpuAllocator            CPUAllocator
 	fullPhysicalCPUsOnly    bool
+	// allowFractionalCapacityRequests is whether the shared devices book
+	// amounts in millicores.
+	allowFractionalCapacityRequests bool
 	// wholeCorePicker is set under fullPhysicalCPUsOnly where the driver picks
 	// the CPUs itself, which an external allocator's cpuset leaves it no room to.
 	wholeCorePicker bool
@@ -209,6 +212,9 @@ type deviceTopology struct {
 	// partitionCPUs is the CPUs of each published device's partition, by
 	// device name, and nil where the configuration uses no partitions.
 	partitionCPUs map[string]cpuset.CPUSet
+	// sharedDevices is the CPUs of each published device whose CPUs its
+	// claims share, by device name.
+	sharedDevices map[string]cpuset.CPUSet
 }
 
 // Providers group the interfaces the CPUDriver depends on
@@ -257,6 +263,8 @@ type Config struct {
 	CPUPartitions []device.Partition
 	// AssumeUnsolicitedUpdatesSafe is driverconfig.Config.AssumeUnsolicitedUpdatesSafe.
 	AssumeUnsolicitedUpdatesSafe bool
+	// AllowFractionalCapacityRequests is driverconfig.Config.AllowFractionalCapacityRequests.
+	AllowFractionalCapacityRequests bool
 	// CancelRun cancels the context given to Start, which refuses to run
 	// without it. HandleError calls it with a cause wrapping ErrFatal, so that
 	// the caller stops the driver.
@@ -404,6 +412,7 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 		Allocator:                             allocator,
 		Partitions:                            partitions,
 		PartitionsUsed:                        len(config.CPUPartitions) > 0,
+		AllowFractionalCapacityRequests:       config.AllowFractionalCapacityRequests,
 	})
 	if err != nil {
 		return err
@@ -424,6 +433,16 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 			cp.topology.partitionCPUs[name] = partition.CPUs
 		}
 	}
+	cp.allowFractionalCapacityRequests = config.AllowFractionalCapacityRequests
+	cp.topology.sharedDevices = make(map[string]cpuset.CPUSet, len(result.Shared))
+	for name := range result.Shared {
+		cpus, ok := result.Mapping.NameToCPUs[name]
+		if !ok {
+			cpus = result.DevicePartitions[name].CPUs
+		}
+		cp.topology.sharedDevices[name] = cpus
+	}
+	cp.allocationState.SetSharedDevices(cp.topology.sharedDevices)
 	// Chunk devices into slices of at most devicesPerResourceSlice
 	for _, devices := range result.DevicesByPartition {
 		cp.topology.deviceSlices = append(cp.topology.deviceSlices, slices.Collect(slices.Chunk(devices, cp.devicesPerResourceSlice))...)

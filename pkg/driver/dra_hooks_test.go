@@ -3289,10 +3289,11 @@ func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool) *kubeletplugin.De
 		"dra.net/numaNode":                  {IntValue: new(int64(cpu.NUMANodeID))},
 		"dra.cpu/numaNodeID":                {IntValue: new(int64(cpu.NUMANodeID))},
 		// The settings of a driver built with the defaults.
-		string(devattr.AttributeFullPhysicalCPUsOnly): {BoolValue: new(false)},
-		string(devattr.AttributeAllocator):            {StringValue: new(cpuallocator.ModeCPUManager)},
-		string(devattr.AttributePartition):            {StringValue: new(devattr.DefaultPartitionName)},
-		string(devattr.AttributeRole):                 {StringValue: new(devattr.PARTITION_ROLE_DEFAULT)},
+		string(devattr.AttributeFullPhysicalCPUsOnly):            {BoolValue: new(false)},
+		string(devattr.AttributeAllocator):                       {StringValue: new(cpuallocator.ModeCPUManager)},
+		string(devattr.AttributeAllowFractionalCapacityRequests): {BoolValue: new(false)},
+		string(devattr.AttributePartition):                       {StringValue: new(devattr.DefaultPartitionName)},
+		string(devattr.AttributeRole):                            {StringValue: new(devattr.PARTITION_ROLE_DEFAULT)},
 	}
 	return &kubeletplugin.DeviceMetadata{Attributes: attrs}
 }
@@ -3366,6 +3367,7 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 	}
 	attrs[string(devattr.AttributeFullPhysicalCPUsOnly)] = resourceapi.DeviceAttribute{BoolValue: new(false)}
 	attrs[string(devattr.AttributeAllocator)] = resourceapi.DeviceAttribute{StringValue: new(allocator)}
+	attrs[string(devattr.AttributeAllowFractionalCapacityRequests)] = resourceapi.DeviceAttribute{BoolValue: new(false)}
 	attrs[string(devattr.AttributePartition)] = resourceapi.DeviceAttribute{StringValue: new(devattr.DefaultPartitionName)}
 	attrs[string(devattr.AttributeRole)] = resourceapi.DeviceAttribute{StringValue: new(devattr.PARTITION_ROLE_DEFAULT)}
 

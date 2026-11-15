@@ -140,8 +140,13 @@ type BuildInput struct {
 	Partitions []Partition
 	// PartitionsUsed is whether the configuration declares the partitions. A
 	// grouped device then counts threads per core and SMT among its
-	// partition's CPUs alone.
+	// partition's CPUs alone, and every partition of role default publishes
+	// shared devices.
 	PartitionsUsed bool
+	// AllowFractionalCapacityRequests lets a request on a shared device book
+	// an amount in millicores rather than in whole CPUs. Every device
+	// publishes it.
+	AllowFractionalCapacityRequests bool
 }
 
 type BuildResult struct {
@@ -159,6 +164,8 @@ type BuildResult struct {
 	DevicesByPartition [][]resourceapi.Device
 	// DevicePartitions is each grouped device's partition, by device name.
 	DevicePartitions map[string]Partition
+	// Shared holds the name of every device whose CPUs its claims share.
+	Shared map[string]bool
 }
 
 // CoreCounts is the number of cores of two threads and of one in a device.
@@ -186,7 +193,7 @@ func Build(input BuildInput) (BuildResult, error) {
 		for _, dev := range devices {
 			addPartitionAttributes(dev.Attributes, partitions[0])
 		}
-		addSettingAttributes(devices, input.FullPhysicalCPUsOnly, input.Allocator)
+		addSettingAttributes(devices, input)
 		if err := validateDeviceAttributeValueCount(devices); err != nil {
 			return BuildResult{}, err
 		}
@@ -216,17 +223,20 @@ func Build(input BuildInput) (BuildResult, error) {
 	res.ThreadsPerCore = make(map[string]int)
 	res.MixedCores = make(map[string]CoreCounts)
 	res.DevicePartitions = make(map[string]Partition)
+	res.Shared = make(map[string]bool)
 	topo := input.Inventory.CPUTopology
 	var ends []int
 	for _, partition := range partitions {
-		if !partition.PublishesOwnedDevices(input.PartitionsUsed) {
+		shared := partition.PublishesSharedDevices(input.PartitionsUsed)
+		if !shared && !partition.PublishesOwnedDevices(input.PartitionsUsed) {
 			continue
 		}
 		counted := topo.CPUDetails
 		if input.PartitionsUsed {
 			counted = counted.KeepOnly(partition.CPUs)
 		}
-		deviceInfos, err := groupedCPUDeviceInfos(input.Layout, topo, counted, partition, input.PartitionsUsed, input.FullPhysicalCPUsOnly)
+		wholeCores := input.FullPhysicalCPUsOnly && !shared
+		deviceInfos, err := groupedCPUDeviceInfos(input.Layout, topo, counted, partition, input.PartitionsUsed, wholeCores)
 		if err != nil {
 			return BuildResult{}, err
 		}
@@ -243,7 +253,10 @@ func Build(input BuildInput) (BuildResult, error) {
 			}
 			res.ThreadsPerCore[dev.name] = dev.threadsPerCore
 			res.DevicePartitions[dev.name] = partition
-			if !input.FullPhysicalCPUsOnly {
+			if shared {
+				res.Shared[dev.name] = true
+			}
+			if !wholeCores {
 				continue
 			}
 			counts, err := countCores(counted, dev)
@@ -254,16 +267,29 @@ func Build(input BuildInput) (BuildResult, error) {
 				res.MixedCores[dev.name] = counts
 			}
 		}
-		devices, err := createGroupedCPUDeviceSlices(input.Layout, deviceInfos, input.PCIeRootMapper, topo, input.PublishNodeAllocatableResourceMapping, input.ExposeExtAttrs, input.FullPhysicalCPUsOnly)
+		mapped := input.PublishNodeAllocatableResourceMapping
+		if shared {
+			// A named partition of role default runs no container without
+			// claims, so its CPUs are in the kubelet's reservation.
+			mapped = mapped && partition.Name == DefaultPartitionName
+		}
+		devices, err := createGroupedCPUDeviceSlices(input.Layout, deviceInfos, input.PCIeRootMapper, topo, mapped, input.ExposeExtAttrs, wholeCores)
 		if err != nil {
 			return BuildResult{}, err
+		}
+		if shared {
+			for _, dev := range devices {
+				capacity := dev.Capacity[CPUResourceQualifiedName]
+				capacity.RequestPolicy = sharedRequestPolicy(capacity.Value, input.AllowFractionalCapacityRequests)
+				dev.Capacity[CPUResourceQualifiedName] = capacity
+			}
 		}
 		if len(devices) > 0 {
 			res.Devices = append(res.Devices, devices...)
 			ends = append(ends, len(res.Devices))
 		}
 	}
-	addSettingAttributes(res.Devices, input.FullPhysicalCPUsOnly, input.Allocator)
+	addSettingAttributes(res.Devices, input)
 	if err := validateDeviceAttributeValueCount(res.Devices); err != nil {
 		return BuildResult{}, err
 	}
@@ -685,6 +711,24 @@ func wholeCoreRequestPolicy(capacityCPUs int64, threadsPerCore int) *resourceapi
 		policy.ValidRange.Step = resource.NewQuantity(threads, resource.DecimalSI)
 	}
 	return policy
+}
+
+// sharedRequestPolicy books what a request names, from nothing up to the whole
+// device: a request naming no amount books nothing. The API server requires
+// the default within the range.
+func sharedRequestPolicy(capacity resource.Quantity, fractional bool) *resourceapi.CapacityRequestPolicy {
+	step := resource.NewQuantity(1, resource.DecimalSI)
+	if fractional {
+		step = resource.NewMilliQuantity(1, resource.DecimalSI)
+	}
+	return &resourceapi.CapacityRequestPolicy{
+		Default: resource.NewQuantity(0, resource.DecimalSI),
+		ValidRange: &resourceapi.CapacityRequestPolicyRange{
+			Min:  resource.NewQuantity(0, resource.DecimalSI),
+			Max:  new(capacity.DeepCopy()),
+			Step: step,
+		},
+	}
 }
 
 // createCPUDeviceSlices creates Device objects based on the CPU topology.
