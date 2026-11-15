@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 {{- if .Values.deviceClass.create }}
+{{- include "dra-driver-cpu.checkCPUPartitions" . }}
+{{- /* Classes are cluster-wide and partitions are per node, so a name declared
+       in any profile gets its class. The "default" entry carries no role and
+       its class is dra.cpu; a reserved partition publishes no device. A device
+       of a driver that publishes no dra.cpu/partition is the default
+       partition's, and has() keeps the selectors from failing on it. */}}
+{{- $cfg := include "dra-driver-cpu.effectiveDriverConfig" . | fromYaml }}
+{{- $lists := list ($cfg.cpuPartitions | default list) }}
+{{- range $_, $profile := ($cfg.profiles | default dict) }}
+{{- $lists = append $lists ($profile.cpuPartitions | default list) }}
+{{- end }}
+{{- $named := dict }}
+{{- range $list := $lists }}
+{{- range $partition := $list }}
+{{- if and (ne (toString $partition.name) "default") (ne (toString $partition.role) "reserved") }}
+{{- $_ := set $named (toString $partition.name) true }}
+{{- end }}
+{{- end }}
+{{- end }}
 ---
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
@@ -20,5 +39,16 @@ metadata:
 spec:
   selectors:
     - cel:
-        expression: device.driver == "dra.cpu"
+        expression: device.driver == "dra.cpu" && (!has(device.attributes["dra.cpu"].partition) || device.attributes["dra.cpu"].partition == "default")
+{{- range $name, $_ := $named }}
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dra.cpu.{{ $name }}
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "dra.cpu" && has(device.attributes["dra.cpu"].partition) && device.attributes["dra.cpu"].partition == "{{ $name }}"
+{{- end }}
 {{- end }}
