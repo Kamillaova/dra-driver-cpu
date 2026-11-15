@@ -53,14 +53,22 @@ func (cp *CPUDriver) PublishResources(ctx context.Context) {
 	logger.V(4).Info("begin: publishing resources")
 	defer logger.V(4).Info("end: publishing resources")
 
+	cp.publishMu.Lock()
+	defer cp.publishMu.Unlock()
+
 	// The library deletes a pool's slices only when the pool is left out or
 	// has none, so a node left with no device still publishes its pool.
-	if len(cp.topology.deviceSlices) == 0 {
+	deviceSlices := cp.topology.deviceSlices
+	switch {
+	case cp.reservationMissing.Load():
+		logger.Info("node misses its kubelet CPU reservation: publishing the node's pool empty")
+		deviceSlices = nil
+	case len(deviceSlices) == 0:
 		logger.Info("no devices to publish: publishing the node's pool empty")
 	}
 
-	slices := make([]resourceslice.Slice, 0, len(cp.topology.deviceSlices))
-	for _, chunk := range cp.topology.deviceSlices {
+	slices := make([]resourceslice.Slice, 0, len(deviceSlices))
+	for _, chunk := range deviceSlices {
 		slices = append(slices, resourceslice.Slice{Devices: chunk})
 	}
 
@@ -594,6 +602,9 @@ func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logge
 	if cp.nriDisconnected.Load() {
 		logger.V(2).Info("refusing to prepare claim while NRI is disconnected")
 		return kubeletplugin.PrepareResult{Err: errNRIDisconnected}
+	}
+	if cp.reservationMissing.Load() {
+		return kubeletplugin.PrepareResult{Err: errors.New(cp.reservation.missingMessage(cp.driverName))}
 	}
 	if err := cp.checkAdminAccess(claim); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
