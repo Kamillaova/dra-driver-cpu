@@ -88,6 +88,7 @@ type DriverConfig struct {
 	Burst                                 int                `json:"burst,omitempty"`
 	FullPhysicalCPUsOnly                  bool               `json:"fullPhysicalCPUsOnly,omitempty"`
 	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+	AllowFractionalCapacityRequests       bool               `json:"allowFractionalCapacityRequests,omitempty"`
 	CPUPartitions                         []CPUPartition     `json:"cpuPartitions,omitempty"`
 	Profiles                              map[string]Profile `json:"profiles,omitempty"`
 }
