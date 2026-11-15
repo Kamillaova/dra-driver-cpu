@@ -27,6 +27,12 @@ rules:
     verbs:
       - get
   - apiGroups:
+      - ""
+    resources:
+      - nodes/status
+    verbs:
+      - patch
+  - apiGroups:
       - resource.k8s.io
     resources:
       - resourceslices
