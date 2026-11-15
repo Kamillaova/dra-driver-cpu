@@ -181,6 +181,15 @@ type CPUDriver struct {
 	// degradedPartitions are the partitions whose smt the kernel contradicts,
 	// each with the contradiction. Set in configure, read-only after that.
 	degradedPartitions map[string]string
+	// reservedPartitions are the partitions of role reserved. Set in
+	// configure, read-only after that.
+	reservedPartitions []device.Partition
+	// reservedHolds are the claims restored at start whose exclusive CPUs a
+	// reserved partition holds, kept under stateMu until each is unprepared.
+	// reservedHoldsClaims is whether there is one, for Ready, which takes no
+	// lock.
+	reservedHolds       map[types.UID]reservedHold
+	reservedHoldsClaims atomic.Bool
 
 	// window is set, under stateMu, while the node's profile is not read yet;
 	// see Config.SelectProfile.
@@ -373,6 +382,14 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 		return err
 	}
 	cp.degradedPartitions = degraded
+	cp.reservedPartitions = nil
+	if len(config.CPUPartitions) > 0 {
+		for _, partition := range partitions {
+			if partition.IsReserved() {
+				cp.reservedPartitions = append(cp.reservedPartitions, partition)
+			}
+		}
+	}
 	withheld := make(map[string]bool, len(degraded))
 	if len(config.CPUPartitions) > 0 {
 		for _, partition := range partitions {
@@ -669,6 +686,7 @@ func (cp *CPUDriver) seedAllocationStoreFromDisk(logger logr.Logger) {
 	if err := cp.cdiMgr.Refresh(); err != nil {
 		logger.Error(err, "failed to refresh CDI cache, continuing with available CDI devices")
 	}
+	restored := make(map[types.UID]store.ClaimRecord)
 	for _, uid := range cp.cdiMgr.ListClaims() {
 		caLogger := logger.WithValues("claimUID", uid)
 		record, err := cp.cdiMgr.GetDeviceAllocations(uid)
@@ -676,9 +694,11 @@ func (cp *CPUDriver) seedAllocationStoreFromDisk(logger logr.Logger) {
 			caLogger.Error(err, "not restoring claim with an unusable CDI spec")
 			continue
 		}
-		cp.allocationState.Restore(caLogger, uid, record.storeRecord())
+		restored[uid] = record.storeRecord()
+		cp.allocationState.Restore(caLogger, uid, restored[uid])
 		cp.reportMisplacedClaim(caLogger, record)
 	}
+	cp.recordReservedHolds(logger, restored)
 	cp.refreshAllocationMetrics()
 }
 
@@ -743,10 +763,11 @@ func (cp *CPUDriver) Stop() {
 }
 
 // Ready reports whether the kubelet has the plugin registered, the NRI plugin
-// is connected and the watchdog finds nothing stuck. It takes no lock, so a
-// held stateMu cannot block a probe. Call it only once Start has returned.
+// is connected, the watchdog finds nothing stuck and no reserved partition
+// holds a prepared claim's CPUs. It takes no lock, so a held stateMu cannot
+// block a probe. Call it only once Start has returned.
 func (cp *CPUDriver) Ready() bool {
-	if cp.watchdog.stuck.Load() {
+	if cp.watchdog.stuck.Load() || cp.reservedHoldsClaims.Load() {
 		return false
 	}
 	if status := cp.draPlugin.RegistrationStatus(); status == nil || !status.PluginRegistered {
