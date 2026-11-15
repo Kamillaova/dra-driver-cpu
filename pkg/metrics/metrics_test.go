@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 17)
+	require.Len(t, descriptors, 18)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -58,6 +58,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_containers_kept_under_older_rule_total",
 		"dra_cpu_watchdog_stuck_seconds",
 		"dra_cpu_node_allocatable_mapping_dropped_total",
+		"dra_cpu_misplaced_claims_total",
 	}, names)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
@@ -65,6 +66,7 @@ func TestDescriptors(t *testing.T) {
 	require.Equal(t, []string{"rule"}, descriptors[14].Labels)
 	require.Empty(t, descriptors[15].Labels)
 	require.Empty(t, descriptors[16].Labels)
+	require.Empty(t, descriptors[17].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -95,6 +97,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_available_cpus",
 		"dra_cpu_claim_allocated_cpus",
 		"dra_cpu_containers_kept_under_older_rule_total",
+		"dra_cpu_misplaced_claims_total",
 		"dra_cpu_node_allocatable_mapping_dropped_total",
 		"dra_cpu_nri_create_container_duration_seconds",
 		"dra_cpu_nri_remove_container_duration_seconds",
@@ -132,6 +135,7 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	m.RecordContainerKeptUnderOlderRule(RulePartialHolder)
 	m.SetWatchdogStuck(61500 * time.Millisecond)
 	m.RecordNodeAllocatableMappingDropped()
+	m.RecordMisplacedClaim()
 
 	require.InDelta(t, 2, testutil.ToFloat64(m.allocatedCPUs), 0.01)
 	require.InDelta(t, 6, testutil.ToFloat64(m.availableCPUs), 0.01)
@@ -144,6 +148,7 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	require.InDelta(t, 1, testutil.ToFloat64(m.containersKeptUnderOlder.WithLabelValues(string(RulePartialHolder))), 0.01)
 	require.InDelta(t, 61.5, testutil.ToFloat64(m.watchdogStuck), 0.01)
 	require.InDelta(t, 1, testutil.ToFloat64(m.mappingDropped), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.misplacedClaims), 0.01)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -202,6 +207,7 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.RecordContainerKeptUnderOlderRule(RulePartialHolder)
 		recorder.SetWatchdogStuck(time.Minute)
 		recorder.RecordNodeAllocatableMappingDropped()
+		recorder.RecordMisplacedClaim()
 	})
 }
 

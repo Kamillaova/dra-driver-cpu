@@ -199,6 +199,9 @@ type deviceTopology struct {
 	device.Mapping
 	deviceSlices   [][]resourceapi.Device
 	threadsPerCore map[string]int
+	// partitionCPUs is the CPUs of each published device's partition, by
+	// device name, and nil where the configuration uses no partitions.
+	partitionCPUs map[string]cpuset.CPUSet
 }
 
 // Providers group the interfaces the CPUDriver depends on
@@ -404,6 +407,12 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 
 	cp.topology.Mapping = result.Mapping
 	cp.topology.threadsPerCore = result.ThreadsPerCore
+	if len(config.CPUPartitions) > 0 {
+		cp.topology.partitionCPUs = make(map[string]cpuset.CPUSet, len(result.DevicePartitions))
+		for name, partition := range result.DevicePartitions {
+			cp.topology.partitionCPUs[name] = partition.CPUs
+		}
+	}
 	// Chunk devices into slices of at most devicesPerResourceSlice
 	for _, devices := range result.DevicesByPartition {
 		cp.topology.deviceSlices = append(cp.topology.deviceSlices, slices.Collect(slices.Chunk(devices, cp.devicesPerResourceSlice))...)
@@ -613,8 +622,32 @@ func (cp *CPUDriver) seedAllocationStoreFromDisk(logger logr.Logger) {
 			continue
 		}
 		cp.allocationState.Restore(caLogger, uid, record.storeRecord())
+		cp.reportMisplacedClaim(caLogger, record)
 	}
 	cp.refreshAllocationMetrics()
+}
+
+// reportMisplacedClaim counts a restored claim that holds CPUs outside the
+// partition of a device its record names, or names a device this node no
+// longer publishes: the partitions changed while it was prepared. It keeps
+// its CPUs until it is unprepared.
+func (cp *CPUDriver) reportMisplacedClaim(logger logr.Logger, record cdiClaimRecord) {
+	if cp.topology.partitionCPUs == nil {
+		return
+	}
+	for _, request := range record.Requests {
+		for _, result := range request.Results {
+			partitionCPUs, published := cp.topology.partitionCPUs[result.Device]
+			if published && request.CPUs.IsSubsetOf(partitionCPUs) {
+				continue
+			}
+			logger.Info("restored claim holds CPUs outside the partition of its device, and keeps them until it is unprepared",
+				"claim", ctxlog.ObjectRef{Namespace: record.Namespace, Name: record.Name}, "request", request.Request,
+				"cpus", request.CPUs.String(), "device", result.Device, "devicePublished", published)
+			cp.metrics.RecordMisplacedClaim()
+			return
+		}
+	}
 }
 
 // startNRIPlugin keeps the NRI plugin connected until Stop, not until ctx is
