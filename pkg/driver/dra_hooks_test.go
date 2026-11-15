@@ -2233,17 +2233,18 @@ func TestPrepareRefusalNamesTheHolders(t *testing.T) {
 // entry naming the CPUs it holds on that device and never the request's union.
 func TestPrepareMetadataNamesEachRequestsCPUs(t *testing.T) {
 	grouped := Config{CPUDeviceMode: devattr.CPU_DEVICE_MODE_GROUPED, CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE}
-	result := func(device, request string, consumed int64) resourceapi.DeviceRequestAllocationResult {
+	result := func(device, request, consumed string) resourceapi.DeviceRequestAllocationResult {
 		r := resourceapi.DeviceRequestAllocationResult{Driver: testDriverName, Pool: testNodeName, Device: device, Request: request}
-		if consumed > 0 {
-			r.ConsumedCapacity = map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: *resource.NewQuantity(consumed, resource.DecimalSI)}
+		if consumed != "" {
+			r.ConsumedCapacity = map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: resource.MustParse(consumed)}
 		}
 		return r
 	}
 	type entry struct {
-		device, request string
-		cpuset          string // "" for none
-		allocated       int64  // 0 for none
+		device, request      string
+		cpuset               string // "" for none
+		allocated            int64  // 0 for none
+		cpuRequest, cpuLimit string // "" for none
 	}
 	tests := []struct {
 		name     string
@@ -2257,37 +2258,44 @@ func TestPrepareMetadataNamesEachRequestsCPUs(t *testing.T) {
 			name:     "a request spanning two devices",
 			cpuInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
 			conf:     grouped,
-			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", 4), result("cpudevnuma001", "a", 4)},
-			want:     []entry{{"cpudevnuma000", "a", "0-1,4-5", 4}, {"cpudevnuma001", "a", "2-3,6-7", 4}},
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", "4"), result("cpudevnuma001", "a", "4")},
+			want:     []entry{{"cpudevnuma000", "a", "0-1,4-5", 4, "4", "max"}, {"cpudevnuma001", "a", "2-3,6-7", 4, "4", "max"}},
 		},
 		{
 			name:     "two requests",
 			cpuInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
 			conf:     grouped,
-			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", 4), result("cpudevnuma001", "b", 4)},
-			want:     []entry{{"cpudevnuma000", "a", "0-1,4-5", 4}, {"cpudevnuma001", "b", "2-3,6-7", 4}},
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", "4"), result("cpudevnuma001", "b", "4")},
+			want:     []entry{{"cpudevnuma000", "a", "0-1,4-5", 4, "4", "max"}, {"cpudevnuma001", "b", "2-3,6-7", 4, "4", "max"}},
+		},
+		{
+			name:     "an amount written in millicores reads in canonical form",
+			cpuInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
+			conf:     grouped,
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", "2000m")},
+			want:     []entry{{"cpudevnuma000", "a", "0,4", 2, "2", "max"}},
 		},
 		{
 			name:     "individual mode",
 			cpuInfos: mockCPUInfos_SingleSocket_4CPUS_HT,
-			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudev000", "a", 0), result("cpudev002", "a", 0)},
-			want:     []entry{{"cpudev000", "a", "0", 0}, {"cpudev002", "a", "1", 0}},
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudev000", "a", ""), result("cpudev002", "a", "")},
+			want:     []entry{{"cpudev000", "a", "0", 0, "", ""}, {"cpudev002", "a", "1", 0, "", ""}},
 		},
 		{
 			name:     "a claim restored from upstream's spec with one request names its CPUs on each device",
 			cpuInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
 			conf:     grouped,
 			restored: []store.RequestAllocation{{CPUs: cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)}},
-			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", 4), result("cpudevnuma001", "a", 4)},
-			want:     []entry{{"cpudevnuma000", "a", "0-1,4-5", 4}, {"cpudevnuma001", "a", "2-3,6-7", 4}},
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", "4"), result("cpudevnuma001", "a", "4")},
+			want:     []entry{{"cpudevnuma000", "a", "0-1,4-5", 4, "4", "max"}, {"cpudevnuma001", "a", "2-3,6-7", 4, "4", "max"}},
 		},
 		{
 			name:     "a claim restored from upstream's spec with two requests names no CPUs",
 			cpuInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
 			conf:     grouped,
 			restored: []store.RequestAllocation{{CPUs: cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)}},
-			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", 4), result("cpudevnuma001", "b", 4)},
-			want:     []entry{{"cpudevnuma000", "a", "", 4}, {"cpudevnuma001", "b", "", 4}},
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", "4"), result("cpudevnuma001", "b", "4")},
+			want:     []entry{{"cpudevnuma000", "a", "", 4, "4", "max"}, {"cpudevnuma001", "b", "", 4, "4", "max"}},
 		},
 	}
 	for _, tc := range tests {
@@ -2315,6 +2323,12 @@ func TestPrepareMetadataNamesEachRequestsCPUs(t *testing.T) {
 				}
 				if attr, ok := prepared.Metadata.Attributes[string(devattr.AttributeAllocatedNumCPUs)]; ok {
 					e.allocated = *attr.IntValue
+				}
+				if attr, ok := prepared.Metadata.Attributes[string(devattr.AttributeCPURequest)]; ok {
+					e.cpuRequest = *attr.StringValue
+				}
+				if attr, ok := prepared.Metadata.Attributes[string(devattr.AttributeCPULimit)]; ok {
+					e.cpuLimit = *attr.StringValue
 				}
 				got = append(got, e)
 			}
@@ -3344,6 +3358,8 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 
 	if allocatedCPUs > 0 {
 		attrs[string(devattr.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(allocatedCPUs)}
+		attrs[string(devattr.AttributeCPURequest)] = resourceapi.DeviceAttribute{StringValue: new(fmt.Sprint(allocatedCPUs))}
+		attrs[string(devattr.AttributeCPULimit)] = resourceapi.DeviceAttribute{StringValue: new("max")}
 	}
 	if held := requestCPUs.Intersection(cpuset.New(cpuIDs...)); !held.IsEmpty() {
 		attrs[string(devattr.AttributeCPUSet)] = resourceapi.DeviceAttribute{StringValue: new(held.String())}

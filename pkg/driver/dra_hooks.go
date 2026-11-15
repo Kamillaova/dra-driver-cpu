@@ -524,6 +524,15 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 					IntValue: &allocatedCount,
 				}
 			}
+			if quantity, ok := device.LookupConsumedCapacity(allocResult.ConsumedCapacity, cp.driverName); ok {
+				metadataAttrs[string(device.AttributeCPURequest)] = resourceapi.DeviceAttribute{
+					StringValue: new(quantity.String()),
+				}
+				// cpu.max's word for no limit: no request is capped.
+				metadataAttrs[string(device.AttributeCPULimit)] = resourceapi.DeviceAttribute{
+					StringValue: new("max"),
+				}
+			}
 			if cpus := requestCPUsOn(record, ref.Request, cp.deviceCPUs(allocResult.Device)); exclusive && cpusKnown && !cpus.IsEmpty() {
 				metadataAttrs[string(device.AttributeCPUSet)] = resourceapi.DeviceAttribute{
 					StringValue: new(cpus.String()),
