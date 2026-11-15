@@ -129,6 +129,15 @@ seconds, `/healthz` answers 503; past 180 seconds the driver stops and exits non
 kubelet to restart it.
 See [troubleshooting](troubleshooting.md#a-stuck-driver).
 
+### Deprecations
+
+#### Device metadata: `dra.cpu/allocatedNumCPUs`
+
+The `dra.cpu/allocatedNumCPUs` attribute of a request's device metadata is deprecated. Read
+`dra.cpu/cpuRequest` instead: the same amount as a quantity string, such as `2`, written beside it.
+The driver still writes `dra.cpu/allocatedNumCPUs`. Its removal will be announced in this document
+one release before it happens.
+
 ### Early warning
 
 Before the driver enters beta stage, a batch of **breaking** changes are planned.
