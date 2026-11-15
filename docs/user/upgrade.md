@@ -112,6 +112,22 @@ the right to create both. With `rbac.create: false`, grant the driver's service 
 and `patch` on `events` yourself; without them the API server refuses the driver's events, and
 the driver logs each refusal.
 
+#### Node status and admission policies
+
+The driver can now keep conditions on its own Node, so its ClusterRole grants `patch` on
+`nodes/status`. With `rbac.create: true` the chart also creates three more
+ValidatingAdmissionPolicies and their bindings, named after the release, which admit a write of
+the driver's service account only on the driver's own node:
+
+- its Node's status, where nothing may change but the driver's own conditions: no other
+  condition, no other status field, and none of the Node's labels, annotations or other metadata;
+- its node's ResourceSlices;
+- the status of a claim allocated on its node, where only the `dra.cpu` entries of
+  `status.devices` may change.
+
+The account that runs the upgrade needs the right to create them. With `rbac.create: false` the
+chart creates no policy.
+
 ### Behavior changes
 
 #### Kubernetes API client limits
