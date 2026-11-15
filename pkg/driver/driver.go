@@ -132,6 +132,9 @@ type CPUDriver struct {
 	// initialSync is closed when hasSynchronized first becomes true.
 	initialSync     chan struct{}
 	initialSyncWait time.Duration
+	// runtimeReportsCDIDevices is whether the runtime NRI last configured the
+	// plugin for fills in the CDI devices it injects into a container.
+	runtimeReportsCDIDevices bool
 
 	driverName              string
 	nodeName                string
