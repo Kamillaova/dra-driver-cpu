@@ -24,13 +24,16 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceclaim"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/utils/cpuset"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
@@ -177,6 +180,9 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 		if err != nil {
 			return kubeletplugin.PrepareResult{Err: err}
 		}
+		if err := cp.checkWholeCoreAmount(claim, alloc, claimCPUCount); err != nil {
+			return kubeletplugin.PrepareResult{Err: err}
+		}
 		logger.V(4).Info("found CPU request", "numCPUs", claimCPUCount, "device", alloc.Device)
 
 		topo := cp.topology.CPUTopology
@@ -199,7 +205,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			socketCPUs := topo.CPUDetails.CPUsInSockets(socketID)
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(socketCPUs)
 			logger.V(4).Info("socket CPU availability", "socketID", socketID, "socketCPUs", socketCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.cpuAllocator.Allocate(logger, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			cur, err = cp.takeCPUsForDevice(logger, alloc, availableCPUsForDevice, preferredCPUs, claimCPUCount)
 		case device.GROUP_BY_NUMA_NODE:
 			numaNodeID, ok := cp.topology.NameToNUMANodeID[alloc.Device]
 			if !ok {
@@ -208,7 +214,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			numaCPUs := topo.CPUDetails.CPUsInNUMANodes(numaNodeID)
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(numaCPUs)
 			logger.V(4).Info("NUMA node CPU availability", "numaNodeID", numaNodeID, "numaCPUs", numaCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
-			cur, err = cp.cpuAllocator.Allocate(logger, availableCPUsForDevice, preferredCPUs, claimCPUCount)
+			cur, err = cp.takeCPUsForDevice(logger, alloc, availableCPUsForDevice, preferredCPUs, claimCPUCount)
 		case device.GROUP_BY_MACHINE:
 			// no mapping needed in machine mode - just one device = the whole machine
 			availableCPUs := topo.CPUDetails.CPUs().Difference(cp.topology.ReservedCPUs)
@@ -244,6 +250,102 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 	cp.metrics.RecordClaimAllocatedCPUs(assignedCPUs.Size())
 	cp.refreshAllocationMetrics()
 	return result
+}
+
+// checkWholeCoreAmount refuses an amount that whole cores of the result's
+// device cannot make. The scheduler rounds a request up to the device's
+// request policy, and gives the amount as written where the policy is missing.
+func (cp *CPUDriver) checkWholeCoreAmount(claim *resourceapi.ResourceClaim, alloc resourceapi.DeviceRequestAllocationResult, consumed int) error {
+	if !cp.fullPhysicalCPUsOnly {
+		return nil
+	}
+	threads := cp.topology.threadsPerCore[alloc.Device]
+	if threads <= 1 {
+		return nil
+	}
+	written, ok := writtenCPUAmount(claim, alloc.Request, cp.driverName)
+	if !ok {
+		written = *resource.NewQuantity(int64(consumed), resource.DecimalSI)
+	}
+	if written.CmpInt64(int64(consumed)) == 0 && consumed%threads == 0 {
+		return nil
+	}
+	return exclusiveRefusal(alloc.Request, "amount "+written.String(),
+		fmt.Sprintf("exclusive request (class %s)", requestDeviceClass(claim, alloc.Request)), wholeCoresAdvice(threads))
+}
+
+// exclusiveRefusal refuses an amount or a limit an exclusive request asks for,
+// saying where the request is exclusive and what to ask for instead.
+func exclusiveRefusal(request, subject, where, advice string) error {
+	return fmt.Errorf("request %q: %s on %s; %s", request, subject, where, advice)
+}
+
+func wholeCoresAdvice(threads int) string {
+	return fmt.Sprintf("ask for whole cores of %d threads (`fullPhysicalCPUsOnly: true`)", threads)
+}
+
+// writtenCPUAmount returns the CPUs the claim's request, or subrequest, names
+// for a result, if it names any.
+func writtenCPUAmount(claim *resourceapi.ResourceClaim, request, driverName string) (resource.Quantity, bool) {
+	base := resourceclaim.BaseRequestRef(request)
+	for _, req := range claim.Spec.Devices.Requests {
+		if req.Name != base {
+			continue
+		}
+		if req.Exactly != nil {
+			return capacityRequest(req.Exactly.Capacity, driverName)
+		}
+		for _, sub := range req.FirstAvailable {
+			if resourceclaim.CreateSubRequestRef(base, sub.Name) == request {
+				return capacityRequest(sub.Capacity, driverName)
+			}
+		}
+	}
+	return resource.Quantity{}, false
+}
+
+// requestDeviceClass returns the device class of the claim's request, or
+// subrequest, a result belongs to.
+func requestDeviceClass(claim *resourceapi.ResourceClaim, request string) string {
+	base := resourceclaim.BaseRequestRef(request)
+	for _, req := range claim.Spec.Devices.Requests {
+		if req.Name != base {
+			continue
+		}
+		if req.Exactly != nil {
+			return req.Exactly.DeviceClassName
+		}
+		for _, sub := range req.FirstAvailable {
+			if resourceclaim.CreateSubRequestRef(base, sub.Name) == request {
+				return sub.DeviceClassName
+			}
+		}
+	}
+	return ""
+}
+
+func capacityRequest(capacity *resourceapi.CapacityRequirements, driverName string) (resource.Quantity, bool) {
+	if capacity == nil {
+		return resource.Quantity{}, false
+	}
+	return device.LookupConsumedCapacity(capacity.Requests, driverName)
+}
+
+// takeCPUsForDevice takes whole cores of either size under fullPhysicalCPUsOnly
+// on a device whose cores have two threads or differ, and leaves every other
+// take to the configured allocator.
+func (cp *CPUDriver) takeCPUsForDevice(logger logr.Logger, alloc resourceapi.DeviceRequestAllocationResult, available, preferred cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
+	threads, ok := cp.topology.threadsPerCore[alloc.Device]
+	if !cp.wholeCorePicker || !ok || threads == 1 {
+		return cp.cpuAllocator.Allocate(logger, available, preferred, numCPUs)
+	}
+	cpus, err := coreselect.TakeWholeCores(cp.topology.CPUTopology, available, numCPUs)
+	var noSingle *coreselect.NoFreeSingleThreadCoreError
+	if errors.As(err, &noSingle) {
+		return cpuset.New(), fmt.Errorf("request %q: %d exclusive CPUs need a free core of 1 thread on device %q, which has none (%d free cores of 2 threads; fullPhysicalCPUsOnly)",
+			alloc.Request, noSingle.CPUs, alloc.Device, noSingle.FreeTwoThreadCores)
+	}
+	return cpus, err
 }
 
 var errNRIDisconnected = errors.New("NRI connection to the container runtime is down; retry preparation")
