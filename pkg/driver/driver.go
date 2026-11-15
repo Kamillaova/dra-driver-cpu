@@ -162,6 +162,10 @@ type CPUDriver struct {
 	// wholeCorePicker is set under fullPhysicalCPUsOnly where the driver picks
 	// the CPUs itself, which an external allocator's cpuset leaves it no room to.
 	wholeCorePicker bool
+	// reconcileTrigger is set under AssumeUnsolicitedUpdatesSafe and carries
+	// coalesced requests to the worker that sends containerUpdater's updates.
+	reconcileTrigger chan struct{}
+	containerUpdater containerUpdater
 }
 
 // deviceHealthEntry is the last known health of a single device.
@@ -220,6 +224,8 @@ type Config struct {
 	PublishNodeAllocatableResourceMapping bool
 	// FullPhysicalCPUsOnly is driverconfig.Config.FullPhysicalCPUsOnly.
 	FullPhysicalCPUsOnly bool
+	// AssumeUnsolicitedUpdatesSafe is driverconfig.Config.AssumeUnsolicitedUpdatesSafe.
+	AssumeUnsolicitedUpdatesSafe bool
 	// CancelRun cancels the context given to Start, which refuses to run
 	// without it. HandleError calls it with a cause wrapping ErrFatal, so that
 	// the caller stops the driver.
@@ -263,6 +269,9 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		health:                  newHealthTracker(),
 		kubeletRootDir:          config.KubeletRootDir,
 		cancelRun:               config.CancelRun,
+	}
+	if config.AssumeUnsolicitedUpdatesSafe {
+		plugin.reconcileTrigger = make(chan struct{}, 1)
 	}
 	topo, err := providers.EnsureCPUInfo().GetCPUTopology(logger)
 	if err != nil {
@@ -505,6 +514,10 @@ func (cp *CPUDriver) seedAllocationStoreFromDisk(logger logr.Logger) {
 func (cp *CPUDriver) startNRIPlugin(ctx context.Context, asyncErr chan<- error) {
 	logger := ctxlog.FromContext(ctx)
 	ctx, cp.cancelNRI = context.WithCancel(context.WithoutCancel(ctx))
+	if cp.reconcileTrigger != nil {
+		cp.containerUpdater = cp.nriPlugin
+		go cp.runReconcileWorker(ctx)
+	}
 	go func() {
 		if err := runNRIPluginWithRetry(ctx, nriConnection{driver: cp, plugin: cp.nriPlugin}, maxAttempts, nriRetryInitialBackoff, nriRetryMaxBackoff, nriRetryHealthyRunDuration); err != nil && ctx.Err() == nil {
 			logger.Error(err, "NRI plugin failed to be restarted", "maxAttempts", maxAttempts)
