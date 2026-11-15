@@ -61,6 +61,12 @@ const (
 	// AttributeCPUSet is a metadata-only attribute that names the CPUs a request
 	// holding exclusive CPUs was given on a device.
 	AttributeCPUSet resourceapi.QualifiedName = "dra.cpu/cpuset"
+	// AttributeCPURequest and AttributeCPULimit are metadata-only attributes
+	// that mirror a container's CPU request and limit: the CPU amount booked for
+	// a request on a device and the request's cap, as quantity strings, the
+	// limit reading "max" where the request has no cap.
+	AttributeCPURequest resourceapi.QualifiedName = "dra.cpu/cpuRequest"
+	AttributeCPULimit   resourceapi.QualifiedName = "dra.cpu/cpuLimit"
 )
 
 // addCompatibilityAttributes add attributes to enable compatibility (e.g. alignment) with other
