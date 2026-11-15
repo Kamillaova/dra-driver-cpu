@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
@@ -36,11 +37,13 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	nodeutil "k8s.io/component-helpers/node/util"
 	"k8s.io/utils/cpuset"
 )
 
@@ -61,9 +64,13 @@ func TestValidatePartitions(t *testing.T) {
 		return device.Partition{Name: name, Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(cpus...), ThreadsPerCore: threads}
 	}
 	defaultEntry := device.Partition{Name: device.DefaultPartitionName}
+	threeThreadCore := cpuinfo.CPUDetails{
+		0: {CpuID: 0, CoreID: 0}, 1: {CpuID: 1, CoreID: 0}, 2: {CpuID: 2, CoreID: 0}, 3: {CpuID: 3, CoreID: 1},
+	}
 
 	for _, tc := range []struct {
 		name     string
+		details  cpuinfo.CPUDetails // nil for mixedCoreCPUInfos'
 		declared []device.Partition
 		wantErr  string
 	}{
@@ -97,13 +104,41 @@ func TestValidatePartitions(t *testing.T) {
 			wantErr:  `partition "vms" splits the physical cores of CPUs 1: a partition holds whole cores, so list their sibling threads 5 in it too`,
 		},
 		{
-			name:     "an smt false partition whose sibling is online",
+			name:     "an smt false partition whose sibling is online is left to the smt check",
 			declared: []device.Partition{defaultEntry, partition("spdk", 1, 1)},
+		},
+		{
+			name:     "a partition without smt whose sibling is online",
+			declared: []device.Partition{defaultEntry, partition("spdk", 0, 1)},
 			wantErr:  `partition "spdk" splits the physical cores of CPUs 1: a partition holds whole cores, so list their sibling threads 5 in it too`,
+		},
+		{
+			name:     "an smt false partition listing both threads of a core",
+			declared: []device.Partition{defaultEntry, partition("vms", 1, 1, 5)},
+			wantErr:  `partition "vms" lists CPUs 1,5 of one core under smt: false: list 1 thread per core`,
+		},
+		{
+			name:     "an smt false partition listing both threads of a core beside one whose sibling is online",
+			declared: []device.Partition{defaultEntry, partition("vms", 1, 0, 1, 5)},
+			wantErr:  `partition "vms" lists CPUs 1,5 of one core under smt: false: list 1 thread per core`,
+		},
+		{
+			name:     "an smt 2 partition listing both threads of a core",
+			declared: []device.Partition{defaultEntry, partition("vms", 2, 1, 5)},
+		},
+		{
+			name:     "an smt 2 partition listing three threads of a core",
+			details:  threeThreadCore,
+			declared: []device.Partition{defaultEntry, partition("vms", 2, 0, 1, 2)},
+			wantErr:  `partition "vms" lists CPUs 0-2 of one core under smt: 2: list 2 threads per core`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validatePartitions(topo.CPUDetails, present, online, tc.declared)
+			details := topo.CPUDetails
+			if tc.details != nil {
+				details = tc.details
+			}
+			err := validatePartitions(details, present, online, tc.declared)
 			if tc.wantErr == "" {
 				require.NoError(t, err)
 				return
@@ -119,14 +154,17 @@ func TestNewWithPartitions(t *testing.T) {
 		{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(0, 1, 4, 5)},
 		{Name: "system", Role: device.PARTITION_ROLE_RESERVED, CPUs: cpuset.New(3)},
 	}
+	spdk := device.Partition{Name: "spdk", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1), ThreadsPerCore: 1}
 	for _, tc := range []struct {
-		name         string
-		sysfs        fstest.MapFS
-		declared     []device.Partition
-		wantErr      string
-		wantReserved cpuset.CPUSet
-		wantSlices   [][]string
-		wantShared   map[string]cpuset.CPUSet
+		name          string
+		sysfs         fstest.MapFS
+		declared      []device.Partition
+		wantErr       string
+		wantReserved  cpuset.CPUSet
+		wantSlices    [][]string
+		wantShared    map[string]cpuset.CPUSet
+		wantClaimless string
+		wantVerified  map[string]float64
 	}{
 		{
 			name:         "the default partition publishes shared devices, the exclusive one owned, the reserved one holds its CPUs back",
@@ -135,6 +173,36 @@ func TestNewWithPartitions(t *testing.T) {
 			wantReserved: cpuset.New(3),
 			wantSlices:   [][]string{{"cpudevnuma000"}, {"cpudevnuma000-vms"}},
 			wantShared:   map[string]cpuset.CPUSet{"cpudevnuma000": cpuset.New(2)},
+			wantVerified: map[string]float64{"default": 1, "vms": 1, "system": 1},
+		},
+		{
+			name:          "an exclusive partition whose smt the kernel contradicts publishes nothing",
+			sysfs:         partitionSysFS(),
+			declared:      []device.Partition{{Name: device.DefaultPartitionName}, {Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(0, 4)}, spdk},
+			wantReserved:  cpuset.New(),
+			wantSlices:    [][]string{{"cpudevnuma000"}, {"cpudevnuma000-vms"}},
+			wantShared:    map[string]cpuset.CPUSet{"cpudevnuma000": cpuset.New(2, 3)},
+			wantClaimless: "2-3",
+			wantVerified:  map[string]float64{"default": 1, "vms": 1, "spdk": 0},
+		},
+		{
+			name:          "the default entry whose smt the kernel contradicts publishes nothing, and containers without claims keep its CPUs",
+			sysfs:         partitionSysFS(),
+			declared:      []device.Partition{{Name: device.DefaultPartitionName, ThreadsPerCore: 1}, {Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)}},
+			wantReserved:  cpuset.New(),
+			wantSlices:    [][]string{{"cpudevnuma000-vms"}},
+			wantShared:    map[string]cpuset.CPUSet{},
+			wantClaimless: "0,2-3",
+			wantVerified:  map[string]float64{"default": 0, "vms": 1},
+		},
+		{
+			name:          "every partition degraded publishes an empty pool",
+			sysfs:         partitionSysFS(),
+			declared:      []device.Partition{{Name: device.DefaultPartitionName, ThreadsPerCore: 1}, spdk},
+			wantReserved:  cpuset.New(),
+			wantShared:    map[string]cpuset.CPUSet{},
+			wantClaimless: "0,2-3",
+			wantVerified:  map[string]float64{"default": 0, "spdk": 0},
 		},
 		{
 			name:     "a partition naming an offline CPU stops the driver",
@@ -157,6 +225,7 @@ func TestNewWithPartitions(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
 			d, err := New(testr.New(t), Providers{
 				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
 				SysFS:   tc.sysfs,
@@ -167,12 +236,28 @@ func TestNewWithPartitions(t *testing.T) {
 				CPUDeviceMode:    device.CPU_DEVICE_MODE_GROUPED,
 				CPUDeviceGroupBy: device.GROUP_BY_NUMA_NODE,
 				CPUPartitions:    tc.declared,
+				Metrics:          cpumetrics.New(reg),
 			})
 			if tc.wantErr != "" {
 				require.EqualError(t, err, tc.wantErr)
 				return
 			}
 			require.NoError(t, err)
+			for partition, want := range tc.wantVerified {
+				require.Equalf(t, want, metricValue(t, reg, "dra_cpu_partition_verified", map[string]string{"partition": partition}), "partition %s", partition)
+			}
+			if tc.wantClaimless != "" {
+				claimless, confined := d.allocationState.ConfinedClaimlessCPUs()
+				require.True(t, confined)
+				require.Equal(t, tc.wantClaimless, claimless.String())
+			}
+			plugin := &mockKubeletPlugin{}
+			d.draPlugin = plugin
+			d.PublishResources(context.Background())
+			require.NotNil(t, plugin.publishedResources, "the node's pool is published even with no device")
+			pool, ok := plugin.publishedResources.Pools[testNodeName]
+			require.True(t, ok, "the node's pool is published even with no device")
+			require.Len(t, pool.Slices, len(tc.wantSlices))
 			require.Truef(t, tc.wantReserved.Equals(d.topology.ReservedCPUs), "reserved CPUs: got %s, want %s", d.topology.ReservedCPUs, tc.wantReserved)
 			require.Truef(t, d.allocationState.GetSharedCPUs().Intersection(tc.wantReserved).IsEmpty(), "shared CPUs %s hold reserved ones", d.allocationState.GetSharedCPUs())
 			var gotSlices [][]string
@@ -298,6 +383,95 @@ func TestPrepareTakesCPUsFromTheDevicePartition(t *testing.T) {
 			})
 			require.NoError(t, err)
 			require.Error(t, results["claim-1"].Err, "the partition has no CPU left, though the NUMA node and socket do")
+		})
+	}
+}
+
+func TestVerifyThreadArity(t *testing.T) {
+	topo, err := (&cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos}).GetCPUTopology(testr.New(t))
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name      string
+		partition device.Partition
+		want      string
+	}{{
+		name:      "no smt accepts any thread count",
+		partition: device.Partition{Name: "vms", CPUs: cpuset.New(1, 5)},
+	}, {
+		name:      "smt 2 on cores of two threads",
+		partition: device.Partition{Name: "vms", CPUs: cpuset.New(1, 5), ThreadsPerCore: 2},
+	}, {
+		name:      "smt false on cores whose siblings the kernel has offline",
+		partition: device.Partition{Name: "spdk", CPUs: cpuset.New(2, 3), ThreadsPerCore: 1},
+	}, {
+		name:      "smt false on a core whose sibling is online",
+		partition: device.Partition{Name: "spdk", CPUs: cpuset.New(1, 2), ThreadsPerCore: 1},
+		want:      `partition "spdk" expects 1 online thread per core, and CPUs 5 of its cores are online too`,
+	}, {
+		name:      "the default entry's lowest threads, its cores' others online",
+		partition: device.Partition{Name: device.DefaultPartitionName, CPUs: cpuset.New(0, 1, 2, 3), ThreadsPerCore: 1},
+		want:      `partition "default" expects 1 online thread per core, and CPUs 4-5 of its cores are online too`,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, verifyThreadArity(topo.CPUDetails, tc.partition))
+		})
+	}
+}
+
+// CPUPartitionDegraded is written wherever partitions are used, the least
+// list included, and nowhere else.
+func TestPartitionDegradedCondition(t *testing.T) {
+	vms := device.Partition{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)}
+	spdk := device.Partition{Name: "spdk", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1), ThreadsPerCore: 1}
+	for _, tc := range []struct {
+		name       string
+		partitions []device.Partition
+		want       *corev1.NodeCondition
+	}{{
+		name: "no partitions",
+	}, {
+		name:       "the least list",
+		partitions: []device.Partition{{Name: device.DefaultPartitionName}},
+		want:       &corev1.NodeCondition{Status: corev1.ConditionFalse, Reason: "PartitionsVerified", Message: "the kernel has online the threads per core every CPU partition's smt declares"},
+	}, {
+		name:       "every smt matching",
+		partitions: []device.Partition{{Name: device.DefaultPartitionName}, vms},
+		want:       &corev1.NodeCondition{Status: corev1.ConditionFalse, Reason: "PartitionsVerified", Message: "the kernel has online the threads per core every CPU partition's smt declares"},
+	}, {
+		name:       "a named partition and the default entry contradicted",
+		partitions: []device.Partition{{Name: device.DefaultPartitionName, ThreadsPerCore: 1}, spdk},
+		want: &corev1.NodeCondition{Status: corev1.ConditionTrue, Reason: "SiblingThreadsOnline",
+			Message: `partitions publish no devices while the kernel contradicts their smt: partition "default" expects 1 online thread per core, and CPUs 4 of its cores are online too; partition "spdk" expects 1 online thread per core, and CPUs 5 of its cores are online too; take those CPUs offline at boot, then restart the driver`},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewClientset(testConditionNode(testReadyCond))
+			d, err := New(testr.New(t), Providers{
+				CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+				SysFS:     partitionSysFS(),
+				K8SClient: client,
+			}, &Config{
+				DriverName:       testDriverName,
+				NodeName:         testNodeName,
+				ReservedCPUs:     cpuset.New(),
+				CPUDeviceMode:    device.CPU_DEVICE_MODE_GROUPED,
+				CPUDeviceGroupBy: device.GROUP_BY_NUMA_NODE,
+				CPUPartitions:    tc.partitions,
+			})
+			require.NoError(t, err)
+			d.nodeConditions.now = func() time.Time { return testClock }
+
+			require.NoError(t, d.nodeConditions.sync(t.Context(), testr.New(t)))
+			node, err := client.CoreV1().Nodes().Get(t.Context(), testNodeName, metav1.GetOptions{})
+			require.NoError(t, err)
+			_, got := nodeutil.GetNodeCondition(&node.Status, conditionPartitionDegraded)
+			if tc.want == nil {
+				require.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			require.Equal(t, tc.want.Status, got.Status)
+			require.Equal(t, tc.want.Reason, got.Reason)
+			require.Equal(t, tc.want.Message, got.Message)
 		})
 	}
 }

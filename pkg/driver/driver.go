@@ -178,6 +178,9 @@ type CPUDriver struct {
 	// allocatableMappingDropped is never cleared: once the API server drops a
 	// field, the plugin library stops sending it until the driver restarts.
 	allocatableMappingDropped atomic.Bool
+	// degradedPartitions are the partitions whose smt the kernel contradicts,
+	// each with the contradiction. Set in configure, read-only after that.
+	degradedPartitions map[string]string
 
 	// window is set, under stateMu, while the node's profile is not read yet;
 	// see Config.SelectProfile.
@@ -349,6 +352,9 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 	if config.PublishNodeAllocatableResourceMapping {
 		conditions = append(conditions, cp.allocatableMappingCondition())
 	}
+	if len(config.CPUPartitions) > 0 {
+		conditions = append(conditions, cp.partitionDegradedCondition())
+	}
 	cp.nodeConditions = newNodeConditionWriter(providers.K8SClient, config.NodeName, &cp.stateMu, conditions,
 		workqueue.DefaultTypedControllerRateLimiter[string]())
 	topo, err := providers.EnsureCPUInfo().GetCPUTopology(logger)
@@ -362,9 +368,18 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 	managedCPUs := cp.topology.ManagedCPUs()
 	logger.V(2).Info("detected topology-validated CPUs", "cpus", managedCPUs.String())
 
-	partitions, err := resolvePartitions(logger, providers.EnsureSysFS(), topo, config.CPUPartitions, config.ReservedCPUs)
+	partitions, degraded, err := resolvePartitions(logger, providers.EnsureSysFS(), topo, config.CPUPartitions, config.ReservedCPUs)
 	if err != nil {
 		return err
+	}
+	cp.degradedPartitions = degraded
+	withheld := make(map[string]bool, len(degraded))
+	if len(config.CPUPartitions) > 0 {
+		for _, partition := range partitions {
+			_, contradicted := degraded[partition.Name]
+			withheld[partition.Name] = contradicted
+			cp.metrics.SetPartitionVerified(partition.Name, !contradicted)
+		}
 	}
 	cp.topology.ReservedCPUs = config.ReservedCPUs.Union(unclaimablePartitionCPUs(partitions))
 
@@ -415,6 +430,7 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 		Allocator:                             allocator,
 		Partitions:                            partitions,
 		PartitionsUsed:                        len(config.CPUPartitions) > 0,
+		Withheld:                              withheld,
 		AllowFractionalCapacityRequests:       config.AllowFractionalCapacityRequests,
 	})
 	if err != nil {
