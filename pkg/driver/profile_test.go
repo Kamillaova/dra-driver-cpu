@@ -374,7 +374,7 @@ func TestAwaitProfileLabel(t *testing.T) {
 			attempts := nodeGetFailures(client, tc.failures, tc.err)
 			driver := profiledDriver(t, client, nil)
 
-			name, err := driver.awaitProfileLabel(ctx, nriErr)
+			name, _, err := driver.awaitProfileLabel(ctx, nriErr)
 			if tc.wantErr != "" {
 				require.EqualError(t, err, tc.wantErr)
 			} else {
@@ -407,8 +407,135 @@ func TestReadProfileLabelHasItsOwnDeadline(t *testing.T) {
 	driver.profileReadTimeout = 50 * time.Millisecond
 
 	ctx := ctxlog.NewContext(context.Background(), testr.New(t))
-	name, err := driver.awaitProfileLabel(ctx, make(chan error))
+	name, _, err := driver.awaitProfileLabel(ctx, make(chan error))
 	require.NoError(t, err)
 	require.Equal(t, "r7625", name)
 	require.Equal(t, int32(2), requests.Load(), "the hung read was abandoned at its deadline and read again")
+}
+
+// unprofiledDriver is a driver whose configuration declares no profiles, as
+// cmd/dracpu builds it, not yet started.
+func unprofiledDriver(t *testing.T, client kubernetes.Interface) *CPUDriver {
+	t.Helper()
+	infos := mockCPUInfos_SingleSocket_4CPUS_HT
+	driver, err := New(testr.New(t), Providers{
+		CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:     testSysFS(infos),
+		K8SClient: client,
+	}, &Config{
+		DriverName: testDriverName, NodeName: testNodeName,
+		CPUDeviceMode: device.CPU_DEVICE_MODE_GROUPED, CPUDeviceGroupBy: device.GROUP_BY_NUMA_NODE,
+		ProfileLabel: driverconfig.ProfileLabel,
+	})
+	require.NoError(t, err)
+	driver.cdiMgr = newMockCdiMgrWithAllocations(nil)
+	driver.profileReadInterval = time.Millisecond
+	return driver
+}
+
+// Without profiles a node carrying the label is refused before the driver
+// registers, whatever the label's value; a node without it goes on.
+func TestRefuseProfileLabel(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		labels  map[string]string
+		wantErr string
+	}{{
+		name: "no label",
+	}, {
+		name:    "a label naming a profile",
+		labels:  map[string]string{driverconfig.ProfileLabel: "r7625"},
+		wantErr: `node label dra.cpu/profile=r7625 names a profile, and the config declares no profiles: declare the profiles the nodes' labels name, or remove the label with kubectl label node ` + testNodeName + ` dra.cpu/profile-`,
+	}, {
+		name:    "a label with an empty value",
+		labels:  map[string]string{driverconfig.ProfileLabel: ""},
+		wantErr: `node label dra.cpu/profile= names a profile, and the config declares no profiles: declare the profiles the nodes' labels name, or remove the label with kubectl label node ` + testNodeName + ` dra.cpu/profile-`,
+	}, {
+		name:   "another label",
+		labels: map[string]string{"dra.cpu/other": "r7625"},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			driver := unprofiledDriver(t, fake.NewClientset(labelledNode(tc.labels)))
+			_, err := driver.Synchronize(ctx, nil, nil)
+			require.NoError(t, err)
+
+			err = driver.refuseProfileLabel(ctx, make(chan error))
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// Without profiles the label is read once NRI has synchronized, and the call
+// that comes before the registration does not return while the API server does
+// not answer.
+func TestRefuseProfileLabelWaitsForTheRead(t *testing.T) {
+	ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+	client := fake.NewClientset(labelledNode(nil))
+	var reachable atomic.Bool
+	var reads atomic.Int32
+	client.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		reads.Add(1)
+		if !reachable.Load() {
+			return true, nil, errors.New("dial tcp 10.96.0.1:443: connect: connection refused")
+		}
+		return false, nil, nil
+	})
+	driver := unprofiledDriver(t, client)
+
+	done := make(chan error, 1)
+	go func() { done <- driver.refuseProfileLabel(ctx, make(chan error)) }()
+	require.Never(t, func() bool { return reads.Load() > 0 }, 100*time.Millisecond, time.Millisecond,
+		"the label was read before the first Synchronize")
+
+	_, err := driver.Synchronize(ctx, nil, nil)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return reads.Load() >= 3 }, 5*time.Second, time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("refuseProfileLabel returned %v before the label was read", err)
+	default:
+	}
+
+	reachable.Store(true)
+	require.NoError(t, <-done)
+}
+
+// A read that times out is repeated, so a node whose API server accepts the
+// connection and does not answer is still refused once it does.
+func TestRefuseProfileLabelRetriesATimedOutRead(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) <= 2 {
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"kind":"Node","apiVersion":"v1","metadata":{"name":%q,"labels":{%q:"r7625"}}}`, testNodeName, driverconfig.ProfileLabel)
+	}))
+	defer server.Close()
+	client, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	require.NoError(t, err)
+	driver := unprofiledDriver(t, client)
+	driver.profileReadTimeout = 50 * time.Millisecond
+
+	ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+	_, err = driver.Synchronize(ctx, nil, nil)
+	require.NoError(t, err)
+	require.ErrorContains(t, driver.refuseProfileLabel(ctx, make(chan error)), "node label dra.cpu/profile=r7625 names a profile")
+	require.Equal(t, int32(3), requests.Load(), "the hung reads were abandoned at their deadline and read again")
+}
+
+// An NRI plugin that fails for good before its first Synchronize ends the wait
+// with its error.
+func TestRefuseProfileLabelEndsOnAnNRIFailure(t *testing.T) {
+	ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+	driver := unprofiledDriver(t, fake.NewClientset(labelledNode(nil)))
+	nriErr := make(chan error, 1)
+	nriErr <- errors.New("connection to the runtime lost")
+	require.EqualError(t, driver.refuseProfileLabel(ctx, nriErr), "NRI plugin failed before it synchronized: connection to the runtime lost")
 }

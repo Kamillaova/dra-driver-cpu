@@ -248,12 +248,14 @@ type Config struct {
 	// without it. HandleError calls it with a cause wrapping ErrFatal, so that
 	// the caller stops the driver.
 	CancelRun context.CancelCauseFunc
-	// ProfileLabel and SelectProfile are set where the configuration declares
-	// profiles. New then builds only what no profile decides, and Start, once
-	// connected to NRI, reads the node's ProfileLabel label, builds the driver
-	// from the Config SelectProfile returns for its value, and only then
-	// registers with the kubelet. An error from SelectProfile stops Start.
-	ProfileLabel  string
+	// ProfileLabel is the node label naming a profile. Start, once connected to
+	// NRI, reads it before it registers with the kubelet, and without
+	// SelectProfile refuses a node that carries it.
+	ProfileLabel string
+	// SelectProfile is set where the configuration declares profiles. New then
+	// builds only what no profile decides, and Start builds the driver from the
+	// Config SelectProfile returns for the node's ProfileLabel label, and only
+	// then registers with the kubelet. An error from SelectProfile stops Start.
 	SelectProfile func(name string) (*Config, error)
 }
 
@@ -460,10 +462,10 @@ func checkSocketPathFits(kubeletRootDir, driverName string) error {
 	return nil
 }
 
-// Start registers the plugin with kubelet, starts the NRI plugin, and begins
-// async resource publication. Setup must have been called first. Where the
-// node's profile is still to be read, it connects to NRI first and registers
-// only once the profile is read and the driver built from it.
+// Start connects to NRI, reads the node's profile label, registers the plugin
+// with kubelet, and begins async resource publication. Setup must have been
+// called first. Where the node's profile is still to be read, the driver is
+// built from it before the registration.
 func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	ctx, logger := ctxlog.WithValues(ctx, "driver", cp.driverName)
 
@@ -493,16 +495,17 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 
 	cp.seedAllocationStoreFromDisk(logger)
 	go cp.runWatchdog(ctx)
-	if err := cp.register(ctx); err != nil {
-		return asyncErr, err
-	}
-
 	cp.eventBroadcaster, cp.eventRecorder = newEventRecorder(ctx, cp.kubeClient, cp.driverName, cp.nodeName)
 
 	if err := cp.startNRI(ctx, asyncErr); err != nil {
 		return asyncErr, err
 	}
-	// Registered already, the driver is in service once NRI first synchronizes.
+	if err := cp.refuseProfileLabel(ctx, asyncErr); err != nil {
+		return asyncErr, err
+	}
+	if err := cp.register(ctx); err != nil {
+		return asyncErr, err
+	}
 	cp.serve(ctx)
 
 	return asyncErr, nil
