@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 18)
+	require.Len(t, descriptors, 19)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -59,6 +59,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_watchdog_stuck_seconds",
 		"dra_cpu_node_allocatable_mapping_dropped_total",
 		"dra_cpu_misplaced_claims_total",
+		"dra_cpu_partition_verified",
 	}, names)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
@@ -136,6 +137,8 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	m.SetWatchdogStuck(61500 * time.Millisecond)
 	m.RecordNodeAllocatableMappingDropped()
 	m.RecordMisplacedClaim()
+	m.SetPartitionVerified("vms", true)
+	m.SetPartitionVerified("spdk", false)
 
 	require.InDelta(t, 2, testutil.ToFloat64(m.allocatedCPUs), 0.01)
 	require.InDelta(t, 6, testutil.ToFloat64(m.availableCPUs), 0.01)
@@ -149,6 +152,8 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	require.InDelta(t, 61.5, testutil.ToFloat64(m.watchdogStuck), 0.01)
 	require.InDelta(t, 1, testutil.ToFloat64(m.mappingDropped), 0.01)
 	require.InDelta(t, 1, testutil.ToFloat64(m.misplacedClaims), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.partitionVerified.WithLabelValues("vms")), 0.01)
+	require.InDelta(t, 0, testutil.ToFloat64(m.partitionVerified.WithLabelValues("spdk")), 0.01)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -167,6 +172,7 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordUnprepare(ResultSuccess, time.Second)
 	m.RecordUnprepare(ResultError, time.Second)
 	m.RecordClaimAllocatedCPUs(1)
+	m.SetPartitionVerified("default", true)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -208,6 +214,7 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.SetWatchdogStuck(time.Minute)
 		recorder.RecordNodeAllocatableMappingDropped()
 		recorder.RecordMisplacedClaim()
+		recorder.SetPartitionVerified("vms", true)
 	})
 }
 

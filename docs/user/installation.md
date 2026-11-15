@@ -300,12 +300,13 @@ without a driver that pod stays `Terminating`.
    ```
 
 1. Remove the conditions the driver kept from every Node: `CPUAllocatableMappingDropped`, which
-   it keeps where `publishNodeAllocatableResourceMapping` is on.
+   it keeps where `publishNodeAllocatableResourceMapping` is on, and `CPUPartitionDegraded`, which it
+   keeps on nodes that use `cpuPartitions`.
 
    ```bash
    for node in $(kubectl get nodes -o name); do
      kubectl patch "${node}" --subresource=status --type=strategic \
-       -p '{"status":{"conditions":[{"type":"CPUAllocatableMappingDropped","$patch":"delete"}]}}'
+       -p '{"status":{"conditions":[{"type":"CPUAllocatableMappingDropped","$patch":"delete"},{"type":"CPUPartitionDegraded","$patch":"delete"}]}}'
    done
    ```
 
