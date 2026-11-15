@@ -58,6 +58,9 @@ const (
 	// settings of the same names, published on every device.
 	AttributeFullPhysicalCPUsOnly resourceapi.QualifiedName = "dra.cpu/fullPhysicalCPUsOnly"
 	AttributeAllocator            resourceapi.QualifiedName = "dra.cpu/allocator"
+	// AttributeCPUSet is a metadata-only attribute that names the CPUs a request
+	// holding exclusive CPUs was given on a device.
+	AttributeCPUSet resourceapi.QualifiedName = "dra.cpu/cpuset"
 )
 
 // addCompatibilityAttributes add attributes to enable compatibility (e.g. alignment) with other

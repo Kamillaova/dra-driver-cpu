@@ -571,6 +571,33 @@ func TestAllocationStateReserveNamesTheHolders(t *testing.T) {
 	}
 }
 
+func TestAllocationStateHoldsExclusiveCPUsOf(t *testing.T) {
+	s := newTestAllocationState(testr.New(t), cpuset.New(0, 1, 2, 3), cpuset.New())
+	require.NoError(t, s.Reserve(testr.New(t), "claim", ClaimRecord{Requests: []RequestAllocation{
+		{Request: "a", CPUs: cpuset.New(0)},
+		{Request: "b", CPUs: cpuset.New(1)},
+	}}, false))
+	s.Restore(testr.New(t), "up", ClaimRecord{Requests: []RequestAllocation{{CPUs: cpuset.New(2)}}})
+
+	tests := []struct {
+		name string
+		ref  ClaimRequestRef
+		want bool
+	}{
+		{name: "a request of a prepared claim", ref: ClaimRequestRef{ClaimUID: "claim", Request: "b"}, want: true},
+		{name: "a prepared claim as a whole", ref: ClaimRequestRef{ClaimUID: "claim"}, want: true},
+		{name: "a request the claim was prepared without", ref: ClaimRequestRef{ClaimUID: "claim", Request: "c"}, want: false},
+		{name: "a claim restored from upstream's spec, as a whole", ref: ClaimRequestRef{ClaimUID: "up"}, want: true},
+		{name: "a request of a claim restored from upstream's spec", ref: ClaimRequestRef{ClaimUID: "up", Request: "a"}, want: false},
+		{name: "a claim that is not prepared", ref: ClaimRequestRef{ClaimUID: "other", Request: "a"}, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, s.HoldsExclusiveCPUsOf(tc.ref))
+		})
+	}
+}
+
 func TestAllocationStateRestoreKeepsOverlappingClaimsUnbound(t *testing.T) {
 	logger := testr.New(t)
 	store := newTestAllocationState(logger, cpuset.New(0, 1, 2, 3, 4), cpuset.New())
