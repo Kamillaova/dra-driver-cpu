@@ -223,6 +223,13 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 	var kept []cpumetrics.Rule
 	var warnings []olderRuleWarning
 	for _, sc := range listed {
+		if uid, hold, held := cp.heldClaimOf(sc.claims); held {
+			if hasTask(sc.container) {
+				sc.logger.Info("stopping container: a reserved partition holds its claim's CPUs", "claimUID", uid, "reason", hold.refusal(uid))
+				containerUpdates = append(containerUpdates, killUpdate(sc.container.GetId()))
+			}
+			continue
+		}
 		allGuaranteedCPUs := cpuset.New()
 		var claimUIDs []types.UID
 		keptUnder := sets.New[cpumetrics.Rule]()
@@ -748,6 +755,9 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		logger.V(2).Info("no guaranteed CPUs found, using shared CPUs", "sharedCPUs", sharedCPUs.String())
 		adjust.SetLinuxCPUSetCPUs(sharedCPUs.String())
 	} else {
+		if uid, hold, held := cp.heldClaimOf(claimAllocations); held {
+			return nil, nil, fmt.Errorf("cannot create container %q in pod %q: %s", ctr.Name, pod.Uid, hold.refusal(uid))
+		}
 		if cp.runtimeReportsCDIDevices {
 			if err := checkInjected(cp.allocationState, ctr, claimAllocations); err != nil {
 				logger.Error(err, "refusing container whose DRA env names a device the runtime did not inject")
@@ -809,6 +819,31 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	}
 
 	return adjust, updates, nil
+}
+
+// StartContainer refuses to start a container of a claim a reserved partition
+// holds. Such a container was created before the driver started, and an
+// update killing it while it has no task only rewrites its stored spec
+// (containerd v2.4.0 internal/cri/server/container_update_resources.go:120-124).
+func (cp *CPUDriver) StartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
+	defer cp.watchdog.track("StartContainer")()
+	cp.stateMu.Lock()
+	defer cp.stateMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if cp.window != nil || len(cp.reservedHolds) == 0 {
+		return nil
+	}
+	_, logger := ctxlog.WithValues(ctx, "pod", ctxlog.KObj(pod), "podUID", pod.Uid, "container", ctr.Name, "containerID", ctr.Id)
+	claims, err := parseDRAEnvToClaimAllocations(logger, ctr.Env)
+	if err != nil {
+		return nil
+	}
+	if uid, hold, held := cp.heldClaimOf(claims); held {
+		return fmt.Errorf("cannot start container %q in pod %q: %s", ctr.Name, pod.Uid, hold.refusal(uid))
+	}
+	return nil
 }
 
 // StopContainer removes runtime container state without changing DRA-owned allocations.
