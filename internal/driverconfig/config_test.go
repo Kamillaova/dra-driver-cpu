@@ -397,6 +397,7 @@ func TestDefault(t *testing.T) {
 	assert.False(t, d.PublishNodeAllocatableResourceMapping)
 	assert.False(t, d.FullPhysicalCPUsOnly)
 	assert.False(t, d.AssumeUnsolicitedUpdatesSafe)
+	assert.False(t, d.AllowFractionalCapacityRequests)
 }
 
 // TestResolve_AssumeUnsolicitedUpdatesSafe: the option comes from the file, and
@@ -421,6 +422,35 @@ func TestResolve_AssumeUnsolicitedUpdatesSafe(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, result.AssumeUnsolicitedUpdatesSafe)
+		})
+	}
+}
+
+// TestResolve_AllowFractionalCapacityRequests: the option comes from the file, a
+// key left out or null keeps the default, and every mode accepts it.
+func TestResolve_AllowFractionalCapacityRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		file string
+		want bool
+	}{
+		{name: "left out", file: "apiVersion: v1alpha1\n", want: false},
+		{name: "null", file: "apiVersion: v1alpha1\nallowFractionalCapacityRequests: null\n", want: false},
+		{name: "false", file: "apiVersion: v1alpha1\nallowFractionalCapacityRequests: false\n", want: false},
+		{name: "true", file: "apiVersion: v1alpha1\nallowFractionalCapacityRequests: true\n", want: true},
+		{name: "true in individual mode", file: "apiVersion: v1alpha1\ncpuDeviceMode: individual\nallowFractionalCapacityRequests: true\n", want: true},
+		{name: "true with partitions", file: "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\nallowFractionalCapacityRequests: true\n", want: true},
+		{name: "true with profiles", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions:\n    - name: default\nallowFractionalCapacityRequests: true\n", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgFile := writeFile(t, t.TempDir(), "config.yaml", tc.file)
+
+			result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+				driverconfig.FromFile(cfgFile),
+			})
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, result.AllowFractionalCapacityRequests)
 		})
 	}
 }
