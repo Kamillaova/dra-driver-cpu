@@ -395,6 +395,33 @@ func TestDefault(t *testing.T) {
 	assert.False(t, d.ExposePCIeRoots)
 	assert.False(t, d.PublishNodeAllocatableResourceMapping)
 	assert.False(t, d.FullPhysicalCPUsOnly)
+	assert.False(t, d.AssumeUnsolicitedUpdatesSafe)
+}
+
+// TestResolve_AssumeUnsolicitedUpdatesSafe: the option comes from the file, and
+// a key left out or null keeps the default.
+func TestResolve_AssumeUnsolicitedUpdatesSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		file string
+		want bool
+	}{
+		{name: "left out", file: "apiVersion: v1alpha1\n", want: false},
+		{name: "null", file: "apiVersion: v1alpha1\nassumeUnsolicitedUpdatesSafe: null\n", want: false},
+		{name: "false", file: "apiVersion: v1alpha1\nassumeUnsolicitedUpdatesSafe: false\n", want: false},
+		{name: "true", file: "apiVersion: v1alpha1\nassumeUnsolicitedUpdatesSafe: true\n", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgFile := writeFile(t, t.TempDir(), "config.yaml", tc.file)
+
+			result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+				driverconfig.FromFile(cfgFile),
+			})
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, result.AssumeUnsolicitedUpdatesSafe)
+		})
+	}
 }
 
 // TestResolve_FullPhysicalCPUsOnly: the option comes from the file, a key left
