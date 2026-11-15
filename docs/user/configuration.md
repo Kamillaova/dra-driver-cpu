@@ -301,6 +301,14 @@ plugin does with `nvidia.com/device-plugin.config`, and NVIDIA's GPU Operator fo
 naming no configuration and apply a change at once; profiles refuse the first two and apply a change
 at the driver's restart.
 
+Without profiles the label configures nothing, and a node carrying it is refused: the driver reads
+its Node at every start, after it connects to the container runtime and before it registers with
+the kubelet, and stops on a `dra.cpu/profile` label before it publishes anything. Remove the label,
+or declare the profiles the labels name. To move a fleet to profiles, change the configuration
+first, then label each node and restart its driver: the driver reads the configuration and the
+label only when it starts. See
+[A Profile Label Without Profiles](troubleshooting.md#a-profile-label-without-profiles).
+
 Running without profiles, the node's CPUs named, if at all, by the fleet-wide `reservedCPUs` and
 `cpuPartitions`, keeps working and is deprecated: profiles replace it, each holding
 `- name: default`, with every node labelled. So is running one Helm release per kind of node; see

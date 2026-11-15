@@ -222,9 +222,9 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		KubeletRootDir:                        cfg.KubeletRootDir,
 		Allocator:                             cfg.Allocator,
 		CancelRun:                             cancel,
+		ProfileLabel:                          driverconfig.ProfileLabel,
 	}
 	if len(cfg.Profiles) > 0 {
-		driverConfig.ProfileLabel = driverconfig.ProfileLabel
 		driverConfig.SelectProfile = func(name string) (*driver.Config, error) {
 			if _, err := cfg.WithProfile(name); err != nil {
 				return nil, err
