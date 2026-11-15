@@ -195,3 +195,52 @@ func TestGenerateDriverConfigSchema_CPUPartitions(t *testing.T) {
 		t.Errorf("smt takes %v, want %v", shapes, want)
 	}
 }
+
+// A profile's partitions are the same partitions, so the values schema
+// constrains them as it does the fleet-wide list, and leaves the key optional in
+// a profile as it does there.
+func TestGenerateDriverConfigSchema_Profiles(t *testing.T) {
+	out, err := GenerateDriverConfigSchema()
+	if err != nil {
+		t.Fatalf("GenerateDriverConfigSchema: %v", err)
+	}
+
+	var schema struct {
+		Required   []string `json:"required"`
+		Properties struct {
+			CPUPartitions json.RawMessage `json:"cpuPartitions"`
+			Profiles      struct {
+				AdditionalProperties struct {
+					Required   []string `json:"required"`
+					Properties struct {
+						CPUPartitions json.RawMessage `json:"cpuPartitions"`
+					} `json:"properties"`
+				} `json:"additionalProperties"`
+			} `json:"profiles"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(out, &schema); err != nil {
+		t.Fatalf("unmarshal generated schema: %v\n%s", err, out)
+	}
+
+	if slices.Contains(schema.Required, "profiles") {
+		t.Errorf("profiles is required, want it optional: %v", schema.Required)
+	}
+	profile := schema.Properties.Profiles.AdditionalProperties
+	if slices.Contains(profile.Required, "cpuPartitions") {
+		t.Errorf("a profile requires cpuPartitions, want it optional: %v", profile.Required)
+	}
+	if len(profile.Properties.CPUPartitions) == 0 {
+		t.Fatalf("a profile has no cpuPartitions in the generated schema:\n%s", out)
+	}
+	var inProfile, fleetWide bytes.Buffer
+	if err := json.Compact(&inProfile, profile.Properties.CPUPartitions); err != nil {
+		t.Fatalf("compact a profile's cpuPartitions: %v", err)
+	}
+	if err := json.Compact(&fleetWide, schema.Properties.CPUPartitions); err != nil {
+		t.Fatalf("compact cpuPartitions: %v", err)
+	}
+	if inProfile.String() != fleetWide.String() {
+		t.Errorf("a profile's cpuPartitions is\n%s\nwant the fleet-wide list's\n%s", &inProfile, &fleetWide)
+	}
+}

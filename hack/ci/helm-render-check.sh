@@ -255,4 +255,94 @@ driverConfig:
   cpuPartitions:
   - name: default')"
 
+# Every profile's list holds the entry too; the chart names the profile.
+refuses profile-vms-without-default "profile \"r7625\": ${no_default}" -f "$(values profile-vms-without-default '
+driverConfig:
+  profiles:
+    r7625:
+      cpuPartitions:
+      - name: vms
+        role: exclusive
+        cpuset: "2-3"')"
+# Within profiles a list left out, null or empty is refused: every node runs
+# a declared profile, and a profile without the entry describes no node.
+no_partitions='profile "r7625" has no partitions; add "- name: default" to its cpuPartitions'
+refuses profile-list-left-out "${no_partitions}" -f "$(values profile-list-left-out '
+driverConfig:
+  profiles:
+    r7625: {}')"
+refuses profile-list-null "${no_partitions}" -f "$(values profile-list-null '
+driverConfig:
+  profiles:
+    r7625:
+      cpuPartitions: null')"
+refuses profile-list-empty "${no_partitions}" -f "$(values profile-list-empty '
+driverConfig:
+  profiles:
+    r7625:
+      cpuPartitions: []')"
+renders profile-default-entry -f "$(values profile-default-entry '
+driverConfig:
+  profiles:
+    r7625:
+      cpuPartitions:
+      - name: default')"
+# A node whose cores are all alike runs a declared profile, which may be named
+# default.
+renders profile-named-default -f "$(values profile-named-default '
+driverConfig:
+  profiles:
+    default:
+      cpuPartitions:
+      - name: default')"
+# A partition name is one device class on every node.
+refuses profile-two-roles 'partition "vms" has role "exclusive" in profile "r7625" and "reserved" in profile "x3d"; a partition keeps one role in every profile' \
+	-f "$(values profile-two-roles '
+driverConfig:
+  profiles:
+    r7625:
+      cpuPartitions:
+      - name: default
+      - name: vms
+        role: exclusive
+        cpuset: "2-3"
+    x3d:
+      cpuPartitions:
+      - name: default
+      - name: vms
+        role: reserved
+        cpuset: "0-1"')"
+renders profile-one-role -f "$(values profile-one-role '
+driverConfig:
+  profiles:
+    r7625:
+      cpuPartitions:
+      - name: default
+      - name: vms
+        role: exclusive
+        cpuset: "2-3"
+    x3d:
+      cpuPartitions:
+      - name: default
+      - name: vms
+        role: exclusive
+        cpuset: "4-7"')"
+refuses profile-allocator-external 'invalid allocator "external" with profiles: must be "cpumanager"' \
+	-f "$(values profile-allocator-external '
+driverConfig:
+  allocator: external
+  profiles:
+    r7625:
+      cpuPartitions:
+      - name: default')"
+refuses profile-groupby-machine 'invalid groupBy "machine" with profiles: needs allocator "external", which partitions do not use' \
+	-f "$(values profile-groupby-machine '
+driverConfig:
+  groupBy: machine
+  allocator: external
+  profiles:
+    r7625:
+      cpuPartitions:
+      - name: default')"
+
 echo "render checks passed"

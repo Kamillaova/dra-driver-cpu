@@ -22,8 +22,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -202,6 +204,10 @@ func makeDriverConfigSnapshot(cfg driverconfig.Config) (gatherinfoapi.DriverConf
 	if err != nil {
 		return gatherinfoapi.DriverConfig{}, err
 	}
+	profiles, err := makeProfileSnapshot(cfg.Profiles)
+	if err != nil {
+		return gatherinfoapi.DriverConfig{}, err
+	}
 	return gatherinfoapi.DriverConfig{
 		Kubeconfig:                            cfg.Kubeconfig,
 		HostnameOverride:                      cfg.HostnameOverride,
@@ -219,7 +225,23 @@ func makeDriverConfigSnapshot(cfg driverconfig.Config) (gatherinfoapi.DriverConf
 		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
 		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
 		CPUPartitions:                         partitions,
+		Profiles:                              profiles,
 	}, nil
+}
+
+func makeProfileSnapshot(profiles map[string]driverconfig.Profile) (map[string]gatherinfoapi.Profile, error) {
+	var snapshot map[string]gatherinfoapi.Profile
+	for _, name := range slices.Sorted(maps.Keys(profiles)) {
+		partitions, err := makeCPUPartitionSnapshot(profiles[name].CPUPartitions)
+		if err != nil {
+			return nil, fmt.Errorf("profile %q: %w", name, err)
+		}
+		if snapshot == nil {
+			snapshot = make(map[string]gatherinfoapi.Profile, len(profiles))
+		}
+		snapshot[name] = gatherinfoapi.Profile{CPUPartitions: partitions}
+	}
+	return snapshot, nil
 }
 
 func makeCPUPartitionSnapshot(partitions []driverconfig.CPUPartition) ([]gatherinfoapi.CPUPartition, error) {
