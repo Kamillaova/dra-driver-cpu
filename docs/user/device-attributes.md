@@ -105,14 +105,14 @@ attributes above instead. They may be removed in a future release.
 ### Prepared-device metadata
 
 When a grouped device is prepared, the driver copies its published attributes into the device
-metadata exposed to the container. It also adds the following metadata-only attribute when the
-claim consumes `dra.cpu/cpu` capacity:
+metadata exposed to the container. It also adds the following metadata-only attributes:
 
-| Attribute                  | Type | Description                                                    |
-| -------------------------- | ---- | -------------------------------------------------------------- |
-| `dra.cpu/allocatedNumCPUs` | int  | Number of CPUs allocated to this claim from the grouped device |
+| Attribute                  | Type   | Description                                                                                                                                      |
+| -------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `dra.cpu/allocatedNumCPUs` | int    | Number of CPUs allocated to this claim from the grouped device, when the claim consumes `dra.cpu/cpu` capacity                                   |
+| `dra.cpu/cpuset`           | string | The CPUs the request holds on this device, in cpuset list form such as `0-1,4-5`, for a request that holds exclusive CPUs, in either device mode |
 
-This attribute is not published in a `ResourceSlice` and cannot be used to select a device.
+These attributes are not published in a `ResourceSlice` and cannot be used to select a device.
 
 ## Versioned attributes
 
