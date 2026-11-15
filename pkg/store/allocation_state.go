@@ -298,6 +298,8 @@ type AllocationState struct {
 	reservedCPUs             cpuset.CPUSet
 	preparedCPUs             cpuset.CPUSet
 	resourceClaimAllocations map[types.UID]claimAllocation
+	claimlessCPUs            cpuset.CPUSet
+	claimlessConfined        bool
 }
 
 // AllocationSnapshot is a point-in-time summary of CPU allocation state.
@@ -327,9 +329,10 @@ func NewAllocationState(cpuTopology *cpuinfo.CPUTopology, reservedCPUs cpuset.CP
 
 // Reserve records a prepared claim and the CPUs each of its requests was given.
 // Its CPUs remain unavailable to shared containers and other exclusive claims
-// until Unprepare. When shared containers are present, the reservation must
-// leave at least one CPU in the shared pool because NRI cannot represent an
-// empty CPUSet.
+// until Unprepare. While containers without claims run, it refuses a
+// reservation that takes the last of the CPUs they run on, GetClaimlessCPUs,
+// because NRI cannot represent an empty CPUSet; one that takes none of those
+// CPUs is never refused for it.
 func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, record ClaimRecord, hasSharedContainers bool) error {
 	logger = logger.WithValues("claimUID", claimUID)
 	reserved := newClaimAllocation(record)
@@ -346,7 +349,8 @@ func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, record
 	if !cpus.IsSubsetOf(sharedCPUs) {
 		return AssignmentOverlapError{ClaimUID: claimUID, CPUs: cpus, Holders: s.holdersLocked(cpus)}
 	}
-	if hasSharedContainers && !cpus.IsEmpty() && sharedCPUs.Difference(cpus).IsEmpty() {
+	claimless := s.claimlessCPUsLocked()
+	if hasSharedContainers && !cpus.Intersection(claimless).IsEmpty() && claimless.Difference(cpus).IsEmpty() {
 		return fmt.Errorf("claim %q would exhaust the shared CPU pool while shared containers are running", claimUID)
 	}
 	s.resourceClaimAllocations[claimUID] = reserved
@@ -490,10 +494,43 @@ func (s *AllocationState) IsOwner(claimUID types.UID, podUID types.UID, containe
 	return info.owner.Equal(OwnerIdent{PodUID: podUID, ContainerName: containerName})
 }
 
+// SetClaimlessCPUs confines the containers without claims to cpus less every
+// prepared claim's CPUs, wherever those lie. Without it they run on every CPU
+// no prepared claim holds.
+func (s *AllocationState) SetClaimlessCPUs(cpus cpuset.CPUSet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claimlessCPUs = cpus.Clone()
+	s.claimlessConfined = true
+}
+
+// ConfinedClaimlessCPUs returns the CPUs SetClaimlessCPUs confined the
+// containers without claims to, and false where it did not.
+func (s *AllocationState) ConfinedClaimlessCPUs() (cpuset.CPUSet, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.claimlessCPUs.Clone(), s.claimlessConfined
+}
+
 // GetSharedCPUs returns CPUs available to shared containers.
 func (s *AllocationState) GetSharedCPUs() cpuset.CPUSet {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.availableCPUs.Difference(s.preparedCPUs)
+}
+
+// GetClaimlessCPUs returns the CPUs containers without claims run on: those
+// SetClaimlessCPUs confined them to, or else GetSharedCPUs.
+func (s *AllocationState) GetClaimlessCPUs() cpuset.CPUSet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.claimlessCPUsLocked()
+}
+
+func (s *AllocationState) claimlessCPUsLocked() cpuset.CPUSet {
+	if s.claimlessConfined {
+		return s.claimlessCPUs.Difference(s.preparedCPUs)
+	}
 	return s.availableCPUs.Difference(s.preparedCPUs)
 }
 
@@ -608,6 +645,8 @@ func (s *AllocationState) Clone() *AllocationState {
 		reservedCPUs:             s.reservedCPUs.Clone(),
 		preparedCPUs:             s.preparedCPUs.Clone(),
 		resourceClaimAllocations: allocations,
+		claimlessCPUs:            s.claimlessCPUs.Clone(),
+		claimlessConfined:        s.claimlessConfined,
 	}
 }
 

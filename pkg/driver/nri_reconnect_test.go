@@ -45,6 +45,11 @@ type reconnectingNRIRuntime struct {
 	mu          sync.Mutex
 	connection  net.Conn
 	syncResults chan error
+	// pods and containers are what each Synchronize lists, and syncReplies,
+	// where set, receives each Synchronize's reply.
+	pods        []*api.PodSandbox
+	containers  []*api.Container
+	syncReplies chan *api.SynchronizeResponse
 }
 
 func (r *reconnectingNRIRuntime) dial(string) (net.Conn, error) {
@@ -84,7 +89,7 @@ func (r *reconnectingNRIRuntime) serve(conn net.Conn) {
 	if err != nil {
 		return
 	}
-	api.RegisterRuntimeService(server, &reconnectingNRIRuntimeService{plugin: plugin, syncResults: r.syncResults})
+	api.RegisterRuntimeService(server, &reconnectingNRIRuntimeService{plugin: plugin, syncResults: r.syncResults, pods: r.pods, containers: r.containers, syncReplies: r.syncReplies})
 	// Register both logical connections before accepting incoming frames.
 	mux.Unblock()
 	_ = server.Serve(context.Background(), runtimeListener)
@@ -93,6 +98,9 @@ func (r *reconnectingNRIRuntime) serve(conn net.Conn) {
 type reconnectingNRIRuntimeService struct {
 	plugin      api.PluginService
 	syncResults chan error
+	pods        []*api.PodSandbox
+	containers  []*api.Container
+	syncReplies chan *api.SynchronizeResponse
 }
 
 func (s *reconnectingNRIRuntimeService) RegisterPlugin(ctx context.Context, _ *api.RegisterPluginRequest) (*api.Empty, error) {
@@ -108,7 +116,10 @@ func (s *reconnectingNRIRuntimeService) RegisterPlugin(ctx context.Context, _ *a
 			s.syncResults <- err
 			return
 		}
-		_, err := s.plugin.Synchronize(requestContext, &api.SynchronizeRequest{})
+		reply, err := s.plugin.Synchronize(requestContext, &api.SynchronizeRequest{Pods: s.pods, Containers: s.containers})
+		if err == nil && s.syncReplies != nil {
+			s.syncReplies <- reply
+		}
 		s.syncResults <- err
 	}()
 	return &api.Empty{}, nil
