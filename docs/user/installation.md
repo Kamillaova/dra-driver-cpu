@@ -286,6 +286,16 @@ without a driver that pod stays `Terminating`.
    helm uninstall dra-driver-cpu -n kube-system
    ```
 
+1. Remove the conditions the driver kept from every Node: `CPUAllocatableMappingDropped`, which
+   it keeps where `publishNodeAllocatableResourceMapping` is on.
+
+   ```bash
+   for node in $(kubectl get nodes -o name); do
+     kubectl patch "${node}" --subresource=status --type=strategic \
+       -p '{"status":{"conditions":[{"type":"CPUAllocatableMappingDropped","$patch":"delete"}]}}'
+   done
+   ```
+
 Pods that are running keep their current cpusets, but nothing manages pinning or the shared
 pool anymore.
 

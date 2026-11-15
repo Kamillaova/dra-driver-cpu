@@ -726,7 +726,9 @@ func (cp *CPUDriver) HandleError(ctx context.Context, err error, msg string) {
 	logger := ctxlog.FromContext(ctx)
 
 	// Log the error using the standard Kubernetes error handler
-	runtime.HandleErrorWithContext(ctx, err, msg)
+	if !cp.handleDroppedMapping(ctx, err, msg) {
+		runtime.HandleErrorWithContext(ctx, err, msg)
+	}
 
 	// For unrecoverable errors, shut down and exit with a clear error message.
 	// This fail-fast behavior is intentional for early project maturity to surface
