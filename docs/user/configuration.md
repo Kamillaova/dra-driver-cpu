@@ -57,7 +57,8 @@ helm install dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driv
 
 #### driverConfig sub-fields
 
-The config file is a flat YAML map - there are no nested groups. All fields are optional
+The config file is a flat YAML map - there are no nested groups, only the `profiles` that
+describe kinds of node. All fields are optional
 except where noted. Unknown fields are rejected at startup to catch typos early.
 
 These fields only affect the driver's own behavior (CPU allocation, hostname, sysfs path,
@@ -169,6 +170,11 @@ on - is configured through other Helm values, not through this file.
   [containerd/nri#301](https://github.com/containerd/nri/pull/301): an older one can deadlock on
   such an update. containerd 2.4.0 vendors it; containerd 2.3 does not. The driver does not check.
 
+`profiles` (map of profile name to profile, default: none)
+
+- How each kind of node partitions its CPUs, by name. A node runs the profile its
+  `dra.cpu/profile` label names. See [Per-node profiles](#per-node-profiles).
+
 #### Settings published as device attributes
 
 Every device the driver publishes carries the settings that decide whether the driver prepares a
@@ -233,6 +239,72 @@ The schema is versioned via the optional `apiVersion` field (currently `v1alpha1
 is intentionally flat for now. If a nested hierarchy is introduced in the future, the
 `apiVersion` field will be bumped so that older config files continue to be accepted or produce
 an error.
+
+### Per-node profiles
+
+Profiles configure nodes that differ. CPU numbering belongs to the hardware: `"1,17"` is one whole
+core on one part and two half cores on another, so a fleet that mixes kinds of node has no single
+`cpuPartitions` list that is right on every node. A profile carries that list for one kind of node,
+by name, and nothing else: every other field of `driverConfig` applies to every node, and the nodes
+of one cluster differ only in what a profile carries.
+
+```yaml
+# values.yaml
+driverConfig:
+  apiVersion: v1alpha1
+  cpuDeviceMode: grouped
+  profiles:
+    r7625:
+      cpuPartitions:
+        - name: default
+        - name: system
+          role: reserved
+          cpuset: "0,128"
+    x3d:
+      cpuPartitions:
+        - name: default
+```
+
+```console
+kubectl label node --selector=node.kubernetes.io/instance-type=r7625 dra.cpu/profile=r7625
+kubectl label node worker-a dra.cpu/profile=x3d
+```
+
+- A node selects its profile by the value of its `dra.cpu/profile` label, so a profile name is a
+  label value: at most 63 characters, letters, digits, `-`, `_` and `.`, starting and ending with a
+  letter or a digit. The driver refuses to start on a configuration declaring a profile whose name
+  is not one, or whose name is empty.
+- Once the configuration declares profiles, every node carries the label. On a node without it, or
+  with a label naming no declared profile, the driver refuses to start rather than run the node on
+  another kind of node's description. The label `default` selects only a declared profile named
+  `default`. A node whose cores are all alike names a declared profile holding only
+  `- name: default`, as `x3d` above does.
+- Every profile's `cpuPartitions` holds the entry `- name: default`. A profile whose list lacks it,
+  or is left out, `null` or empty, fails the Helm render, and the driver refuses to start on it.
+- Every profile is checked on every node, so a broken profile stops the rollout rather than one
+  kind of node at its next restart.
+- Beside `profiles`, the fleet-wide `reservedCPUs` and `cpuPartitions` are refused, so that a node's
+  CPUs are never described two ways, and so are `allocator: external` and `groupBy: machine`.
+- The driver reads the label when it starts. A changed label takes effect at the driver's next
+  restart.
+
+Until it has read the label, the driver serves the container runtime without a configuration and
+does not register with the kubelet. In that window only the containers without claims of
+host-network pods start, such as kube-proxy and the CNI's agents, on the CPUs the runtime gives
+them; the driver refuses every other container, and the kubelet creates it again later. The window
+lasts as long as the driver cannot read its Node, an API server outage at start included: the
+driver logs each failed read, and its readiness probe fails meanwhile.
+
+Selecting a node's configuration from named configurations by a node label is what NVIDIA's device
+plugin does with `nvidia.com/device-plugin.config`, and NVIDIA's GPU Operator for MIG layouts with
+`nvidia.com/mig.config`. Those fall back to a default on a node without the label, skip a value
+naming no configuration and apply a change at once; profiles refuse the first two and apply a change
+at the driver's restart.
+
+Running without profiles, the node's CPUs named, if at all, by the fleet-wide `reservedCPUs` and
+`cpuPartitions`, keeps working and is deprecated: profiles replace it, each holding
+`- name: default`, with every node labelled. So is running one Helm release per kind of node; see
+[Installing with Helm](installation.md#installing-with-helm).
 
 ### Helm: deprecated args values vs driverConfig
 

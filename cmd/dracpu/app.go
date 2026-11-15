@@ -223,6 +223,17 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		Allocator:                             cfg.Allocator,
 		CancelRun:                             cancel,
 	}
+	if len(cfg.Profiles) > 0 {
+		driverConfig.ProfileLabel = driverconfig.ProfileLabel
+		driverConfig.SelectProfile = func(name string) (*driver.Config, error) {
+			if _, err := cfg.WithProfile(name); err != nil {
+				return nil, err
+			}
+			selected := driverConfig
+			selected.ProfileLabel, selected.SelectProfile = "", nil
+			return &selected, nil
+		}
+	}
 	driverProviders := driver.Providers{
 		K8SClient: clientset,
 		SysFS:     sfs,
