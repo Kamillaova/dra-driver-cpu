@@ -55,7 +55,7 @@ helm install dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driv
 | nodeSelector | object | `{}` | Node selector for scheduling the DaemonSet pods |
 | podAnnotations | object | `{}` | Annotations to add to pods |
 | podLabels | object | `{}` | Extra labels to add to pods |
-| rbac.create | bool | `true` | Create RBAC resources (ClusterRole and ClusterRoleBinding), and the ValidatingAdmissionPolicy and its binding that admit an event from the driver's service account only when the event's source host is the driver's own node |
+| rbac.create | bool | `true` | Create RBAC resources (ClusterRole and ClusterRoleBinding), and the ValidatingAdmissionPolicies and their bindings that keep the driver's service account to its own node: events whose source host is that node, that Node's status with nothing changed but the driver's own conditions, that node's ResourceSlices, and the `dra.cpu` entries in the status of claims allocated on that node |
 | resources.limits | object | `{}` | Resource limits (unset by default) |
 | resources.requests.cpu | string | `"100m"` | CPU resource request |
 | resources.requests.memory | string | `"50Mi"` | Memory resource request |
