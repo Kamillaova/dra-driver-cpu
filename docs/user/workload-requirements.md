@@ -97,7 +97,8 @@ container without claims runs there, so those CPUs are not the node's to give to
 Requires the feature gate on the API server, scheduler, and kubelets, and the driver deployed
 with `driverConfig.publishNodeAllocatableResourceMapping: true`.
 
-The driver then publishes a `nodeAllocatableResources` mapping on every device, and:
+The driver then publishes a `nodeAllocatableResources` mapping on every device, or, on a node that
+uses `cpuPartitions`, on the devices of the `default` entry alone, and:
 
 - the **scheduler** counts the claim's CPUs against node allocatable `cpu`. Do not also add
   them to container requests; that counts them twice.

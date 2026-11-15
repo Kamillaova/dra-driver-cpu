@@ -352,7 +352,9 @@ spec:
 When the driver runs with `publishNodeAllocatableResourceMapping: true` (requires the
 `DRANodeAllocatableResources` feature gate, alpha in 1.37+), every device additionally
 carries a `nodeAllocatableResources` entry translating its DRA allocation into node
-allocatable `cpu`.
+allocatable `cpu`. On a node that uses `cpuPartitions` only the devices of the `default`
+entry carry it, since the kubelet's reservation already holds the CPUs of every other
+partition.
 
 Grouped mode maps the consumed `dra.cpu/cpu` capacity 1:1:
 
