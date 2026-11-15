@@ -468,6 +468,104 @@ func TestResolve_FullPhysicalCPUsOnly(t *testing.T) {
 	}
 }
 
+// TestResolve_CPUPartitions: the list left out, null, a bare key and empty
+// all mean no partitions; the default entry alone switches them on.
+func TestResolve_CPUPartitions(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		file     string
+		want     []driverconfig.CPUPartition
+		wantUsed bool
+	}{
+		{name: "left out", file: "apiVersion: v1alpha1\n"},
+		{name: "null", file: "apiVersion: v1alpha1\ncpuPartitions: null\n"},
+		{name: "a bare key", file: "apiVersion: v1alpha1\ncpuPartitions:\n"},
+		{name: "empty", file: "apiVersion: v1alpha1\ncpuPartitions: []\n"},
+		{
+			name:     "the default entry",
+			file:     "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n",
+			want:     []driverconfig.CPUPartition{{Name: "default"}},
+			wantUsed: true,
+		},
+		{
+			name: "the default entry and two partitions",
+			file: "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n  smt: false\n" +
+				"- name: system\n  role: reserved\n  cpuset: \"0-1\"\n" +
+				"- name: vms\n  role: exclusive\n  cpuset: \"2-7\"\n  smt: 2\n",
+			want: []driverconfig.CPUPartition{
+				{Name: "default", SMT: &driverconfig.SMT{Threads: 1}},
+				{Name: "system", Role: "reserved", CPUSet: "0-1"},
+				{Name: "vms", Role: "exclusive", CPUSet: "2-7", SMT: &driverconfig.SMT{Threads: 2}},
+			},
+			wantUsed: true,
+		},
+		{
+			name:     "smt null, as the key left out",
+			file:     "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n  smt: null\n",
+			want:     []driverconfig.CPUPartition{{Name: "default"}},
+			wantUsed: true,
+		},
+		{
+			name:     "smt true",
+			file:     "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n  smt: true\n",
+			want:     []driverconfig.CPUPartition{{Name: "default", SMT: &driverconfig.SMT{Threads: 0}}},
+			wantUsed: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgFile := writeFile(t, t.TempDir(), "config.yaml", tc.file)
+
+			result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+				driverconfig.FromFile(cfgFile),
+			})
+
+			require.NoError(t, err)
+			if len(tc.want) == 0 {
+				assert.Empty(t, result.CPUPartitions)
+			} else {
+				assert.Equal(t, tc.want, result.CPUPartitions)
+			}
+			assert.Equal(t, tc.wantUsed, result.PartitionsUsed())
+		})
+	}
+}
+
+// TestResolve_CPUPartitionsRefusedAtLoad: a configuration file the driver
+// refuses before it starts.
+func TestResolve_CPUPartitionsRefusedAtLoad(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		file    string
+		wantErr string
+	}{
+		{
+			name:    "a list naming partitions without the default entry",
+			file:    "apiVersion: v1alpha1\ncpuPartitions:\n- name: vms\n  role: exclusive\n  cpuset: \"2-7\"\n",
+			wantErr: `cpuPartitions names partitions but no partition "default": add "- name: default" to cpuPartitions to use partitions`,
+		},
+		{
+			name:    "smt below one",
+			file:    "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n  smt: 0\n",
+			wantErr: "invalid smt 0: a core has at least one online thread",
+		},
+		{
+			name:    "smt that is neither a boolean nor a count",
+			file:    "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n  smt: native\n",
+			wantErr: `invalid smt "native": must be true, false or a thread count`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgFile := writeFile(t, t.TempDir(), "config.yaml", tc.file)
+
+			_, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+				driverconfig.FromFile(cfgFile),
+			})
+
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
 // TestResolve_APIClientLimits: qps and burst come from the file, and a value
 // client-go would read as its default or as no limit is refused.
 func TestResolve_APIClientLimits(t *testing.T) {

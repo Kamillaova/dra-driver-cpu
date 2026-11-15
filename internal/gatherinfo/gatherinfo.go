@@ -17,6 +17,7 @@ limitations under the License.
 package gatherinfo
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -179,6 +180,11 @@ func collectReport(logger logr.Logger, driverCmdlinePath string) (gatherinfoapi.
 		return gatherinfoapi.Report{}, fmt.Errorf("failed to get CPU infos: %w", err)
 	}
 
+	driverConfigSnapshot, err := makeDriverConfigSnapshot(driverConfig)
+	if err != nil {
+		return gatherinfoapi.Report{}, fmt.Errorf("failed to snapshot driver config: %w", err)
+	}
+
 	return gatherinfoapi.Report{
 		ToolVersion:   readToolVersion(),
 		LayoutVersion: gatherinfoapi.LayoutVersion,
@@ -186,12 +192,16 @@ func collectReport(logger logr.Logger, driverCmdlinePath string) (gatherinfoapi.
 			Topology: makeTopologySummary(topology),
 			CPUs:     makeCPUList(cpus),
 		},
-		DriverConfig: makeDriverConfigSnapshot(driverConfig),
+		DriverConfig: driverConfigSnapshot,
 	}, nil
 }
 
 // makeDriverConfigSnapshot maps runtime settings to the fixed v1 report schema.
-func makeDriverConfigSnapshot(cfg driverconfig.Config) gatherinfoapi.DriverConfig {
+func makeDriverConfigSnapshot(cfg driverconfig.Config) (gatherinfoapi.DriverConfig, error) {
+	partitions, err := makeCPUPartitionSnapshot(cfg.CPUPartitions)
+	if err != nil {
+		return gatherinfoapi.DriverConfig{}, err
+	}
 	return gatherinfoapi.DriverConfig{
 		Kubeconfig:                            cfg.Kubeconfig,
 		HostnameOverride:                      cfg.HostnameOverride,
@@ -208,7 +218,31 @@ func makeDriverConfigSnapshot(cfg driverconfig.Config) gatherinfoapi.DriverConfi
 		Burst:                                 cfg.Burst,
 		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
 		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
+		CPUPartitions:                         partitions,
+	}, nil
+}
+
+func makeCPUPartitionSnapshot(partitions []driverconfig.CPUPartition) ([]gatherinfoapi.CPUPartition, error) {
+	if len(partitions) == 0 {
+		return nil, nil
 	}
+	snapshot := make([]gatherinfoapi.CPUPartition, 0, len(partitions))
+	for _, partition := range partitions {
+		entry := gatherinfoapi.CPUPartition{
+			Name:   partition.Name,
+			Role:   partition.Role,
+			CPUSet: partition.CPUSet,
+		}
+		if partition.SMT != nil {
+			smt, err := json.Marshal(partition.SMT)
+			if err != nil {
+				return nil, fmt.Errorf("marshal smt of partition %q: %w", partition.Name, err)
+			}
+			entry.SMT = smt
+		}
+		snapshot = append(snapshot, entry)
+	}
+	return snapshot, nil
 }
 
 // driverFilesystemPath resolves a path in the running driver's mount namespace.
