@@ -1139,6 +1139,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 				Mapping: devattr.Mapping{
 					NameToSocketID:   map[string]int{"cpudevsocket0": 0},
 					NameToNUMANodeID: map[string]int{},
+					NameToCPUs:       map[string]cpuset.CPUSet{"cpudevsocket0": topo.CPUDetails.CPUsInSockets(0)},
 				},
 			},
 			allocationState: store.NewAllocationState(topo, cpuset.New()),
@@ -2513,6 +2514,10 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 				Mapping: devattr.Mapping{
 					NameToSocketID:   map[string]int{"cpudevsocket0": 0, "cpudevsocket1": 1},
 					NameToNUMANodeID: map[string]int{},
+					NameToCPUs: map[string]cpuset.CPUSet{
+						"cpudevsocket0": topo.CPUDetails.CPUsInSockets(0),
+						"cpudevsocket1": topo.CPUDetails.CPUsInSockets(1),
+					},
 				},
 			},
 			allocationState: cpuStore,
@@ -2538,6 +2543,10 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 				Mapping: devattr.Mapping{
 					NameToSocketID:   map[string]int{},
 					NameToNUMANodeID: map[string]int{"cpudevnuma0": 0, "cpudevnuma1": 1},
+					NameToCPUs: map[string]cpuset.CPUSet{
+						"cpudevnuma0": topo.CPUDetails.CPUsInNUMANodes(0),
+						"cpudevnuma1": topo.CPUDetails.CPUsInNUMANodes(1),
+					},
 				},
 			},
 			allocationState: cpuStore,
