@@ -128,6 +128,21 @@ refuses() {
 	fi
 }
 
+# checkDeviceClasses <name> <want> [helm args...]; the DeviceClasses the chart
+# renders, comma-separated in name order, and the selector of each.
+checkDeviceClasses() {
+	local name=$1 want=$2
+	shift 2
+
+	echo "device classes render check: ${name}"
+	"${helm}" template test "${chart}" --kube-version "${kube_version}" \
+		--show-only templates/deviceclass.yaml "$@" >"${tmp}/${name}-classes.yaml"
+	go test -count=1 ./test/render/ -args \
+		-chart "${tmp}/${name}-classes.yaml" \
+		-check-device-classes \
+		-expected-device-classes "${want}"
+}
+
 # renders <name> <helm args...>; the render has to succeed.
 renders() {
 	local name=$1
@@ -344,5 +359,48 @@ driverConfig:
     r7625:
       cpuPartitions:
       - name: default')"
+
+# One DeviceClass per partition that can publish devices: dra.cpu for the
+# entry "default", dra.cpu.<name> for every other partition but a reserved one,
+# across the fleet-wide list and every profile, each name once.
+checkDeviceClasses classes-without-partitions 'dra.cpu'
+checkDeviceClasses classes-off '' --set deviceClass.create=false
+checkDeviceClasses classes-partitions 'dra.cpu,dra.cpu.pool,dra.cpu.vms' -f "$(values classes-partitions '
+driverConfig:
+  cpuPartitions:
+  - name: default
+  - name: system
+    role: reserved
+    cpuset: "0-1"
+  - name: vms
+    role: exclusive
+    cpuset: "4-7"
+  - name: pool
+    role: default
+    cpuset: "2-3"')"
+checkDeviceClasses classes-profiles 'dra.cpu,dra.cpu.infra,dra.cpu.spdk,dra.cpu.vms' -f "$(values classes-profiles '
+driverConfig:
+  profiles:
+    r7625:
+      cpuPartitions:
+      - name: default
+      - name: vms
+        role: exclusive
+        cpuset: "16-127"
+      - name: spdk
+        role: exclusive
+        cpuset: "8-15"
+    x3d:
+      cpuPartitions:
+      - name: default
+      - name: system
+        role: reserved
+        cpuset: "0-1"
+      - name: vms
+        role: exclusive
+        cpuset: "8-31"
+      - name: infra
+        role: default
+        cpuset: "2-7"')"
 
 echo "render checks passed"
