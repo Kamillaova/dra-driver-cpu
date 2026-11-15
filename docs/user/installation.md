@@ -310,6 +310,11 @@ without a driver that pod stays `Terminating`.
    done
    ```
 
+1. On nodes that use `cpuPartitions`, lower the kubelet's `kubeReserved` or `systemReserved` CPU
+   back to what the node reserved before the driver, through the platform's kubelet
+   configuration. The CPUs it held outside the default partition count toward allocatable again
+   only then.
+
 1. If the configuration declared profiles, remove the `dra.cpu/profile` label from every Node:
 
    ```bash

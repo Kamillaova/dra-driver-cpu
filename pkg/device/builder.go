@@ -270,12 +270,10 @@ func Build(input BuildInput) (BuildResult, error) {
 				res.MixedCores[dev.name] = counts
 			}
 		}
-		mapped := input.PublishNodeAllocatableResourceMapping
-		if shared {
-			// A named partition of role default runs no container without
-			// claims, so its CPUs are in the kubelet's reservation.
-			mapped = mapped && partition.Name == DefaultPartitionName
-		}
+		// On a node using partitions the kubelet's reservation holds every CPU
+		// outside the default entry, where alone containers without claims run;
+		// a mapping there would charge those CPUs against allocatable twice.
+		mapped := input.PublishNodeAllocatableResourceMapping && (!input.PartitionsUsed || partition.Name == DefaultPartitionName)
 		devices, err := createGroupedCPUDeviceSlices(input.Layout, deviceInfos, input.PCIeRootMapper, topo, mapped, input.ExposeExtAttrs, wholeCores)
 		if err != nil {
 			return BuildResult{}, err

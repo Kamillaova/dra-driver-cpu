@@ -98,7 +98,7 @@ Requires the feature gate on the API server, scheduler, and kubelets, and the dr
 with `driverConfig.publishNodeAllocatableResourceMapping: true`.
 
 The driver then publishes a `nodeAllocatableResources` mapping on every device, or, on a node that
-uses `cpuPartitions`, on every device but those of a named partition of role `default`, and:
+uses `cpuPartitions`, on the devices of the `default` entry alone, and:
 
 - the **scheduler** counts the claim's CPUs against node allocatable `cpu`. Do not also add
   them to container requests; that counts them twice.
