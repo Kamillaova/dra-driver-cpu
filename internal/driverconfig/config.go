@@ -55,6 +55,10 @@ type Config struct {
 	// updates the driver sends unasked, which a runtime vendoring an NRI older
 	// than v0.12.1 can deadlock on (containerd/nri#301). Defaults to false.
 	AssumeUnsolicitedUpdatesSafe bool `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+	// AllowFractionalCapacityRequests asserts that the cluster enables the
+	// DRAFractionalCapacityRange feature gate, so that a request may consume a
+	// fraction of a CPU. Defaults to false.
+	AllowFractionalCapacityRequests bool `json:"allowFractionalCapacityRequests,omitempty"`
 	// CPUPartitions splits the node's CPUs into named partitions. Left out,
 	// null and empty all mean the node uses no partitions.
 	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
@@ -81,6 +85,7 @@ func (c Config) LogValues() []any {
 		"burst", c.Burst,
 		"fullPhysicalCPUsOnly", c.FullPhysicalCPUsOnly,
 		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
+		"allowFractionalCapacityRequests", c.AllowFractionalCapacityRequests,
 		"cpuPartitions", c.CPUPartitions,
 		"profiles", c.Profiles,
 	}
@@ -104,6 +109,7 @@ type dumpConfig struct {
 	Burst                                 int                `json:"burst"`
 	FullPhysicalCPUsOnly                  bool               `json:"fullPhysicalCPUsOnly"`
 	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe"`
+	AllowFractionalCapacityRequests       bool               `json:"allowFractionalCapacityRequests"`
 	CPUPartitions                         []CPUPartition     `json:"cpuPartitions"`
 	Profiles                              map[string]Profile `json:"profiles"`
 }
