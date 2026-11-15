@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"testing/fstest"
@@ -24,7 +25,10 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/utils/cpuset"
 )
 
@@ -165,6 +169,119 @@ func TestNewWithPartitions(t *testing.T) {
 				gotSlices = append(gotSlices, names)
 			}
 			require.Equal(t, tc.wantSlices, gotSlices)
+		})
+	}
+}
+
+func TestSeedCountsMisplacedClaims(t *testing.T) {
+	request := func(name, device string, cpus ...int) cdiRequestRecord {
+		return cdiRequestRecord{Request: name, CPUs: cpuset.New(cpus...), Results: []cdiResultRecord{{Device: device}}}
+	}
+	partitions := []device.Partition{
+		{Name: device.DefaultPartitionName},
+		{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)},
+		{Name: "spdk", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(2)},
+	}
+	for _, tc := range []struct {
+		name     string
+		declared []device.Partition
+		requests []cdiRequestRecord
+		want     float64
+	}{
+		{
+			name:     "requests in two partitions, each inside its device's",
+			declared: partitions,
+			requests: []cdiRequestRecord{request("vcpu", "cpudevnuma000-vms", 1, 5), request("poll", "cpudevnuma000-spdk", 2)},
+		},
+		{
+			name:     "a request outside its device's partition",
+			declared: partitions,
+			requests: []cdiRequestRecord{request("vcpu", "cpudevnuma000-vms", 1, 2), request("poll", "cpudevnuma000-spdk", 2)},
+			want:     1,
+		},
+		{
+			name:     "two requests outside count the claim once",
+			declared: partitions,
+			requests: []cdiRequestRecord{request("vcpu", "cpudevnuma000-vms", 0), request("poll", "cpudevnuma000-spdk", 3)},
+			want:     1,
+		},
+		{
+			name:     "a device the node no longer publishes",
+			declared: partitions,
+			requests: []cdiRequestRecord{request("vcpu", "cpudevnuma000-dpdk", 1)},
+			want:     1,
+		},
+		{
+			name:     "no partitions",
+			requests: []cdiRequestRecord{request("vcpu", "cpudevnuma001", 1)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			d, err := New(testr.New(t), Providers{
+				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+				SysFS:   partitionSysFS(),
+			}, &Config{
+				DriverName:       testDriverName,
+				NodeName:         testNodeName,
+				ReservedCPUs:     cpuset.New(),
+				CPUDeviceMode:    device.CPU_DEVICE_MODE_GROUPED,
+				CPUDeviceGroupBy: device.GROUP_BY_NUMA_NODE,
+				CPUPartitions:    tc.declared,
+				Metrics:          cpumetrics.New(reg),
+			})
+			require.NoError(t, err)
+			cdi := newMockCdiMgr()
+			cdi.records["claim-0"] = cdiClaimRecord{Namespace: "default", Name: "vm-0", Requests: tc.requests}
+			d.cdiMgr = cdi
+
+			d.seedAllocationStoreFromDisk(testr.New(t))
+			require.Equal(t, tc.want, metricValue(t, reg, "dra_cpu_misplaced_claims_total", nil))
+		})
+	}
+}
+
+func TestPrepareTakesCPUsFromTheDevicePartition(t *testing.T) {
+	for _, tc := range []struct {
+		groupBy string
+		device  string
+	}{
+		{groupBy: device.GROUP_BY_NUMA_NODE, device: "cpudevnuma000-vms"},
+		{groupBy: device.GROUP_BY_SOCKET, device: "cpudevsocket000-vms"},
+	} {
+		t.Run(tc.groupBy, func(t *testing.T) {
+			d, err := New(testr.New(t), Providers{
+				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+				SysFS:   partitionSysFS(),
+			}, &Config{
+				DriverName:       testDriverName,
+				NodeName:         testNodeName,
+				ReservedCPUs:     cpuset.New(),
+				CPUDeviceMode:    device.CPU_DEVICE_MODE_GROUPED,
+				CPUDeviceGroupBy: tc.groupBy,
+				CPUPartitions: []device.Partition{
+					{Name: device.DefaultPartitionName},
+					{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)},
+				},
+			})
+			require.NoError(t, err)
+			d.cdiMgr = newMockCdiMgr()
+			d.hasSynchronized = true
+
+			results, err := d.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{
+				testClaim("claim-0", testDriverName, testNodeName, map[string]int64{tc.device: 2}),
+			})
+			require.NoError(t, err)
+			require.NoError(t, results["claim-0"].Err)
+			got, ok := d.allocationState.GetResourceClaimAllocation("claim-0")
+			require.True(t, ok)
+			require.Truef(t, cpuset.New(1, 5).Equals(got), "claim CPUs: got %s, want the partition's 1,5", got)
+
+			results, err = d.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{
+				testClaim("claim-1", testDriverName, testNodeName, map[string]int64{tc.device: 1}),
+			})
+			require.NoError(t, err)
+			require.Error(t, results["claim-1"].Err, "the partition has no CPU left, though the NUMA node and socket do")
 		})
 	}
 }

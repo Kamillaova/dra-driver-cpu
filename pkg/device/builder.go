@@ -62,7 +62,7 @@ func (inv Inventory) AllocatableCPUs() cpuset.CPUSet {
 
 // Mapping includes the reverse lookup maps to bind the exposed DRA device names
 // to the pool we need to allocate resources from.
-// At most one lookup map is populated. LayoutMachine does not populate one, by design.
+// At most one id lookup map is populated. LayoutMachine does not populate one, by design.
 type Mapping struct {
 	// NameToCPUID is populated for LayoutIndividual.
 	NameToCPUID map[string]int
@@ -70,8 +70,9 @@ type Mapping struct {
 	NameToSocketID map[string]int
 	// NameToNUMANodeID is populated for LayoutNUMANode.
 	NameToNUMANodeID map[string]int
-	// NameToCPUs is populated for LayoutUncoreCache, whose device is no
-	// socket or NUMA node: it holds the CPUs each device publishes.
+	// NameToCPUs is populated for LayoutSocket, LayoutNUMANode and
+	// LayoutUncoreCache: it holds the CPUs each device publishes, its
+	// partition's part of the group.
 	NameToCPUs map[string]cpuset.CPUSet
 }
 
@@ -156,6 +157,8 @@ type BuildResult struct {
 	// DevicesByPartition holds Devices split by partition, in the order of
 	// the partitions, leaving out a partition without devices.
 	DevicesByPartition [][]resourceapi.Device
+	// DevicePartitions is each grouped device's partition, by device name.
+	DevicePartitions map[string]Partition
 }
 
 // CoreCounts is the number of cores of two threads and of one in a device.
@@ -203,13 +206,16 @@ func Build(input BuildInput) (BuildResult, error) {
 	switch input.Layout {
 	case LayoutSocket:
 		res.Mapping.NameToSocketID = make(map[string]int)
+		res.Mapping.NameToCPUs = make(map[string]cpuset.CPUSet)
 	case LayoutNUMANode:
 		res.Mapping.NameToNUMANodeID = make(map[string]int)
+		res.Mapping.NameToCPUs = make(map[string]cpuset.CPUSet)
 	case LayoutUncoreCache:
 		res.Mapping.NameToCPUs = make(map[string]cpuset.CPUSet)
 	}
 	res.ThreadsPerCore = make(map[string]int)
 	res.MixedCores = make(map[string]CoreCounts)
+	res.DevicePartitions = make(map[string]Partition)
 	topo := input.Inventory.CPUTopology
 	var ends []int
 	for _, partition := range partitions {
@@ -228,12 +234,15 @@ func Build(input BuildInput) (BuildResult, error) {
 			switch input.Layout {
 			case LayoutSocket:
 				res.Mapping.NameToSocketID[dev.name] = dev.socketID
+				res.Mapping.NameToCPUs[dev.name] = dev.cpus
 			case LayoutNUMANode:
 				res.Mapping.NameToNUMANodeID[dev.name] = dev.numaNodeID
+				res.Mapping.NameToCPUs[dev.name] = dev.cpus
 			case LayoutUncoreCache:
 				res.Mapping.NameToCPUs[dev.name] = dev.cpus
 			}
 			res.ThreadsPerCore[dev.name] = dev.threadsPerCore
+			res.DevicePartitions[dev.name] = partition
 			if !input.FullPhysicalCPUsOnly {
 				continue
 			}
