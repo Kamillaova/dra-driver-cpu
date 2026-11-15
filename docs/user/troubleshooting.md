@@ -226,6 +226,16 @@ The driver decides this at start, and the condition holds until the driver resta
 the message names offline at boot, through the platform's configuration, then restart the driver
 pod. What the driver does with CPUs taken offline while it runs is undefined.
 
+The condition has a second cause, a `reserved` partition holding CPUs of a claim prepared before the
+partitions changed. The driver finds such claims at start, from the claims it restores, and keeps
+serving everything else. It kills the running containers of each such claim, refuses to create or
+start them again, and keeps the condition `True` with reason `ReservedHoldsClaims`, or
+`SiblingThreadsOnline` where a partition's `smt` is contradicted too, the message naming every
+problem. The driver pod is not ready while such a claim is prepared. Delete the pods using the
+claims the message names: once the last such claim is unprepared, the condition turns `False` with
+reason `PartitionsVerified`, or stays `True` with `SiblingThreadsOnline` where a partition's `smt`
+is still contradicted, and the driver pod is ready again.
+
 ## Integration With Bug Reports
 
 1. Run `dracpu gatherinfo` on the affected node.

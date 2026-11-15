@@ -840,6 +840,7 @@ func (cp *CPUDriver) unprepareResourceClaim(ctx context.Context, logger logr.Log
 		return err
 	}
 	cp.allocationState.Release(logger, claim.UID)
+	cp.releaseReservedHold(claim.UID)
 	cp.refreshAllocationMetrics()
 	cp.requestReconcile()
 	return nil
