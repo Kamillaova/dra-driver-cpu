@@ -18,8 +18,10 @@ limitations under the License.
 package driverconfig
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -136,5 +138,60 @@ func TestGenerateDriverConfigSchema_ExcludesKubeletRootDir(t *testing.T) {
 	}
 	if want := "use the chart's top-level kubeletRootDir value, or --kubelet-root-dir when running the binary directly"; schemaExcludedFields["kubeletRootDir"] != want {
 		t.Errorf("kubeletRootDir exclusion hint = %q, want %q", schemaExcludedFields["kubeletRootDir"], want)
+	}
+}
+
+// The list is optional and may be null, and an item requires its name alone, so
+// the entry "- name: default" passes the chart's values schema. An entry's smt
+// is a boolean or a count of at least one, or null as for any pointer field.
+func TestGenerateDriverConfigSchema_CPUPartitions(t *testing.T) {
+	out, err := GenerateDriverConfigSchema()
+	if err != nil {
+		t.Fatalf("GenerateDriverConfigSchema: %v", err)
+	}
+
+	var schema struct {
+		Required   []string `json:"required"`
+		Properties map[string]struct {
+			Type  json.RawMessage `json:"type"`
+			Items struct {
+				Required   []string `json:"required"`
+				Properties map[string]struct {
+					Enum  []string          `json:"enum"`
+					OneOf []json.RawMessage `json:"oneOf"`
+				} `json:"properties"`
+			} `json:"items"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(out, &schema); err != nil {
+		t.Fatalf("unmarshal generated schema: %v\n%s", err, out)
+	}
+
+	if slices.Contains(schema.Required, "cpuPartitions") {
+		t.Errorf("cpuPartitions is required, want it optional: %v", schema.Required)
+	}
+	list, ok := schema.Properties["cpuPartitions"]
+	if !ok {
+		t.Fatalf("cpuPartitions is missing from the generated schema:\n%s", out)
+	}
+	if want := `["null","array"]`; strings.Join(strings.Fields(string(list.Type)), "") != want {
+		t.Errorf("cpuPartitions type = %s, want %s", list.Type, want)
+	}
+	if want := []string{"name"}; !slices.Equal(list.Items.Required, want) {
+		t.Errorf("a partition requires %v, want %v", list.Items.Required, want)
+	}
+	if want := []string{"default", "exclusive", "reserved"}; !slices.Equal(list.Items.Properties["role"].Enum, want) {
+		t.Errorf("role enum = %v, want %v", list.Items.Properties["role"].Enum, want)
+	}
+	var shapes []string
+	for _, shape := range list.Items.Properties["smt"].OneOf {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, shape); err != nil {
+			t.Fatalf("compact smt shape %s: %v", shape, err)
+		}
+		shapes = append(shapes, compact.String())
+	}
+	if want := []string{`{"type":"null"}`, `{"type":"boolean"}`, `{"type":"integer","minimum":1}`}; !slices.Equal(shapes, want) {
+		t.Errorf("smt takes %v, want %v", shapes, want)
 	}
 }

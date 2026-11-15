@@ -16,13 +16,43 @@ limitations under the License.
 
 package driverconfig
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+const noDefaultPartition = `cpuPartitions names partitions but no partition "default": add "- name: default" to cpuPartitions to use partitions`
+
+// partitioned is a valid grouped configuration carrying partitions.
+func partitioned(partitions ...CPUPartition) Config {
+	return Config{
+		KubeletRootDir: "/var/lib/kubelet",
+		QPS:            20,
+		Burst:          50,
+		CPUDeviceMode:  "grouped",
+		GroupBy:        "numanode",
+		Allocator:      "cpumanager",
+		CPUPartitions:  partitions,
+	}
+}
+
+func withConfig(c Config, change func(*Config)) Config {
+	change(&c)
+	return c
+}
+
+var (
+	defaultEntry = CPUPartition{Name: "default"}
+	vms          = CPUPartition{Name: "vms", Role: "exclusive", CPUSet: "2-3"}
+)
 
 func TestValidate(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		conf        Config
 		expectedErr bool
+		// wantErr, when set, is a part of the error the configuration must give.
+		wantErr string
 	}{{
 		name: "error: unknown allocator",
 		conf: Config{
@@ -177,12 +207,133 @@ func TestValidate(t *testing.T) {
 			FullPhysicalCPUsOnly: true,
 		},
 		expectedErr: true,
+	}, {
+		name:        "error: a reserved partition without the default entry",
+		conf:        partitioned(CPUPartition{Name: "system", Role: "reserved", CPUSet: "0-1"}),
+		expectedErr: true,
+		wantErr:     noDefaultPartition,
+	}, {
+		name:        "error: vms without the default entry",
+		conf:        partitioned(vms),
+		expectedErr: true,
+		wantErr:     noDefaultPartition,
+	}, {
+		name:        "error: the missing default entry comes before any other partition check",
+		conf:        withConfig(partitioned(CPUPartition{Name: "Bad Name"}), func(c *Config) { c.CPUDeviceMode = "individual" }),
+		expectedErr: true,
+		wantErr:     noDefaultPartition,
+	}, {
+		name: "valid: the default entry alone",
+		conf: partitioned(defaultEntry),
+	}, {
+		name: "valid: the default entry, a reserved and an exclusive partition",
+		conf: partitioned(defaultEntry, CPUPartition{Name: "system", Role: "reserved", CPUSet: "0-1"}, vms),
+	}, {
+		name: "valid: smt on the default entry",
+		conf: partitioned(CPUPartition{Name: "default", SMT: &SMT{Threads: 1}}, vms),
+	}, {
+		name:        "error: cpuset on the default entry",
+		conf:        partitioned(CPUPartition{Name: "default", CPUSet: "0-1"}, vms),
+		expectedErr: true,
+		wantErr:     `partition "default": cpuset is filled in automatically; remove it`,
+	}, {
+		name:        "error: role on the default entry",
+		conf:        partitioned(CPUPartition{Name: "default", Role: "default"}, vms),
+		expectedErr: true,
+		wantErr:     `partition "default": role is always default; remove it`,
+	}, {
+		name:        "error: a partition other than the default entry without a role",
+		conf:        partitioned(defaultEntry, CPUPartition{Name: "vms", CPUSet: "2-3"}),
+		expectedErr: true,
+		wantErr:     `invalid role "" of partition "vms": must be one of ["default" "exclusive" "reserved"]`,
+	}, {
+		name:        "error: a partition other than the default entry without a cpuset",
+		conf:        partitioned(defaultEntry, CPUPartition{Name: "vms", Role: "exclusive"}),
+		expectedErr: true,
+		wantErr:     `invalid cpuset "" of partition "vms": names no CPUs`,
+	}, {
+		name:        "error: role shared, like any unknown role",
+		conf:        partitioned(defaultEntry, CPUPartition{Name: "ctrl", Role: "shared", CPUSet: "2-5"}),
+		expectedErr: true,
+		wantErr:     `invalid role "shared" of partition "ctrl": must be one of ["default" "exclusive" "reserved"]`,
+	}, {
+		name:        "error: a cpuset that does not parse",
+		conf:        partitioned(defaultEntry, CPUPartition{Name: "vms", Role: "exclusive", CPUSet: "2-"}),
+		expectedErr: true,
+		wantErr:     `invalid cpuset "2-" of partition "vms": strconv.Atoi: parsing "": invalid syntax`,
+	}, {
+		name:        "error: two partitions naming one CPU",
+		conf:        partitioned(defaultEntry, vms, CPUPartition{Name: "spdk", Role: "exclusive", CPUSet: "3-4"}),
+		expectedErr: true,
+		wantErr:     `partitions "vms" and "spdk" both claim 3: a CPU belongs to one partition`,
+	}, {
+		name:        "error: a partition declared twice",
+		conf:        partitioned(defaultEntry, vms, CPUPartition{Name: "vms", Role: "exclusive", CPUSet: "6-7"}),
+		expectedErr: true,
+		wantErr:     `invalid cpuPartitions: partition "vms" is declared twice`,
+	}, {
+		name:        "error: the default entry declared twice",
+		conf:        partitioned(defaultEntry, defaultEntry),
+		expectedErr: true,
+		wantErr:     `invalid cpuPartitions: partition "default" is declared twice`,
+	}, {
+		name:        "error: a partition without a name",
+		conf:        partitioned(defaultEntry, CPUPartition{Role: "exclusive", CPUSet: "2-3"}),
+		expectedErr: true,
+		wantErr:     "invalid cpuPartitions: a partition has no name",
+	}, {
+		name:        "error: a partition name that is not a DNS label",
+		conf:        partitioned(defaultEntry, CPUPartition{Name: "VMs", Role: "exclusive", CPUSet: "2-3"}),
+		expectedErr: true,
+		wantErr:     `invalid partition name "VMs": a lowercase RFC 1123 label must consist of`,
+	}, {
+		name: "valid: a partition name of 46 characters",
+		conf: partitioned(defaultEntry, CPUPartition{Name: strings.Repeat("a", 46), Role: "exclusive", CPUSet: "2-3"}),
+	}, {
+		name:        "error: a partition name of 47 characters",
+		conf:        partitioned(defaultEntry, CPUPartition{Name: strings.Repeat("a", 47), Role: "exclusive", CPUSet: "2-3"}),
+		expectedErr: true,
+		wantErr:     `invalid partition name "` + strings.Repeat("a", 47) + `": at most 46 characters, so that the device names built from it stay DNS labels`,
+	}, {
+		name:        "error: partitions beside reservedCPUs",
+		conf:        withConfig(partitioned(defaultEntry), func(c *Config) { c.ReservedCPUs = "0-1" }),
+		expectedErr: true,
+		wantErr:     `invalid cpuPartitions: reservedCPUs "0-1" names CPUs in the same scope; declare a partition with role "reserved" instead`,
+	}, {
+		name: "valid: an empty list beside reservedCPUs",
+		conf: withConfig(partitioned(), func(c *Config) { c.ReservedCPUs = "0-1"; c.CPUPartitions = []CPUPartition{} }),
+	}, {
+		name:        "error: partitions in individual mode",
+		conf:        withConfig(partitioned(defaultEntry), func(c *Config) { c.CPUDeviceMode = "individual" }),
+		expectedErr: true,
+		wantErr:     `invalid cpuPartitions: requires cpuDeviceMode "grouped", got "individual"`,
+	}, {
+		name: "valid: an empty list in individual mode",
+		conf: withConfig(partitioned(), func(c *Config) { c.CPUDeviceMode = "individual"; c.CPUPartitions = []CPUPartition{} }),
+	}, {
+		name:        "error: partitions with the external allocator",
+		conf:        withConfig(partitioned(defaultEntry), func(c *Config) { c.Allocator = "external" }),
+		expectedErr: true,
+		wantErr:     `invalid allocator "external" with cpuPartitions: must be "cpumanager"`,
+	}, {
+		name:        "error: partitions with groupBy machine",
+		conf:        withConfig(partitioned(defaultEntry), func(c *Config) { c.GroupBy = "machine"; c.Allocator = "external" }),
+		expectedErr: true,
+		wantErr:     `invalid groupBy "machine" with cpuPartitions: needs allocator "external", which partitions do not use`,
+	}, {
+		name:        "error: partitions with groupBy machine and the default allocator",
+		conf:        withConfig(partitioned(defaultEntry), func(c *Config) { c.GroupBy = "machine" }),
+		expectedErr: true,
+		wantErr:     `invalid groupBy "machine" with cpuPartitions: needs allocator "external", which partitions do not use`,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.conf.Validate()
 			gotErr := (err != nil)
 			if gotErr != tc.expectedErr {
 				t.Errorf("error got=%v expected=%v (err=%v)", gotErr, tc.expectedErr, err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Errorf("error = %v, want it to contain %q", err, tc.wantErr)
 			}
 		})
 	}
