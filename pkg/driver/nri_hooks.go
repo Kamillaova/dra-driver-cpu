@@ -219,6 +219,7 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 	// container on the node without the driver.
 	contenders := contendersForUnboundClaims(allocationState, listed)
 	refused := 0
+	var noSharedCPUs []string
 	var kept []cpumetrics.Rule
 	var warnings []olderRuleWarning
 	for _, sc := range listed {
@@ -260,7 +261,9 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 		}
 
 		state := store.NewContainerState(sc.container.GetName(), types.UID(sc.container.GetId()), claimUIDs...)
-		if len(claimUIDs) > 0 {
+		if len(claimUIDs) > 0 && allGuaranteedCPUs.IsEmpty() {
+			noSharedCPUs = append(noSharedCPUs, sc.container.GetId())
+		} else if len(claimUIDs) > 0 {
 			sc.logger.V(2).Info("found guaranteed CPUs", "cpus", allGuaranteedCPUs.String())
 
 			// Reconcile guaranteed container CPU mask.
@@ -272,6 +275,12 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 		}
 		podState.SetContainerState(sc.owner.PodUID, state)
 		sc.logger.V(6).Info("set container state", "claims", len(claimUIDs))
+	}
+
+	if len(noSharedCPUs) > 0 {
+		// NRI can neither give a container an empty cpuset nor stop it from here.
+		slices.Sort(noSharedCPUs)
+		logger.Error(errNoSharedRequestCPUs, "leaving containers holding only shared requests on their current CPUs", "containers", noSharedCPUs)
 	}
 
 	// Reconcile container CPU masks to handle cases where the NRI plugin might have crashed
@@ -427,7 +436,11 @@ func (sc *syncContainer) recordClaims(allocations *store.AllocationState) {
 		if _, err := allocations.GetRequestAllocationUnion(claim.refs(uid)...); err != nil {
 			continue
 		}
-		recorded = recorded.Union(record.CPUs())
+		whole, err := allocations.GetRequestAllocationUnion(store.ClaimRequestRef{ClaimUID: uid})
+		if err != nil {
+			continue
+		}
+		recorded = recorded.Union(whole)
 		sc.onRecord = append(sc.onRecord, uid)
 	}
 	pinned, err := cpuset.Parse(sc.container.GetLinux().GetResources().GetCpu().GetCpus())
@@ -493,7 +506,14 @@ func (w olderRuleWarning) message() string {
 // requests, where upstream's driver gives such a container the whole claim.
 func wholeClaimUse(allocations *store.AllocationState, uid types.UID, claim draEnvClaim, container string) error {
 	record, ok := allocations.GetClaimRecord(uid)
-	if claim.upstreamForm() || !ok || len(claim.requests) >= len(record.Requests) {
+	if !ok || claim.upstreamForm() {
+		return nil
+	}
+	named := sets.New[string]()
+	for _, request := range record.Requests {
+		named.Insert(request.Request)
+	}
+	if len(claim.requests) >= named.Len() {
 		return nil
 	}
 	name := record.Name
@@ -606,6 +626,29 @@ func contendersForUnboundClaims(allocations *store.AllocationState, listed []*sy
 
 var errNoDefaultPartitionCPUs = errors.New("cannot update containers without claims: the default partition holds no CPU")
 
+var errNoSharedRequestCPUs = errors.New("every CPU of the devices its shared requests use is held by an exclusive claim")
+
+// allocationOf labels a container for the NRI metrics by the requests it
+// names: shared where they hold no CPU alone, and exclusive where they do or
+// are not prepared.
+func allocationOf(allocations *store.AllocationState, refs []store.ClaimRequestRef) cpumetrics.CPUAllocation {
+	if len(refs) == 0 {
+		return cpumetrics.CPUAllocationShared
+	}
+	if exclusive, err := allocations.GetExclusiveRequestUnion(refs...); err == nil && exclusive.IsEmpty() {
+		return cpumetrics.CPUAllocationShared
+	}
+	return cpumetrics.CPUAllocationExclusive
+}
+
+func wholeClaimRefs(claimUIDs []types.UID) []store.ClaimRequestRef {
+	refs := make([]store.ClaimRequestRef, 0, len(claimUIDs))
+	for _, uid := range claimUIDs {
+		refs = append(refs, store.ClaimRequestRef{ClaimUID: uid})
+	}
+	return refs
+}
+
 // sharedContainerUpdatesFor computes updates from the supplied stores. Callers
 // using the live driver stores must hold stateMu; Synchronize passes candidate stores.
 func sharedContainerUpdatesFor(logger logr.Logger, allocations *store.AllocationState, pods *store.PodState, excludeID types.UID) ([]*api.ContainerUpdate, error) {
@@ -658,14 +701,18 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	adjust := &api.ContainerAdjustment{}
 	var updates []*api.ContainerUpdate
 
-	claimCount := -1
+	alloc := cpumetrics.CPUAllocationUnknown
 	claimAllocations, err := parseDRAEnvToClaimAllocations(logger, ctr.Env)
-	defer func() { cp.metrics.RecordNRICreateContainer(rerr, claimCount, time.Since(startTime)) }()
+	defer func() { cp.metrics.RecordNRICreateContainer(rerr, alloc, time.Since(startTime)) }()
 	if err != nil {
 		logger.Error(err, "error parsing DRA env for container")
 		return nil, nil, fmt.Errorf("failed to parse DRA environment for container %q in pod %q: %w", ctr.Name, pod.Uid, err)
 	}
-	claimCount = len(claimAllocations)
+	claimCount := len(claimAllocations)
+	alloc = cpumetrics.CPUAllocationShared
+	if claimCount > 0 {
+		alloc = cpumetrics.CPUAllocationExclusive
+	}
 	if cp.window != nil {
 		return cp.window.admit(cp.profileLabel, pod, ctr, claimCount)
 	}
@@ -705,7 +752,16 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 			}
 			refs = append(refs, claim.refs(uid)...)
 		}
+		alloc = allocationOf(cp.allocationState, refs)
 		guaranteedCPUs, err := cp.allocationState.GetRequestAllocationUnion(refs...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("cannot bind claim to container %q in pod %q: %w", ctr.Name, pod.Uid, err)
+		}
+		if guaranteedCPUs.IsEmpty() {
+			// NRI cannot represent an empty CPUSet as a ContainerAdjustment.
+			return nil, nil, fmt.Errorf("cannot create container %q in pod %q: %w", ctr.Name, pod.Uid, errNoSharedRequestCPUs)
+		}
+		exclusiveCPUs, err := cp.allocationState.GetExclusiveRequestUnion(refs...)
 		if err != nil {
 			return nil, nil, fmt.Errorf("cannot bind claim to container %q in pod %q: %w", ctr.Name, pod.Uid, err)
 		}
@@ -721,7 +777,9 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		logger.V(2).Info("guaranteed CPUs found", "cpus", guaranteedCPUs.String())
 		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...)
 		adjust.SetLinuxCPUSetCPUs(guaranteedCPUs.String())
-		adjust.AddEnv(dracpuapi.EnvVarExclusiveAssignedCPUSet, guaranteedCPUs.String())
+		if !exclusiveCPUs.IsEmpty() {
+			adjust.AddEnv(dracpuapi.EnvVarExclusiveAssignedCPUSet, exclusiveCPUs.String())
+		}
 		// An updated claim means this is the first CreateContainer after Prepare, so
 		// existing shared containers must be moved off the newly claimed CPUs.
 		// On restart the owner already exists and no shared-container updates are
@@ -775,7 +833,7 @@ func (cp *CPUDriver) StopContainer(ctx context.Context, pod *api.PodSandbox, ctr
 	}
 
 	// leverage the fact the hook can't fail in our current design
-	cp.metrics.RecordNRIStopContainer(nil, len(claimUIDs), time.Since(startTime))
+	cp.metrics.RecordNRIStopContainer(nil, allocationOf(cp.allocationState, wholeClaimRefs(claimUIDs)), time.Since(startTime))
 	return updates, nil
 }
 
@@ -816,6 +874,6 @@ func (cp *CPUDriver) RemoveContainer(ctx context.Context, pod *api.PodSandbox, c
 	// leverage the fact the hook can't fail in our current design
 	// **NOTE** because of the flow (see comment before StopContainer) this metric becomes a signal
 	// we leaked state and StopContainer didn't clean up properly.
-	cp.metrics.RecordNRIRemoveContainer(nil, len(claimUIDs), time.Since(startTime))
+	cp.metrics.RecordNRIRemoveContainer(nil, allocationOf(cp.allocationState, wholeClaimRefs(claimUIDs)), time.Since(startTime))
 	return nil
 }

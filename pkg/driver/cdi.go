@@ -60,6 +60,7 @@ type cdiClaimRecord struct {
 type cdiRequestRecord struct {
 	Request string
 	CPUs    cpuset.CPUSet
+	Role    store.Role
 	Results []cdiResultRecord
 }
 
@@ -79,13 +80,20 @@ type cdiRecord struct {
 type cdiPlacement struct {
 	Request string            `json:"request"`
 	CPUs    string            `json:"cpus"`
+	Role    store.Role        `json:"role,omitempty"`
 	Results []cdiResultRecord `json:"results,omitempty"`
 }
 
 func (r cdiClaimRecord) storeRecord() store.ClaimRecord {
 	record := store.ClaimRecord{Namespace: r.Namespace, Name: r.Name}
 	for _, request := range r.Requests {
-		record.Requests = append(record.Requests, store.RequestAllocation{Request: request.Request, CPUs: request.CPUs})
+		allocation := store.RequestAllocation{Request: request.Request, CPUs: request.CPUs, Role: request.Role}
+		if request.Role == store.RoleShared {
+			for _, result := range request.Results {
+				allocation.Devices = append(allocation.Devices, result.Device)
+			}
+		}
+		record.Requests = append(record.Requests, allocation)
 	}
 	return record
 }
@@ -93,7 +101,7 @@ func (r cdiClaimRecord) storeRecord() store.ClaimRecord {
 func encodeClaimRecord(record cdiClaimRecord) (string, error) {
 	encoded := cdiRecord{Namespace: record.Namespace, Name: record.Name, Placements: make([]cdiPlacement, 0, len(record.Requests))}
 	for _, request := range record.Requests {
-		encoded.Placements = append(encoded.Placements, cdiPlacement{Request: request.Request, CPUs: request.CPUs.String(), Results: request.Results})
+		encoded.Placements = append(encoded.Placements, cdiPlacement{Request: request.Request, CPUs: request.CPUs.String(), Role: request.Role, Results: request.Results})
 	}
 	value, err := json.Marshal(encoded)
 	if err != nil {
@@ -121,8 +129,10 @@ func decodeClaimRecord(value string) (cdiClaimRecord, error) {
 	}
 	record := cdiClaimRecord{Namespace: decoded.Namespace, Name: decoded.Name}
 	for _, placement := range decoded.Placements {
-		if placement.Request == "" || slices.ContainsFunc(record.Requests, func(r cdiRequestRecord) bool { return r.Request == placement.Request }) {
-			return cdiClaimRecord{}, fmt.Errorf("%s records request %q twice or without a name", cdiRecordAnnotation, placement.Request)
+		if placement.Request == "" || slices.ContainsFunc(record.Requests, func(r cdiRequestRecord) bool {
+			return r.Request == placement.Request && r.Role == placement.Role
+		}) {
+			return cdiClaimRecord{}, fmt.Errorf("%s records request %q twice in one role or without a name", cdiRecordAnnotation, placement.Request)
 		}
 		cpus, err := cpuset.Parse(placement.CPUs)
 		if err != nil {
@@ -131,7 +141,13 @@ func decodeClaimRecord(value string) (cdiClaimRecord, error) {
 		if cpus.IsEmpty() {
 			return cdiClaimRecord{}, fmt.Errorf("%s records no CPU for request %q", cdiRecordAnnotation, placement.Request)
 		}
-		record.Requests = append(record.Requests, cdiRequestRecord{Request: placement.Request, CPUs: cpus, Results: placement.Results})
+		if placement.Role != store.RoleExclusive && placement.Role != store.RoleShared {
+			return cdiClaimRecord{}, fmt.Errorf("%s records request %q with role %q, which this driver does not know", cdiRecordAnnotation, placement.Request, placement.Role)
+		}
+		if placement.Role == store.RoleShared && len(placement.Results) == 0 {
+			return cdiClaimRecord{}, fmt.Errorf("%s records shared request %q with no device", cdiRecordAnnotation, placement.Request)
+		}
+		record.Requests = append(record.Requests, cdiRequestRecord{Request: placement.Request, CPUs: cpus, Role: placement.Role, Results: placement.Results})
 	}
 	return record, nil
 }
