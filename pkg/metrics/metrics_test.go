@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 16)
+	require.Len(t, descriptors, 17)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -57,12 +57,14 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_nri_synchronize_refused_claims_total",
 		"dra_cpu_containers_kept_under_older_rule_total",
 		"dra_cpu_watchdog_stuck_seconds",
+		"dra_cpu_node_allocatable_mapping_dropped_total",
 	}, names)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
 	require.Empty(t, descriptors[13].Labels)
 	require.Equal(t, []string{"rule"}, descriptors[14].Labels)
 	require.Empty(t, descriptors[15].Labels)
+	require.Empty(t, descriptors[16].Labels)
 }
 
 func TestWriteJSON(t *testing.T) {
@@ -93,6 +95,7 @@ func TestNewRegistersExpectedMetricFamilies(t *testing.T) {
 		"dra_cpu_available_cpus",
 		"dra_cpu_claim_allocated_cpus",
 		"dra_cpu_containers_kept_under_older_rule_total",
+		"dra_cpu_node_allocatable_mapping_dropped_total",
 		"dra_cpu_nri_create_container_duration_seconds",
 		"dra_cpu_nri_remove_container_duration_seconds",
 		"dra_cpu_nri_stop_container_duration_seconds",
@@ -128,6 +131,7 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	require.Equal(t, 1, testutil.CollectAndCount(m.containersKeptUnderOlder), "every rule is exported before any container is kept")
 	m.RecordContainerKeptUnderOlderRule(RulePartialHolder)
 	m.SetWatchdogStuck(61500 * time.Millisecond)
+	m.RecordNodeAllocatableMappingDropped()
 
 	require.InDelta(t, 2, testutil.ToFloat64(m.allocatedCPUs), 0.01)
 	require.InDelta(t, 6, testutil.ToFloat64(m.availableCPUs), 0.01)
@@ -139,6 +143,7 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	require.InDelta(t, 2, testutil.ToFloat64(m.nriSynchronizeRefused), 0.01)
 	require.InDelta(t, 1, testutil.ToFloat64(m.containersKeptUnderOlder.WithLabelValues(string(RulePartialHolder))), 0.01)
 	require.InDelta(t, 61.5, testutil.ToFloat64(m.watchdogStuck), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.mappingDropped), 0.01)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -196,6 +201,7 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.RecordNRISynchronizeRefusedClaim()
 		recorder.RecordContainerKeptUnderOlderRule(RulePartialHolder)
 		recorder.SetWatchdogStuck(time.Minute)
+		recorder.RecordNodeAllocatableMappingDropped()
 	})
 }
 

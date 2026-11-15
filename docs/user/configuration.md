@@ -135,6 +135,9 @@ on - is configured through other Helm values, not through this file.
   and kubelet account claimed CPUs as node allocatable `cpu`.
 - Requires the `DRANodeAllocatableResources` feature gate (alpha, 1.37+). See
   [Workload Configuration Requirements](workload-requirements.md).
+- The driver keeps the condition `CPUAllocatableMappingDropped` on its Node, `True` when the API
+  server drops the mapping; see
+  [troubleshooting](troubleshooting.md#a-node-allocatable-mapping-the-api-server-dropped).
 
 `qps` (number, default: `20`)
 
