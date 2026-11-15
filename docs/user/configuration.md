@@ -157,6 +157,15 @@ on - is configured through other Helm values, not through this file.
   to start otherwise. It also refuses to start on a node with a core of more than two logical
   CPUs, unless that core is wholly in `reservedCPUs`.
 
+`assumeUnsolicitedUpdatesSafe` (bool, default: `false`)
+
+- Widen the containers without claims onto the CPUs an unprepared claim freed as soon as it is
+  unprepared, through a container update the runtime did not ask for. Without it they get those
+  CPUs at the next container creation of a claim or the next NRI reconnect.
+- Set it only where every node's runtime vendors NRI v0.12.1 or later, which fixes
+  [containerd/nri#301](https://github.com/containerd/nri/pull/301): an older one can deadlock on
+  such an update. containerd 2.4.0 vendors it; containerd 2.3 does not. The driver does not check.
+
 #### Settings published as device attributes
 
 Every device the driver publishes carries the settings that decide whether the driver prepares a
