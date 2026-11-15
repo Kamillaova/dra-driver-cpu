@@ -107,10 +107,12 @@ attributes above instead. They may be removed in a future release.
 When a grouped device is prepared, the driver copies its published attributes into the device
 metadata exposed to the container. It also adds the following metadata-only attributes:
 
-| Attribute                  | Type   | Description                                                                                                                                      |
-| -------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `dra.cpu/allocatedNumCPUs` | int    | Number of CPUs allocated to this claim from the grouped device, when the claim consumes `dra.cpu/cpu` capacity                                   |
-| `dra.cpu/cpuset`           | string | The CPUs the request holds on this device, in cpuset list form such as `0-1,4-5`, for a request that holds exclusive CPUs, in either device mode |
+| Attribute                  | Type   | Description                                                                                                                                                                                                 |
+| -------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dra.cpu/allocatedNumCPUs` | int    | **Deprecated:** use `dra.cpu/cpuRequest`. Number of CPUs allocated to this claim from the grouped device, written for each request that holds exclusive CPUs when the claim consumes `dra.cpu/cpu` capacity |
+| `dra.cpu/cpuRequest`       | string | The CPU amount booked for the request on this device, as a quantity such as `2` or `1500m`, when the claim consumes `dra.cpu/cpu` capacity                                                                  |
+| `dra.cpu/cpuLimit`         | string | The request's CPU limit as a quantity, or `max` where the request has none, as a request that holds exclusive CPUs has none; written with `dra.cpu/cpuRequest`                                              |
+| `dra.cpu/cpuset`           | string | The CPUs the request holds on this device, in cpuset list form such as `0-1,4-5`, for a request that holds exclusive CPUs, in either device mode                                                            |
 
 These attributes are not published in a `ResourceSlice` and cannot be used to select a device.
 
