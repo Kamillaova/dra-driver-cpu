@@ -253,6 +253,9 @@
             "v1alpha1"
           ]
         },
+        "assumeUnsolicitedUpdatesSafe": {
+          "type": "boolean"
+        },
         "burst": {
           "type": "integer"
         },

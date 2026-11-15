@@ -85,4 +85,5 @@ type DriverConfig struct {
 	QPS                                   float32 `json:"qps,omitempty"`
 	Burst                                 int     `json:"burst,omitempty"`
 	FullPhysicalCPUsOnly                  bool    `json:"fullPhysicalCPUsOnly,omitempty"`
+	AssumeUnsolicitedUpdatesSafe          bool    `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
 }
