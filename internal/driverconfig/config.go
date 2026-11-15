@@ -58,6 +58,9 @@ type Config struct {
 	// CPUPartitions splits the node's CPUs into named partitions. Left out,
 	// null and empty all mean the node uses no partitions.
 	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
+	// Profiles holds a cpuPartitions list per kind of node, by name. Left out,
+	// null and empty all mean the configuration declares no profiles.
+	Profiles map[string]Profile `json:"profiles,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -79,28 +82,30 @@ func (c Config) LogValues() []any {
 		"fullPhysicalCPUsOnly", c.FullPhysicalCPUsOnly,
 		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
 		"cpuPartitions", c.CPUPartitions,
+		"profiles", c.Profiles,
 	}
 }
 
 // dumpConfig mirrors Config field-for-field but drops the omitempty json
 // tags, so Dump also prints zero values (e.g. exposePCIeRoots=false).
 type dumpConfig struct {
-	Kubeconfig                            string         `json:"kubeconfig"`
-	HostnameOverride                      string         `json:"hostnameOverride"`
-	BindAddress                           string         `json:"bindAddress"`
-	ReservedCPUs                          string         `json:"reservedCPUs"`
-	CPUDeviceMode                         string         `json:"cpuDeviceMode"`
-	GroupBy                               string         `json:"groupBy"`
-	ExposePCIeRoots                       bool           `json:"exposePCIeRoots"`
-	SysFSOverlay                          string         `json:"sysfsOverlay"`
-	KubeletRootDir                        string         `json:"kubeletRootDir"`
-	PublishNodeAllocatableResourceMapping bool           `json:"publishNodeAllocatableResourceMapping"`
-	Allocator                             string         `json:"allocator"`
-	QPS                                   float32        `json:"qps"`
-	Burst                                 int            `json:"burst"`
-	FullPhysicalCPUsOnly                  bool           `json:"fullPhysicalCPUsOnly"`
-	AssumeUnsolicitedUpdatesSafe          bool           `json:"assumeUnsolicitedUpdatesSafe"`
-	CPUPartitions                         []CPUPartition `json:"cpuPartitions"`
+	Kubeconfig                            string             `json:"kubeconfig"`
+	HostnameOverride                      string             `json:"hostnameOverride"`
+	BindAddress                           string             `json:"bindAddress"`
+	ReservedCPUs                          string             `json:"reservedCPUs"`
+	CPUDeviceMode                         string             `json:"cpuDeviceMode"`
+	GroupBy                               string             `json:"groupBy"`
+	ExposePCIeRoots                       bool               `json:"exposePCIeRoots"`
+	SysFSOverlay                          string             `json:"sysfsOverlay"`
+	KubeletRootDir                        string             `json:"kubeletRootDir"`
+	PublishNodeAllocatableResourceMapping bool               `json:"publishNodeAllocatableResourceMapping"`
+	Allocator                             string             `json:"allocator"`
+	QPS                                   float32            `json:"qps"`
+	Burst                                 int                `json:"burst"`
+	FullPhysicalCPUsOnly                  bool               `json:"fullPhysicalCPUsOnly"`
+	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe"`
+	CPUPartitions                         []CPUPartition     `json:"cpuPartitions"`
+	Profiles                              map[string]Profile `json:"profiles"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of

@@ -36,7 +36,7 @@ var groupings = []string{
 }
 
 // Validate checks that enum fields hold recognised values, that cpuPartitions
-// is well formed, that kubeletRootDir is non-empty and absolute, and that qps
+// and every profile are well formed, that kubeletRootDir is non-empty and absolute, and that qps
 // and burst are positive. The root is required rather than optional because the hostPath
 // mounts render from the same value.
 // Config files bypass the flag.Value validators, so Resolve calls this after merging.
@@ -53,6 +53,9 @@ func (c Config) Validate() error {
 			c.Allocator, cpuallocator.ModeExternal, cpuallocator.ModeCPUManager)
 	}
 	if err := c.validateCPUPartitions(); err != nil {
+		return err
+	}
+	if err := c.validateProfiles(); err != nil {
 		return err
 	}
 	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED && c.GroupBy == device.GROUP_BY_MACHINE && c.Allocator != cpuallocator.ModeExternal {

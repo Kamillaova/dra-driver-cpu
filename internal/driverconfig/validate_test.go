@@ -36,6 +36,17 @@ func partitioned(partitions ...CPUPartition) Config {
 	}
 }
 
+// profiled is a valid grouped configuration declaring profiles.
+func profiled(profiles map[string]Profile) Config {
+	c := partitioned()
+	c.Profiles = profiles
+	return c
+}
+
+func profile(partitions ...CPUPartition) Profile {
+	return Profile{CPUPartitions: partitions}
+}
+
 func withConfig(c Config, change func(*Config)) Config {
 	change(&c)
 	return c
@@ -325,6 +336,100 @@ func TestValidate(t *testing.T) {
 		conf:        withConfig(partitioned(defaultEntry), func(c *Config) { c.GroupBy = "machine" }),
 		expectedErr: true,
 		wantErr:     `invalid groupBy "machine" with cpuPartitions: needs allocator "external", which partitions do not use`,
+	}, {
+		name: "valid: two profiles, each holding the default entry",
+		conf: profiled(map[string]Profile{"r7625": profile(defaultEntry, vms), "x3d": profile(defaultEntry)}),
+	}, {
+		name: "valid: a profile named default",
+		conf: profiled(map[string]Profile{"default": profile(defaultEntry)}),
+	}, {
+		name:        "error: a profile without partitions",
+		conf:        profiled(map[string]Profile{"r7625": {}}),
+		expectedErr: true,
+		wantErr:     `profile "r7625" has no partitions; add "- name: default" to its cpuPartitions`,
+	}, {
+		name:        "error: a profile naming vms without the default entry",
+		conf:        profiled(map[string]Profile{"r7625": profile(vms)}),
+		expectedErr: true,
+		wantErr:     `profile "r7625": ` + noDefaultPartition,
+	}, {
+		name: "error: a profile no node under test selects is checked too",
+		conf: profiled(map[string]Profile{
+			"r7625": profile(defaultEntry, vms),
+			"x3d":   profile(defaultEntry, CPUPartition{Name: "ctrl", Role: "shared", CPUSet: "2-5"}),
+		}),
+		expectedErr: true,
+		wantErr:     `profile "x3d": invalid role "shared" of partition "ctrl": must be one of ["default" "exclusive" "reserved"]`,
+	}, {
+		name:        "error: a fleet-wide list beside profiles",
+		conf:        withConfig(profiled(map[string]Profile{"r7625": profile(defaultEntry)}), func(c *Config) { c.CPUPartitions = []CPUPartition{defaultEntry} }),
+		expectedErr: true,
+		wantErr:     "invalid cpuPartitions: with profiles declared, the partitions belong to the profiles, one complete description per node type",
+	}, {
+		name: "valid: an empty fleet-wide list beside profiles",
+		conf: withConfig(profiled(map[string]Profile{"r7625": profile(defaultEntry)}), func(c *Config) { c.CPUPartitions = []CPUPartition{} }),
+	}, {
+		name:        "error: reservedCPUs beside profiles",
+		conf:        withConfig(profiled(map[string]Profile{"r7625": profile(defaultEntry)}), func(c *Config) { c.ReservedCPUs = "0-1" }),
+		expectedErr: true,
+		wantErr:     `invalid reservedCPUs "0-1": with profiles declared, the CPUs a node keeps from workloads are a partition with role "reserved" inside that node's own profile`,
+	}, {
+		name:        "error: profiles with the external allocator",
+		conf:        withConfig(profiled(map[string]Profile{"r7625": profile(defaultEntry)}), func(c *Config) { c.Allocator = "external" }),
+		expectedErr: true,
+		wantErr:     `invalid allocator "external" with profiles: must be "cpumanager"`,
+	}, {
+		name:        "error: profiles with groupBy machine",
+		conf:        withConfig(profiled(map[string]Profile{"r7625": profile(defaultEntry)}), func(c *Config) { c.GroupBy = "machine"; c.Allocator = "external" }),
+		expectedErr: true,
+		wantErr:     `invalid groupBy "machine" with profiles: needs allocator "external", which partitions do not use`,
+	}, {
+		name:        "error: profiles with groupBy machine and the default allocator",
+		conf:        withConfig(profiled(map[string]Profile{"r7625": profile(defaultEntry)}), func(c *Config) { c.GroupBy = "machine" }),
+		expectedErr: true,
+		wantErr:     `invalid groupBy "machine" with profiles: needs allocator "external", which partitions do not use`,
+	}, {
+		name: "error: a partition name with two roles in different profiles",
+		conf: profiled(map[string]Profile{
+			"r7625": profile(defaultEntry, vms),
+			"x3d":   profile(defaultEntry, CPUPartition{Name: "vms", Role: "reserved", CPUSet: "0-1"}),
+		}),
+		expectedErr: true,
+		wantErr:     `partition "vms" has role "exclusive" in profile "r7625" and "reserved" in profile "x3d"; a partition keeps one role in every profile`,
+	}, {
+		name: "valid: a profile name of 63 characters",
+		conf: profiled(map[string]Profile{strings.Repeat("a", 63): profile(defaultEntry)}),
+	}, {
+		name:        "error: a profile name of 64 characters",
+		conf:        profiled(map[string]Profile{strings.Repeat("a", 64): profile(defaultEntry)}),
+		expectedErr: true,
+		wantErr:     `invalid profile name "` + strings.Repeat("a", 64) + `": a node selects its profile by the value of its dra.cpu/profile label, and this name is not a label value: must be no more than 63 bytes`,
+	}, {
+		name:        "error: a profile name with a character outside the label alphabet",
+		conf:        profiled(map[string]Profile{"r7625/a": profile(defaultEntry)}),
+		expectedErr: true,
+		wantErr:     `invalid profile name "r7625/a": a node selects its profile by the value of its dra.cpu/profile label, and this name is not a label value: a valid label must be an empty string or consist of alphanumeric characters`,
+	}, {
+		name:        "error: a profile name starting with a dash",
+		conf:        profiled(map[string]Profile{"-r7625": profile(defaultEntry)}),
+		expectedErr: true,
+		wantErr:     `invalid profile name "-r7625": a node selects its profile by the value of its dra.cpu/profile label, and this name is not a label value: a valid label must be an empty string or consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character`,
+	}, {
+		name:        "error: a profile name ending with a dash",
+		conf:        profiled(map[string]Profile{"r7625-": profile(defaultEntry)}),
+		expectedErr: true,
+		wantErr:     `invalid profile name "r7625-": a node selects its profile by the value of its dra.cpu/profile label, and this name is not a label value: a valid label must be an empty string or consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character`,
+	}, {
+		name:        "error: an empty profile name",
+		conf:        profiled(map[string]Profile{"": profile(defaultEntry), "r7625": profile(defaultEntry)}),
+		expectedErr: true,
+		wantErr:     `invalid profile name "": a node selects its profile by the value of its dra.cpu/profile label, and an empty label selects no profile`,
+	}, {
+		name: "valid: a partition name with one role in every profile",
+		conf: profiled(map[string]Profile{
+			"r7625": profile(defaultEntry, vms),
+			"x3d":   profile(defaultEntry, CPUPartition{Name: "vms", Role: "exclusive", CPUSet: "4-7"}),
+		}),
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.conf.Validate()
