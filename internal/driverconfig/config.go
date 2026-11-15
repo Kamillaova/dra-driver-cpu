@@ -51,6 +51,10 @@ type Config struct {
 	// FullPhysicalCPUsOnly is the driver's counterpart of the kubelet CPU
 	// Manager's full-pcpus-only policy option. Defaults to false.
 	FullPhysicalCPUsOnly bool `json:"fullPhysicalCPUsOnly,omitempty"`
+	// AssumeUnsolicitedUpdatesSafe asserts that the runtime takes container
+	// updates the driver sends unasked, which a runtime vendoring an NRI older
+	// than v0.12.1 can deadlock on (containerd/nri#301). Defaults to false.
+	AssumeUnsolicitedUpdatesSafe bool `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -70,6 +74,7 @@ func (c Config) LogValues() []any {
 		"qps", c.QPS,
 		"burst", c.Burst,
 		"fullPhysicalCPUsOnly", c.FullPhysicalCPUsOnly,
+		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
 	}
 }
 
@@ -90,6 +95,7 @@ type dumpConfig struct {
 	QPS                                   float32 `json:"qps"`
 	Burst                                 int     `json:"burst"`
 	FullPhysicalCPUsOnly                  bool    `json:"fullPhysicalCPUsOnly"`
+	AssumeUnsolicitedUpdatesSafe          bool    `json:"assumeUnsolicitedUpdatesSafe"`
 }
 
 // Dump renders the Config as YAML, for logging a human-readable snapshot of
