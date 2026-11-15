@@ -178,7 +178,14 @@ type CPUDriver struct {
 
 	// window is set, under stateMu, while the node's profile is not read yet;
 	// see Config.SelectProfile.
-	window              *unconfiguredWindow
+	window *unconfiguredWindow
+	// reconnecting marks the next return of the NRI plugin's Run as the
+	// driver's own reconnect, and resynced, set under stateMu, is closed by the
+	// Synchronize that follows it. nriClosed receives a signal each time the
+	// NRI stub's close callback has run.
+	reconnecting        atomic.Bool
+	resynced            chan struct{}
+	nriClosed           chan struct{}
 	providers           Providers
 	profileLabel        string
 	selectProfile       func(name string) (*Config, error)
@@ -288,6 +295,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	plugin := &CPUDriver{
 		initialSync:         make(chan struct{}),
 		initialSyncWait:     initialSyncWait,
+		nriClosed:           make(chan struct{}, 1),
 		driverName:          config.DriverName,
 		nodeName:            config.NodeName,
 		kubeClient:          providers.K8SClient,
@@ -363,6 +371,9 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 	}
 
 	cp.allocationState = store.NewAllocationState(cp.topology.CPUTopology, cp.topology.ReservedCPUs)
+	if len(config.CPUPartitions) > 0 {
+		cp.allocationState.SetClaimlessCPUs(defaultPartitionCPUs(partitions))
+	}
 	cp.refreshAllocationMetrics()
 	cp.podState = store.NewPodState()
 
@@ -532,13 +543,18 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 }
 
 // startWithProfile serves NRI unconfigured until the node's profile is read,
-// then builds the driver from it and registers with the kubelet.
+// then builds the driver from it, narrows the containers started meanwhile and
+// registers with the kubelet.
 func (cp *CPUDriver) startWithProfile(ctx context.Context, asyncErr chan error) error {
 	go cp.runWatchdog(ctx)
 	if err := cp.startNRI(ctx, asyncErr); err != nil {
 		return err
 	}
-	if err := cp.configureFromProfile(ctx, asyncErr); err != nil {
+	bound, err := cp.configureFromProfile(ctx, asyncErr)
+	if err != nil {
+		return err
+	}
+	if err := cp.narrowWindowContainers(ctx, asyncErr, bound); err != nil {
 		return err
 	}
 	if err := cp.register(ctx); err != nil {
@@ -580,6 +596,7 @@ func (cp *CPUDriver) startNRI(ctx context.Context, asyncErr chan<- error) error 
 		// Otherwise it silently exits the program
 		stub.WithOnClose(func() {
 			logger.Info("NRI plugin closed")
+			cp.signalNRIClosed()
 		}),
 	}
 	stub, err := stub.New(cp, nriOpts...)
@@ -666,6 +683,14 @@ func (cp *CPUDriver) startNRIPlugin(ctx context.Context, asyncErr chan<- error) 
 			asyncErr <- err
 		}
 	}()
+}
+
+// signalNRIClosed is the NRI stub's close callback.
+func (cp *CPUDriver) signalNRIClosed() {
+	select {
+	case cp.nriClosed <- struct{}{}:
+	default:
+	}
 }
 
 // Stop stops the CPUDriver.
@@ -767,8 +792,22 @@ func (c nriConnection) Run(ctx context.Context) error {
 	c.driver.stateMu.Lock()
 	c.driver.nriDisconnected.Store(true)
 	c.driver.stateMu.Unlock()
+	if c.driver.reconnecting.CompareAndSwap(true, false) {
+		// The stub's close callback for the stopped connection runs after Run
+		// returns, and closes whatever connection the stub holds by then.
+		select {
+		case <-c.driver.nriClosed:
+		case <-time.After(nriRetryInitialBackoff):
+		case <-ctx.Done():
+		}
+		return errNRIReconnect
+	}
 	return err
 }
+
+// errNRIReconnect is the return of a Run the driver ended itself so that the
+// runtime synchronizes it again.
+var errNRIReconnect = errors.New("NRI connection closed by the driver to synchronize again")
 
 const (
 	nriRetryInitialBackoff     = 1 * time.Second
@@ -786,6 +825,10 @@ func runNRIPluginWithRetry(ctx context.Context, plugin nriRunner, maxAttempts in
 		if ctx.Err() != nil {
 			logger.Info("NRI plugin stopped", "reason", "context cancelled")
 			return ctx.Err()
+		}
+		if errors.Is(err, errNRIReconnect) {
+			logger.Info("reconnecting the NRI plugin")
+			continue
 		}
 		if time.Since(started) >= healthyRunDuration {
 			attempts = 0

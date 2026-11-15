@@ -95,6 +95,18 @@ func siblingsOutside(details cpuinfo.CPUDetails, cpus, inside cpuset.CPUSet) cpu
 	return siblings.Difference(inside)
 }
 
+// defaultPartitionCPUs is the CPUs of the entry device.DefaultPartitionName,
+// where containers without claims run; a named partition of role default
+// takes claims on its devices only.
+func defaultPartitionCPUs(partitions []device.Partition) cpuset.CPUSet {
+	for _, partition := range partitions {
+		if partition.Name == device.DefaultPartitionName {
+			return partition.CPUs
+		}
+	}
+	return cpuset.New()
+}
+
 // unclaimablePartitionCPUs is every CPU of a partition that keeps its CPUs from
 // every workload.
 func unclaimablePartitionCPUs(partitions []device.Partition) cpuset.CPUSet {
