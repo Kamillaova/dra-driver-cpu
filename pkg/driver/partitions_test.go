@@ -22,13 +22,16 @@ import (
 	"testing"
 	"testing/fstest"
 
+	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
 )
 
@@ -282,6 +285,64 @@ func TestPrepareTakesCPUsFromTheDevicePartition(t *testing.T) {
 			})
 			require.NoError(t, err)
 			require.Error(t, results["claim-1"].Err, "the partition has no CPU left, though the NUMA node and socket do")
+		})
+	}
+}
+
+// A container without claims runs on the default partition's CPUs less every
+// prepared claim's, where upstream's runs on every CPU no claim holds.
+func TestContainersWithoutClaimsRunOnTheDefaultPartition(t *testing.T) {
+	vms := device.Partition{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)}
+	for _, tc := range []struct {
+		name     string
+		declared []device.Partition
+		onDisk   map[types.UID]cpuset.CPUSet
+		want     string
+	}{{
+		name:   "no partitions: every CPU no claim holds",
+		onDisk: map[types.UID]cpuset.CPUSet{"vm": cpuset.New(1, 5)},
+		want:   "0,2-4",
+	}, {
+		name:     "partitions: the default partition alone",
+		declared: []device.Partition{{Name: device.DefaultPartitionName}, vms},
+		want:     "0,2-4",
+	}, {
+		name:     "partitions: a free exclusive partition stays off limits",
+		declared: []device.Partition{{Name: device.DefaultPartitionName}, {Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(0, 4)}},
+		want:     "1-3,5",
+	}, {
+		name:     "partitions: a claim restored inside the default partition is left out",
+		declared: []device.Partition{{Name: device.DefaultPartitionName}, vms},
+		onDisk:   map[types.UID]cpuset.CPUSet{"moved": cpuset.New(2)},
+		want:     "0,3-4",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			d, err := New(testr.New(t), Providers{
+				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+				SysFS:   partitionSysFS(),
+			}, &Config{
+				DriverName:       testDriverName,
+				NodeName:         testNodeName,
+				ReservedCPUs:     cpuset.New(),
+				CPUDeviceMode:    device.CPU_DEVICE_MODE_GROUPED,
+				CPUDeviceGroupBy: device.GROUP_BY_NUMA_NODE,
+				CPUPartitions:    tc.declared,
+			})
+			require.NoError(t, err)
+			d.cdiMgr = newMockCdiMgrWithAllocations(tc.onDisk)
+			d.seedAllocationStoreFromDisk(testr.New(t))
+
+			pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "default"}
+			updates, err := d.Synchronize(ctx, []*api.PodSandbox{pod}, []*api.Container{{Id: "running", Name: "running", PodSandboxId: pod.Id}})
+			require.NoError(t, err)
+			require.Len(t, updates, 1)
+			require.Equal(t, "running", updates[0].GetContainerId())
+			require.Equal(t, tc.want, updates[0].GetLinux().GetResources().GetCpu().GetCpus(), "Synchronize")
+
+			adjust, _, err := d.CreateContainer(ctx, pod, &api.Container{Id: "created", Name: "created", PodSandboxId: pod.Id})
+			require.NoError(t, err)
+			require.Equal(t, tc.want, adjust.GetLinux().GetResources().GetCpu().GetCpus(), "CreateContainer")
 		})
 	}
 }
