@@ -62,10 +62,15 @@ helm install dra-driver-cpu oci://registry.k8s.io/dra-driver-cpu/charts/dra-driv
 
 See the [Helm chart README](../../deployment/helm/dra-driver-cpu/README.md) for the full list of configuration options.
 
+Nodes that partition their CPUs differently are configured by
+[profiles](configuration.md#per-node-profiles) in one release. One release per kind of node, each
+with its own `nodeSelector` or `affinity` and its own `reservedCPUs`, is still supported and
+deprecated: profiles replace it. The nodes of one cluster differ only in what a profile carries;
+releases that give any other setting different values are not supported.
+
 Besides the driver DaemonSet, the chart installs the cluster-scoped `dra.cpu` `DeviceClass`
 that workload claims reference — verify it with `kubectl get deviceclass`. The DeviceClass
-name is fixed, so a cluster that runs several releases of the chart (for example one per
-node class with a different `reservedCPUs` or `kubeletRootDir`) keeps `deviceClass.create`
+name is fixed, so a cluster that runs several releases of the chart keeps `deviceClass.create`
 enabled in only one of them. Give each release its own `nodeSelector` or `affinity`, since
 the default selects every node and a node must run exactly one driver. Do not reuse
 `fullnameOverride` across releases: it replaces the release name in the ClusterRole,
@@ -294,6 +299,12 @@ without a driver that pod stays `Terminating`.
      kubectl patch "${node}" --subresource=status --type=strategic \
        -p '{"status":{"conditions":[{"type":"CPUAllocatableMappingDropped","$patch":"delete"}]}}'
    done
+   ```
+
+1. If the configuration declared profiles, remove the `dra.cpu/profile` label from every Node:
+
+   ```bash
+   kubectl label nodes --all dra.cpu/profile-
    ```
 
 Pods that are running keep their current cpusets, but nothing manages pinning or the shared

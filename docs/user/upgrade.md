@@ -163,6 +163,15 @@ The `dra.cpu/allocatedNumCPUs` attribute of a request's device metadata is depre
 The driver still writes `dra.cpu/allocatedNumCPUs`. Its removal will be announced in this document
 one release before it happens.
 
+#### Running without profiles
+
+A configuration that declares no `profiles`, the node's CPUs named, if at all, by the fleet-wide
+`reservedCPUs` and `cpuPartitions`, keeps working and is deprecated, and so is one Helm release per
+kind of node. [Per-node profiles](configuration.md#per-node-profiles) replace both: declare a
+profile for each kind of node, each holding `- name: default`, and label every node with its own;
+a node whose cores are all alike names a profile holding only that entry. Its removal will be
+announced in this document one release before it happens.
+
 ### Early warning
 
 Before the driver enters beta stage, a batch of **breaking** changes are planned.
