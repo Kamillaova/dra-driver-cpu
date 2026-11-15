@@ -498,6 +498,7 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 	}
 
 	preparedDevices := []kubeletplugin.Device{}
+	cpusKnown := requestCPUsKnown(claim, record, cp.driverName)
 	for _, allocResult := range claim.Status.Allocation.Devices.Results {
 		if allocResult.Driver != cp.driverName {
 			continue
@@ -515,10 +516,17 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 			for k, v := range attrs {
 				metadataAttrs[string(k)] = v
 			}
-			if quantity, ok := device.LookupConsumedCapacity(allocResult.ConsumedCapacity, cp.driverName); ok {
+			ref := metadataRef(claim.UID, record, allocResult.Request)
+			exclusive := cp.allocationState.HoldsExclusiveCPUsOf(ref)
+			if quantity, ok := device.LookupConsumedCapacity(allocResult.ConsumedCapacity, cp.driverName); ok && exclusive {
 				allocatedCount := quantity.Value()
 				metadataAttrs[string(device.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{
 					IntValue: &allocatedCount,
+				}
+			}
+			if cpus := requestCPUsOn(record, ref.Request, cp.deviceCPUs(allocResult.Device)); exclusive && cpusKnown && !cpus.IsEmpty() {
+				metadataAttrs[string(device.AttributeCPUSet)] = resourceapi.DeviceAttribute{
+					StringValue: new(cpus.String()),
 				}
 			}
 			preparedDevice.Metadata = &kubeletplugin.DeviceMetadata{
@@ -533,6 +541,63 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 	return kubeletplugin.PrepareResult{
 		Devices: preparedDevices,
 	}
+}
+
+// metadataRef names the request a result's metadata describes, or the whole
+// claim for a claim restored from upstream's spec, which records no requests.
+func metadataRef(claimUID types.UID, record store.ClaimRecord, request string) store.ClaimRequestRef {
+	if len(record.Requests) == 1 && record.Requests[0].Request == "" {
+		return store.ClaimRequestRef{ClaimUID: claimUID}
+	}
+	return store.ClaimRequestRef{ClaimUID: claimUID, Request: resourceclaim.BaseRequestRef(request)}
+}
+
+// requestCPUsKnown reports whether the record names the CPUs of each request.
+// A claim restored from upstream's spec records one set for the whole claim,
+// which is a request's own only where the claim has one request of this driver.
+func requestCPUsKnown(claim *resourceapi.ResourceClaim, record store.ClaimRecord, driverName string) bool {
+	if len(record.Requests) != 1 || record.Requests[0].Request != "" {
+		return true
+	}
+	requests := sets.New[string]()
+	for _, result := range claim.Status.Allocation.Devices.Results {
+		if result.Driver == driverName {
+			requests.Insert(resourceclaim.BaseRequestRef(result.Request))
+		}
+	}
+	return requests.Len() == 1 && !requests.Has("")
+}
+
+// requestCPUsOn returns the CPUs the record gives a request on a device: a
+// request spanning several devices holds CPUs of each.
+func requestCPUsOn(record store.ClaimRecord, request string, deviceCPUs cpuset.CPUSet) cpuset.CPUSet {
+	for _, held := range record.Requests {
+		if held.Request == request {
+			return held.CPUs.Intersection(deviceCPUs)
+		}
+	}
+	return cpuset.New()
+}
+
+// deviceCPUs returns the CPUs a device groups, reserved CPUs included.
+func (cp *CPUDriver) deviceCPUs(deviceName string) cpuset.CPUSet {
+	details := cp.topology.CPUTopology.CPUDetails
+	if cpuID, ok := cp.topology.NameToCPUID[deviceName]; ok {
+		return cpuset.New(cpuID)
+	}
+	if socketID, ok := cp.topology.NameToSocketID[deviceName]; ok {
+		return details.CPUsInSockets(socketID)
+	}
+	if numaNodeID, ok := cp.topology.NameToNUMANodeID[deviceName]; ok {
+		return details.CPUsInNUMANodes(numaNodeID)
+	}
+	if cpus, ok := cp.topology.NameToCPUs[deviceName]; ok {
+		return cpus
+	}
+	if deviceName == device.CPUDeviceMachineGrouped {
+		return details.CPUs()
+	}
+	return cpuset.New()
 }
 
 // writeClaimDevices writes the CDI spec of a claim and returns the qualified

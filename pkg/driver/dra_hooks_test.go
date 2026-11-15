@@ -1551,6 +1551,12 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 
 					// Build expected devices based on the claim request
 					expectedPreparedDevices := []kubeletplugin.Device{}
+					// Which CPU went to which request is the driver's choice, so
+					// it is read back rather than predicted.
+					cpusByRequest := map[string]cpuset.CPUSet{}
+					for _, request := range mockCdiMgr.records[claimUID].storeRecord().Requests {
+						cpusByRequest[request.Request] = request.CPUs
+					}
 					if tc.expectedCPUSet.Size() != 0 || tc.expectedError {
 						smtEnabled := driver.topology.CPUTopology.SMTEnabled
 						for _, res := range tc.claims[0].Status.Allocation.Devices.Results {
@@ -1563,7 +1569,7 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 								DeviceName:   res.Device,
 								CDIDeviceIDs: []string{requestDevice(res.Request)},
 								Requests:     []string{res.Request},
-								Metadata:     expectedGroupMetadata(tc.groupBy, tc.cpuInfos, tc.reservedCPUs, res.Device, smtEnabled, allocatedCPUs, tc.exposeExtAttrs),
+								Metadata:     expectedGroupMetadata(tc.groupBy, tc.cpuInfos, tc.reservedCPUs, res.Device, smtEnabled, allocatedCPUs, tc.exposeExtAttrs, cpusByRequest[resourceclaim.BaseRequestRef(res.Request)]),
 							})
 						}
 					}
@@ -2219,6 +2225,100 @@ func TestPrepareRefusalNamesTheHolders(t *testing.T) {
 			require.EqualError(t, results[tc.claim.UID].Err, tc.wantErr)
 			_, recorded := d.allocationState.GetClaimRecord(tc.claim.UID)
 			require.False(t, recorded)
+		})
+	}
+}
+
+// A request holding exclusive CPUs finds them in its metadata, each device's
+// entry naming the CPUs it holds on that device and never the request's union.
+func TestPrepareMetadataNamesEachRequestsCPUs(t *testing.T) {
+	grouped := Config{CPUDeviceMode: devattr.CPU_DEVICE_MODE_GROUPED, CPUDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE}
+	result := func(device, request string, consumed int64) resourceapi.DeviceRequestAllocationResult {
+		r := resourceapi.DeviceRequestAllocationResult{Driver: testDriverName, Pool: testNodeName, Device: device, Request: request}
+		if consumed > 0 {
+			r.ConsumedCapacity = map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: *resource.NewQuantity(consumed, resource.DecimalSI)}
+		}
+		return r
+	}
+	type entry struct {
+		device, request string
+		cpuset          string // "" for none
+		allocated       int64  // 0 for none
+	}
+	tests := []struct {
+		name     string
+		cpuInfos []cpuinfo.CPUInfo
+		conf     Config
+		restored []store.RequestAllocation
+		results  []resourceapi.DeviceRequestAllocationResult
+		want     []entry
+	}{
+		{
+			name:     "a request spanning two devices",
+			cpuInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
+			conf:     grouped,
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", 4), result("cpudevnuma001", "a", 4)},
+			want:     []entry{{"cpudevnuma000", "a", "0-1,4-5", 4}, {"cpudevnuma001", "a", "2-3,6-7", 4}},
+		},
+		{
+			name:     "two requests",
+			cpuInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
+			conf:     grouped,
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", 4), result("cpudevnuma001", "b", 4)},
+			want:     []entry{{"cpudevnuma000", "a", "0-1,4-5", 4}, {"cpudevnuma001", "b", "2-3,6-7", 4}},
+		},
+		{
+			name:     "individual mode",
+			cpuInfos: mockCPUInfos_SingleSocket_4CPUS_HT,
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudev000", "a", 0), result("cpudev002", "a", 0)},
+			want:     []entry{{"cpudev000", "a", "0", 0}, {"cpudev002", "a", "1", 0}},
+		},
+		{
+			name:     "a claim restored from upstream's spec with one request names its CPUs on each device",
+			cpuInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
+			conf:     grouped,
+			restored: []store.RequestAllocation{{CPUs: cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)}},
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", 4), result("cpudevnuma001", "a", 4)},
+			want:     []entry{{"cpudevnuma000", "a", "0-1,4-5", 4}, {"cpudevnuma001", "a", "2-3,6-7", 4}},
+		},
+		{
+			name:     "a claim restored from upstream's spec with two requests names no CPUs",
+			cpuInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
+			conf:     grouped,
+			restored: []store.RequestAllocation{{CPUs: cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)}},
+			results:  []resourceapi.DeviceRequestAllocationResult{result("cpudevnuma000", "a", 4), result("cpudevnuma001", "b", 4)},
+			want:     []entry{{"cpudevnuma000", "a", "", 4}, {"cpudevnuma001", "b", "", 4}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := tc.conf
+			conf.DriverName, conf.NodeName = testDriverName, testNodeName
+			d, err := New(testr.New(t), Providers{CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: tc.cpuInfos}, SysFS: testSysFS(tc.cpuInfos)}, &conf)
+			require.NoError(t, err)
+			d.cdiMgr = newMockCdiMgr()
+			d.hasSynchronized = true
+			claim := testClaimWithResults("claim", tc.results)
+			if tc.restored != nil {
+				d.allocationState.Restore(testr.New(t), claim.UID, store.ClaimRecord{Requests: tc.restored})
+			}
+
+			results, err := d.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
+			require.NoError(t, err)
+			require.NoError(t, results[claim.UID].Err)
+			var got []entry
+			for _, prepared := range results[claim.UID].Devices {
+				require.NotNil(t, prepared.Metadata, prepared.DeviceName)
+				e := entry{device: prepared.DeviceName, request: prepared.Requests[0]}
+				if attr, ok := prepared.Metadata.Attributes[string(devattr.AttributeCPUSet)]; ok {
+					e.cpuset = *attr.StringValue
+				}
+				if attr, ok := prepared.Metadata.Attributes[string(devattr.AttributeAllocatedNumCPUs)]; ok {
+					e.allocated = *attr.IntValue
+				}
+				got = append(got, e)
+			}
+			require.Equal(t, tc.want, got)
 		})
 	}
 }
@@ -3174,7 +3274,8 @@ func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool) *kubeletplugin.De
 
 // expectedGroupMetadata builds the expected DeviceMetadata for a grouped
 // device from static test data, independent of production code paths.
-func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedCPUs cpuset.CPUSet, deviceName string, smtEnabled bool, allocatedCPUs int64, exposeExtAttrs bool) *kubeletplugin.DeviceMetadata {
+// requestCPUs is what the device's request holds over every device it spans.
+func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedCPUs cpuset.CPUSet, deviceName string, smtEnabled bool, allocatedCPUs int64, exposeExtAttrs bool, requestCPUs cpuset.CPUSet) *kubeletplugin.DeviceMetadata {
 	attrs := map[string]resourceapi.DeviceAttribute{}
 	topo := &cpuinfo.CPUTopology{
 		CPUDetails: make(map[int]cpuinfo.CPUInfo),
@@ -3243,6 +3344,9 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 
 	if allocatedCPUs > 0 {
 		attrs[string(devattr.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(allocatedCPUs)}
+	}
+	if held := requestCPUs.Intersection(cpuset.New(cpuIDs...)); !held.IsEmpty() {
+		attrs[string(devattr.AttributeCPUSet)] = resourceapi.DeviceAttribute{StringValue: new(held.String())}
 	}
 	if exposeExtAttrs {
 		if smtLayout := devattr.FormatSMTLayout(topo); smtLayout != "" {
