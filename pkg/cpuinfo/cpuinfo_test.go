@@ -18,6 +18,7 @@ package cpuinfo
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -30,6 +31,47 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/sysfs"
 	"k8s.io/utils/cpuset"
 )
+
+func TestOnlineAndPresentCPUs(t *testing.T) {
+	cpuFile := func(name, data string) (string, *fstest.MapFile) {
+		return filepath.Join("devices", "system", "cpu", name), &fstest.MapFile{Data: []byte(data)}
+	}
+	onlinePath, online := cpuFile("online", "0-7\n")
+	presentPath, present := cpuFile("present", "0-15\n")
+	bothFiles := fstest.MapFS{onlinePath: online, presentPath: present}
+	_, malformed := cpuFile("present", "0-")
+
+	tests := []struct {
+		name    string
+		read    func(fs.ReadLinkFS) (cpuset.CPUSet, error)
+		fs      fstest.MapFS
+		want    cpuset.CPUSet
+		wantErr bool
+	}{
+		{name: "online", read: OnlineCPUs, fs: bothFiles, want: cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)},
+		{name: "present beyond online", read: PresentCPUs, fs: bothFiles, want: cpuset.New(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)},
+		{name: "online file missing", read: OnlineCPUs, fs: fstest.MapFS{presentPath: present}, wantErr: true},
+		{name: "present file missing", read: PresentCPUs, fs: fstest.MapFS{onlinePath: online}, wantErr: true},
+		{name: "present file malformed", read: PresentCPUs, fs: fstest.MapFS{presentPath: malformed}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.read(tt.fs)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("got %v, want an error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !got.Equals(tt.want) {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestPopulateCpuSiblings(t *testing.T) {
 	testCases := []struct {
