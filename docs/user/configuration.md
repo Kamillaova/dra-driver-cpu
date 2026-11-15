@@ -142,6 +142,16 @@ on - is configured through other Helm values, not through this file.
 - Requests the driver's Kubernetes API client may send at once before `qps` applies. Must be at
   least 1.
 
+`fullPhysicalCPUsOnly` (bool, default: `false`)
+
+- Give claims whole physical cores only, the counterpart of the kubelet CPU Manager's
+  `full-pcpus-only` [policy option](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/#cpu-policy-static--options):
+  the logical CPUs of one core never go to two claims. See
+  [Whole physical cores](feature-support.md#whole-physical-cores).
+- Requires `cpuDeviceMode: grouped`, and `reservedCPUs` must hold whole cores: the driver refuses
+  to start otherwise. It also refuses to start on a node with a core of more than two logical
+  CPUs, unless that core is wholly in `reservedCPUs`.
+
 #### Example
 
 ```yaml
