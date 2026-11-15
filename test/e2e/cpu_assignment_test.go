@@ -46,6 +46,23 @@ const (
 	minCPUsAvailableForPodAllocation = 3
 )
 
+// verifySharedPoolAfterRelease checks the best-effort pods after claims were
+// unprepared: on the released CPUs at once with assumeUnsolicitedUpdatesSafe,
+// else on their last CPUs until the next CreateContainer or Synchronize.
+func verifySharedPoolAfterRelease(ctx context.Context, fxt *fixture.Fixture, beforeRelease, afterRelease cpuset.CPUSet, pods ...*v1.Pod) {
+	ginkgo.GinkgoHelper()
+	want := beforeRelease
+	if getDriverConfig(ctx, fxt.K8SClientset).AssumeUnsolicitedUpdatesSafe {
+		ginkgo.By("checking shared containers are widened onto the released CPUs at once")
+		want = afterRelease
+	} else {
+		ginkgo.By("checking existing shared containers keep their last cpuset until the next CreateContainer or Synchronize")
+	}
+	for _, pod := range pods {
+		gomega.Eventually(observeAssignedCPUs(ctx, fxt, pod)).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(cpusetmatchers.Equal(want), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(pod))
+	}
+}
+
 /*
 gingko flags explained:
 
@@ -244,9 +261,41 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 					gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, pod)).To(gomega.Succeed(), "cannot delete pod %s", e2epod.Identify(pod))
 				}
 
-				ginkgo.By("checking existing shared containers keep their last cpuset until the next CreateContainer or Synchronize")
-				gomega.Eventually(observeAssignedCPUs(ctx, fxt, shrPod1)).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(cpusetmatchers.Equal(expectedSharedCPUs), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(shrPod1))
-				gomega.Eventually(observeAssignedCPUs(ctx, fxt, shrPod2)).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(cpusetmatchers.Equal(expectedSharedCPUs), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(shrPod2))
+				verifySharedPoolAfterRelease(ctx, fxt, expectedSharedCPUs, availableCPUs, shrPod1, shrPod2)
+			})
+
+			ginkgo.It("should widen shared containers right after an unprepare", func(ctx context.Context) {
+				if !getDriverConfig(ctx, fxt.K8SClientset).AssumeUnsolicitedUpdatesSafe {
+					ginkgo.Skip("the driver widens shared containers after an unprepare only with assumeUnsolicitedUpdatesSafe")
+				}
+				if cpuDeviceMode == "grouped" && groupBy == "machine" {
+					ginkgo.Skip("skipping this test in machine grouping mode as we do not configure opaque config in claim")
+				}
+				fixture.By("creating a best-effort reference pod")
+				shrPod := mustCreateBestEffortPod(ctx, fxt, targetNode.Name, dracpuTesterImage)
+
+				fixture.By("creating a pod with a claim of %d exclusive CPUs", cpusPerClaim)
+				claimTemplate := resourcev1.ResourceClaimTemplate{
+					ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("cpu-request-%d-widen", cpusPerClaim)},
+					Spec: resourcev1.ResourceClaimTemplateSpec{
+						Spec: makeResourceClaimSpec(cpusPerClaim, cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED),
+					},
+				}
+				createdClaimTemplate, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &claimTemplate, metav1.CreateOptions{})
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+				pod := makeTesterPodWithExclusiveCPUClaim(fxt.Namespace.Name, dracpuTesterImage, createdClaimTemplate.Name, int64(cpusPerClaim), targetNode.Name, publishNodeAllocatableMapping)
+				exclPod, err := e2epod.CreateSync(ctx, fxt.K8SClientset, pod)
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+				exclusive := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, exclPod).CPUAssigned
+				gomega.Expect(exclusive).To(cpusetmatchers.HaveSize(cpusPerClaim))
+
+				fixture.By("checking the best-effort pod %s left the claim's CPUs", e2epod.Identify(shrPod))
+				gomega.Eventually(observeAssignedCPUs(ctx, fxt, shrPod)).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(cpusetmatchers.Equal(availableCPUs.Difference(exclusive)), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(shrPod))
+
+				fixture.By("deleting the pod with exclusive CPUs, which unprepares its claim")
+				gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, exclPod)).To(gomega.Succeed(), "cannot delete pod %s", e2epod.Identify(exclPod))
+
+				verifySharedPoolAfterRelease(ctx, fxt, availableCPUs.Difference(exclusive), availableCPUs, shrPod)
 			})
 
 			ginkgo.It("should reject a claim that would exhaust the shared pool while shared containers exist", ginkgo.Label("negative"), func(ctx context.Context) {
@@ -765,9 +814,7 @@ var _ = ginkgo.Describe("CPU Allocation", ginkgo.Serial, ginkgo.Ordered, ginkgo.
 					gomega.Expect(e2epod.DeleteSync(ctx, fxt.K8SClientset, pod)).To(gomega.Succeed(), "cannot delete pod %s", e2epod.Identify(pod))
 				}
 
-				ginkgo.By("checking existing shared containers keep their last cpuset until the next CreateContainer or Synchronize")
-				gomega.Eventually(observeAssignedCPUs(ctx, fxt, shrPod1)).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(cpusetmatchers.Equal(expectedSharedCPUs), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(shrPod1))
-				gomega.Eventually(observeAssignedCPUs(ctx, fxt, shrPod2)).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(cpusetmatchers.Equal(expectedSharedCPUs), "the best-effort pod %s does not have the expected shared CPU set", e2epod.Identify(shrPod2))
+				verifySharedPoolAfterRelease(ctx, fxt, expectedSharedCPUs, availableCPUs, shrPod1, shrPod2)
 			})
 		})
 	})
