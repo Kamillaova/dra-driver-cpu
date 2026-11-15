@@ -413,6 +413,59 @@ func TestAllocationStateGetSharedCPUs(t *testing.T) {
 	require.True(t, store.GetSharedCPUs().Equals(expectedShared))
 }
 
+func TestAllocationStateClaimlessCPUs(t *testing.T) {
+	logger := testr.New(t)
+	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
+	for _, tc := range []struct {
+		name          string
+		claimless     *cpuset.CPUSet
+		prepared      map[types.UID]cpuset.CPUSet
+		wantClaimless cpuset.CPUSet
+		wantShared    cpuset.CPUSet
+	}{{
+		name:          "not confined: every CPU no claim holds",
+		prepared:      map[types.UID]cpuset.CPUSet{"vm": cpuset.New(6, 7)},
+		wantClaimless: cpuset.New(0, 1, 2, 3, 4, 5),
+		wantShared:    cpuset.New(0, 1, 2, 3, 4, 5),
+	}, {
+		name:          "confined: the set less nothing",
+		claimless:     new(cpuset.New(0, 1, 2, 3)),
+		prepared:      map[types.UID]cpuset.CPUSet{"vm": cpuset.New(6, 7)},
+		wantClaimless: cpuset.New(0, 1, 2, 3),
+		wantShared:    cpuset.New(0, 1, 2, 3, 4, 5),
+	}, {
+		name:          "confined: a prepared claim's CPUs inside the set are left out",
+		claimless:     new(cpuset.New(0, 1, 2, 3)),
+		prepared:      map[types.UID]cpuset.CPUSet{"moved": cpuset.New(2, 3), "vm": cpuset.New(6)},
+		wantClaimless: cpuset.New(0, 1),
+		wantShared:    cpuset.New(0, 1, 4, 5, 7),
+	}, {
+		name:          "confined to no CPU",
+		claimless:     new(cpuset.New()),
+		wantClaimless: cpuset.New(),
+		wantShared:    allCPUs,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestAllocationState(logger, allCPUs, cpuset.New())
+			if tc.claimless != nil {
+				store.SetClaimlessCPUs(*tc.claimless)
+			}
+			for uid, cpus := range tc.prepared {
+				requirePreparedAllocation(t, logger, store, uid, cpus)
+			}
+			for name, s := range map[string]*AllocationState{"store": store, "clone": store.Clone()} {
+				require.Truef(t, tc.wantClaimless.Equals(s.GetClaimlessCPUs()), "%s: claimless %s, want %s", name, s.GetClaimlessCPUs(), tc.wantClaimless)
+				require.Truef(t, tc.wantShared.Equals(s.GetSharedCPUs()), "%s: shared %s, want %s", name, s.GetSharedCPUs(), tc.wantShared)
+				confined, ok := s.ConfinedClaimlessCPUs()
+				require.Equal(t, tc.claimless != nil, ok, name)
+				if tc.claimless != nil {
+					require.Truef(t, tc.claimless.Equals(confined), "%s: confined to %s, want %s", name, confined, *tc.claimless)
+				}
+			}
+		})
+	}
+}
+
 func TestAllocationStateReserveRepeatedCalls(t *testing.T) {
 	logger := testr.New(t)
 	allCPUs := cpuset.New(0, 1, 2, 3, 4, 5, 6, 7)
@@ -468,6 +521,8 @@ func TestAllocationStateReserveSharedPoolGuard(t *testing.T) {
 
 	tests := []struct {
 		name                string
+		claimless           *cpuset.CPUSet
+		prepared            cpuset.CPUSet
 		cpus                cpuset.CPUSet
 		hasSharedContainers bool
 		wantErr             bool
@@ -488,20 +543,53 @@ func TestAllocationStateReserveSharedPoolGuard(t *testing.T) {
 			cpus:                cpuset.New(0, 1),
 			hasSharedContainers: true,
 		},
+		{
+			name:                "rejects the last shared CPU with shared containers",
+			prepared:            cpuset.New(0, 1, 2),
+			cpus:                cpuset.New(3),
+			hasSharedContainers: true,
+			wantErr:             true,
+		},
+		{
+			name:                "confined to no CPU: allows the last free CPUs with shared containers",
+			claimless:           new(cpuset.New()),
+			cpus:                allCPUs,
+			hasSharedContainers: true,
+		},
+		{
+			name:                "confined: allows taking every CPU outside the set with shared containers",
+			claimless:           new(cpuset.New(0, 1)),
+			cpus:                cpuset.New(2, 3),
+			hasSharedContainers: true,
+		},
+		{
+			name:                "confined: rejects taking the last CPUs of the set with shared containers",
+			claimless:           new(cpuset.New(0, 1)),
+			cpus:                cpuset.New(0, 1),
+			hasSharedContainers: true,
+			wantErr:             true,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := newTestAllocationState(logger, allCPUs, cpuset.New())
+			if test.claimless != nil {
+				store.SetClaimlessCPUs(*test.claimless)
+			}
+			if !test.prepared.IsEmpty() {
+				requirePreparedAllocation(t, logger, store, "earlier", test.prepared)
+			}
+			free := allCPUs.Difference(test.prepared)
 			err := store.Reserve(logger, "claim", oneRequest(test.cpus), test.hasSharedContainers)
 			if test.wantErr {
 				require.ErrorContains(t, err, "would exhaust the shared CPU pool")
 				_, ok := store.GetResourceClaimAllocation("claim")
 				require.False(t, ok)
-				require.True(t, store.GetSharedCPUs().Equals(allCPUs))
+				require.True(t, store.GetSharedCPUs().Equals(free))
 			} else {
 				require.NoError(t, err)
-				require.True(t, store.GetSharedCPUs().Equals(allCPUs.Difference(test.cpus)))
+				require.True(t, store.GetSharedCPUs().Equals(free.Difference(test.cpus)))
 			}
 		})
 	}
