@@ -19,6 +19,7 @@ package driverconfig
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -110,35 +111,39 @@ func GenerateDriverConfigSchema() ([]byte, error) {
 	}
 
 	for jsonKey, enums := range schemaListEnums {
-		item, err := listItemSchema(schema, jsonKey)
+		items, err := listItemSchemas(schema, jsonKey)
 		if err != nil {
 			return nil, err
 		}
-		for field, enum := range enums {
-			prop, ok := item.Properties[field]
-			if !ok {
-				return nil, fmt.Errorf("schemaListEnums has entry %q.%q but the list item has no matching field", jsonKey, field)
+		for _, item := range items {
+			for field, enum := range enums {
+				prop, ok := item.Properties[field]
+				if !ok {
+					return nil, fmt.Errorf("schemaListEnums has entry %q.%q but the list item has no matching field", jsonKey, field)
+				}
+				prop.Enum = enum
 			}
-			prop.Enum = enum
 		}
 	}
 
 	for jsonKey, fields := range schemaListFields {
-		item, err := listItemSchema(schema, jsonKey)
+		items, err := listItemSchemas(schema, jsonKey)
 		if err != nil {
 			return nil, err
 		}
-		for field, replacement := range fields {
-			inferred, ok := item.Properties[field]
-			if !ok {
-				return nil, fmt.Errorf("schemaListFields has entry %q.%q but the list item has no matching field", jsonKey, field)
+		for _, item := range items {
+			for field, replacement := range fields {
+				inferred, ok := item.Properties[field]
+				if !ok {
+					return nil, fmt.Errorf("schemaListFields has entry %q.%q but the list item has no matching field", jsonKey, field)
+				}
+				if slices.Contains(inferred.Types, "null") {
+					nullable := replacement.CloneSchemas()
+					nullable.OneOf = append([]*jsonschema.Schema{{Type: "null"}}, nullable.OneOf...)
+					replacement = nullable
+				}
+				item.Properties[field] = replacement
 			}
-			if slices.Contains(inferred.Types, "null") {
-				nullable := replacement.CloneSchemas()
-				nullable.OneOf = append([]*jsonschema.Schema{{Type: "null"}}, nullable.OneOf...)
-				replacement = nullable
-			}
-			item.Properties[field] = replacement
 		}
 	}
 
@@ -159,14 +164,36 @@ func GenerateDriverConfigSchema() ([]byte, error) {
 	return append(out, '\n'), nil
 }
 
-// listItemSchema returns the item schema of the list field jsonKey of Config.
-func listItemSchema(schema *jsonschema.Schema, jsonKey string) (*jsonschema.Schema, error) {
-	prop, ok := schema.Properties[jsonKey]
-	if !ok {
+// listItemSchemas returns the item schema of every list named jsonKey under
+// schema, a profile's included: a constraint applied to the fleet-wide list
+// alone would let a profile carry what the list refuses.
+func listItemSchemas(schema *jsonschema.Schema, jsonKey string) ([]*jsonschema.Schema, error) {
+	var items []*jsonschema.Schema
+	visited := map[*jsonschema.Schema]bool{}
+	var walk func(*jsonschema.Schema) error
+	walk = func(s *jsonschema.Schema) error {
+		if s == nil || visited[s] {
+			return nil
+		}
+		visited[s] = true
+		if prop, ok := s.Properties[jsonKey]; ok {
+			if prop.Items == nil {
+				return fmt.Errorf("field %q is not a list", jsonKey)
+			}
+			items = append(items, prop.Items)
+		}
+		for _, key := range slices.Sorted(maps.Keys(s.Properties)) {
+			if err := walk(s.Properties[key]); err != nil {
+				return err
+			}
+		}
+		return walk(s.AdditionalProperties)
+	}
+	if err := walk(schema); err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
 		return nil, fmt.Errorf("Config has no field %q", jsonKey)
 	}
-	if prop.Items == nil {
-		return nil, fmt.Errorf("field %q is not a list", jsonKey)
-	}
-	return prop.Items, nil
+	return items, nil
 }
