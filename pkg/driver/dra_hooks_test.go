@@ -1732,21 +1732,21 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 			cpuInfos:             wholeCoreCPUInfos,
 			fullPhysicalCPUsOnly: true,
 			claim:                claimShape{consumed: 4, written: "3"},
-			wantErr:              "request \"vcpu\": amount 3 on exclusive request (class dra.cpu); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
+			wantErr:              "request \"vcpu\": amount 3 on exclusive request (class dra.cpu, no cpuPartitions); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
 		},
 		{
 			name:                 "a subrequest's refusal names its own class",
 			cpuInfos:             wholeCoreCPUInfos,
 			fullPhysicalCPUsOnly: true,
 			claim:                claimShape{consumed: 4, written: "3", subrequest: "whole"},
-			wantErr:              "request \"vcpu/whole\": amount 3 on exclusive request (class dra.cpu.whole); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
+			wantErr:              "request \"vcpu/whole\": amount 3 on exclusive request (class dra.cpu.whole, no cpuPartitions); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
 		},
 		{
 			name:                 "an odd amount the scheduler gave as written is refused",
 			cpuInfos:             wholeCoreCPUInfos,
 			fullPhysicalCPUsOnly: true,
 			claim:                claimShape{consumed: 3},
-			wantErr:              "request \"vcpu\": amount 3 on exclusive request (class dra.cpu); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
+			wantErr:              "request \"vcpu\": amount 3 on exclusive request (class dra.cpu, no cpuPartitions); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
 		},
 		{
 			name:     "without the option an odd amount is taken as written",
@@ -3305,10 +3305,11 @@ func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool) *kubeletplugin.De
 		"dra.net/numaNode":                  {IntValue: new(int64(cpu.NUMANodeID))},
 		"dra.cpu/numaNodeID":                {IntValue: new(int64(cpu.NUMANodeID))},
 		// The settings of a driver built with the defaults.
-		string(devattr.AttributeFullPhysicalCPUsOnly): {BoolValue: new(false)},
-		string(devattr.AttributeAllocator):            {StringValue: new(cpuallocator.ModeCPUManager)},
-		string(devattr.AttributePartition):            {StringValue: new(devattr.DefaultPartitionName)},
-		string(devattr.AttributeRole):                 {StringValue: new(devattr.PARTITION_ROLE_DEFAULT)},
+		string(devattr.AttributeFullPhysicalCPUsOnly):            {BoolValue: new(false)},
+		string(devattr.AttributeAllocator):                       {StringValue: new(cpuallocator.ModeCPUManager)},
+		string(devattr.AttributeAllowFractionalCapacityRequests): {BoolValue: new(false)},
+		string(devattr.AttributePartition):                       {StringValue: new(devattr.DefaultPartitionName)},
+		string(devattr.AttributeRole):                            {StringValue: new(devattr.PARTITION_ROLE_DEFAULT)},
 	}
 	return &kubeletplugin.DeviceMetadata{Attributes: attrs}
 }
@@ -3382,6 +3383,7 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 	}
 	attrs[string(devattr.AttributeFullPhysicalCPUsOnly)] = resourceapi.DeviceAttribute{BoolValue: new(false)}
 	attrs[string(devattr.AttributeAllocator)] = resourceapi.DeviceAttribute{StringValue: new(allocator)}
+	attrs[string(devattr.AttributeAllowFractionalCapacityRequests)] = resourceapi.DeviceAttribute{BoolValue: new(false)}
 	attrs[string(devattr.AttributePartition)] = resourceapi.DeviceAttribute{StringValue: new(devattr.DefaultPartitionName)}
 	attrs[string(devattr.AttributeRole)] = resourceapi.DeviceAttribute{StringValue: new(devattr.PARTITION_ROLE_DEFAULT)}
 
