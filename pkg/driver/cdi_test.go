@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr/testr"
@@ -242,6 +243,25 @@ func TestGetDeviceAllocations(t *testing.T) {
 			}}},
 		},
 		{
+			name: "a capped share keeps its cap",
+			spec: specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vmm-cpu","cpus":"0-3","role":"shared","results":[{"device":"cpudevcache000","consumed":"250m"}],"cap":"250m"}]}`), "DRA_CPUSET_vm_vmm-cpu=dynamic"),
+			want: cdiClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []cdiRequestRecord{{
+				Request: "vmm-cpu", CPUs: cpuset.New(0, 1, 2, 3), Role: store.RoleShared,
+				Results: []cdiResultRecord{{Device: "cpudevcache000", Consumed: new(resource.MustParse("250m"))}},
+				Cap:     250,
+			}}},
+		},
+		{
+			name:    "a cap on an exclusive request",
+			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vcpus","cpus":"0","cap":"1"}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
+			wantErr: `dra.cpu/record records cap 1 on request "vcpus", which only a shared request above 0 has`,
+		},
+		{
+			name:    "a cap of 0",
+			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vmm-cpu","cpus":"0","role":"shared","results":[{"device":"cpudevcache000"}],"cap":"0"}]}`), "DRA_CPUSET_vm_vmm-cpu=dynamic"),
+			wantErr: `dra.cpu/record records cap 0 on request "vmm-cpu", which only a shared request above 0 has`,
+		},
+		{
 			name:    "a role this driver does not know",
 			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vcpus","cpus":"0","role":"pinned"}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
 			wantErr: `dra.cpu/record records request "vcpus" with role "pinned", which this driver does not know`,
@@ -276,6 +296,21 @@ func TestGetDeviceAllocations(t *testing.T) {
 			require.Equal(t, tc.want, record)
 		})
 	}
+}
+
+func TestClaimRecordCapRoundTrip(t *testing.T) {
+	written := cdiClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []cdiRequestRecord{
+		{Request: "vmm-cpu", CPUs: cpuset.New(0, 1), Role: store.RoleShared, Results: []cdiResultRecord{{Device: "cpudevcache000"}}, Cap: 1500},
+		{Request: "helper", CPUs: cpuset.New(0, 1), Role: store.RoleShared, Results: []cdiResultRecord{{Device: "cpudevcache000"}}},
+	}}
+	encoded, err := encodeClaimRecord(written)
+	require.NoError(t, err)
+	require.Contains(t, encoded, `"cap":"1500m"`)
+	require.Equal(t, 1, strings.Count(encoded, `"cap"`), "a share without a cap records none")
+	read, err := decodeClaimRecord(encoded)
+	require.NoError(t, err)
+	require.Equal(t, written, read)
+	require.Equal(t, int64(1500), read.storeRecord().Requests[0].Cap)
 }
 
 func TestListClaims(t *testing.T) {

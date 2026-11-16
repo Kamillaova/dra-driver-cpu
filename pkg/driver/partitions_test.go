@@ -709,15 +709,31 @@ func TestPrepareRecordsASharedRequest(t *testing.T) {
 		result      claimResult
 		wantErr     string
 		wantRequest string
+		wantCap     int64
+		wantLimit   string
 	}{{
-		name:        "an amount booked as written",
+		name:        "an amount booked as written and capped at",
 		fractional:  true,
 		result:      claimResult{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"},
 		wantRequest: "250m",
+		wantCap:     250,
+		wantLimit:   "250m",
 	}, {
-		name:        "no amount books nothing",
+		name:        "a whole amount capped at whole CPUs",
+		result:      claimResult{request: "vmm-cpu", written: "2", consumed: "2", device: "cpudevnuma000"},
+		wantRequest: "2",
+		wantCap:     2000,
+		wantLimit:   "2",
+	}, {
+		name:        "no amount books nothing and caps nothing",
 		result:      claimResult{request: "vmm-cpu", consumed: "0", device: "cpudevnuma000"},
 		wantRequest: "0",
+		wantLimit:   "max",
+	}, {
+		name:        "an amount of 0 caps nothing",
+		result:      claimResult{request: "vmm-cpu", written: "0", consumed: "0", device: "cpudevnuma000"},
+		wantRequest: "0",
+		wantLimit:   "max",
 	}, {
 		name:    "a fractional amount rounded up where the option is off",
 		result:  claimResult{request: "cpus", written: "500m", consumed: "1", device: "cpudevnuma000"},
@@ -731,6 +747,8 @@ func TestPrepareRecordsASharedRequest(t *testing.T) {
 		fractional:  true,
 		result:      claimResult{request: "vmm-cpu/shared", written: "500m", consumed: "500m", device: "cpudevnuma000"},
 		wantRequest: "500m",
+		wantCap:     500,
+		wantLimit:   "500m",
 	}, {
 		name:       "an alternative's amount rounded up",
 		fractional: true,
@@ -756,7 +774,7 @@ func TestPrepareRecordsASharedRequest(t *testing.T) {
 			record, ok := d.allocationState.GetClaimRecord("share")
 			require.True(t, ok)
 			base, _, _ := strings.Cut(tc.result.request, "/")
-			require.Equal(t, []store.RequestAllocation{{Request: base, CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Devices: []string{"cpudevnuma000"}}}, record.Requests)
+			require.Equal(t, []store.RequestAllocation{{Request: base, CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Devices: []string{"cpudevnuma000"}, Cap: tc.wantCap}}, record.Requests)
 			require.True(t, d.allocationState.GetPreparedCPUs().IsEmpty(), "a share reserves no CPU")
 			require.Truef(t, cpuset.New(0, 2, 3, 4).Equals(d.allocationState.GetClaimlessCPUs()), "containers without claims keep the default partition, got %s", d.allocationState.GetClaimlessCPUs())
 
@@ -765,10 +783,100 @@ func TestPrepareRecordsASharedRequest(t *testing.T) {
 			require.NotContains(t, attrs, string(device.AttributeCPUSet))
 			require.NotContains(t, attrs, string(device.AttributeAllocatedNumCPUs))
 			require.Equal(t, tc.wantRequest, *attrs[string(device.AttributeCPURequest)].StringValue)
-			require.Equal(t, "max", *attrs[string(device.AttributeCPULimit)].StringValue)
+			require.Equal(t, tc.wantLimit, *attrs[string(device.AttributeCPULimit)].StringValue)
 
 			written := d.cdiMgr.(*mockCdiMgr).records["share"]
 			require.Equal(t, store.RoleShared, written.Requests[0].Role, "the CDI record keeps the role")
+			require.Equal(t, tc.wantCap, written.Requests[0].Cap, "the CDI record keeps the cap")
+		})
+	}
+}
+
+// A share capped at its amount takes one device, and is alone in the cgroup of
+// the container using its claim, which holds every request of the claim.
+func TestPrepareRefusesACappedShareThatIsNotAlone(t *testing.T) {
+	spread := func(mode resourceapi.DeviceAllocationMode, count int64) func(*resourceapi.ResourceClaim) {
+		return func(claim *resourceapi.ResourceClaim) {
+			request := &claim.Spec.Devices.Requests[0]
+			if request.Exactly != nil {
+				request.Exactly.AllocationMode, request.Exactly.Count = mode, count
+				return
+			}
+			sub := &request.FirstAvailable[len(request.FirstAvailable)-1]
+			sub.AllocationMode, sub.Count = mode, count
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		results []claimResult
+		edit    func(*resourceapi.ResourceClaim)
+		wantErr string
+	}{{
+		name:    "a cap with count 2",
+		results: []claimResult{{request: "cpus", written: "1", consumed: "1", device: "cpudevnuma000"}},
+		edit:    spread(resourceapi.DeviceAllocationModeExactCount, 2),
+		wantErr: "request \"cpus\" has limit of 1 with `count: 2`; a limit can be applied to only one device: ask for one device",
+	}, {
+		name:    "a cap with allocationMode: All on a node where one device matches",
+		results: []claimResult{{request: "cpus", written: "250m", consumed: "250m", device: "cpudevnuma000"}},
+		edit:    spread(resourceapi.DeviceAllocationModeAll, 0),
+		wantErr: "request \"cpus\" has limit of 250m with `allocationMode: All`, which may take several devices; a limit can be applied to only one device: ask for one device",
+	}, {
+		name:    "a capped alternative with count 2",
+		results: []claimResult{{request: "cpus/shared", written: "250m", consumed: "250m", device: "cpudevnuma000"}},
+		edit:    spread(resourceapi.DeviceAllocationModeExactCount, 2),
+		wantErr: "subrequest \"cpus/shared\" has limit of 250m with `count: 2`; a limit can be applied to only one device: ask for one device",
+	}, {
+		name: "a capped share beside an uncapped one",
+		results: []claimResult{
+			{request: "helper", consumed: "0", device: "cpudevnuma000"},
+			{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"},
+		},
+		wantErr: `request "vmm-cpu" has limit of 250m, so the container using its claim cannot also hold the claim's other requests: put them in separate claims`,
+	}, {
+		name: "a capped share beside exclusive CPUs",
+		results: []claimResult{
+			{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
+			{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"},
+		},
+		wantErr: `request "vmm-cpu" has limit of 250m, so the container using its claim cannot also hold the claim's other requests: put them in separate claims`,
+	}, {
+		name: "a picked capped alternative beside another request",
+		results: []claimResult{
+			{request: "helper/shared", written: "500m", consumed: "500m", device: "cpudevnuma000"},
+			{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
+		},
+		wantErr: `subrequest "helper/shared" has limit of 500m, so the container using its claim cannot also hold the claim's other requests: put them in separate claims`,
+	}, {
+		name:    "an uncapped share spanning devices",
+		results: []claimResult{{request: "cpus", consumed: "0", device: "cpudevnuma000"}},
+		edit:    spread(resourceapi.DeviceAllocationModeExactCount, 2),
+	}, {
+		name: "an uncapped share beside exclusive CPUs",
+		results: []claimResult{
+			{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
+			{request: "vmm-cpu", consumed: "0", device: "cpudevnuma000"},
+		},
+	}, {
+		name:    "a capped share alone",
+		results: []claimResult{{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"}},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := sharingDriver(t, true, nil, nil)
+			claim := claimWithResults("share", tc.results...)
+			if tc.edit != nil {
+				tc.edit(claim)
+			}
+			results, err := d.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+			require.NoError(t, err)
+			_, recorded := d.allocationState.GetClaimRecord("share")
+			if tc.wantErr != "" {
+				require.EqualError(t, results["share"].Err, tc.wantErr)
+				require.False(t, recorded, "a refused claim leaves no record")
+				return
+			}
+			require.NoError(t, results["share"].Err)
+			require.True(t, recorded)
 		})
 	}
 }
@@ -1146,6 +1254,112 @@ func TestCreateContainerRunsASharedRequestOnItsDevice(t *testing.T) {
 	}
 }
 
+func capped(name string, capMilli int64) cdiClaimRecord {
+	return cdiClaimRecord{Namespace: "vms", Name: name, Requests: []cdiRequestRecord{{
+		Request: "cpus", CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Results: []cdiResultRecord{{Device: "cpudevnuma000"}}, Cap: capMilli,
+	}}}
+}
+
+func kubeletQuota(quota int64) *api.LinuxContainer {
+	return &api.LinuxContainer{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Quota: &api.OptionalInt64{Value: quota}}}}
+}
+
+// A container whose cgroup holds a capped share alone gets the cap as its CPU
+// quota, unless the kubelet sent one for a CPU limit; a capped share beside any
+// other request in one cgroup is refused before the container binds a claim.
+func TestCreateContainerCapsACappedShareAlone(t *testing.T) {
+	onDisk := map[types.UID]cdiClaimRecord{
+		"a":        capped("a", 250),
+		"b":        capped("b", 500),
+		"tiny":     capped("tiny", 5),
+		"uncapped": capped("uncapped", 0),
+		"vcpu":     exclusiveOnDisk(cpuset.New(1, 5)),
+		"older": {Namespace: "vms", Name: "older", Requests: []cdiRequestRecord{
+			{Request: "vcpu", CPUs: cpuset.New(1, 5), Results: []cdiResultRecord{{Device: "cpudevnuma000-vms"}}},
+			{Request: "vmm-cpu", CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Results: []cdiResultRecord{{Device: "cpudevnuma000"}}, Cap: 250},
+		}},
+	}
+	env := func(vars ...string) []string {
+		out := make([]string, 0, len(vars))
+		for _, v := range vars {
+			out = append(out, fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, v, cdiEnvDynamicValue))
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name        string
+		env         []string
+		linux       *api.LinuxContainer
+		wantQuota   int64 // 0 for none
+		wantErr     string
+		wantUnbound []types.UID
+	}{{
+		name:      "a capped share alone",
+		env:       env("a_cpus"),
+		wantQuota: 25000,
+	}, {
+		name:      "a cap below 10m written as the kernel's 1 ms",
+		env:       env("tiny_cpus"),
+		wantQuota: 1000,
+	}, {
+		name:  "a kubelet quota stays",
+		env:   env("a_cpus"),
+		linux: kubeletQuota(50000),
+	}, {
+		name: "an uncapped share alone",
+		env:  env("uncapped_cpus"),
+	}, {
+		name:        "two capped shares",
+		env:         env("a_cpus", "b_cpus"),
+		wantErr:     `container "app": request "cpus" of claim "a" and request "cpus" of claim "b" both have limits, so one container cannot hold both: use the claims in separate containers`,
+		wantUnbound: []types.UID{"a", "b"},
+	}, {
+		name:        "a capped share beside an uncapped one",
+		env:         env("a_cpus", "uncapped_cpus"),
+		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so the container cannot also hold request "cpus" of claim "uncapped": use the claims in separate containers`,
+		wantUnbound: []types.UID{"a", "uncapped"},
+	}, {
+		name:        "a capped share beside exclusive CPUs",
+		env:         env("a_cpus", "vcpu_vcpu"),
+		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so the container cannot also hold request "vcpu" of claim "exclusive": use the claims in separate containers`,
+		wantUnbound: []types.UID{"a", "vcpu"},
+	}, {
+		name:        "a capped share beside another request of its claim",
+		env:         env("older_vcpu", "older_vmm-cpu"),
+		wantErr:     `container "app": request "vmm-cpu" of claim "older" has limit of 250m, so the container cannot also hold request "vcpu" of claim "older": use the claims in separate containers`,
+		wantUnbound: []types.UID{"older"},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			d := sharingDriver(t, true, onDisk, nil)
+			pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "vms"}
+			adjust, _, err := d.CreateContainer(ctx, pod, &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: tc.env, Linux: tc.linux})
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				for _, uid := range tc.wantUnbound {
+					_, bound := d.allocationState.Owner(uid)
+					require.Falsef(t, bound, "claim %s is left to another container", uid)
+				}
+				if len(tc.wantUnbound) > 1 {
+					_, _, err = d.CreateContainer(ctx, pod, &api.Container{Id: "other", Name: "other", PodSandboxId: pod.Id, Env: tc.env[:1]})
+					require.NoError(t, err, "another container takes a claim the refused one named")
+				}
+				return
+			}
+			require.NoError(t, err)
+			cpu := adjust.GetLinux().GetResources().GetCpu()
+			if tc.wantQuota == 0 {
+				require.Nil(t, cpu.GetQuota(), "no quota written")
+				require.Nil(t, cpu.GetPeriod())
+				return
+			}
+			require.Equal(t, tc.wantQuota, cpu.GetQuota().GetValue())
+			require.Equal(t, uint64(100000), cpu.GetPeriod().GetValue())
+			require.Nil(t, cpu.GetShares(), "shares are never set")
+		})
+	}
+}
+
 // Synchronize gives a running share holder its share computed from the device
 // as published now, the default partition's CPUs where its device is gone, and
 // leaves it where the runtime started it where that set is empty.
@@ -1182,6 +1396,95 @@ func TestSynchronizeConvergesASharedRequest(t *testing.T) {
 				got[update.GetContainerId()] = update.GetLinux().GetResources().GetCpu().GetCpus()
 			}
 			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// Synchronize converges the cap of a listed container as CreateContainer would
+// have written it, and leaves a container whose quota the kubelet set or the
+// driver already wrote, or that holds its claims under an older rule.
+func TestSynchronizeConvergesTheCap(t *testing.T) {
+	onDisk := map[types.UID]cdiClaimRecord{
+		"a":        capped("a", 250),
+		"uncapped": capped("uncapped", 0),
+		"older": {Namespace: "vms", Name: "older", Requests: []cdiRequestRecord{
+			{Request: "vcpu", CPUs: cpuset.New(1, 5), Results: []cdiResultRecord{{Device: "cpudevnuma000-vms"}}},
+			{Request: "vmm-cpu", CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Results: []cdiResultRecord{{Device: "cpudevnuma000"}}, Cap: 250},
+		}},
+	}
+	linux := func(cpus string, quota int64) *api.LinuxContainer {
+		cpu := &api.LinuxCPU{Cpus: cpus}
+		if quota > 0 {
+			cpu.Quota = &api.OptionalInt64{Value: quota}
+		}
+		return &api.LinuxContainer{Resources: &api.LinuxResources{Cpu: cpu}}
+	}
+	for _, tc := range []struct {
+		name        string
+		vars        []string
+		linux       *api.LinuxContainer
+		wantQuota   int64 // 0 for none
+		wantWarning string
+	}{{
+		name:      "no quota: the cap written",
+		vars:      []string{"a_cpus"},
+		linux:     linux("0,2-4", 0),
+		wantQuota: 25000,
+	}, {
+		name:  "a kubelet quota left",
+		vars:  []string{"a_cpus"},
+		linux: linux("0,2-4", 50000),
+	}, {
+		name:  "the cap already there left",
+		vars:  []string{"a_cpus"},
+		linux: linux("0,2-4", 25000),
+	}, {
+		name:  "a container kept under an older rule left",
+		vars:  []string{"older_vmm-cpu"},
+		linux: linux("0-5", 0),
+	}, {
+		name:        "a capped share beside another request left uncapped, with a Warning",
+		vars:        []string{"a_cpus", "uncapped_cpus"},
+		linux:       linux("0,2-4", 0),
+		wantWarning: `container "app" was created under an older rule and keeps its claims until it is created again, when it is refused by rule capped_beside_other: it holds request "cpus" of claim "a", which has limit of 250m, beside request "cpus" of claim "uncapped"; use the claims in separate containers`,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			d := sharingDriver(t, true, onDisk, nil)
+			events := &capturingRecorder{}
+			d.eventRecorder = events
+			reg := prometheus.NewRegistry()
+			d.metrics = cpumetrics.New(reg)
+			pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "vms"}
+			var env []string
+			for _, v := range tc.vars {
+				env = append(env, fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, v, cdiEnvDynamicValue))
+			}
+			updates, err := d.Synchronize(ctx, []*api.PodSandbox{pod}, []*api.Container{{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: env, Linux: tc.linux}})
+			require.NoError(t, err)
+			var update *api.ContainerUpdate
+			for _, u := range updates {
+				if u.GetContainerId() == "app" {
+					update = u
+				}
+			}
+			require.NotNil(t, update, "the container gets its cpuset")
+			owner, bound := d.allocationState.Owner(types.UID(strings.SplitN(tc.vars[0], "_", 2)[0]))
+			require.True(t, bound, "the container stays bound")
+			require.Equal(t, "app", owner.ContainerName)
+			kept := 0.0
+			if tc.wantWarning != "" {
+				kept = 1
+				require.Equal(t, []string{"Warning KeptUnderOlderRule " + tc.wantWarning}, events.lines())
+			}
+			require.Equal(t, kept, metricValue(t, reg, "dra_cpu_containers_kept_under_older_rule_total", map[string]string{"rule": string(cpumetrics.RuleCappedBesideOther)}))
+			cpu := update.GetLinux().GetResources().GetCpu()
+			if tc.wantQuota == 0 {
+				require.Nil(t, cpu.GetQuota(), "no quota written")
+				return
+			}
+			require.Equal(t, tc.wantQuota, cpu.GetQuota().GetValue())
+			require.Equal(t, uint64(100000), cpu.GetPeriod().GetValue())
 		})
 	}
 }
