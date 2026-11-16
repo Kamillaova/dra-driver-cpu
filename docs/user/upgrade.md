@@ -136,6 +136,19 @@ the driver's service account only on the driver's own node:
 The account that runs the upgrade needs the right to create them. With `rbac.create: false` the
 chart creates no policy.
 
+#### Kubelet CPU reservation on partitioned nodes
+
+The driver now checks, always and with no setting to turn it off, that the kubelet reserves the
+CPUs a node's partitions keep from pods without claims: every online CPU outside the `default`
+partition. It checks nothing on a node whose partitions keep no such CPU, so a configuration
+without `cpuPartitions` is not affected. Where the kubelet reserves less, the node publishes no
+devices, refuses to prepare claims and its driver pod is not ready, until the reservation is set;
+see [troubleshooting](troubleshooting.md#a-node-missing-its-kubelet-cpu-reservation). Moving a
+`reservedCPUs` list into a `reserved` partition raises the reservation required, since the
+partition's every core counts. The driver watches its own Node for this, so its ClusterRole now
+grants `list` and `watch` on `nodes` beside `get`. With `rbac.create: false`, grant them yourself;
+without them the driver checks the reservation only when it starts.
+
 #### A `dra.cpu/profile` label without profiles
 
 On a node carrying a `dra.cpu/profile` label, a driver whose configuration declares no

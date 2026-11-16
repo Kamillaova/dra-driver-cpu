@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -209,6 +210,24 @@ type CPUDriver struct {
 	// profileName is the profile the node's label names, and empty where the
 	// configuration declares no profiles.
 	profileName string
+
+	// reservation is the kubelet CPU reservation the node's partitions need.
+	// Set in configure, read-only after that.
+	reservation             reservationRequirement
+	reservationReadTimeout  time.Duration
+	reservationReadInterval time.Duration
+	// reservationMissing is the last check's result, set under stateMu; Ready
+	// reads it without the lock. reservedMilliCPU and reservationChecked are
+	// kept under stateMu.
+	reservationMissing atomic.Bool
+	reservedMilliCPU   int64
+	reservationChecked bool
+	// publishMu orders the publishes, so that the last one sent carries the
+	// last check's result.
+	publishMu     sync.Mutex
+	stopNodeWatch func()
+	// nodeWatchDone is closed when the Node watch has stopped.
+	nodeWatchDone <-chan struct{}
 }
 
 // deviceHealthEntry is the last known health of a single device.
@@ -331,6 +350,9 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		selectProfile:       config.SelectProfile,
 		profileReadTimeout:  profileReadTimeout,
 		profileReadInterval: profileReadInterval,
+
+		reservationReadTimeout:  reservationReadTimeout,
+		reservationReadInterval: reservationReadInterval,
 	}
 	if config.AssumeUnsolicitedUpdatesSafe {
 		plugin.reconcileTrigger = make(chan struct{}, 1)
@@ -364,8 +386,6 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 	if len(config.CPUPartitions) > 0 {
 		conditions = append(conditions, cp.partitionDegradedCondition())
 	}
-	cp.nodeConditions = newNodeConditionWriter(providers.K8SClient, config.NodeName, &cp.stateMu, conditions,
-		workqueue.DefaultTypedControllerRateLimiter[string]())
 	topo, err := providers.EnsureCPUInfo().GetCPUTopology(logger)
 	if err != nil {
 		return fmt.Errorf("failed to get CPU topology: %w", err)
@@ -382,6 +402,15 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 		return err
 	}
 	cp.degradedPartitions = degraded
+	cp.reservation = requiredReservation(topo.CPUDetails, partitions, len(config.CPUPartitions) > 0)
+	if cp.reservation.cpus > 0 {
+		logger.Info("the node's partitions need a kubelet CPU reservation", "requiredCPUs", cp.reservation.cpus)
+		conditions = append(conditions, cp.reservationCondition())
+	} else {
+		cp.metrics.SetNodeReservationOK(true)
+	}
+	cp.nodeConditions = newNodeConditionWriter(providers.K8SClient, config.NodeName, &cp.stateMu, conditions,
+		workqueue.DefaultTypedControllerRateLimiter[string]())
 	cp.reservedPartitions = nil
 	if len(config.CPUPartitions) > 0 {
 		for _, partition := range partitions {
@@ -589,6 +618,9 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	if err := cp.refuseProfileLabel(ctx, asyncErr); err != nil {
 		return asyncErr, err
 	}
+	if err := cp.awaitReservation(ctx, asyncErr); err != nil {
+		return asyncErr, err
+	}
 	if err := cp.register(ctx); err != nil {
 		return asyncErr, err
 	}
@@ -610,6 +642,9 @@ func (cp *CPUDriver) startWithProfile(ctx context.Context, asyncErr chan error) 
 		return err
 	}
 	if err := cp.narrowWindowContainers(ctx, asyncErr, bound); err != nil {
+		return err
+	}
+	if err := cp.awaitReservation(ctx, asyncErr); err != nil {
 		return err
 	}
 	if err := cp.register(ctx); err != nil {
@@ -664,9 +699,13 @@ func (cp *CPUDriver) startNRI(ctx context.Context, asyncErr chan<- error) error 
 }
 
 // serve starts the work of a registered driver: the Node conditions, the
-// published resources and the device health.
+// published resources and the device health, and where the partitions need a
+// kubelet CPU reservation, the watch of the Node that checks it again.
 func (cp *CPUDriver) serve(ctx context.Context) {
 	cp.nodeConditions.run(ctx, cp.initialSync)
+	if cp.reservation.cpus > 0 {
+		cp.watchNode(ctx)
+	}
 
 	// publish available resources
 	go cp.PublishResources(ctx)
@@ -756,6 +795,9 @@ func (cp *CPUDriver) Stop() {
 	cp.health.Stop()
 	cp.eventBroadcaster.Shutdown()
 	cp.draPlugin.Stop()
+	if cp.stopNodeWatch != nil {
+		cp.stopNodeWatch()
+	}
 	cp.nodeConditions.stop()
 	cp.nodeConditions.writeStopped()
 	cp.cancelNRI()
@@ -763,11 +805,12 @@ func (cp *CPUDriver) Stop() {
 }
 
 // Ready reports whether the kubelet has the plugin registered, the NRI plugin
-// is connected, the watchdog finds nothing stuck and no reserved partition
-// holds a prepared claim's CPUs. It takes no lock, so a held stateMu cannot
-// block a probe. Call it only once Start has returned.
+// is connected, the watchdog finds nothing stuck, no reserved partition holds a
+// prepared claim's CPUs and the node has its kubelet CPU reservation. It takes
+// no lock, so a held stateMu cannot block a probe. Call it only once Start has
+// returned.
 func (cp *CPUDriver) Ready() bool {
-	if cp.watchdog.stuck.Load() || cp.reservedHoldsClaims.Load() {
+	if cp.watchdog.stuck.Load() || cp.reservedHoldsClaims.Load() || cp.reservationMissing.Load() {
 		return false
 	}
 	if status := cp.draPlugin.RegistrationStatus(); status == nil || !status.PluginRegistered {

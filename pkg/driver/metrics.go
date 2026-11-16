@@ -37,6 +37,7 @@ type Recorder interface {
 	SetWatchdogStuck(stalled time.Duration)
 	RecordNodeAllocatableMappingDropped()
 	SetPartitionVerified(partition string, verified bool)
+	SetNodeReservationOK(ok bool)
 }
 
 // refreshAllocationMetrics requires stateMu once the driver is serving callbacks.
