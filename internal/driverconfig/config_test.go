@@ -566,6 +566,136 @@ func TestResolve_CPUPartitionsRefusedAtLoad(t *testing.T) {
 	}
 }
 
+// TestResolve_Profiles: profiles left out, null and empty all mean none; a
+// declared profile may be named default; a profile whose list holds no entry,
+// however it is written, is refused; a profile carries cpuPartitions alone.
+func TestResolve_Profiles(t *testing.T) {
+	const noPartitions = "profile \"r7625\" has no partitions; add `- name: default` to its cpuPartitions"
+	for _, tc := range []struct {
+		name    string
+		file    string
+		want    map[string]driverconfig.Profile
+		wantErr string
+	}{
+		{name: "left out", file: "apiVersion: v1alpha1\n"},
+		{name: "null", file: "apiVersion: v1alpha1\nprofiles: null\n"},
+		{name: "empty", file: "apiVersion: v1alpha1\nprofiles: {}\n"},
+		{
+			name: "a profile named default holding the default entry",
+			file: "apiVersion: v1alpha1\nprofiles:\n  default:\n    cpuPartitions:\n    - name: default\n",
+			want: map[string]driverconfig.Profile{"default": {CPUPartitions: []driverconfig.CPUPartition{{Name: "default"}}}},
+		},
+		{name: "a profile's list left out", file: "apiVersion: v1alpha1\nprofiles:\n  r7625: {}\n", wantErr: noPartitions},
+		{name: "a profile left null", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n", wantErr: noPartitions},
+		{name: "a profile's list null", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions: null\n", wantErr: noPartitions},
+		{name: "a profile's list a bare key", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions:\n", wantErr: noPartitions},
+		{name: "a profile's list empty", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions: []\n", wantErr: noPartitions},
+		{
+			name:    "reservedCPUs inside a profile",
+			file:    "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    reservedCPUs: \"0,128\"\n",
+			wantErr: `unknown field "reservedCPUs"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgFile := writeFile(t, t.TempDir(), "config.yaml", tc.file)
+
+			result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+				driverconfig.FromFile(cfgFile),
+			})
+
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			if len(tc.want) == 0 {
+				assert.Empty(t, result.Profiles)
+			} else {
+				assert.Equal(t, tc.want, result.Profiles)
+			}
+		})
+	}
+}
+
+// TestWithProfile: the label's value selects a declared profile, whose list
+// becomes the node's as it is; there is no implicit profile, so an unlabelled
+// node and a label naming no declared profile, default among them, are
+// refused; without profiles the label selects nothing.
+func TestWithProfile(t *testing.T) {
+	r7625 := []driverconfig.CPUPartition{{Name: "default"}, {Name: "vms", Role: "exclusive", CPUSet: "8-15"}}
+	withProfiles := func(profiles map[string]driverconfig.Profile) driverconfig.Config {
+		cfg := driverconfig.Default()
+		cfg.Profiles = profiles
+		return cfg
+	}
+	fleet := withProfiles(map[string]driverconfig.Profile{
+		"r7625": {CPUPartitions: r7625},
+		"x3d":   {CPUPartitions: []driverconfig.CPUPartition{{Name: "default"}, {Name: "vms", Role: "exclusive", CPUSet: "4-7"}}},
+	})
+	running := func(partitions []driverconfig.CPUPartition) driverconfig.Config {
+		cfg := driverconfig.Default()
+		cfg.CPUPartitions = partitions
+		return cfg
+	}
+	withoutProfiles := driverconfig.Default()
+	withoutProfiles.ReservedCPUs = "0-1"
+
+	for _, tc := range []struct {
+		name     string
+		cfg      driverconfig.Config
+		label    string
+		want     driverconfig.Config
+		wantUsed bool
+		wantErr  string
+	}{
+		{
+			name:     "a profile's list becomes the node's",
+			cfg:      fleet,
+			label:    "r7625",
+			want:     running(r7625),
+			wantUsed: true,
+		},
+		{
+			name:     "the profile named default, selected by the label default",
+			cfg:      withProfiles(map[string]driverconfig.Profile{"default": {CPUPartitions: []driverconfig.CPUPartition{{Name: "default"}}}}),
+			label:    "default",
+			want:     running([]driverconfig.CPUPartition{{Name: "default"}}),
+			wantUsed: true,
+		},
+		{
+			name:    "the label default where no profile of that name is declared",
+			cfg:     fleet,
+			label:   "default",
+			wantErr: `node label dra.cpu/profile=default names no declared profile; declared: ["r7625" "x3d"]`,
+		},
+		{
+			name:    "a label naming no declared profile",
+			cfg:     fleet,
+			label:   "tpyo",
+			wantErr: `node label dra.cpu/profile=tpyo names no declared profile; declared: ["r7625" "x3d"]`,
+		},
+		{
+			name:    "an unlabelled node",
+			cfg:     fleet,
+			wantErr: `node has no dra.cpu/profile label; label it with one of the declared profiles ["r7625" "x3d"]`,
+		},
+		{name: "an unlabelled node without profiles", cfg: withoutProfiles, want: withoutProfiles},
+		{name: "a label without profiles", cfg: withoutProfiles, label: "r7625", want: withoutProfiles},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.cfg.WithProfile(tc.label)
+
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.wantUsed, got.PartitionsUsed())
+		})
+	}
+}
+
 // TestResolve_APIClientLimits: qps and burst come from the file, and a value
 // client-go would read as its default or as no limit is refused.
 func TestResolve_APIClientLimits(t *testing.T) {
