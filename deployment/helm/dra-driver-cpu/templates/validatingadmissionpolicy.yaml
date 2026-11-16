@@ -96,7 +96,7 @@ spec:
         request.userInfo.?extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
     - name: driverConditions
       expression: >-
-        ['CPUAllocatableMappingDropped']
+        ['CPUAllocatableMappingDropped', 'CPUPartitionDegraded']
     - name: newMetadata
       expression: >-
         object.metadata
