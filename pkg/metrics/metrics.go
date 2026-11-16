@@ -118,6 +118,7 @@ type Metrics struct {
 	containersKeptUnderOlder   *prometheus.CounterVec
 	watchdogStuck              prometheus.Gauge
 	mappingDropped             prometheus.Counter
+	partitionVerified          *prometheus.GaugeVec
 }
 
 type metricKind string
@@ -249,6 +250,12 @@ var (
 		kind: metricCounter,
 		help: "Total number of ResourceSlices the API server stored without the nodeAllocatableResources mapping the driver published.",
 	}
+	partitionVerifiedSpec = metricSpec{
+		name:   "dra_cpu_partition_verified",
+		kind:   metricGauge,
+		help:   "Whether the threads per core a CPU partition's smt declares are what the kernel has online (1), or the kernel contradicts them and the partition publishes no devices (0).",
+		labels: []string{"partition"},
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -270,6 +277,7 @@ var metricSpecs = []metricSpec{
 	watchdogStuckSpec,
 	mappingDroppedSpec,
 	misplacedClaimsSpec,
+	partitionVerifiedSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -319,6 +327,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		watchdogStuck:              newGauge(watchdogStuckSpec),
 		mappingDropped:             newCounter(mappingDroppedSpec),
 		misplacedClaims:            newCounter(misplacedClaimsSpec),
+		partitionVerified:          newGaugeVec(partitionVerifiedSpec),
 	}
 
 	reg.MustRegister(
@@ -340,6 +349,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.watchdogStuck,
 		m.mappingDropped,
 		m.misplacedClaims,
+		m.partitionVerified,
 	)
 	for _, rule := range rules {
 		m.containersKeptUnderOlder.WithLabelValues(string(rule))
@@ -364,6 +374,13 @@ func newGauge(spec metricSpec) prometheus.Gauge {
 		Name: spec.name,
 		Help: spec.help,
 	})
+}
+
+func newGaugeVec(spec metricSpec) *prometheus.GaugeVec {
+	return prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: spec.name,
+		Help: spec.help,
+	}, spec.labels)
 }
 
 func newCounter(spec metricSpec) prometheus.Counter {
@@ -457,6 +474,14 @@ func (m *Metrics) RecordNodeAllocatableMappingDropped() {
 	m.mappingDropped.Inc()
 }
 
+func (m *Metrics) SetPartitionVerified(partition string, verified bool) {
+	value := 0.0
+	if verified {
+		value = 1
+	}
+	m.partitionVerified.WithLabelValues(partition).Set(value)
+}
+
 func determineResult(err error) Result {
 	if err != nil {
 		return ResultError
@@ -484,3 +509,4 @@ func (noopRecorder) RecordMisplacedClaim()                                      
 func (noopRecorder) RecordContainerKeptUnderOlderRule(Rule)                       {}
 func (noopRecorder) SetWatchdogStuck(time.Duration)                               {}
 func (noopRecorder) RecordNodeAllocatableMappingDropped()                         {}
+func (noopRecorder) SetPartitionVerified(string, bool)                            {}
