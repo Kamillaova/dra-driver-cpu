@@ -119,6 +119,7 @@ type Metrics struct {
 	watchdogStuck              prometheus.Gauge
 	mappingDropped             prometheus.Counter
 	partitionVerified          *prometheus.GaugeVec
+	nodeReservationOK          prometheus.Gauge
 }
 
 type metricKind string
@@ -256,6 +257,11 @@ var (
 		help:   "Whether the threads per core a CPU partition's smt declares are what the kernel has online (1), or the kernel contradicts them and the partition publishes no devices (0).",
 		labels: []string{"partition"},
 	}
+	nodeReservationOKSpec = metricSpec{
+		name: "dra_cpu_node_reservation_ok",
+		kind: metricGauge,
+		help: "Whether the kubelet reserves the CPUs the node's partitions keep from pods without claims (1), or reserves fewer, so the node publishes no devices and refuses every Prepare (0).",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -278,6 +284,7 @@ var metricSpecs = []metricSpec{
 	mappingDroppedSpec,
 	misplacedClaimsSpec,
 	partitionVerifiedSpec,
+	nodeReservationOKSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -328,6 +335,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		mappingDropped:             newCounter(mappingDroppedSpec),
 		misplacedClaims:            newCounter(misplacedClaimsSpec),
 		partitionVerified:          newGaugeVec(partitionVerifiedSpec),
+		nodeReservationOK:          newGauge(nodeReservationOKSpec),
 	}
 
 	reg.MustRegister(
@@ -350,6 +358,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.mappingDropped,
 		m.misplacedClaims,
 		m.partitionVerified,
+		m.nodeReservationOK,
 	)
 	for _, rule := range rules {
 		m.containersKeptUnderOlder.WithLabelValues(string(rule))
@@ -482,6 +491,14 @@ func (m *Metrics) SetPartitionVerified(partition string, verified bool) {
 	m.partitionVerified.WithLabelValues(partition).Set(value)
 }
 
+func (m *Metrics) SetNodeReservationOK(ok bool) {
+	value := 0.0
+	if ok {
+		value = 1
+	}
+	m.nodeReservationOK.Set(value)
+}
+
 func determineResult(err error) Result {
 	if err != nil {
 		return ResultError
@@ -510,3 +527,4 @@ func (noopRecorder) RecordContainerKeptUnderOlderRule(Rule)                     
 func (noopRecorder) SetWatchdogStuck(time.Duration)                               {}
 func (noopRecorder) RecordNodeAllocatableMappingDropped()                         {}
 func (noopRecorder) SetPartitionVerified(string, bool)                            {}
+func (noopRecorder) SetNodeReservationOK(bool)                                    {}

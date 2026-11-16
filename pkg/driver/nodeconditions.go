@@ -44,6 +44,9 @@ const (
 // nodeConditionSource is one condition the driver keeps on its Node.
 type nodeConditionSource struct {
 	conditionType corev1.NodeConditionType
+	// observe, where set, is handed each Node the writer compares, before
+	// evaluate and with no lock held.
+	observe func(ctx context.Context, logger logr.Logger, node *corev1.Node)
 	// evaluate runs with stateMu held.
 	evaluate func() nodeConditionValue
 	// stoppedMessage is written with status Unknown when the driver stops.
@@ -210,6 +213,11 @@ func (w *nodeConditionWriter) sync(ctx context.Context, logger logr.Logger) erro
 	node, err := w.currentNode(ctx)
 	if err != nil {
 		return err
+	}
+	for _, src := range w.sources {
+		if src.observe != nil {
+			src.observe(ctx, logger, node)
+		}
 	}
 	values := w.evaluate()
 	for i, src := range w.sources {

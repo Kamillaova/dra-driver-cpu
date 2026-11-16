@@ -599,5 +599,14 @@ func checkAdmissionPolicies(docs []document, want bool, namespace, fullname stri
 			errs = append(errs, fmt.Errorf("the ClusterRole grants %s the verbs %v, want one rule with %v, which a policy confines", resource, verbs, want[0]))
 		}
 	}
+	var nodeVerbs [][]string
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.Resources, "nodes") {
+			nodeVerbs = append(nodeVerbs, rule.Verbs)
+		}
+	}
+	if want := [][]string{{"get", "list", "watch"}}; !reflect.DeepEqual(nodeVerbs, want) {
+		errs = append(errs, fmt.Errorf("the ClusterRole grants nodes the verbs %v, want one rule with %v, which the reservation check's Node watch needs", nodeVerbs, want[0]))
+	}
 	return errors.Join(errs...)
 }
