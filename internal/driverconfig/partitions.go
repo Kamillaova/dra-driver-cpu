@@ -91,6 +91,32 @@ func (c Config) PartitionsUsed() bool {
 	})
 }
 
+// Partitions returns the declared partitions in the form the driver resolves
+// against the node, and nil where the configuration uses no partitions.
+func (c Config) Partitions() ([]device.Partition, error) {
+	if !c.PartitionsUsed() {
+		return nil, nil
+	}
+	partitions := make([]device.Partition, 0, len(c.CPUPartitions))
+	for _, partition := range c.CPUPartitions {
+		cpus, err := cpuset.Parse(partition.CPUSet)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cpuset %q of partition %q: %w", partition.CPUSet, partition.Name, err)
+		}
+		threads := 0
+		if partition.SMT != nil {
+			threads = partition.SMT.Threads
+		}
+		partitions = append(partitions, device.Partition{
+			Name:           partition.Name,
+			Role:           partition.Role,
+			CPUs:           cpus,
+			ThreadsPerCore: threads,
+		})
+	}
+	return partitions, nil
+}
+
 // partitionNameMaxLength keeps every device name the driver builds from a
 // partition a DNS label: a device name may be 63 characters and the longest
 // prefix the driver prepends is "cpudevsocket000-".

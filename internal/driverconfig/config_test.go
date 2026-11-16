@@ -34,6 +34,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/utils/cpuset"
 )
 
 // newFlagSet creates a FlagSet with cfg registered and args parsed.
@@ -472,10 +473,11 @@ func TestResolve_FullPhysicalCPUsOnly(t *testing.T) {
 // all mean no partitions; the default entry alone switches them on.
 func TestResolve_CPUPartitions(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		file     string
-		want     []driverconfig.CPUPartition
-		wantUsed bool
+		name           string
+		file           string
+		want           []driverconfig.CPUPartition
+		wantUsed       bool
+		wantPartitions []device.Partition
 	}{
 		{name: "left out", file: "apiVersion: v1alpha1\n"},
 		{name: "null", file: "apiVersion: v1alpha1\ncpuPartitions: null\n"},
@@ -486,6 +488,9 @@ func TestResolve_CPUPartitions(t *testing.T) {
 			file:     "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n",
 			want:     []driverconfig.CPUPartition{{Name: "default"}},
 			wantUsed: true,
+			wantPartitions: []device.Partition{
+				{Name: "default", CPUs: cpuset.New()},
+			},
 		},
 		{
 			name: "the default entry and two partitions",
@@ -498,18 +503,29 @@ func TestResolve_CPUPartitions(t *testing.T) {
 				{Name: "vms", Role: "exclusive", CPUSet: "2-7", SMT: &driverconfig.SMT{Threads: 2}},
 			},
 			wantUsed: true,
+			wantPartitions: []device.Partition{
+				{Name: "default", CPUs: cpuset.New(), ThreadsPerCore: 1},
+				{Name: "system", Role: "reserved", CPUs: cpuset.New(0, 1)},
+				{Name: "vms", Role: "exclusive", CPUs: cpuset.New(2, 3, 4, 5, 6, 7), ThreadsPerCore: 2},
+			},
 		},
 		{
 			name:     "smt null, as the key left out",
 			file:     "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n  smt: null\n",
 			want:     []driverconfig.CPUPartition{{Name: "default"}},
 			wantUsed: true,
+			wantPartitions: []device.Partition{
+				{Name: "default", CPUs: cpuset.New()},
+			},
 		},
 		{
 			name:     "smt true",
 			file:     "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n  smt: true\n",
 			want:     []driverconfig.CPUPartition{{Name: "default", SMT: &driverconfig.SMT{Threads: 0}}},
 			wantUsed: true,
+			wantPartitions: []device.Partition{
+				{Name: "default", CPUs: cpuset.New()},
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -526,6 +542,15 @@ func TestResolve_CPUPartitions(t *testing.T) {
 				assert.Equal(t, tc.want, result.CPUPartitions)
 			}
 			assert.Equal(t, tc.wantUsed, result.PartitionsUsed())
+			partitions, err := result.Partitions()
+			require.NoError(t, err)
+			require.Len(t, partitions, len(tc.wantPartitions))
+			for i, want := range tc.wantPartitions {
+				assert.Equal(t, want.Name, partitions[i].Name)
+				assert.Equal(t, want.Role, partitions[i].Role, "partition %q role", want.Name)
+				assert.Equal(t, want.ThreadsPerCore, partitions[i].ThreadsPerCore, "partition %q threads per core", want.Name)
+				assert.Truef(t, want.CPUs.Equals(partitions[i].CPUs), "partition %q CPUs: got %s, want %s", want.Name, partitions[i].CPUs, want.CPUs)
+			}
 		})
 	}
 }
