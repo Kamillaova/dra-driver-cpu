@@ -67,6 +67,10 @@ const (
 	// limit reading "max" where the request has no cap.
 	AttributeCPURequest resourceapi.QualifiedName = "dra.cpu/cpuRequest"
 	AttributeCPULimit   resourceapi.QualifiedName = "dra.cpu/cpuLimit"
+	// AttributePartition and AttributeRole are the partition a device's CPUs
+	// belong to and that partition's role.
+	AttributePartition resourceapi.QualifiedName = "dra.cpu/partition"
+	AttributeRole      resourceapi.QualifiedName = "dra.cpu/role"
 )
 
 // addCompatibilityAttributes add attributes to enable compatibility (e.g. alignment) with other
@@ -85,4 +89,12 @@ func addSettingAttributes(devices []resourceapi.Device, fullPhysicalCPUsOnly boo
 		dev.Attributes[AttributeFullPhysicalCPUsOnly] = resourceapi.DeviceAttribute{BoolValue: new(fullPhysicalCPUsOnly)}
 		dev.Attributes[AttributeAllocator] = resourceapi.DeviceAttribute{StringValue: new(allocator)}
 	}
+}
+
+// addPartitionAttributes names the partition a device's CPUs belong to and its
+// role, the default partition on a node without partitions included, so that
+// a selector on them means the same on every node.
+func addPartitionAttributes(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, partition Partition) {
+	attrs[AttributePartition] = resourceapi.DeviceAttribute{StringValue: new(partition.Name)}
+	attrs[AttributeRole] = resourceapi.DeviceAttribute{StringValue: new(partition.Role)}
 }
