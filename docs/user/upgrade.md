@@ -57,6 +57,14 @@ in patch releases.
 Public packages (not these in internal/...) must be considered to have best-effort
 backward compatibility promise until documented otherwise.
 
+## Upgrading Kubernetes from 1.37 to 1.38
+
+Where the driver publishes the node-allocatable mapping (`publishNodeAllocatableResourceMapping: true`) and the `DRANodeAllocatableResources` feature gate is on, recreate the pods that were
+scheduled under Kubernetes 1.37 after the cluster runs 1.38, so that their claims keep being counted
+against the node's CPU and their cgroups keep being sized from them. See the
+[KEP-5517 upgrade guidance](https://github.com/kubernetes/enhancements/blob/ae5e51243dea53ea23b53ad64752a515456a6524/keps/sig-scheduling/5517-dra-node-allocatable-resources/README.md#upgrade--downgrade-strategy)
+for the API changes.
+
 ## Upgrade from 0.3.0 to 0.4.0
 
 ### Action required

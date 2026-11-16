@@ -176,10 +176,25 @@ func (oi OwnerIdent) Equal(ident OwnerIdent) bool {
 	return oi.PodUID == ident.PodUID && oi.ContainerName == ident.ContainerName
 }
 
-// RequestAllocation is the CPUs one request of a claim was given.
+// Role is whether a request holds its CPUs alone or shares them.
+type Role string
+
+const (
+	// RoleExclusive is a request holding its CPUs alone, the zero Role.
+	RoleExclusive Role = ""
+	// RoleShared is a request sharing its devices' CPUs with every other
+	// shared request of them and with no exclusive request.
+	RoleShared Role = "shared"
+)
+
+// RequestAllocation is the CPUs one request of a claim was given. A shared
+// request is never reserved: CPUs records its devices' CPUs as Prepare saw
+// them, and the CPUs it runs on are computed when used, from Devices.
 type RequestAllocation struct {
 	Request string
 	CPUs    cpuset.CPUSet
+	Role    Role
+	Devices []string
 }
 
 // ClaimRequestRef names one request of a claim, or the whole claim where
@@ -200,11 +215,13 @@ type ClaimRecord struct {
 	Requests  []RequestAllocation
 }
 
-// CPUs returns the CPUs of every request of the claim.
+// CPUs returns the CPUs the claim's exclusive requests hold.
 func (r ClaimRecord) CPUs() cpuset.CPUSet {
 	cpus := cpuset.New()
 	for _, request := range r.Requests {
-		cpus = cpus.Union(request.CPUs)
+		if request.Role == RoleExclusive {
+			cpus = cpus.Union(request.CPUs)
+		}
 	}
 	return cpus
 }
@@ -219,7 +236,9 @@ type claimAllocation struct {
 
 func newClaimAllocation(record ClaimRecord) claimAllocation {
 	sorted := cloneRequests(record.Requests)
-	slices.SortFunc(sorted, func(a, b RequestAllocation) int { return strings.Compare(a.Request, b.Request) })
+	slices.SortFunc(sorted, func(a, b RequestAllocation) int {
+		return cmp.Or(strings.Compare(a.Request, b.Request), strings.Compare(string(a.Role), string(b.Role)))
+	})
 	return claimAllocation{cpus: record.CPUs(), requests: sorted, namespace: record.Namespace, name: record.Name}
 }
 
@@ -230,26 +249,26 @@ func (ca claimAllocation) record() ClaimRecord {
 func cloneRequests(requests []RequestAllocation) []RequestAllocation {
 	cloned := make([]RequestAllocation, len(requests))
 	for i, request := range requests {
-		cloned[i] = RequestAllocation{Request: request.Request, CPUs: request.CPUs.Clone()}
+		cloned[i] = RequestAllocation{Request: request.Request, CPUs: request.CPUs.Clone(), Role: request.Role, Devices: slices.Clone(request.Devices)}
 	}
 	return cloned
 }
 
-func (ca claimAllocation) cpusOf(request string) (cpuset.CPUSet, bool) {
-	if request == "" {
-		return ca.cpus, true
-	}
-	for _, held := range ca.requests {
-		if held.Request == request {
-			return held.CPUs, true
+// request returns the allocations of a request: one, or where its results
+// lie on shared and owned devices, one per role.
+func (ca claimAllocation) request(name string) []RequestAllocation {
+	var held []RequestAllocation
+	for _, allocation := range ca.requests {
+		if allocation.Request == name {
+			held = append(held, allocation)
 		}
 	}
-	return cpuset.CPUSet{}, false
+	return held
 }
 
 func (ca claimAllocation) sameRequests(requests []RequestAllocation) bool {
 	return slices.EqualFunc(ca.requests, requests, func(a, b RequestAllocation) bool {
-		return a.Request == b.Request && a.CPUs.Equals(b.CPUs)
+		return a.Request == b.Request && a.CPUs.Equals(b.CPUs) && a.Role == b.Role && slices.Equal(a.Devices, b.Devices)
 	})
 }
 
@@ -300,6 +319,7 @@ type AllocationState struct {
 	resourceClaimAllocations map[types.UID]claimAllocation
 	claimlessCPUs            cpuset.CPUSet
 	claimlessConfined        bool
+	sharedDevices            map[string]cpuset.CPUSet
 }
 
 // AllocationSnapshot is a point-in-time summary of CPU allocation state.
@@ -414,7 +434,7 @@ func (s *AllocationState) Bind(logger logr.Logger, podUID types.UID, containerNa
 				ClaimUID: ref.ClaimUID,
 			}
 		}
-		held, ok := allocation.cpusOf(ref.Request)
+		held, ok := s.cpusOfLocked(allocation, ref.Request)
 		if !ok {
 			return nil, UnknownRequestError(ref)
 		}
@@ -504,6 +524,71 @@ func (s *AllocationState) SetClaimlessCPUs(cpus cpuset.CPUSet) {
 	s.claimlessConfined = true
 }
 
+// SetSharedDevices records the CPUs of every device whose CPUs shared
+// requests share, by device name. A shared request runs on its devices' CPUs
+// less every CPU an exclusive request holds, and on the CPUs of the containers
+// without claims where none of its devices is published any more.
+func (s *AllocationState) SetSharedDevices(cpus map[string]cpuset.CPUSet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sharedDevices = cloneDeviceCPUs(cpus)
+}
+
+func cloneDeviceCPUs(cpus map[string]cpuset.CPUSet) map[string]cpuset.CPUSet {
+	if cpus == nil {
+		return nil
+	}
+	cloned := make(map[string]cpuset.CPUSet, len(cpus))
+	for name, set := range cpus {
+		cloned[name] = set.Clone()
+	}
+	return cloned
+}
+
+// cpusOfLocked returns the CPUs a request of a claim runs on, or every
+// request's where request is empty.
+func (s *AllocationState) cpusOfLocked(ca claimAllocation, request string) (cpuset.CPUSet, bool) {
+	if request == "" {
+		cpus := ca.cpus
+		for _, held := range ca.requests {
+			if held.Role == RoleShared {
+				cpus = cpus.Union(s.sharedCPUsLocked(held))
+			}
+		}
+		return cpus, true
+	}
+	held := ca.request(request)
+	if len(held) == 0 {
+		return cpuset.CPUSet{}, false
+	}
+	cpus := cpuset.New()
+	for _, allocation := range held {
+		if allocation.Role == RoleShared {
+			cpus = cpus.Union(s.sharedCPUsLocked(allocation))
+			continue
+		}
+		cpus = cpus.Union(allocation.CPUs)
+	}
+	return cpus, true
+}
+
+func (s *AllocationState) sharedCPUsLocked(request RequestAllocation) cpuset.CPUSet {
+	cpus := cpuset.New()
+	gone := len(request.Devices) == 0
+	for _, name := range request.Devices {
+		deviceCPUs, ok := s.sharedDevices[name]
+		if !ok {
+			gone = true
+			continue
+		}
+		cpus = cpus.Union(deviceCPUs)
+	}
+	if gone && s.claimlessConfined {
+		cpus = cpus.Union(s.claimlessCPUs)
+	}
+	return cpus.Difference(s.preparedCPUs)
+}
+
 // ConfinedClaimlessCPUs returns the CPUs SetClaimlessCPUs confined the
 // containers without claims to, and false where it did not.
 func (s *AllocationState) ConfinedClaimlessCPUs() (cpuset.CPUSet, bool) {
@@ -563,11 +648,39 @@ func (s *AllocationState) GetRequestAllocationUnion(refs ...ClaimRequestRef) (cp
 		if !ok {
 			return cpuset.New(), UnknownClaimError{ClaimUID: ref.ClaimUID}
 		}
-		cpus, ok := allocation.cpusOf(ref.Request)
+		cpus, ok := s.cpusOfLocked(allocation, ref.Request)
 		if !ok {
 			return cpuset.New(), UnknownRequestError(ref)
 		}
 		union = union.Union(cpus)
+	}
+	return union, nil
+}
+
+// GetExclusiveRequestUnion returns the CPUs the referenced requests hold
+// alone, leaving out every shared request's.
+func (s *AllocationState) GetExclusiveRequestUnion(refs ...ClaimRequestRef) (cpuset.CPUSet, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	union := cpuset.New()
+	for _, ref := range refs {
+		allocation, ok := s.resourceClaimAllocations[ref.ClaimUID]
+		if !ok {
+			return cpuset.New(), UnknownClaimError{ClaimUID: ref.ClaimUID}
+		}
+		if ref.Request == "" {
+			union = union.Union(allocation.cpus)
+			continue
+		}
+		held := allocation.request(ref.Request)
+		if len(held) == 0 {
+			return cpuset.New(), UnknownRequestError(ref)
+		}
+		for _, request := range held {
+			if request.Role == RoleExclusive {
+				union = union.Union(request.CPUs)
+			}
+		}
 	}
 	return union, nil
 }
@@ -582,8 +695,12 @@ func (s *AllocationState) HoldsExclusiveCPUsOf(ref ClaimRequestRef) bool {
 	if !ok {
 		return false
 	}
-	cpus, ok := allocation.cpusOf(ref.Request)
-	return ok && !cpus.IsEmpty()
+	if ref.Request == "" {
+		return !allocation.cpus.IsEmpty()
+	}
+	return slices.ContainsFunc(allocation.request(ref.Request), func(held RequestAllocation) bool {
+		return held.Role == RoleExclusive && !held.CPUs.IsEmpty()
+	})
 }
 
 // Holders returns the prepared claims holding any of cpus, from their records,
@@ -647,6 +764,7 @@ func (s *AllocationState) Clone() *AllocationState {
 		resourceClaimAllocations: allocations,
 		claimlessCPUs:            s.claimlessCPUs.Clone(),
 		claimlessConfined:        s.claimlessConfined,
+		sharedDevices:            cloneDeviceCPUs(s.sharedDevices),
 	}
 }
 
