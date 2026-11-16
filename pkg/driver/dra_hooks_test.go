@@ -373,7 +373,7 @@ func TestPublishResources(t *testing.T) {
 			name:          "no devices to publish",
 			cpuInfos:      []cpuinfo.CPUInfo{},
 			reservedCPUs:  cpuset.New(),
-			expectPublish: false,
+			expectPublish: true,
 		},
 		{
 			name:          "error getting cpu info",
@@ -421,7 +421,7 @@ func TestPublishResources(t *testing.T) {
 			name:                       "all cpus reserved",
 			cpuInfos:                   mockCPUInfos_SingleSocket_4CPUS_HT,
 			reservedCPUs:               cpuset.New(0, 1, 2, 3),
-			expectPublish:              false,
+			expectPublish:              true,
 			expectedNumSlices:          0, // No cpus to publish in ResourceSlice
 			expectedDevices:            0,
 			expectedDevicesPerNUMANode: map[int]int{},
@@ -467,9 +467,11 @@ func TestPublishResources(t *testing.T) {
 			}
 
 			if tc.expectedNumSlices == 0 {
-				if tc.cpuInfoErr == nil {
-					require.Len(t, mockPlugin.publishedResources.Pools, 0)
-				}
+				// The pool is published with no slice, so the library deletes
+				// the slices an earlier run published.
+				pool, ok := mockPlugin.publishedResources.Pools[testNodeName]
+				require.True(t, ok)
+				require.Empty(t, pool.Slices)
 				return
 			}
 

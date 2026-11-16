@@ -53,9 +53,10 @@ func (cp *CPUDriver) PublishResources(ctx context.Context) {
 	logger.V(4).Info("begin: publishing resources")
 	defer logger.V(4).Info("end: publishing resources")
 
-	if cp.topology.deviceSlices == nil {
-		logger.Info("no devices to publish or error occurred")
-		return
+	// The library deletes a pool's slices only when the pool is left out or
+	// has none, so a node left with no device still publishes its pool.
+	if len(cp.topology.deviceSlices) == 0 {
+		logger.Info("no devices to publish: publishing the node's pool empty")
 	}
 
 	slices := make([]resourceslice.Slice, 0, len(cp.topology.deviceSlices))
