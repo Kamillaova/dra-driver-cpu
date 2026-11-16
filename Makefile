@@ -110,12 +110,23 @@ LOCAL_PLATFORM?=linux/$(ARCH)
 # set convenient defaults for user variables
 DRACPU_E2E_CPU_DEVICE_MODE ?= grouped
 DRACPU_E2E_CPU_GROUP_BY ?= numanode
-DRACPU_E2E_RESERVED_CPUS ?= 0
+# A lane configures the cluster for the specs that need more than the default
+# install; see test/e2e/README.md. Empty keeps the default install.
+DRACPU_E2E_LANE ?=
+# Partitions replace reservedCPUs, so a lane reserves nothing through it.
+DRACPU_E2E_RESERVED_CPUS ?= $(if $(DRACPU_E2E_LANE),,0)
+# Set by hack/ci/lane-setup.sh from the host's topology on a lane; a value
+# given here is kept.
+DRACPU_E2E_NOSMT_PARTITION_CPUS ?=
+DRACPU_E2E_RESERVED_PARTITION_CPUS ?=
 DRACPU_E2E_LABEL_FILTER ?=
 GINKGO_LABEL_FILTER_ARG :=
 ifneq ($(strip $(DRACPU_E2E_LABEL_FILTER)),)
 GINKGO_LABEL_FILTER_ARG := --ginkgo.label-filter="$(DRACPU_E2E_LABEL_FILTER)"
 endif
+# Path of a Ginkgo JSON report for test-e2e to write; empty writes none.
+DRACPU_E2E_REPORT ?=
+GINKGO_REPORT_ARG := $(if $(DRACPU_E2E_REPORT),--ginkgo.json-report="$(DRACPU_E2E_REPORT)")
 # Set to "true" to have ci-kind-setup deploy the driver with the
 # publishNodeAllocatableResourceMapping driverConfig option.
 # Also requires a cluster (KIND_K8S_VERSION node image) with the
@@ -206,13 +217,47 @@ else
 		> dist/helm-manifest.yaml
 endif
 
+comma := ,
+# A lane runs with the profiles e2e, on the control plane and worker, and
+# e2e-wide, on worker2, each node's kubelet reserving every CPU outside its
+# profile's default partition, as the driver requires before it publishes.
+cpuset_size = $(if $(1),$(shell echo '$(1)' | tr ',' '\n' | awk -F- '{ n += (NF == 2 ? $$2 - $$1 + 1 : 1) } END { print n }'),0)
+E2E_NOSMT_PARTITION := {"name":"nosmt","role":"exclusive","cpuset":"$(DRACPU_E2E_NOSMT_PARTITION_CPUS)","smt":false}
+E2E_RESERVED_PARTITION := {"name":"reserved","role":"reserved","cpuset":"$(DRACPU_E2E_RESERVED_PARTITION_CPUS)"}
+E2E_WIDE_PARTITIONS := {"name":"default"}$(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),$(comma)$(E2E_NOSMT_PARTITION))
+E2E_PARTITIONS := $(E2E_WIDE_PARTITIONS)$(if $(DRACPU_E2E_RESERVED_PARTITION_CPUS),$(comma)$(E2E_RESERVED_PARTITION))
+E2E_WIDE_RESERVE := $(call cpuset_size,$(DRACPU_E2E_NOSMT_PARTITION_CPUS))
+E2E_RESERVE := $(shell echo $$(( $(E2E_WIDE_RESERVE) + $(call cpuset_size,$(DRACPU_E2E_RESERVED_PARTITION_CPUS)) )))
+E2E_LANE_HELM_ARGS := --set-json 'driverConfig.profiles={"e2e":{"cpuPartitions":[$(E2E_PARTITIONS)]},"e2e-wide":{"cpuPartitions":[$(E2E_WIDE_PARTITIONS)]}}'
+KIND_CI_LANE_CONFIG := $(or $(wildcard hack/ci/kind-ci-$(DRACPU_E2E_LANE).yaml),hack/ci/kind-ci.yaml)
+KIND_CI_CONFIG := $(if $(DRACPU_E2E_LANE),$(OUT_DIR)/kind-ci-$(DRACPU_E2E_LANE).yaml,hack/ci/kind-ci.yaml)
+# Adds the reservation to each node's kubeletExtraArgs, the nodes being the
+# control plane, worker and worker2 in that order.
+KIND_RESERVE_AWK := BEGIN { split(reserve, cpus, " ") } /^- role:/ { node++ } { print } /^ +kubeletExtraArgs:$$/ && cpus[node] > 0 { match($$0, /^ +/); print substr($$0, 1, RLENGTH) "  kube-reserved: \"cpu=" cpus[node] "\"" }
+
 ci-kind-setup: ensure-kind-node-image install-helm build-image build-test-image ## setup a CI cluster from scratch using reserved CPUs
 ifneq ($(DRACPU_E2E_VERBOSE),)
 	@echo "creating a kind cluster for mode=$(DRACPU_E2E_CPU_DEVICE_MODE)"
 endif
-	kind create cluster --name ${CLUSTER_NAME} --image=kindest/node:$(KIND_K8S_VERSION) --config hack/ci/kind-ci.yaml
+ifneq ($(DRACPU_E2E_LANE),)
+	lane_vars="$$(hack/ci/lane-setup.sh $(DRACPU_E2E_LANE) pre)" && $(MAKE) ci-kind-cluster TAG=$(TAG) $$lane_vars
+	hack/ci/lane-setup.sh $(DRACPU_E2E_LANE) post
+else
+	$(MAKE) ci-kind-cluster TAG=$(TAG)
+endif
+
+ci-kind-cluster: $(OUT_DIR)
+ifneq ($(DRACPU_E2E_LANE),)
+	awk -v reserve='$(E2E_RESERVE) $(E2E_RESERVE) $(E2E_WIDE_RESERVE)' '$(KIND_RESERVE_AWK)' $(KIND_CI_LANE_CONFIG) > $(KIND_CI_CONFIG)
+endif
+	kind create cluster --name ${CLUSTER_NAME} --image=kindest/node:$(KIND_K8S_VERSION) --config $(KIND_CI_CONFIG)
 	kubectl wait --for=create node/${CLUSTER_NAME}-worker --timeout=120s
 	kubectl label node ${CLUSTER_NAME}-worker node-role.kubernetes.io/worker=''
+ifneq ($(DRACPU_E2E_LANE),)
+	kubectl wait --for=create node/${CLUSTER_NAME}-worker2 --timeout=120s
+	kubectl label node ${CLUSTER_NAME}-control-plane ${CLUSTER_NAME}-worker dra.cpu/profile=e2e
+	kubectl label node ${CLUSTER_NAME}-worker2 dra.cpu/profile=e2e-wide
+endif
 	kind load docker-image --name ${CLUSTER_NAME} ${IMAGE_CI} ${IMAGE_TEST}
 	$(HELM) install dra-driver-cpu ${HELM_CHART} ${HELM_COMMON_ARGS} \
 		--set image.repository=${IMAGE_REPO_CI} \
@@ -224,8 +269,10 @@ endif
 		--set-string args.reservedCPUs=${DRACPU_E2E_RESERVED_CPUS} \
 		--set args.exposePCIeRoots=true \
 		--set driverConfig.publishNodeAllocatableResourceMapping=$(DRACPU_E2E_NODE_ALLOCATABLE_MAPPING) \
+		--set driverConfig.allowFractionalCapacityRequests=true \
 		--set driverConfig.allocator=$(DRACPU_E2E_ALLOCATOR) \
-		--set driverConfig.fullPhysicalCPUsOnly=$(DRACPU_E2E_FULL_PCPUS_ONLY)
+		--set driverConfig.fullPhysicalCPUsOnly=$(DRACPU_E2E_FULL_PCPUS_ONLY) \
+		$(if $(DRACPU_E2E_LANE),$(E2E_LANE_HELM_ARGS))
 	hack/ci/wait-resourcelices.sh
 
 build-test-image: ## build tests image
@@ -242,7 +289,7 @@ build-test-dracpuinfo: ## build helper to expose hardware info in the internal d
 	go build -v -o "$(OUT_DIR)/dracpuinfo" ./test/image/dracpuinfo
 
 test-e2e: ## run e2e test against an existing configured cluster
-	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(DRACPU_E2E_RESERVED_CPUS) go test -v ./test/e2e/ --ginkgo.v $(GINKGO_LABEL_FILTER_ARG)
+	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(DRACPU_E2E_RESERVED_CPUS) go test -v ./test/e2e/ --ginkgo.v $(GINKGO_LABEL_FILTER_ARG) $(GINKGO_REPORT_ARG)
 
 test-e2e-kind: ci-kind-setup test-e2e ## run e2e test against a purpose-built kind cluster
 
