@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/allocation/v1alpha1"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/discovery"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
 	podmatchers "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/matchers/pod"
@@ -40,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/cpuset"
@@ -345,6 +347,7 @@ type driverConfigValues struct {
 	Allocator                             string `json:"allocator,omitempty"`
 	ReservedCPUs                          string `json:"reservedCPUs,omitempty"`
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
+	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly,omitempty"`
 }
 
 // getDriverConfigValues reads the ConfigMap if the daemonset uses --config=, else falls back to
@@ -403,6 +406,22 @@ func makeTesterPodWithNamedClaim(ns, image, nodeName string, nodeAllocatableMapp
 		})
 	}
 	return e2epod.PinToNode(pod, nodeName)
+}
+
+// createClaimedTesterPod runs a tester pod on nodeName holding one exclusive
+// claim of numCPUs, and returns it with the claim's UID.
+func createClaimedTesterPod(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, cfg driverConfigValues, numCPUs int, claimTemplateName string) (*v1.Pod, types.UID) {
+	ginkgo.GinkgoHelper()
+	template := &resourcev1.ResourceClaimTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: claimTemplateName},
+		Spec: resourcev1.ResourceClaimTemplateSpec{
+			Spec: makeResourceClaimSpec(numCPUs, cfg.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED),
+		},
+	}
+	pod := makeTesterPodWithExclusiveCPUClaimWithoutCPURequest(fxt.Namespace.Name, image, claimTemplateName, nodeName)
+	created, claimUID, err := e2epod.CreateSyncWithClaimTemplate(ctx, fxt.K8SClientset, template, pod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot run a tester pod on a claim for %d CPUs", numCPUs)
+	return created, claimUID
 }
 
 func makeResourceClaimSpec(cpus int, isConsumable bool) resourcev1.ResourceClaimSpec {
