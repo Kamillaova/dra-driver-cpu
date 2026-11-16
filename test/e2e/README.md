@@ -81,7 +81,8 @@ honor these settings, where applicable.
 - `DRACPU_E2E_RESERVED_CPUS`: (optional) if set, it is meant to mirror the driver `reservedCPUs`
   setting. The value must be a linux cpuset string. The tests will ensure no containers
   consume these CPUs.
-  NOTE: the Makefile defaults to "0" if not set, because a nonempty value is needed internally.
+  NOTE: the Makefile defaults to "0" if not set, because a nonempty value is needed internally,
+  and to empty on a lane, whose partitions replace it.
   NOTE: at the moment is not easy to autodetect this setting from the driver configuration.
   Future version may autodetect it.
 
@@ -112,6 +113,17 @@ honor these settings, where applicable.
   CPUs the driver then refuses to prepare a claim for an amount that whole cores do not make up, as
   several other specs ask for, so run the whole-core specs alone there with
   `DRACPU_E2E_LABEL_FILTER=whole-cores`.
+
+- `DRACPU_E2E_LANE`: (optional, default empty): the lane *the Makefile* `ci-kind-setup` target
+  prepares; see [lanes](#lanes). Empty creates the cluster from `hack/ci/kind-ci.yaml` and installs
+  the driver without CPU partitions.
+
+- `DRACPU_E2E_NOSMT_PARTITION_CPUS` and `DRACPU_E2E_RESERVED_PARTITION_CPUS`: (optional, used on a
+  lane): the cpusets of the `nosmt` and `reserved` partitions. `hack/ci/lane-setup.sh` computes
+  each from the host where it is empty, and leaves it empty where the host lacks the shape.
+
+- `DRACPU_E2E_REPORT`: (optional): a path, best absolute, where *the Makefile* `test-e2e` target
+  writes the Ginkgo JSON report.
 
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
@@ -158,6 +170,30 @@ test image is available to the cluster, or override the image explicitly:
 ```bash
 DRACPU_E2E_TEST_IMAGE=<image> make test-e2e
 ```
+
+### lanes
+
+Specs that need more than the default install run on a lane, which
+`make test-e2e-kind DRACPU_E2E_LANE=<lane>` prepares: `ci-kind-setup` takes
+`hack/ci/kind-ci-<lane>.yaml` where it exists, and runs `hack/ci/lane-setup.sh <lane> pre` before it creates the cluster and
+`hack/ci/lane-setup.sh <lane> post` after. Each lane's specs carry a Ginkgo label, and skip
+where their lane did not prepare the cluster.
+
+- No lane: the driver without CPU partitions, its devices owned by the claims, as the Prow jobs
+  of this repository install it. Those jobs set none of the lane's variables, so they run this
+  lane as they stand, and the specs of the other lanes skip there.
+- `partitions` (label `partitions`): the driver with the profiles `e2e`, on the control plane and
+  `worker`, and `e2e-wide`, on `worker2`, which `ci-kind-setup` labels with `dra.cpu/profile`.
+  Both hold the `default` partition and, where the host has a core without an online sibling,
+  a partition `nosmt` of one such core; `e2e` also holds a partition `reserved` of one whole core.
+  `lane-setup.sh pre` leaves at least two CPUs to `default`, and fails unless the host's
+  kernel can enable `cpuset` in a threaded cgroup subtree. Each kubelet reserves the CPUs outside
+  its profile's `default` partition, as the driver requires before it publishes devices. The
+  specs of the `nosmt` partition skip where the host has no core without an online sibling,
+  which is any host whose cores all run two threads.
+
+`.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner, and
+fails when a spec the runner's host can run was skipped.
 
 ### troubleshooting
 
