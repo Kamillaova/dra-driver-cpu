@@ -43,6 +43,37 @@ var schemaEnums = map[string][]any{
 	"allocator":     {cpuallocator.ModeCPUManager, cpuallocator.ModeExternal},
 }
 
+// schemaListEnums are the allowed values for a field of a list field's item,
+// which schemaEnums cannot express: it keys on the name of the list.
+var schemaListEnums = map[string]map[string][]any{
+	"cpuPartitions": {
+		"role": partitionRoleEnum(),
+	},
+}
+
+// schemaListFields replace the inferred schema of a list item's field, for a
+// field whose Go type describes less than the file accepts. A null the inferred
+// schema allows, as it does for a pointer, stays allowed.
+var schemaListFields = map[string]map[string]*jsonschema.Schema{
+	"cpuPartitions": {
+		"smt": {
+			OneOf: []*jsonschema.Schema{
+				{Type: "boolean"},
+				{Type: "integer", Minimum: new(float64(1))},
+			},
+		},
+	},
+}
+
+func partitionRoleEnum() []any {
+	roles := device.PartitionRoles()
+	enum := make([]any, 0, len(roles))
+	for _, role := range roles {
+		enum = append(enum, role)
+	}
+	return enum
+}
+
 func groupingEnum() []any {
 	enum := make([]any, 0, len(groupings))
 	for _, grouping := range groupings {
@@ -78,6 +109,39 @@ func GenerateDriverConfigSchema() ([]byte, error) {
 		prop.Enum = enum
 	}
 
+	for jsonKey, enums := range schemaListEnums {
+		item, err := listItemSchema(schema, jsonKey)
+		if err != nil {
+			return nil, err
+		}
+		for field, enum := range enums {
+			prop, ok := item.Properties[field]
+			if !ok {
+				return nil, fmt.Errorf("schemaListEnums has entry %q.%q but the list item has no matching field", jsonKey, field)
+			}
+			prop.Enum = enum
+		}
+	}
+
+	for jsonKey, fields := range schemaListFields {
+		item, err := listItemSchema(schema, jsonKey)
+		if err != nil {
+			return nil, err
+		}
+		for field, replacement := range fields {
+			inferred, ok := item.Properties[field]
+			if !ok {
+				return nil, fmt.Errorf("schemaListFields has entry %q.%q but the list item has no matching field", jsonKey, field)
+			}
+			if slices.Contains(inferred.Types, "null") {
+				nullable := replacement.CloneSchemas()
+				nullable.OneOf = append([]*jsonschema.Schema{{Type: "null"}}, nullable.OneOf...)
+				replacement = nullable
+			}
+			item.Properties[field] = replacement
+		}
+	}
+
 	schema.Properties["apiVersion"] = &jsonschema.Schema{
 		Type: "string",
 		Enum: []any{ConfigAPIVersion},
@@ -93,4 +157,16 @@ func GenerateDriverConfigSchema() ([]byte, error) {
 		return nil, fmt.Errorf("marshaling schema: %w", err)
 	}
 	return append(out, '\n'), nil
+}
+
+// listItemSchema returns the item schema of the list field jsonKey of Config.
+func listItemSchema(schema *jsonschema.Schema, jsonKey string) (*jsonschema.Schema, error) {
+	prop, ok := schema.Properties[jsonKey]
+	if !ok {
+		return nil, fmt.Errorf("Config has no field %q", jsonKey)
+	}
+	if prop.Items == nil {
+		return nil, fmt.Errorf("field %q is not a list", jsonKey)
+	}
+	return prop.Items, nil
 }

@@ -17,6 +17,8 @@ limitations under the License.
 // Package v1 defines the legacy gatherinfo report schema.
 package v1
 
+import "encoding/json"
+
 const (
 	APIVersion = "v1"
 	// LayoutVersion identifies the serialized report layout.
@@ -71,19 +73,29 @@ type ToolVersion struct {
 // Future version of `gatherinfo` will just expose the serialized most recent version driverconfig data.
 // See the driverconfig API for details.
 type DriverConfig struct {
-	Kubeconfig                            string  `json:"kubeconfig,omitempty"`
-	HostnameOverride                      string  `json:"hostnameOverride,omitempty"`
-	BindAddress                           string  `json:"bindAddress,omitempty"`
-	ReservedCPUs                          string  `json:"reservedCPUs,omitempty"`
-	CPUDeviceMode                         string  `json:"cpuDeviceMode,omitempty"`
-	GroupBy                               string  `json:"groupBy,omitempty"`
-	ExposePCIeRoots                       bool    `json:"exposePCIeRoots,omitempty"`
-	SysFSOverlay                          string  `json:"sysfsOverlay,omitempty"`
-	KubeletRootDir                        string  `json:"kubeletRootDir,omitempty"`
-	PublishNodeAllocatableResourceMapping bool    `json:"publishNodeAllocatableResourceMapping,omitempty"`
-	Allocator                             string  `json:"allocator,omitempty"`
-	QPS                                   float32 `json:"qps,omitempty"`
-	Burst                                 int     `json:"burst,omitempty"`
-	FullPhysicalCPUsOnly                  bool    `json:"fullPhysicalCPUsOnly,omitempty"`
-	AssumeUnsolicitedUpdatesSafe          bool    `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+	Kubeconfig                            string         `json:"kubeconfig,omitempty"`
+	HostnameOverride                      string         `json:"hostnameOverride,omitempty"`
+	BindAddress                           string         `json:"bindAddress,omitempty"`
+	ReservedCPUs                          string         `json:"reservedCPUs,omitempty"`
+	CPUDeviceMode                         string         `json:"cpuDeviceMode,omitempty"`
+	GroupBy                               string         `json:"groupBy,omitempty"`
+	ExposePCIeRoots                       bool           `json:"exposePCIeRoots,omitempty"`
+	SysFSOverlay                          string         `json:"sysfsOverlay,omitempty"`
+	KubeletRootDir                        string         `json:"kubeletRootDir,omitempty"`
+	PublishNodeAllocatableResourceMapping bool           `json:"publishNodeAllocatableResourceMapping,omitempty"`
+	Allocator                             string         `json:"allocator,omitempty"`
+	QPS                                   float32        `json:"qps,omitempty"`
+	Burst                                 int            `json:"burst,omitempty"`
+	FullPhysicalCPUsOnly                  bool           `json:"fullPhysicalCPUsOnly,omitempty"`
+	AssumeUnsolicitedUpdatesSafe          bool           `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+	CPUPartitions                         []CPUPartition `json:"cpuPartitions,omitempty"`
+}
+
+// CPUPartition is one cpuPartitions entry as configured.
+type CPUPartition struct {
+	Name   string `json:"name,omitempty"`
+	Role   string `json:"role,omitempty"`
+	CPUSet string `json:"cpuset,omitempty"`
+	// SMT is the entry's smt value as written: true, false or a thread count.
+	SMT json.RawMessage `json:"smt,omitempty"`
 }
