@@ -678,10 +678,100 @@ func TestAllocationStateHoldsExclusiveCPUsOf(t *testing.T) {
 		{name: "a claim restored from upstream's spec, as a whole", ref: ClaimRequestRef{ClaimUID: "up"}, want: true},
 		{name: "a request of a claim restored from upstream's spec", ref: ClaimRequestRef{ClaimUID: "up", Request: "a"}, want: false},
 		{name: "a claim that is not prepared", ref: ClaimRequestRef{ClaimUID: "other", Request: "a"}, want: false},
+		{name: "a shared request", ref: ClaimRequestRef{ClaimUID: "share", Request: "s"}, want: false},
+		{name: "a claim of shared requests alone, as a whole", ref: ClaimRequestRef{ClaimUID: "share"}, want: false},
 	}
+	require.NoError(t, s.Reserve(testr.New(t), "share", ClaimRecord{Requests: []RequestAllocation{
+		{Request: "s", CPUs: cpuset.New(0, 1, 2, 3), Role: RoleShared, Devices: []string{"dev"}},
+	}}, false))
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Equal(t, tc.want, s.HoldsExclusiveCPUsOf(tc.ref))
+		})
+	}
+}
+
+// A shared request reserves nothing and runs on its devices' CPUs as last
+// set, less every CPU an exclusive request holds, wherever that lies.
+func TestAllocationStateSharedRequests(t *testing.T) {
+	logger := testr.New(t)
+	share := func(devices ...string) ClaimRecord {
+		return ClaimRecord{Requests: []RequestAllocation{{Request: "vmm-cpu", CPUs: cpuset.New(0, 1, 2, 3), Role: RoleShared, Devices: devices}}}
+	}
+	for _, tc := range []struct {
+		name      string
+		claimless *cpuset.CPUSet
+		devices   map[string]cpuset.CPUSet
+		share     ClaimRecord
+		exclusive cpuset.CPUSet
+		wantShare cpuset.CPUSet
+		wantWhole cpuset.CPUSet
+	}{{
+		name:      "its device's CPUs",
+		devices:   map[string]cpuset.CPUSet{"dev": cpuset.New(0, 1, 2, 3)},
+		share:     share("dev"),
+		wantShare: cpuset.New(0, 1, 2, 3),
+		wantWhole: cpuset.New(0, 1, 2, 3),
+	}, {
+		name:      "less the CPUs an exclusive request holds inside the device",
+		devices:   map[string]cpuset.CPUSet{"dev": cpuset.New(0, 1, 2, 3)},
+		share:     share("dev"),
+		exclusive: cpuset.New(2),
+		wantShare: cpuset.New(0, 1, 3),
+		wantWhole: cpuset.New(0, 1, 3),
+	}, {
+		name:      "the device as last set, not as recorded",
+		devices:   map[string]cpuset.CPUSet{"dev": cpuset.New(0, 1)},
+		share:     share("dev"),
+		wantShare: cpuset.New(0, 1),
+		wantWhole: cpuset.New(0, 1),
+	}, {
+		name:      "each of its devices",
+		devices:   map[string]cpuset.CPUSet{"a": cpuset.New(0, 1), "b": cpuset.New(4, 5)},
+		share:     share("a", "b"),
+		wantShare: cpuset.New(0, 1, 4, 5),
+		wantWhole: cpuset.New(0, 1, 4, 5),
+	}, {
+		name:      "the CPUs of the containers without claims where its device is gone",
+		claimless: new(cpuset.New(4, 5, 6)),
+		devices:   map[string]cpuset.CPUSet{"other": cpuset.New(0, 1)},
+		share:     share("dev"),
+		exclusive: cpuset.New(6),
+		wantShare: cpuset.New(4, 5),
+		wantWhole: cpuset.New(4, 5),
+	}, {
+		name:      "no CPU where exclusive requests hold the device",
+		devices:   map[string]cpuset.CPUSet{"dev": cpuset.New(2)},
+		share:     share("dev"),
+		exclusive: cpuset.New(2),
+		wantShare: cpuset.New(),
+		wantWhole: cpuset.New(),
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestAllocationState(logger, cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+			if tc.claimless != nil {
+				store.SetClaimlessCPUs(*tc.claimless)
+			}
+			store.SetSharedDevices(tc.devices)
+			if !tc.exclusive.IsEmpty() {
+				store.Restore(logger, "exclusive", oneRequest(tc.exclusive))
+			}
+			require.NoError(t, store.Reserve(logger, "share", tc.share, true))
+			require.Equalf(t, tc.exclusive.String(), store.GetPreparedCPUs().String(), "a share reserves nothing")
+			for name, s := range map[string]*AllocationState{"store": store, "clone": store.Clone()} {
+				got, err := s.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: "share", Request: "vmm-cpu"})
+				require.NoError(t, err)
+				require.Truef(t, tc.wantShare.Equals(got), "%s: share %s, want %s", name, got, tc.wantShare)
+				whole, err := s.GetRequestAllocationUnion(ClaimRequestRef{ClaimUID: "share"})
+				require.NoError(t, err)
+				require.Truef(t, tc.wantWhole.Equals(whole), "%s: whole claim %s, want %s", name, whole, tc.wantWhole)
+				exclusive, err := s.GetExclusiveRequestUnion(ClaimRequestRef{ClaimUID: "share", Request: "vmm-cpu"})
+				require.NoError(t, err)
+				require.Truef(t, exclusive.IsEmpty(), "%s: a share holds no CPU alone, got %s", name, exclusive)
+				record, ok := s.GetClaimRecord("share")
+				require.True(t, ok)
+				require.Equal(t, tc.share.Requests, record.Requests, "%s: the record keeps the role and the devices", name)
+			}
 		})
 	}
 }

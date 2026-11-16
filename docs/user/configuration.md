@@ -172,6 +172,20 @@ on - is configured through other Helm values, not through this file.
 - With profiles it also decides how the driver moves the containers that started before it read
   the node's profile; see [Per-node profiles](#per-node-profiles).
 
+`allowFractionalCapacityRequests` (bool, default: `false`)
+
+- Let a shared request book an amount in millicores, such as `250m`, rather than in whole CPUs:
+  the shared devices then take amounts in steps of `1m`, and of `1` without it.
+- Set it only where every scheduler that places claim pods runs with the
+  `DRAFractionalCapacityRange` feature gate, which Kubernetes 1.37 leaves off by default and 1.36
+  does not have; the API server needs none. A scheduler without the gate books a fractional amount
+  as whole CPUs, and the driver refuses to prepare the claim.
+- An exclusive request books whole CPUs with the option on or off: the driver refuses to prepare a
+  claim that writes a fractional amount for a request given an owned device.
+- Once the driver's minimum supported Kubernetes version has `DRAFractionalCapacityRange` on by
+  default, fractional amounts are always allowed and the option is removed, after a release that
+  deprecates it.
+
 `profiles` (map of profile name to profile, default: none)
 
 - How each kind of node partitions its CPUs, by name. A node runs the profile its
@@ -183,10 +197,11 @@ Every device the driver publishes carries the settings that decide whether the d
 claim, so that a claim's selector can keep it off the nodes that would refuse it after the
 scheduler placed it there. Each attribute is named as its setting and is always present.
 
-| Attribute                      | Type   | Value                      | What the driver refuses to prepare                                                               |
-| ------------------------------ | ------ | -------------------------- | ------------------------------------------------------------------------------------------------ |
-| `dra.cpu/fullPhysicalCPUsOnly` | bool   | `fullPhysicalCPUsOnly`     | When `true`, an amount that whole cores of the device do not make up                             |
-| `dra.cpu/allocator`            | string | `cpumanager` or `external` | In grouped mode, a `cpuConfig.cpuset` under `cpumanager`, a request without one under `external` |
+| Attribute                                 | Type   | Value                             | What the driver refuses to prepare                                                               |
+| ----------------------------------------- | ------ | --------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `dra.cpu/fullPhysicalCPUsOnly`            | bool   | `fullPhysicalCPUsOnly`            | When `true`, an amount that whole cores of the device do not make up                             |
+| `dra.cpu/allocator`                       | string | `cpumanager` or `external`        | In grouped mode, a `cpuConfig.cpuset` under `cpumanager`, a request without one under `external` |
+| `dra.cpu/allowFractionalCapacityRequests` | bool   | `allowFractionalCapacityRequests` | When `false`, an amount on a shared request that is not a whole number of CPUs                   |
 
 See [Whole physical cores](feature-support.md#whole-physical-cores) and
 [Custom Opaque CPUSet Allocation Overrides](opaque-cpuset-overrides.md) for these refusals.
@@ -208,6 +223,15 @@ cores have one logical CPU:
             expression: >-
               !device.attributes["dra.cpu"].fullPhysicalCPUsOnly ||
               device.attributes["dra.cpu"].threadsPerCore == 1
+```
+
+and a claim whose shared request books a fractional amount, such as `250m`, selects the nodes that
+take one:
+
+```yaml
+        selectors:
+        - cel:
+            expression: device.attributes["dra.cpu"].allowFractionalCapacityRequests
 ```
 
 A selector that reads an attribute the device does not carry is a CEL runtime error, which fails

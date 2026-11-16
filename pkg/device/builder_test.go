@@ -562,6 +562,7 @@ func TestBuildUncoreCacheDevices(t *testing.T) {
 					"dra.cpu/numaNodeID",
 					device.AttributeFullPhysicalCPUsOnly,
 					device.AttributeAllocator,
+					device.AttributeAllowFractionalCapacityRequests,
 					device.AttributePartition,
 					device.AttributeRole,
 				}, slices.Collect(maps.Keys(dev.Attributes)), "device %q attributes", dev.Name)
@@ -595,10 +596,10 @@ func TestBuildGroupedDeviceAttributeCount(t *testing.T) {
 		layout device.Layout
 		want   int
 	}{
-		{layout: device.LayoutNUMANode, want: 14},
-		{layout: device.LayoutSocket, want: 11},
-		{layout: device.LayoutMachine, want: 10},
-		{layout: device.LayoutUncoreCache, want: 15},
+		{layout: device.LayoutNUMANode, want: 15},
+		{layout: device.LayoutSocket, want: 12},
+		{layout: device.LayoutMachine, want: 11},
+		{layout: device.LayoutUncoreCache, want: 16},
 	} {
 		res, err := device.Build(device.BuildInput{
 			Inventory: device.Inventory{
@@ -625,8 +626,11 @@ func TestBuildPublishesSettingAttributes(t *testing.T) {
 		layout               device.Layout
 		fullPhysicalCPUsOnly bool
 		allocator            string
+		fractional           bool
 	}{
 		{name: "individual", layout: device.LayoutIndividual, allocator: "cpumanager"},
+		{name: "individual, fractional amounts", layout: device.LayoutIndividual, allocator: "cpumanager", fractional: true},
+		{name: "NUMA node, fractional amounts", layout: device.LayoutNUMANode, allocator: "cpumanager", fractional: true},
 		{name: "individual, external allocator", layout: device.LayoutIndividual, allocator: "external"},
 		{name: "NUMA node", layout: device.LayoutNUMANode, allocator: "cpumanager"},
 		{name: "NUMA node, whole cores", layout: device.LayoutNUMANode, fullPhysicalCPUsOnly: true, allocator: "cpumanager"},
@@ -639,11 +643,12 @@ func TestBuildPublishesSettingAttributes(t *testing.T) {
 					CPUTopology:  coreTopology(true, twoNUMANodes, twoThreadCores(4)...),
 					ReservedCPUs: cpuset.New(),
 				},
-				Layout:               tc.layout,
-				PCIeRootMapper:       store.NewPCIeRootMapper(),
-				ExposeExtAttrs:       tc.allocator == "external",
-				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
-				Allocator:            tc.allocator,
+				Layout:                          tc.layout,
+				PCIeRootMapper:                  store.NewPCIeRootMapper(),
+				ExposeExtAttrs:                  tc.allocator == "external",
+				FullPhysicalCPUsOnly:            tc.fullPhysicalCPUsOnly,
+				Allocator:                       tc.allocator,
+				AllowFractionalCapacityRequests: tc.fractional,
 			})
 			require.NoError(t, err)
 			require.NotEmpty(t, res.Devices)
@@ -654,6 +659,9 @@ func TestBuildPublishesSettingAttributes(t *testing.T) {
 				allocator := dev.Attributes[device.AttributeAllocator]
 				require.NotNilf(t, allocator.StringValue, "device %q must publish allocator as a string", dev.Name)
 				require.Equalf(t, tc.allocator, *allocator.StringValue, "device %q allocator", dev.Name)
+				fractional := dev.Attributes[device.AttributeAllowFractionalCapacityRequests]
+				require.NotNilf(t, fractional.BoolValue, "device %q must publish allowFractionalCapacityRequests as a bool", dev.Name)
+				require.Equalf(t, tc.fractional, *fractional.BoolValue, "device %q allowFractionalCapacityRequests", dev.Name)
 				require.LessOrEqualf(t, len(dev.Attributes)+len(dev.Capacity), resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice,
 					"device %q attributes and capacities", dev.Name)
 			}
@@ -957,6 +965,7 @@ func TestBuildPartitionDevices(t *testing.T) {
 		role           string
 		threadsPerCore int64
 		smtEnabled     bool
+		shared         bool
 	}
 	twoNUMANodes := func(core int) int { return core / 2 }
 	exclusive := func(name string, threads int, cpus ...int) device.Partition {
@@ -973,6 +982,7 @@ func TestBuildPartitionDevices(t *testing.T) {
 		wantSlices [][]string
 	}{
 		{
+			// Kept for upstream compatibility and deprecated: one mode would need another device shape here.
 			name:   "without partitions the node is the partition default with upstream's devices",
 			topo:   coreTopology(true, onNUMANode0, twoThreadCores(4)...),
 			layout: device.LayoutUncoreCache,
@@ -991,7 +1001,30 @@ func TestBuildPartitionDevices(t *testing.T) {
 			wantSlices: [][]string{{"cpudevcache000"}},
 		},
 		{
-			name:   "only an exclusive partition publishes devices, named after it",
+			name:     "the entry default alone publishes shared devices over every CPU",
+			topo:     coreTopology(true, onNUMANode0, twoThreadCores(4)...),
+			layout:   device.LayoutUncoreCache,
+			declared: []device.Partition{defaultEntry},
+			want: []wantDevice{
+				{name: "cpudevcache000", cpus: cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), partition: "default", role: "default", threadsPerCore: 2, smtEnabled: true, shared: true},
+			},
+			wantSlices: [][]string{{"cpudevcache000"}},
+		},
+		{
+			name:   "the entry default beside reserved partitions alone publishes shared devices",
+			topo:   coreTopology(true, onNUMANode0, twoThreadCores(4)...),
+			layout: device.LayoutUncoreCache,
+			declared: []device.Partition{
+				{Name: "system", Role: device.PARTITION_ROLE_RESERVED, CPUs: cpuset.New(3, 7)},
+				defaultEntry,
+			},
+			want: []wantDevice{
+				{name: "cpudevcache000", cpus: cpuset.New(0, 1, 2, 4, 5, 6), partition: "default", role: "default", threadsPerCore: 2, smtEnabled: true, shared: true},
+			},
+			wantSlices: [][]string{{"cpudevcache000"}},
+		},
+		{
+			name:   "an exclusive partition publishes owned devices named after it, the default partition shared ones",
 			topo:   coreTopology(true, onNUMANode0, twoThreadCores(4)...),
 			layout: device.LayoutUncoreCache,
 			declared: []device.Partition{
@@ -1000,9 +1033,24 @@ func TestBuildPartitionDevices(t *testing.T) {
 				{Name: "system", Role: device.PARTITION_ROLE_RESERVED, CPUs: cpuset.New(3, 7)},
 			},
 			want: []wantDevice{
+				{name: "cpudevcache000", cpus: cpuset.New(0, 4), partition: "default", role: "default", threadsPerCore: 2, smtEnabled: true, shared: true},
 				{name: "cpudevcache000-vms", cpus: cpuset.New(1, 2, 5, 6), partition: "vms", role: "exclusive", threadsPerCore: 2, smtEnabled: true},
 			},
-			wantSlices: [][]string{{"cpudevcache000-vms"}},
+			wantSlices: [][]string{{"cpudevcache000"}, {"cpudevcache000-vms"}},
+		},
+		{
+			name:   "a named partition of role default publishes shared devices named after it",
+			topo:   coreTopology(true, onNUMANode0, twoThreadCores(4)...),
+			layout: device.LayoutUncoreCache,
+			declared: []device.Partition{
+				defaultEntry,
+				{Name: "infra", Role: device.PARTITION_ROLE_DEFAULT, CPUs: cpuset.New(1, 5)},
+			},
+			want: []wantDevice{
+				{name: "cpudevcache000", cpus: cpuset.New(0, 2, 3, 4, 6, 7), partition: "default", role: "default", threadsPerCore: 2, smtEnabled: true, shared: true},
+				{name: "cpudevcache000-infra", cpus: cpuset.New(1, 5), partition: "infra", role: "default", threadsPerCore: 2, smtEnabled: true, shared: true},
+			},
+			wantSlices: [][]string{{"cpudevcache000"}, {"cpudevcache000-infra"}},
 		},
 		{
 			name:   "each partition's devices are cut by the layout and sliced on their own",
@@ -1016,9 +1064,10 @@ func TestBuildPartitionDevices(t *testing.T) {
 			want: []wantDevice{
 				{name: "cpudevnuma000-dpdk", cpus: cpuset.New(0, 4), partition: "dpdk", role: "exclusive", threadsPerCore: 2, smtEnabled: true},
 				{name: "cpudevnuma001-dpdk", cpus: cpuset.New(2, 6), partition: "dpdk", role: "exclusive", threadsPerCore: 2, smtEnabled: true},
+				{name: "cpudevnuma001", cpus: cpuset.New(3, 7), partition: "default", role: "default", threadsPerCore: 2, smtEnabled: true, shared: true},
 				{name: "cpudevnuma000-vms", cpus: cpuset.New(1, 5), partition: "vms", role: "exclusive", threadsPerCore: 2, smtEnabled: true},
 			},
-			wantSlices: [][]string{{"cpudevnuma000-dpdk", "cpudevnuma001-dpdk"}, {"cpudevnuma000-vms"}},
+			wantSlices: [][]string{{"cpudevnuma000-dpdk", "cpudevnuma001-dpdk"}, {"cpudevnuma001"}, {"cpudevnuma000-vms"}},
 		},
 		{
 			name:   "a degraded smt false partition counts its own threads",
@@ -1029,9 +1078,10 @@ func TestBuildPartitionDevices(t *testing.T) {
 				exclusive("spdk", 1, 1, 2),
 			},
 			want: []wantDevice{
+				{name: "cpudevcache000", cpus: cpuset.New(0, 3, 4, 7), partition: "default", role: "default", threadsPerCore: 2, smtEnabled: true, shared: true},
 				{name: "cpudevcache000-spdk", cpus: cpuset.New(1, 2), partition: "spdk", role: "exclusive", threadsPerCore: 1, smtEnabled: false},
 			},
-			wantSlices: [][]string{{"cpudevcache000-spdk"}},
+			wantSlices: [][]string{{"cpudevcache000"}, {"cpudevcache000-spdk"}},
 		},
 		{
 			name:   "a partition of one-thread cores publishes no SMT on a node with SMT",
@@ -1042,9 +1092,10 @@ func TestBuildPartitionDevices(t *testing.T) {
 				exclusive("vms", 0, 4, 5),
 			},
 			want: []wantDevice{
+				{name: "cpudevcache000", cpus: cpuset.New(0, 1, 2, 3, 128, 129, 130, 131), partition: "default", role: "default", threadsPerCore: 2, smtEnabled: true, shared: true},
 				{name: "cpudevcache000-vms", cpus: cpuset.New(4, 5), partition: "vms", role: "exclusive", threadsPerCore: 1, smtEnabled: false},
 			},
-			wantSlices: [][]string{{"cpudevcache000-vms"}},
+			wantSlices: [][]string{{"cpudevcache000"}, {"cpudevcache000-vms"}},
 		},
 		{
 			name:   "a partition whose cores differ in threads publishes 0 and SMT on a node without it",
@@ -1104,6 +1155,66 @@ func TestBuildPartitionDevices(t *testing.T) {
 				require.Equalf(t, want.role, *dev.Attributes[device.AttributeRole].StringValue, "device %q role", dev.Name)
 				require.Equalf(t, want.threadsPerCore, *dev.Attributes[device.AttributeThreadsPerCore].IntValue, "device %q threadsPerCore", dev.Name)
 				require.Equalf(t, want.smtEnabled, *dev.Attributes[device.AttributeSMTEnabled].BoolValue, "device %q smtEnabled", dev.Name)
+				require.Equalf(t, want.shared, res.Shared[dev.Name], "device %q shared", dev.Name)
+				if want.shared {
+					require.NotNilf(t, capacity.RequestPolicy, "device %q request policy", dev.Name)
+					require.Equalf(t, "0", capacity.RequestPolicy.Default.String(), "device %q default amount", dev.Name)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildSharedDevices(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		fractional bool
+		mapping    bool
+		wantStep   string
+		wantMapped map[string]bool
+	}{
+		{name: "whole CPUs", wantStep: "1", wantMapped: map[string]bool{"cpudevcache000": false, "cpudevcache000-infra": false}},
+		{name: "fractional amounts", fractional: true, wantStep: "1m", wantMapped: map[string]bool{"cpudevcache000": false, "cpudevcache000-infra": false}},
+		{name: "the mapping on the entry default's devices alone", mapping: true, wantStep: "1", wantMapped: map[string]bool{"cpudevcache000": true, "cpudevcache000-infra": false}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			topo := coreTopology(true, onNUMANode0, twoThreadCores(4)...)
+			declared := []device.Partition{
+				{Name: device.DefaultPartitionName},
+				{Name: "infra", Role: device.PARTITION_ROLE_DEFAULT, CPUs: cpuset.New(1, 5)},
+				{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(2, 6)},
+			}
+			res, err := device.Build(device.BuildInput{
+				Inventory:                             device.Inventory{CPUTopology: topo, ReservedCPUs: cpuset.New()},
+				Layout:                                device.LayoutUncoreCache,
+				PCIeRootMapper:                        store.NewPCIeRootMapper(),
+				PublishNodeAllocatableResourceMapping: tc.mapping,
+				FullPhysicalCPUsOnly:                  true,
+				Partitions:                            device.ResolvePartitions(declared, topo.CPUDetails, cpuset.New()),
+				PartitionsUsed:                        true,
+				AllowFractionalCapacityRequests:       tc.fractional,
+			})
+			require.NoError(t, err)
+			require.Equal(t, map[string]bool{"cpudevcache000": true, "cpudevcache000-infra": true}, res.Shared)
+			for _, dev := range res.Devices {
+				fractional := dev.Attributes[device.AttributeAllowFractionalCapacityRequests]
+				require.NotNilf(t, fractional.BoolValue, "device %q must publish allowFractionalCapacityRequests as a bool", dev.Name)
+				require.Equalf(t, tc.fractional, *fractional.BoolValue, "device %q allowFractionalCapacityRequests", dev.Name)
+				mapped, shared := tc.wantMapped[dev.Name]
+				if !shared {
+					continue
+				}
+				capacity := dev.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+				policy := capacity.RequestPolicy
+				require.NotNilf(t, policy, "device %q request policy", dev.Name)
+				require.NotNil(t, policy.ValidRange)
+				require.Equalf(t, "0", policy.Default.String(), "device %q default", dev.Name)
+				require.Equalf(t, "0", policy.ValidRange.Min.String(), "device %q min", dev.Name)
+				require.Equalf(t, capacity.Value.String(), policy.ValidRange.Max.String(), "device %q max", dev.Name)
+				require.Equalf(t, tc.wantStep, policy.ValidRange.Step.String(), "device %q step", dev.Name)
+				require.Truef(t, *dev.AllowMultipleAllocations, "device %q allows multiple allocations", dev.Name)
+				require.Emptyf(t, dev.Taints, "device %q taints", dev.Name)
+				require.Equalf(t, mapped, dev.NodeAllocatableResources != nil, "device %q mapping", dev.Name)
 			}
 		})
 	}
