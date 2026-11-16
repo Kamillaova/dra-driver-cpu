@@ -225,6 +225,13 @@ names: events whose source host is that node, that Node's status with nothing ch
 driver's own conditions, that node's ResourceSlices, and the `dra.cpu` entries in the status of
 a claim allocated on that node.
 
+The ClusterRole grants `get`, `list` and `watch` on nodes: the driver reads its own Node at start
+and, on a node whose partitions need a
+[kubelet CPU reservation](troubleshooting.md#a-node-missing-its-kubelet-cpu-reservation), watches it
+afterwards. RBAC cannot grant them on one Node alone. Where you grant the driver's service account
+its permissions yourself, with `rbac.create: false`, grant all three: without `list` and `watch` the
+driver checks the reservation only when it starts, and logs once that it does not watch the Node.
+
 ## Health probes
 
 The driver's HTTP server listens on `--bind-address`, which the chart sets from `healthzPort`,
@@ -232,12 +239,13 @@ and serves two probe endpoints:
 
 - `/livez` answers 200 as soon as the server serves. The chart's liveness probe uses it.
 - `/healthz` answers 200 only while the driver is registered with the kubelet and connected to
-  NRI, and 503 before that and while the driver reconnects to NRI. The chart's readiness probe
-  uses it.
+  NRI, and 503 before that, while the driver reconnects to NRI and while its node misses the
+  [kubelet CPU reservation](troubleshooting.md#a-node-missing-its-kubelet-cpu-reservation) its
+  partitions need. The chart's readiness probe uses it.
 
 The manifests under `manifests/base`, which the chart does not render, keep the liveness probe on
 `/healthz`, so a driver that is alive but not yet registered or connected to NRI is restarted
-there.
+there, and on a node missing its kubelet CPU reservation the driver is restarted again and again.
 
 ## Kubernetes API client
 
@@ -300,13 +308,14 @@ without a driver that pod stays `Terminating`.
    ```
 
 1. Remove the conditions the driver kept from every Node: `CPUAllocatableMappingDropped`, which
-   it keeps where `publishNodeAllocatableResourceMapping` is on, and `CPUPartitionDegraded`, which it
-   keeps on nodes that use `cpuPartitions`.
+   it keeps where `publishNodeAllocatableResourceMapping` is on, `CPUPartitionDegraded`, which it
+   keeps on nodes that use `cpuPartitions`, and `CPUReservationMissing`, which it keeps on nodes
+   whose partitions need a kubelet CPU reservation.
 
    ```bash
    for node in $(kubectl get nodes -o name); do
      kubectl patch "${node}" --subresource=status --type=strategic \
-       -p '{"status":{"conditions":[{"type":"CPUAllocatableMappingDropped","$patch":"delete"},{"type":"CPUPartitionDegraded","$patch":"delete"}]}}'
+       -p '{"status":{"conditions":[{"type":"CPUAllocatableMappingDropped","$patch":"delete"},{"type":"CPUPartitionDegraded","$patch":"delete"},{"type":"CPUReservationMissing","$patch":"delete"}]}}'
    done
    ```
 
