@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/allocation/v1alpha1"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/discovery"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
@@ -349,6 +350,35 @@ type driverConfigValues struct {
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
 	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly,omitempty"`
 	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+
+	CPUPartitions []driverconfig.CPUPartition     `json:"cpuPartitions,omitempty"`
+	Profiles      map[string]driverconfig.Profile `json:"profiles,omitempty"`
+}
+
+// effectiveFor returns the configuration node runs: with profiles declared,
+// the one its driverconfig.ProfileLabel label names, as the driver selects it.
+func (v driverConfigValues) effectiveFor(node *v1.Node) driverConfigValues {
+	ginkgo.GinkgoHelper()
+	name := node.Labels[driverconfig.ProfileLabel]
+	if len(v.Profiles) == 0 {
+		gomega.Expect(name).To(gomega.BeEmpty(),
+			"node %s selects profile %q, but the driver configuration declares no profiles", node.Name, name)
+		return v
+	}
+	gomega.Expect(name).ToNot(gomega.BeEmpty(), "node %s has no %s label, so its driver does not start", node.Name, driverconfig.ProfileLabel)
+	profile, ok := v.Profiles[name]
+	gomega.Expect(ok).To(gomega.BeTrue(), "node %s selects profile %q, which the driver configuration does not declare", node.Name, name)
+	v.CPUPartitions = profile.CPUPartitions
+	v.Profiles = nil
+	return v
+}
+
+// partitionsUsed reports whether the configuration's list holds the entry
+// whose presence switches a node into partitions.
+func (v driverConfigValues) partitionsUsed() bool {
+	return slices.ContainsFunc(v.CPUPartitions, func(p driverconfig.CPUPartition) bool {
+		return p.Name == device.DefaultPartitionName
+	})
 }
 
 // getDriverConfigValues reads the ConfigMap if the daemonset uses --config=, else falls back to

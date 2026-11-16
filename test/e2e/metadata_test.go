@@ -76,6 +76,7 @@ var _ = ginkgo.Describe("Device Metadata", ginkgo.Ordered, func() {
 		cpuDeviceMode     string
 		groupBy           string
 		nodeAllocMapping  bool
+		partitioned       bool
 	)
 
 	ginkgo.BeforeAll(func(ctx context.Context) {
@@ -102,6 +103,7 @@ var _ = ginkgo.Describe("Device Metadata", ginkgo.Ordered, func() {
 		targetNode, err = e2enode.PickWorker(ctx, rootFxt.K8SClientset, 5*time.Second, 1*time.Minute, rootFxt.Log)
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 		rootFxt.Log.Info("using worker node", "nodeName", targetNode.Name)
+		partitioned = cfgValues.effectiveFor(targetNode).partitionsUsed()
 	})
 
 	ginkgo.Context("when a pod with a CPU claim is running", func() {
@@ -111,6 +113,9 @@ var _ = ginkgo.Describe("Device Metadata", ginkgo.Ordered, func() {
 			fxt = rootFxt.WithPrefix("metadata")
 			if cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED && groupBy == device.GROUP_BY_MACHINE {
 				ginkgo.Skip("skipping this test in machine grouping mode as we do not configure opaque config in claim")
+			}
+			if partitioned {
+				ginkgo.Skip("skipping this test on a node using CPU partitions, where a dra.cpu claim is a share")
 			}
 		})
 		ginkgo.JustBeforeEach(func(ctx context.Context) {
