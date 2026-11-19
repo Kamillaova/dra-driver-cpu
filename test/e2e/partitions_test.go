@@ -20,7 +20,9 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
+	"os/exec"
 	"slices"
 	"time"
 
@@ -317,6 +319,79 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 			}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
 		})
 	})
+
+	// e2e-grown gives the CPUs of e2e-wide's single-thread partition to a
+	// reserved partition: a node moved to it with a claim prepared there has a
+	// reserved partition holding the claim's CPUs.
+	ginkgo.Context("with a reserved partition grown over a prepared claim", func() {
+		ginkgo.It("should stop the claim's containers and refuse them until the claim's pod is deleted", func(ctx context.Context) {
+			cs := rootFxt.K8SClientset
+			grown, ok := cfgValues.Profiles[grownProfile]
+			if !ok {
+				ginkgo.Skip("the configuration declares no profile " + grownProfile + "; the partitions lane declares it where the host has a core without an online sibling")
+			}
+			nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: driverconfig.ProfileLabel + "=" + wideProfile})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot list nodes")
+			gomega.Expect(nodes.Items).ToNot(gomega.BeEmpty(), "no node runs profile %s", wideProfile)
+			node := &nodes.Items[0]
+			partition, ok := singleThreadPartition(cfgValues.effectiveFor(node))
+			gomega.Expect(ok).To(gomega.BeTrue(), "profile %s holds no single-thread partition beside %s", wideProfile, grownProfile)
+			gomega.Expect(grown.CPUPartitions).To(gomega.ContainElement(gomega.And(
+				gomega.HaveField("Name", grownPartition),
+				gomega.HaveField("Role", device.PARTITION_ROLE_RESERVED),
+				gomega.HaveField("CPUSet", partition.CPUSet),
+			)), "profile %s does not reserve the CPUs of partition %s", grownProfile, partition.Name)
+			if !kindNodeReachable(ctx, node.Name) {
+				ginkgo.Skip("docker reaches no container of node " + node.Name + ", whose containerd the spec restarts; run it on a kind cluster")
+			}
+
+			ginkgo.DeferCleanup(relabelAndRestartDriver, cs, node.Name, wideProfile)
+			fxt := rootFxt.WithPrefix("grown-reserved")
+			gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(fxt.Teardown)
+			spec := makeResourceClaimSpec(1, true)
+			spec.Devices.Requests[0].Exactly.DeviceClassName = driverName + "." + partition.Name
+			pod := createTesterPodWithClaimSpec(ctx, fxt, dracpuTesterImage, node.Name, spec, "grown-claim")
+			assigned := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod).CPUAssigned
+			gomega.Expect(pod.Status.ResourceClaimStatuses).To(gomega.HaveLen(1))
+			claimName := *pod.Status.ResourceClaimStatuses[0].ResourceClaimName
+
+			fixture.By("moving node %s to profile %s, whose reserved partition %s holds CPUs %s of claim %s", node.Name, grownProfile, grownPartition, assigned.String(), claimName)
+			relabelAndRestartDriver(ctx, cs, node.Name, grownProfile)
+			refusal := fmt.Sprintf("reserved partition %q now holds CPUs %s of prepared claim %s/%s (request %q); its containers are stopped: delete the claim's pod or keep those CPUs out of the partition",
+				grownPartition, assigned.String(), pod.Namespace, claimName, "request-cpus")
+			expectPartitionDegraded(ctx, cs, node.Name, v1.ConditionTrue, "ReservedHoldsClaims", refusal)
+			gomega.Eventually(func(g gomega.Gomega) {
+				current, err := cs.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				g.Expect(current.Status.ContainerStatuses).To(gomega.ContainElement(gomega.HaveField("LastTerminationState.Terminated",
+					gomega.HaveValue(gomega.HaveField("ExitCode", int32(137))))), "the claim's container was not killed")
+			}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+			created := fmt.Sprintf("cannot create container %q in pod %q: %s", pod.Spec.Containers[0].Name, pod.UID, refusal)
+			expectPodEvent(ctx, cs, pod, "Failed", created)
+			expectDriverHealthz(ctx, cs, node.Name, http.StatusServiceUnavailable)
+
+			fixture.By("restarting containerd in node %s while partition %s holds the claim", node.Name, grownPartition)
+			driverPod, err := e2epod.GetDRACPUPod(ctx, cs, node.Name)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			restarted := metav1.Now()
+			restartContainerd(ctx, node.Name)
+			expectDriverSynchronizedSince(ctx, cs, driverPod, restarted)
+			gomega.Consistently(func(g gomega.Gomega) {
+				current, err := cs.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				for _, status := range current.Status.ContainerStatuses {
+					g.Expect(status.State.Running).To(gomega.BeNil(), "the claim's container runs while partition %s holds its CPUs", grownPartition)
+				}
+			}).WithTimeout(30 * time.Second).WithPolling(2 * time.Second).Should(gomega.Succeed())
+			expectDriverHealthz(ctx, cs, node.Name, http.StatusServiceUnavailable)
+
+			fixture.By("deleting the claim's pod")
+			gomega.Expect(e2epod.DeleteSync(ctx, cs, pod)).To(gomega.Succeed())
+			expectDriverHealthz(ctx, cs, node.Name, http.StatusOK)
+			expectPartitionDegraded(ctx, cs, node.Name, v1.ConditionFalse, "PartitionsVerified", "the kernel has online the threads per core every CPU partition's smt declares")
+		})
+	})
 })
 
 const (
@@ -409,6 +484,84 @@ func clearStoppedCondition(ctx context.Context, cs kubernetes.Interface, nodeNam
 		_, err = cs.CoreV1().Nodes().Patch(ctx, nodeName, types.JSONPatchType, []byte(patch), metav1.PatchOptions{}, "status")
 		g.Expect(err).ToNot(gomega.HaveOccurred())
 	}).WithTimeout(time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+}
+
+const (
+	wideProfile    = "e2e-wide"
+	grownProfile   = "e2e-grown"
+	grownPartition = "grown"
+)
+
+func expectPartitionDegraded(ctx context.Context, cs kubernetes.Interface, nodeName string, status v1.ConditionStatus, reason, message string) {
+	ginkgo.GinkgoHelper()
+	gomega.Eventually(func(g gomega.Gomega) {
+		node, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		g.Expect(nodeCondition(node, conditionPartitionDegraded)).To(gomega.HaveValue(gomega.And(
+			gomega.HaveField("Status", status),
+			gomega.HaveField("Reason", reason),
+			gomega.HaveField("Message", message),
+		)), "node %s", nodeName)
+	}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+}
+
+// expectPodEvent waits for an event of reason on pod whose message holds
+// text, as the kubelet posts a failed container create with its error.
+func expectPodEvent(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod, reason, text string) {
+	ginkgo.GinkgoHelper()
+	gomega.Eventually(func(g gomega.Gomega) {
+		events, err := cs.CoreV1().Events(pod.Namespace).List(ctx, metav1.ListOptions{
+			FieldSelector: "involvedObject.kind=Pod,involvedObject.name=" + pod.Name + ",reason=" + reason,
+		})
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		g.Expect(events.Items).To(gomega.ContainElement(gomega.HaveField("Message", gomega.ContainSubstring(text))),
+			"pod %s has no %s event holding %q", pod.Name, reason, text)
+	}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+}
+
+func expectDriverHealthz(ctx context.Context, cs kubernetes.Interface, nodeName string, want int) {
+	ginkgo.GinkgoHelper()
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	gomega.Eventually(func(g gomega.Gomega) {
+		driverPod, err := e2epod.GetDRACPUPod(ctx, cs, nodeName)
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		g.Expect(driverPod.Status.PodIP).ToNot(gomega.BeEmpty())
+		resp, err := httpClient.Get(healthzURL(driverPod.Status.PodIP)) //nolint:noctx // httpClient.Timeout covers this
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		defer resp.Body.Close()
+		g.Expect(resp.StatusCode).To(gomega.Equal(want), "/healthz of the driver on node %s", nodeName)
+	}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+}
+
+// kindNodeReachable reports whether docker runs a container named as the
+// node, which kind nodes are.
+func kindNodeReachable(ctx context.Context, nodeName string) bool {
+	return exec.CommandContext(ctx, "docker", "inspect", "--type", "container", nodeName).Run() == nil
+}
+
+func restartContainerd(ctx context.Context, nodeName string) {
+	ginkgo.GinkgoHelper()
+	out, err := exec.CommandContext(ctx, "docker", "exec", nodeName, "systemctl", "restart", "containerd").CombinedOutput()
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot restart containerd in node %s: %s", nodeName, out)
+}
+
+// expectDriverSynchronizedSince waits for the driver to log the end of a
+// Synchronize after since, which the runtime sends once the driver has
+// connected to NRI again.
+func expectDriverSynchronizedSince(ctx context.Context, cs kubernetes.Interface, driverPod *v1.Pod, since metav1.Time) {
+	ginkgo.GinkgoHelper()
+	gomega.Eventually(func(g gomega.Gomega) {
+		logs, err := cs.CoreV1().Pods(driverPod.Namespace).GetLogs(driverPod.Name, &v1.PodLogOptions{SinceTime: &since}).DoRaw(ctx)
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		g.Expect(string(logs)).To(gomega.ContainSubstring("end: synchronize state with the runtime"),
+			"the driver on node %s logged no Synchronize since %s", driverPod.Spec.NodeName, since)
+	}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+	current, err := cs.CoreV1().Pods(driverPod.Namespace).Get(ctx, driverPod.Name, metav1.GetOptions{})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	for i, status := range current.Status.ContainerStatuses {
+		gomega.Expect(status.RestartCount).To(gomega.Equal(driverPod.Status.ContainerStatuses[i].RestartCount),
+			"the driver on node %s restarted instead of connecting to NRI again", driverPod.Spec.NodeName)
+	}
 }
 
 // restoreDaemonSetNodes drops the affinity the spec gave the dracpu DaemonSet,
