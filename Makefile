@@ -233,7 +233,11 @@ E2E_RESERVE := $(shell echo $$(( $(E2E_WIDE_RESERVE) + $(call cpuset_size,$(DRAC
 # e2e-wide's and worker2's reservation still holds.
 E2E_GROWN_PARTITIONS := {"name":"default"},{"name":"grown","role":"reserved","cpuset":"$(DRACPU_E2E_NOSMT_PARTITION_CPUS)"}
 E2E_GROWN_PROFILE := $(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),$(comma)"e2e-grown":{"cpuPartitions":[$(E2E_GROWN_PARTITIONS)]})
-E2E_LANE_HELM_ARGS := --set-json 'driverConfig.profiles={"e2e":{"cpuPartitions":[$(E2E_PARTITIONS)]},"e2e-wide":{"cpuPartitions":[$(E2E_WIDE_PARTITIONS)]}$(E2E_GROWN_PROFILE)}'
+# The lane's kind configuration names this annotation for containerd's NRI
+# default validator, so that a spec requiring the driver's plugin on a node
+# leaves the driver's own pod to start.
+E2E_LANE_HELM_ARGS := --set-json 'driverConfig.profiles={"e2e":{"cpuPartitions":[$(E2E_PARTITIONS)]},"e2e-wide":{"cpuPartitions":[$(E2E_WIDE_PARTITIONS)]}$(E2E_GROWN_PROFILE)}' \
+	--set-string 'podAnnotations.e2e\.dra\.cpu/tolerate-missing-nri-plugins=true'
 KIND_CI_LANE_CONFIG := $(or $(wildcard hack/ci/kind-ci-$(DRACPU_E2E_LANE).yaml),hack/ci/kind-ci.yaml)
 KIND_CI_CONFIG := $(if $(DRACPU_E2E_LANE),$(OUT_DIR)/kind-ci-$(DRACPU_E2E_LANE).yaml,hack/ci/kind-ci.yaml)
 # Adds the reservation to each node's kubeletExtraArgs, the nodes being the
