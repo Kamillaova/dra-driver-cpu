@@ -111,6 +111,53 @@ where its detail gives advice, and counts the container in
 rules. Change the pod so it no longer breaks the rule: when the container is created again, the
 driver refuses it.
 
+## CPUs Held by Another Claim
+
+When the driver cannot prepare a claim because claims it has already prepared hold the CPUs, the
+pod's `FailedPrepareDynamicResources` event carries the refusal. It names each claim that holds
+them, from the driver's own record and with no API call: its namespace and name where the driver
+recorded them, its UID, the CPUs it holds, and the container it is bound to, or `bound to no container`. The list ends with a pointer to this section. The refusal takes one of three forms:
+
+- An overlap, when the claim was allocated CPUs a prepared claim holds, for example
+  `claim ns/new has overlapping device assignment with other claims: claim ns/old (UID "...") holds CPUs 0, bound to no container`.
+- A shortage, when a device has fewer free CPUs or free whole cores than the scheduler counted:
+  `not enough cpus available to satisfy request: requested=2, available=1: the CPUs the scheduler counts free on device "cpudevnuma000" are held by one of these claims: ...`,
+  followed by every claim that holds CPUs of that device.
+- With `fullPhysicalCPUsOnly`, an odd number of CPUs on a device whose cores differ in threads
+  needs a free core of 1 thread:
+  `` request "vcpu": 3 exclusive CPUs need a free core of 1 thread on device "cpudevnuma000", which has none (2 free cores of 2 threads; `fullPhysicalCPUsOnly: true`): claims holding the device's cores of 1 thread: ... ``.
+
+The third form can come on a healthy node: the scheduler counts CPUs, not the threads of their
+cores, so every claim it lists can be live. A request for an even number of CPUs needs no core of 1
+thread.
+
+After an overlap or a shortage, one of the listed claims holds CPUs the scheduler counts free,
+since it counts free only the CPUs no allocated claim holds. Look up each listed claim with the API:
+
+- If a listed claim is gone, replaced by a claim of the same name, or allocated to another node,
+  the driver keeps the record of a claim the kubelet no longer knows. Free its CPUs as below.
+- If every listed claim still exists and is allocated to this node, the scheduler allocated one
+  device twice. Kubernetes v1.37.0's scheduler can do so after a failed PreBind, fixed for 1.38 by
+  kubernetes#143450. The listed claims are live: do not free their CPUs as below.
+
+The driver frees a claim's CPUs only when the kubelet unprepares the claim, and it restores every
+claim from its CDI spec when it starts. Never remove the kubelet's DRA state, its
+`dra_manager_state` checkpoint or the kubelet root directory, on a node with prepared claims: drain
+the node first, or reboot it before it runs pods again. Otherwise the claims the kubelet forgets
+keep their CPUs until the node reboots.
+
+To free the CPUs of a claim the kubelet no longer knows:
+
+1. Find the holding claim in the pod's `FailedPrepareDynamicResources` event.
+1. Confirm with the API that the claim is gone, replaced, or allocated to another node, and that
+   `dra_cpu_resource_claims_active` on the node is above the number of `dra.cpu` claims allocated
+   to the node.
+1. Drain the node and reboot it.
+
+Where the node cannot be rebooted, remove the claim's CDI spec,
+`/var/run/cdi/dra.k8s.io-cpu_claim-<claim UID>.json`, from a privileged pod on the node, then
+delete the driver pod: the new driver pod restores its records without that claim.
+
 ## Integration With Bug Reports
 
 1. Run `dracpu gatherinfo` on the affected node.
