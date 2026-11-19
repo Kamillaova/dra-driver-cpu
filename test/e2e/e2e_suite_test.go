@@ -178,6 +178,8 @@ type CPUAllocation struct {
 	CPUAffinity cpuset.CPUSet
 	// CPUReported is the CPUSet reported by the environment variables
 	CPUReported cpuset.CPUSet
+	// CPUMax is the container cgroup's cpu.max, "" where it has none
+	CPUMax string
 }
 
 func unmarshalLatestReport(data string, v any) error {
@@ -207,6 +209,7 @@ func getTesterPodCPUAllocation(cs kubernetes.Interface, ctx context.Context, pod
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse assigned cpuset: %q", testerInfo.Allocation.CPUs)
 	ret.CPUAffinity, err = cpuset.Parse(testerInfo.Runtimeinfo.CPUAffinity)
 	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse affinity cpuset: %q", testerInfo.Runtimeinfo.CPUAffinity)
+	ret.CPUMax = testerInfo.Allocation.CPUMax
 	ret.CPUReported, err = testerInfo.Runtimeinfo.Environ.AssignedCPUSet()
 	if !errors.Is(err, discovery.ErrNotFound) { // no exclusive claims reports NotFound
 		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse assigned cpuset env var")
@@ -350,6 +353,7 @@ type driverConfigValues struct {
 	PublishNodeAllocatableResourceMapping bool   `json:"publishNodeAllocatableResourceMapping,omitempty"`
 	FullPhysicalCPUsOnly                  bool   `json:"fullPhysicalCPUsOnly,omitempty"`
 	AssumeUnsolicitedUpdatesSafe          bool   `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+	AllowFractionalCapacityRequests       bool   `json:"allowFractionalCapacityRequests,omitempty"`
 
 	CPUPartitions []driverconfig.CPUPartition     `json:"cpuPartitions,omitempty"`
 	Profiles      map[string]driverconfig.Profile `json:"profiles,omitempty"`
