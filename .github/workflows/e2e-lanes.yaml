@@ -36,6 +36,10 @@ jobs:
             labels: partitions
             mustRun: |
               should publish on each node the partitions of its own profile
+              should publish the default partition's devices with a shared request policy, and map only them
+              should cap a share at its amount and give the amount in its metadata file
+              should run a share that books no amount uncapped
+              should refuse a container holding a second capped share
           # Four cores of one thread.
           - lane: partitions
             runner: ubuntu-26.04-arm
@@ -46,6 +50,10 @@ jobs:
               should give a claim on the partition's class CPUs of the partition without an online sibling
               should keep a container without a claim off the partition
               should give a claim on dra.cpu a share of the default partition
+              should publish the default partition's devices with a shared request policy, and map only them
+              should cap a share at its amount and give the amount in its metadata file
+              should run a share that books no amount uncapped
+              should refuse a container holding a second capped share
     name: e2e (${{ matrix.lane }}, ${{ matrix.runner }})
     steps:
       - name: Checkout
