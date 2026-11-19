@@ -245,9 +245,86 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 			}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
 		})
 	})
+
+	// A driver writes the conditions it keeps Unknown as it stops, so a node
+	// it left does not keep reporting what nobody checks any more.
+	ginkgo.Context("when the driver leaves a node", func() {
+		ginkgo.It("should turn the node conditions it keeps Unknown, and evaluate them again when it returns", func(ctx context.Context) {
+			cs := rootFxt.K8SClientset
+			node, err := e2enode.PickWorker(ctx, cs, 5*time.Second, 1*time.Minute, rootFxt.Log)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			if !cfgValues.effectiveFor(node).partitionsUsed() {
+				ginkgo.Skip("node " + node.Name + " uses no CPU partitions; create the cluster with DRACPU_E2E_LANE=partitions")
+			}
+			kept := map[v1.NodeConditionType]string{conditionPartitionDegraded: "driver stopped; partitions not checked"}
+			if cfgValues.PublishNodeAllocatableResourceMapping {
+				kept[conditionAllocatableMappingDropped] = "driver stopped; mapping not checked"
+			}
+			if reservedCPUs(node) > 0 {
+				kept[conditionReservationMissing] = "driver stopped; reservation not checked"
+			}
+
+			evaluated := map[v1.NodeConditionType]v1.NodeCondition{}
+			gomega.Eventually(func(g gomega.Gomega) {
+				current, err := cs.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				for conditionType := range kept {
+					cond := nodeCondition(current, conditionType)
+					g.Expect(cond).ToNot(gomega.BeNil(), "node %s has no %s condition", node.Name, conditionType)
+					g.Expect(cond.Reason).ToNot(gomega.Equal(nodeConditionStoppedReason), "node %s: %s not evaluated", node.Name, conditionType)
+					evaluated[conditionType] = *cond
+				}
+			}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+
+			daemonSet, err := cs.AppsV1().DaemonSets(daemonSetNamespace).Get(ctx, "dracpu", metav1.GetOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get dracpu daemonset")
+			if daemonSet.Spec.Template.Spec.Affinity != nil {
+				ginkgo.Skip("the dracpu DaemonSet carries an affinity of its own, which this spec would replace")
+			}
+			fixture.By("leaving node %s out of the dracpu DaemonSet", node.Name)
+			ginkgo.DeferCleanup(restoreDaemonSetNodes, cs, node.Name)
+			patch := fmt.Sprintf(`{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"NotIn","values":[%q]}]}]}}}}}}}`, node.Name)
+			_, err = cs.AppsV1().DaemonSets(daemonSetNamespace).Patch(ctx, "dracpu", types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot patch the dracpu DaemonSet")
+			gomega.Eventually(func(g gomega.Gomega) {
+				pods, err := cs.CoreV1().Pods(daemonSetNamespace).List(ctx, metav1.ListOptions{LabelSelector: daemonSetLabel, FieldSelector: "spec.nodeName=" + node.Name})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				g.Expect(pods.Items).To(gomega.BeEmpty(), "a driver pod is still on node %s", node.Name)
+			}).WithTimeout(driverPodPollTimeout).WithPolling(driverPodPollInterval).Should(gomega.Succeed())
+
+			current, err := cs.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			for conditionType, stopped := range kept {
+				gomega.Expect(nodeCondition(current, conditionType)).To(gomega.HaveValue(gomega.And(
+					gomega.HaveField("Status", v1.ConditionUnknown),
+					gomega.HaveField("Reason", nodeConditionStoppedReason),
+					gomega.HaveField("Message", stopped),
+				)), "node %s after its driver left", node.Name)
+			}
+
+			fixture.By("giving node %s its driver back", node.Name)
+			restoreDaemonSetNodes(ctx, cs, node.Name)
+			gomega.Eventually(func(g gomega.Gomega) {
+				current, err := cs.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				for conditionType, before := range evaluated {
+					g.Expect(nodeCondition(current, conditionType)).To(gomega.HaveValue(gomega.And(
+						gomega.HaveField("Status", before.Status),
+						gomega.HaveField("Reason", before.Reason),
+						gomega.HaveField("Message", before.Message),
+					)), "node %s after its driver returned", node.Name)
+				}
+			}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+		})
+	})
 })
 
-const conditionReservationMissing v1.NodeConditionType = "CPUReservationMissing"
+const (
+	conditionReservationMissing        v1.NodeConditionType = "CPUReservationMissing"
+	conditionPartitionDegraded         v1.NodeConditionType = "CPUPartitionDegraded"
+	conditionAllocatableMappingDropped v1.NodeConditionType = "CPUAllocatableMappingDropped"
+	nodeConditionStoppedReason                              = "DriverStopped"
+)
 
 // reservedCPUs is the kubelet's CPU reservation on node, capacity less
 // allocatable, which the lane sets in whole CPUs.
@@ -332,6 +409,29 @@ func clearStoppedCondition(ctx context.Context, cs kubernetes.Interface, nodeNam
 		_, err = cs.CoreV1().Nodes().Patch(ctx, nodeName, types.JSONPatchType, []byte(patch), metav1.PatchOptions{}, "status")
 		g.Expect(err).ToNot(gomega.HaveOccurred())
 	}).WithTimeout(time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+}
+
+// restoreDaemonSetNodes drops the affinity the spec gave the dracpu DaemonSet,
+// and waits for its driver to run on the node again and the rollout to end.
+func restoreDaemonSetNodes(ctx context.Context, cs kubernetes.Interface, nodeName string) {
+	ginkgo.GinkgoHelper()
+	daemonSet, err := cs.AppsV1().DaemonSets(daemonSetNamespace).Get(ctx, "dracpu", metav1.GetOptions{})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get dracpu daemonset")
+	if daemonSet.Spec.Template.Spec.Affinity != nil {
+		_, err = cs.AppsV1().DaemonSets(daemonSetNamespace).Patch(ctx, "dracpu", types.JSONPatchType,
+			[]byte(`[{"op":"remove","path":"/spec/template/spec/affinity"}]`), metav1.PatchOptions{})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot restore the dracpu DaemonSet")
+	}
+	gomega.Eventually(func(g gomega.Gomega) {
+		daemonSet, err := cs.AppsV1().DaemonSets(daemonSetNamespace).Get(ctx, "dracpu", metav1.GetOptions{})
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		g.Expect(daemonSet.Status.ObservedGeneration).To(gomega.BeNumerically(">=", daemonSet.Generation))
+		g.Expect(daemonSet.Status.UpdatedNumberScheduled).To(gomega.Equal(daemonSet.Status.DesiredNumberScheduled))
+		g.Expect(daemonSet.Status.NumberAvailable).To(gomega.Equal(daemonSet.Status.DesiredNumberScheduled))
+		pods, err := cs.CoreV1().Pods(daemonSetNamespace).List(ctx, metav1.ListOptions{LabelSelector: daemonSetLabel, FieldSelector: "spec.nodeName=" + nodeName})
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		g.Expect(pods.Items).To(gomega.ContainElement(gomega.HaveField("Status.Phase", v1.PodRunning)), "no driver pod runs on node %s", nodeName)
+	}).WithTimeout(5 * time.Minute).WithPolling(driverPodPollInterval).Should(gomega.Succeed())
 }
 
 // singleThreadPartition returns the first partition of v whose smt keeps one
