@@ -46,6 +46,9 @@ jobs:
               should publish devices and report the reservation on a node whose kubelet reserves its partitions' CPUs
               should publish nothing and report the missing reservation on a node whose kubelet reserves too little
               should turn the node conditions it keeps Unknown, and evaluate them again when it returns
+              should connect to NRI again and keep the containers on their CPUs
+              should hold a pod that requires the driver's NRI plugin until the driver is back
+              should refuse a pod without the toleration while the node requires the driver's NRI plugin, and never the driver's own
           # Four cores of one thread.
           - lane: partitions
             runner: ubuntu-26.04-arm
@@ -67,6 +70,9 @@ jobs:
               should publish devices and report the reservation on a node whose kubelet reserves its partitions' CPUs
               should publish nothing and report the missing reservation on a node whose kubelet reserves too little
               should turn the node conditions it keeps Unknown, and evaluate them again when it returns
+              should connect to NRI again and keep the containers on their CPUs
+              should hold a pod that requires the driver's NRI plugin until the driver is back
+              should refuse a pod without the toleration while the node requires the driver's NRI plugin, and never the driver's own
     name: e2e (${{ matrix.lane }}, ${{ matrix.runner }})
     steps:
       - name: Checkout
