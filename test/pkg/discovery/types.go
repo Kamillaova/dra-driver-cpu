@@ -41,6 +41,8 @@ type DRACPUBuildinfo struct {
 
 type DRACPUAllocation struct {
 	CPUs string `json:"cpus"`
+	// CPUMax is the container cgroup's cpu.max, "" where it has none.
+	CPUMax string `json:"cpuMax,omitempty"`
 }
 
 type DRACPUEnvVar struct {

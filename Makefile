@@ -128,10 +128,10 @@ endif
 DRACPU_E2E_REPORT ?=
 GINKGO_REPORT_ARG := $(if $(DRACPU_E2E_REPORT),--ginkgo.json-report="$(DRACPU_E2E_REPORT)")
 # Set to "true" to have ci-kind-setup deploy the driver with the
-# publishNodeAllocatableResourceMapping driverConfig option.
+# publishNodeAllocatableResourceMapping driverConfig option, as a lane does.
 # Also requires a cluster (KIND_K8S_VERSION node image) with the
 # DRANodeAllocatableResources feature gate enabled.
-DRACPU_E2E_NODE_ALLOCATABLE_MAPPING ?= false
+DRACPU_E2E_NODE_ALLOCATABLE_MAPPING ?= $(if $(DRACPU_E2E_LANE),true,false)
 DRACPU_E2E_ALLOCATOR ?= cpumanager
 # Set to "true" to have ci-kind-setup deploy the driver with the
 # fullPhysicalCPUsOnly driverConfig option. DRACPU_E2E_RESERVED_CPUS must then

@@ -20,6 +20,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -37,6 +38,7 @@ import (
 const (
 	cgroupPath = "fs/cgroup"
 	cpusetFile = "cpuset.cpus.effective"
+	cpuMaxFile = "cpu.max"
 	// affinityScanMax is the upper bound when scanning sched_getaffinity if topology is unavailable.
 	// Using runtime.NumCPU() would miss CPUs when the cgroup cpuset is non-contiguous (e.g. 2-5,9-13).
 	affinityScanMax = 2048
@@ -44,6 +46,19 @@ const (
 
 func cpuSetPath() string {
 	return filepath.Join(cgroupPath, cpusetFile)
+}
+
+// cpuMax returns the container cgroup's CPU quota and period as the kernel
+// writes them, "" where the cgroup has no cpu controller.
+func cpuMax(sfs fs.FS) (string, error) {
+	data, err := fs.ReadFile(sfs, filepath.Join(cgroupPath, cpuMaxFile))
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 func cpuSet(sfs fs.FS) (cpuset.CPUSet, error) {
@@ -96,6 +111,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error determining allocated cpus: %v\n", err)
 			os.Exit(1)
 		}
+		quota, err := cpuMax(containerSysfs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error determining CPU quota: %v\n", err)
+			os.Exit(1)
+		}
 		cpuAff, err := getAffinity(logger)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error determining CPU affinity: %v\n", err)
@@ -104,7 +124,8 @@ func main() {
 		info := discovery.DRACPUTester{
 			Buildinfo: discovery.NewBuildinfo(),
 			Allocation: discovery.DRACPUAllocation{
-				CPUs: cpus.String(),
+				CPUs:   cpus.String(),
+				CPUMax: quota,
 			},
 			Runtimeinfo: discovery.DRACPURuntimeinfo{
 				CPUAffinity: cpuAff.String(),

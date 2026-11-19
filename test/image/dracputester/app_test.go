@@ -20,6 +20,7 @@ package main
 
 import (
 	"testing"
+	"testing/fstest"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"k8s.io/utils/cpuset"
@@ -106,6 +107,41 @@ func TestAffinityScanBoundFromTopology(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := affinityScanBoundFromTopology(tt.topo); got != tt.want {
 				t.Errorf("affinityScanBoundFromTopology() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCPUMax(t *testing.T) {
+	tests := []struct {
+		name string
+		sfs  fstest.MapFS
+		want string
+	}{
+		{
+			name: "a quota",
+			sfs:  fstest.MapFS{"fs/cgroup/cpu.max": {Data: []byte("25000 100000\n")}},
+			want: "25000 100000",
+		},
+		{
+			name: "no quota",
+			sfs:  fstest.MapFS{"fs/cgroup/cpu.max": {Data: []byte("max 100000\n")}},
+			want: "max 100000",
+		},
+		{
+			name: "no cpu controller",
+			sfs:  fstest.MapFS{"fs/cgroup/cpuset.cpus.effective": {Data: []byte("0-3\n")}},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := cpuMax(tt.sfs)
+			if err != nil {
+				t.Fatalf("cpuMax() error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("cpuMax() = %q, want %q", got, tt.want)
 			}
 		})
 	}
