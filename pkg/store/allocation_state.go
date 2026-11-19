@@ -195,6 +195,8 @@ type RequestAllocation struct {
 	CPUs    cpuset.CPUSet
 	Role    Role
 	Devices []string
+	// Cap is the CPU time a shared request may use, in millicores, 0 for none.
+	Cap int64
 }
 
 // ClaimRequestRef names one request of a claim, or the whole claim where
@@ -249,7 +251,7 @@ func (ca claimAllocation) record() ClaimRecord {
 func cloneRequests(requests []RequestAllocation) []RequestAllocation {
 	cloned := make([]RequestAllocation, len(requests))
 	for i, request := range requests {
-		cloned[i] = RequestAllocation{Request: request.Request, CPUs: request.CPUs.Clone(), Role: request.Role, Devices: slices.Clone(request.Devices)}
+		cloned[i] = RequestAllocation{Request: request.Request, CPUs: request.CPUs.Clone(), Role: request.Role, Devices: slices.Clone(request.Devices), Cap: request.Cap}
 	}
 	return cloned
 }
@@ -268,7 +270,7 @@ func (ca claimAllocation) request(name string) []RequestAllocation {
 
 func (ca claimAllocation) sameRequests(requests []RequestAllocation) bool {
 	return slices.EqualFunc(ca.requests, requests, func(a, b RequestAllocation) bool {
-		return a.Request == b.Request && a.CPUs.Equals(b.CPUs) && a.Role == b.Role && slices.Equal(a.Devices, b.Devices)
+		return a.Request == b.Request && a.CPUs.Equals(b.CPUs) && a.Role == b.Role && slices.Equal(a.Devices, b.Devices) && a.Cap == b.Cap
 	})
 }
 

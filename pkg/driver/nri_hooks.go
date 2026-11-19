@@ -34,6 +34,7 @@ import (
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -262,6 +263,13 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 			allGuaranteedCPUs = allGuaranteedCPUs.Union(cpus)
 			claimUIDs = append(claimUIDs, uid)
 		}
+		members := boundMembers(sc, allocationState, claimUIDs)
+		var capped cappedBesideError
+		if err := checkCappedAlone(sc.container.GetName(), members); errors.As(err, &capped) {
+			sc.logger.Info("keeping the container bound to its claims under an older rule, without a limit: NRI gives no way to stop it from here", "rule", cpumetrics.RuleLimitWithOthers)
+			keptUnder.Insert(cpumetrics.RuleLimitWithOthers)
+			broken = append(broken, olderRule{rule: cpumetrics.RuleLimitWithOthers, detail: capped.detail()})
+		}
 		kept = append(kept, sets.List(keptUnder)...)
 		if len(broken) > 0 {
 			warnings = append(warnings, olderRuleWarning{pod: sc.pod, container: sc.container.GetName(), broken: broken})
@@ -278,6 +286,9 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 				ContainerId: sc.container.GetId(),
 			}
 			guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
+			if len(broken) == 0 {
+				convergeCap(sc, members, guaranteedUpdate)
+			}
 			containerUpdates = append(containerUpdates, guaranteedUpdate)
 		}
 		podState.SetContainerState(sc.owner.PodUID, state)
@@ -324,6 +335,26 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 		cp.eventRecorder.Event(warning.object(), corev1.EventTypeWarning, reasonKeptUnderOlderRule, warning.message())
 	}
 	return containerUpdates, nil
+}
+
+// boundMembers returns the requests of the claims bound to a listed
+// container.
+func boundMembers(sc *syncContainer, allocations *store.AllocationState, claimUIDs []types.UID) []cgroupMember {
+	bound := make(map[types.UID]draEnvClaim, len(claimUIDs))
+	for _, uid := range claimUIDs {
+		bound[uid] = sc.claims[uid]
+	}
+	return cgroupMembers(allocations, bound)
+}
+
+// convergeCap gives a listed container the cap CreateContainer would have
+// written. A CPU quota a container shows was set by the kubelet or written
+// before.
+func convergeCap(sc *syncContainer, members []cgroupMember, update *api.ContainerUpdate) {
+	if capMilli := soleCap(members); capMilli > 0 && !hasKubeletQuota(sc.container) {
+		update.SetLinuxCPUQuota(cfsQuota(capMilli))
+		update.SetLinuxCPUPeriod(cfsPeriodUS)
+	}
 }
 
 // draEnvClaim is what a container's DRA_CPUSET_* variables say of one claim:
@@ -474,7 +505,7 @@ func syncBinding(allocations *store.AllocationState, uid types.UID, sc *syncCont
 		if !sc.pinnedToRecord || !errors.As(err, &partial) {
 			return nil, nil, olderRule{}, err
 		}
-		return []store.ClaimRequestRef{{ClaimUID: uid}}, nil, olderRule{rule: cpumetrics.RulePartialHolder, detail: partial.detail()}, nil
+		return []store.ClaimRequestRef{{ClaimUID: uid}}, nil, olderRule{rule: cpumetrics.RulePartialHolder, detail: "it " + partial.detail()}, nil
 	}
 	return refs, nil, olderRule{}, nil
 }
@@ -503,7 +534,7 @@ func (w olderRuleWarning) object() *corev1.Pod {
 func (w olderRuleWarning) message() string {
 	broken := make([]string, 0, len(w.broken))
 	for _, older := range w.broken {
-		broken = append(broken, fmt.Sprintf("rule %s: it %s", older.rule, older.detail))
+		broken = append(broken, fmt.Sprintf("rule %s: %s", older.rule, older.detail))
 	}
 	return fmt.Sprintf("container %q was created under an older rule and keeps its claims until it is created again, when it is refused by %s",
 		w.container, strings.Join(broken, ", and by "))
@@ -629,6 +660,117 @@ func contendersForUnboundClaims(allocations *store.AllocationState, listed []*sy
 		}
 	}
 	return result
+}
+
+// cgroupMember is one request a container holds in its cgroup.
+type cgroupMember struct {
+	claim    string
+	request  string
+	capMilli int64
+}
+
+func (m cgroupMember) String() string {
+	if m.request == "" {
+		return fmt.Sprintf("claim %q", m.claim)
+	}
+	return fmt.Sprintf("request %q of claim %q", m.request, m.claim)
+}
+
+// cgroupMembers returns the requests a container's variables name, from their
+// claims' records, in order of claim UID and request.
+func cgroupMembers(allocations *store.AllocationState, claims map[types.UID]draEnvClaim) []cgroupMember {
+	var members []cgroupMember
+	for _, uid := range slices.Sorted(maps.Keys(claims)) {
+		claim := claims[uid]
+		record, ok := allocations.GetClaimRecord(uid)
+		if !ok {
+			continue
+		}
+		name := record.Name
+		if name == "" {
+			name = string(uid)
+		}
+		for _, request := range record.Requests {
+			if !claim.upstreamForm() && !slices.Contains(claim.requests, request.Request) {
+				continue
+			}
+			members = append(members, cgroupMember{claim: name, request: request.Request, capMilli: request.Cap})
+		}
+	}
+	return members
+}
+
+// checkCappedAlone refuses a container whose cgroup holds a capped share
+// beside any other request: a cgroup has one cpu.max, under which an uncapped
+// share would run, and which would throttle exclusive CPUs.
+func checkCappedAlone(container string, members []cgroupMember) error {
+	if len(members) < 2 {
+		return nil
+	}
+	capped := slices.IndexFunc(members, func(m cgroupMember) bool { return m.capMilli > 0 })
+	if capped < 0 {
+		return nil
+	}
+	for i, other := range members {
+		if i != capped && other.capMilli > 0 {
+			return cappedBesideError{container: container, capped: members[capped], other: other}
+		}
+	}
+	other := members[0]
+	if capped == 0 {
+		other = members[1]
+	}
+	return cappedBesideError{container: container, capped: members[capped], other: other}
+}
+
+type cappedBesideError struct {
+	container string
+	capped    cgroupMember
+	other     cgroupMember
+}
+
+func (err cappedBesideError) Error() string {
+	if err.other.capMilli > 0 {
+		return fmt.Sprintf("container %q: %s and %s both have limits, so they cannot be used together: use the claims in separate containers",
+			err.container, err.capped, err.other)
+	}
+	return fmt.Sprintf("container %q: %s has limit of %s, so it cannot be used together with %s: use the claims in separate containers",
+		err.container, err.capped, resource.NewMilliQuantity(err.capped.capMilli, resource.DecimalSI), err.other)
+}
+
+func (err cappedBesideError) detail() string {
+	if err.other.capMilli > 0 {
+		return fmt.Sprintf("%s and %s both have limits, so they cannot be used together", err.capped, err.other)
+	}
+	return fmt.Sprintf("%s has limit of %s, so it cannot be used together with %s",
+		err.capped, resource.NewMilliQuantity(err.capped.capMilli, resource.DecimalSI), err.other)
+}
+
+// soleCap returns the cap of a container holding one capped request alone, 0
+// for any other container.
+func soleCap(members []cgroupMember) int64 {
+	if len(members) != 1 {
+		return 0
+	}
+	return members[0].capMilli
+}
+
+const (
+	cfsPeriodUS = 100000
+	// The kernel refuses a quota below 1 ms (linux v7.2 kernel/sched/core.c:10107-10109).
+	minCFSQuotaUS = 1000
+)
+
+func cfsQuota(capMilli int64) int64 {
+	return max(capMilli*cfsPeriodUS/1000, minCFSQuotaUS)
+}
+
+// hasKubeletQuota reports whether the container arrives with a CPU quota,
+// which containerd sets only from a non-zero quota the kubelet sends for a CPU
+// limit on the container or its pod (containerd v2.4.0
+// internal/cri/opts/spec_linux_opts.go:389-391). That quota stays the cap.
+func hasKubeletQuota(ctr *api.Container) bool {
+	return ctr.GetLinux().GetResources().GetCpu().GetQuota().GetValue() > 0
 }
 
 var errNoDefaultPartitionCPUs = errors.New("cannot update containers without claims: the default partition holds no CPU")
@@ -794,6 +936,10 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 				return nil, nil, err
 			}
 		}
+		members := cgroupMembers(cp.allocationState, claimAllocations)
+		if err := checkCappedAlone(ctr.GetName(), members); err != nil {
+			return nil, nil, err
+		}
 		updatedClaims, err := cp.allocationState.Bind(logger, podUID, ctr.Name, refs, expected)
 		if err != nil {
 			return nil, nil, fmt.Errorf("cannot bind claim to container %q in pod %q: %w", ctr.Name, pod.Uid, err)
@@ -803,6 +949,10 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		adjust.SetLinuxCPUSetCPUs(guaranteedCPUs.String())
 		if !exclusiveCPUs.IsEmpty() {
 			adjust.AddEnv(dracpuapi.EnvVarExclusiveAssignedCPUSet, exclusiveCPUs.String())
+		}
+		if capMilli := soleCap(members); capMilli > 0 && !hasKubeletQuota(ctr) {
+			adjust.SetLinuxCPUQuota(cfsQuota(capMilli))
+			adjust.SetLinuxCPUPeriod(cfsPeriodUS)
 		}
 		// An updated claim means this is the first CreateContainer after Prepare, so
 		// existing shared containers must be moved off the newly claimed CPUs.
