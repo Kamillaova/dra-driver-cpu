@@ -98,7 +98,7 @@ honor these settings, where applicable.
   and/or machine mode testing.
   NOTE: the Makefile defaults to "cpumanager" if not set, because a nonempty value is needed internally.
 
-- `DRACPU_E2E_NODE_ALLOCATABLE_MAPPING`: (optional, default `false`): when `true`, *the Makefile*
+- `DRACPU_E2E_NODE_ALLOCATABLE_MAPPING`: (optional, default `false`, `true` on a lane): when `true`, *the Makefile*
   `ci-kind-setup` target deploys the driver with the
   `driverConfig.publishNodeAllocatableResourceMapping: true` option; any other value
   deploys without it. The cluster must have the `DRANodeAllocatableResources` feature
@@ -189,8 +189,9 @@ where their lane did not prepare the cluster.
   `lane-setup.sh pre` leaves at least two CPUs to `default`, and fails unless the host's
   kernel can enable `cpuset` in a threaded cgroup subtree. Each kubelet reserves the CPUs outside
   its profile's `default` partition, as the driver requires before it publishes devices. The
-  specs of the `nosmt` partition skip where the host has no core without an online sibling,
-  which is any host whose cores all run two threads.
+  driver publishes the node allocatable mapping, which only the `default` partition's shared
+  devices carry. The specs of the `nosmt` partition skip where the host has no core without an
+  online sibling, which is any host whose cores all run two threads.
 
 `.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner, and
 fails when a spec the runner's host can run was skipped.
