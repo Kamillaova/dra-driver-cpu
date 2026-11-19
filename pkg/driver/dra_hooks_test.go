@@ -1626,6 +1626,241 @@ func TestPrepareResourceClaimsGroupedModeRejectsInvalidCPUCapacity(t *testing.T)
 	}
 }
 
+// wholeCoreCPUInfos is 16 CPUs of one NUMA node: 8 cores of two threads in two
+// uncore caches, core c holding CPUs c and c+8.
+var wholeCoreCPUInfos = func() []cpuinfo.CPUInfo {
+	var infos []cpuinfo.CPUInfo
+	for cpu := range 16 {
+		core := cpu % 8
+		infos = append(infos, cpuinfo.CPUInfo{
+			CpuID: cpu, CoreID: core, SocketID: 0, NUMANodeID: 0, UncoreCacheID: core / 4,
+			SiblingCPUID: (cpu + 8) % 16, SiblingCPUSet: cpuset.New(core, core+8), CoreType: cpuinfo.CoreTypeStandard,
+		})
+	}
+	return infos
+}()
+
+func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
+	type claimShape struct {
+		consumed   int64
+		written    string // "" names no amount
+		cpuset     string // the external allocator's cpuset
+		subrequest string // "" asks with a request of class dra.cpu
+	}
+	tests := []struct {
+		name                 string
+		cpuInfos             []cpuinfo.CPUInfo
+		groupBy              string // "" groups by NUMA node
+		allocator            string
+		fullPhysicalCPUsOnly bool
+		earlier              []int64
+		claim                claimShape
+		want                 cpuset.CPUSet
+		wantSize             int
+		wantErr              string
+	}{
+		{
+			name:                 "two cores of two threads from one cache",
+			cpuInfos:             wholeCoreCPUInfos,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 4, written: "4"},
+			want:                 cpuset.New(0, 1, 8, 9),
+		},
+		{
+			name:                 "a cache's worth stays in one cache",
+			cpuInfos:             wholeCoreCPUInfos,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 8},
+			want:                 cpuset.New(0, 1, 2, 3, 8, 9, 10, 11),
+		},
+		{
+			name:                 "naming no amount takes the whole device",
+			cpuInfos:             wholeCoreCPUInfos,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 16},
+			want:                 cpuset.New(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+		},
+		{
+			name:                 "a written 3 the scheduler rounded to 4 is refused",
+			cpuInfos:             wholeCoreCPUInfos,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 4, written: "3"},
+			wantErr:              "request \"vcpu\": amount 3 on exclusive request (class dra.cpu); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
+		},
+		{
+			name:                 "a subrequest's refusal names its own class",
+			cpuInfos:             wholeCoreCPUInfos,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 4, written: "3", subrequest: "whole"},
+			wantErr:              "request \"vcpu/whole\": amount 3 on exclusive request (class dra.cpu.whole); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
+		},
+		{
+			name:                 "an odd amount the scheduler gave as written is refused",
+			cpuInfos:             wholeCoreCPUInfos,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 3},
+			wantErr:              "request \"vcpu\": amount 3 on exclusive request (class dra.cpu); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
+		},
+		{
+			name:     "without the option an odd amount is taken as written",
+			cpuInfos: wholeCoreCPUInfos,
+			claim:    claimShape{consumed: 3, written: "3"},
+			wantSize: 3,
+		},
+		{
+			name:                 "a mixed device gives an odd amount a core of two threads and one of one",
+			cpuInfos:             mixedCoreCPUInfos,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 3, written: "3"},
+			want:                 cpuset.New(0, 2, 4),
+		},
+		{
+			name:                 "a mixed device gives an even amount cores of two threads",
+			cpuInfos:             mixedCoreCPUInfos,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 2, written: "2"},
+			want:                 cpuset.New(0, 4),
+		},
+		{
+			name:                 "a mixed device refuses an odd amount once its one-thread cores are taken",
+			cpuInfos:             mixedCoreCPUInfos,
+			fullPhysicalCPUsOnly: true,
+			earlier:              []int64{1, 1},
+			claim:                claimShape{consumed: 3, written: "3"},
+			wantErr:              "request \"vcpu\": 3 exclusive CPUs need a free core of 1 thread on device \"cpudevnuma000\", which has none (2 free cores of 2 threads; `fullPhysicalCPUsOnly: true`)",
+		},
+		{
+			name:                 "the external allocator's cpuset is taken as given",
+			cpuInfos:             wholeCoreCPUInfos,
+			allocator:            cpuallocator.ModeExternal,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 4, written: "4", cpuset: "3,4,11,12"},
+			want:                 cpuset.New(3, 4, 11, 12),
+		},
+		{
+			name:                 "the external allocator's cpuset may not split a core",
+			cpuInfos:             wholeCoreCPUInfos,
+			allocator:            cpuallocator.ModeExternal,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 4, written: "4", cpuset: "0-3"},
+			wantErr:              "split physical cores",
+		},
+		{
+			name:                 "the machine device's external cpuset may not split a core",
+			cpuInfos:             wholeCoreCPUInfos,
+			groupBy:              devattr.GROUP_BY_MACHINE,
+			allocator:            cpuallocator.ModeExternal,
+			fullPhysicalCPUsOnly: true,
+			claim:                claimShape{consumed: 4, written: "4", cpuset: "0-3"},
+			wantErr:              "split physical cores",
+		},
+	}
+
+	newClaim := func(uid, deviceName string, shape claimShape) *resourceapi.ResourceClaim {
+		request := resourceapi.DeviceRequest{
+			Name:    "vcpu",
+			Exactly: &resourceapi.ExactDeviceRequest{DeviceClassName: "dra.cpu"},
+		}
+		if shape.written != "" {
+			request.Exactly.Capacity = &resourceapi.CapacityRequirements{
+				Requests: map[resourceapi.QualifiedName]resource.Quantity{devattr.CPUResourceQualifiedName: resource.MustParse(shape.written)},
+			}
+		}
+		resultRequest := "vcpu"
+		if shape.subrequest != "" {
+			request = resourceapi.DeviceRequest{Name: "vcpu", FirstAvailable: []resourceapi.DeviceSubRequest{
+				{Name: "other", DeviceClassName: "dra.cpu.other"},
+				{Name: shape.subrequest, DeviceClassName: "dra.cpu.whole", Capacity: request.Exactly.Capacity},
+			}}
+			resultRequest = "vcpu/" + shape.subrequest
+		}
+		claim := &resourceapi.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: uid, Namespace: "ns", UID: types.UID(uid)},
+			Spec: resourceapi.ResourceClaimSpec{
+				Devices: resourceapi.DeviceClaim{Requests: []resourceapi.DeviceRequest{request}},
+			},
+			Status: resourceapi.ResourceClaimStatus{
+				Allocation: &resourceapi.AllocationResult{
+					Devices: resourceapi.DeviceAllocationResult{
+						Results: []resourceapi.DeviceRequestAllocationResult{{
+							Request: resultRequest,
+							Driver:  testDriverName,
+							Pool:    testNodeName,
+							Device:  deviceName,
+							ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{
+								devattr.CPUResourceQualifiedName: *resource.NewQuantity(shape.consumed, resource.DecimalSI),
+							},
+						}},
+					},
+				},
+			},
+		}
+		if shape.cpuset != "" {
+			claim.Status.Allocation.Devices.Config = []resourceapi.DeviceAllocationConfiguration{{
+				Source:   resourceapi.AllocationConfigSourceClaim,
+				Requests: []string{"vcpu"},
+				DeviceConfiguration: resourceapi.DeviceConfiguration{
+					Opaque: &resourceapi.OpaqueDeviceConfiguration{
+						Driver:     testDriverName,
+						Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1alpha1","cpuConfig":{"cpuset":"` + shape.cpuset + `"}}`)},
+					},
+				},
+			}}
+		}
+		return claim
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := Providers{
+				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: tc.cpuInfos},
+				SysFS:   testSysFS(tc.cpuInfos),
+			}
+			groupBy, deviceName := devattr.GROUP_BY_NUMA_NODE, devattr.CPUDeviceNUMAGroupedPrefix+"000"
+			if tc.groupBy == devattr.GROUP_BY_MACHINE {
+				groupBy, deviceName = devattr.GROUP_BY_MACHINE, devattr.CPUDeviceMachineGrouped
+			}
+			driver, err := New(testr.New(t), prov, &Config{
+				DriverName:           testDriverName,
+				NodeName:             testNodeName,
+				ReservedCPUs:         cpuset.New(),
+				CPUDeviceMode:        devattr.CPU_DEVICE_MODE_GROUPED,
+				CPUDeviceGroupBy:     groupBy,
+				Allocator:            tc.allocator,
+				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
+			})
+			require.NoError(t, err)
+			driver.cdiMgr = newMockCdiMgr()
+			driver.hasSynchronized = true
+
+			for i, amount := range tc.earlier {
+				earlier := newClaim(fmt.Sprintf("earlier-%d", i), deviceName, claimShape{consumed: amount, written: fmt.Sprint(amount)})
+				prepared, err := driver.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{earlier})
+				require.NoError(t, err)
+				require.NoError(t, prepared[earlier.UID].Err, "earlier claim %d", i)
+			}
+
+			claim := newClaim("claim", deviceName, tc.claim)
+			prepared, err := driver.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+			require.NoError(t, err)
+			result := prepared[claim.UID]
+			got, allocated := driver.allocationState.GetResourceClaimAllocation(claim.UID)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, result.Err, tc.wantErr)
+				require.False(t, allocated, "a refused claim holds no CPUs")
+				return
+			}
+			require.NoError(t, result.Err)
+			require.True(t, allocated)
+			if tc.wantSize > 0 {
+				require.Equal(t, tc.wantSize, got.Size())
+				return
+			}
+			require.True(t, got.Equals(tc.want), "got CPUs %s, want %s", got, tc.want)
+		})
+	}
+}
+
 func TestPrepareResourceClaimsGroupedModeIgnoresAllocationsFromOtherDrivers(t *testing.T) {
 	prov := Providers{
 		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},

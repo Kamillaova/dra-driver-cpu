@@ -21,7 +21,9 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr/testr"
+	topology "github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
+	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -209,6 +211,71 @@ func TestExternalValidate(t *testing.T) {
 			if !tt.expectErr && gotErr {
 				t.Fatalf("Validate(%v, %v, %v) unexpected error: %v", tt.preferredCPUs, tt.preparedCPUs, tt.assignedCPUs, err)
 			}
+		})
+	}
+}
+
+func TestExternalRequireWholeCores(t *testing.T) {
+	// Four cores of two threads each: 0/4, 1/5, 2/6, 3/7.
+	details := topology.CPUDetails{}
+	for cpuID := range 8 {
+		details[cpuID] = topology.CPUInfo{CpuID: cpuID, CoreID: cpuID % 4, SocketID: 0, NUMANodeID: 0}
+	}
+	topo := &topology.CPUTopology{CPUDetails: details}
+
+	allocationWith := func(cpus string) *resourceapi.AllocationResult {
+		return &resourceapi.AllocationResult{
+			Devices: resourceapi.DeviceAllocationResult{
+				Config: []resourceapi.DeviceAllocationConfiguration{{
+					Source:   resourceapi.AllocationConfigSourceClaim,
+					Requests: []string{"req"},
+					DeviceConfiguration: resourceapi.DeviceConfiguration{
+						Opaque: &resourceapi.OpaqueDeviceConfiguration{
+							Driver:     "dra.cpu",
+							Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1alpha1","cpuConfig":{"cpuset":"` + cpus + `"}}`)},
+						},
+					},
+				}},
+				Results: []resourceapi.DeviceRequestAllocationResult{{
+					Request: "req",
+					Driver:  "dra.cpu",
+					Device:  "cpudevmachine",
+					ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{
+						resourceapi.QualifiedName(device.CPUResourceQualifiedName): *resource.NewQuantity(2, resource.DecimalSI),
+					},
+				}},
+			},
+		}
+	}
+
+	tests := []struct {
+		name         string
+		requireWhole bool
+		cpuset       string
+		want         cpuset.CPUSet
+		wantErr      []string
+	}{
+		{name: "not required: a split cpuset is the external scheduler's choice", cpuset: "0,1", want: cpuset.New(0, 1)},
+		{name: "required: a whole core passes", requireWhole: true, cpuset: "0,4", want: cpuset.New(0, 4)},
+		{name: "required: a split cpuset is refused", requireWhole: true, cpuset: "0,1", wantErr: []string{"split physical cores", "fullPhysicalCPUsOnly", "siblings of 0-1"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			alc := NewExternal("dra.cpu", cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), cpuset.New())
+			if tc.requireWhole {
+				alc.RequireWholeCores(topo)
+			}
+			allocation := allocationWith(tc.cpuset)
+			got, err := alc.GetPreferredCPUs(testr.New(t), allocation, allocation.Devices.Results[0])
+			if len(tc.wantErr) > 0 {
+				require.Error(t, err)
+				for _, want := range tc.wantErr {
+					require.Contains(t, err.Error(), want)
+				}
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, got.Equals(tc.want), "GetPreferredCPUs = %s, want %s", got, tc.want)
 		})
 	}
 }
