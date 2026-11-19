@@ -45,6 +45,7 @@ jobs:
               should book no more of a node's shared devices than they hold under a burst of racing shares
               should publish devices and report the reservation on a node whose kubelet reserves its partitions' CPUs
               should publish nothing and report the missing reservation on a node whose kubelet reserves too little
+              should turn the node conditions it keeps Unknown, and evaluate them again when it returns
           # Four cores of one thread.
           - lane: partitions
             runner: ubuntu-26.04-arm
@@ -64,6 +65,7 @@ jobs:
               should book no more of a node's shared devices than they hold under a burst of racing shares
               should publish devices and report the reservation on a node whose kubelet reserves its partitions' CPUs
               should publish nothing and report the missing reservation on a node whose kubelet reserves too little
+              should turn the node conditions it keeps Unknown, and evaluate them again when it returns
     name: e2e (${{ matrix.lane }}, ${{ matrix.runner }})
     steps:
       - name: Checkout
