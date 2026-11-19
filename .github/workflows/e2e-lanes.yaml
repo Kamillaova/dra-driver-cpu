@@ -43,6 +43,8 @@ jobs:
               should leave a share no shared device can hold Pending
               should route a share only the largest shared device can hold to its node
               should book no more of a node's shared devices than they hold under a burst of racing shares
+              should publish devices and report the reservation on a node whose kubelet reserves its partitions' CPUs
+              should publish nothing and report the missing reservation on a node whose kubelet reserves too little
           # Four cores of one thread.
           - lane: partitions
             runner: ubuntu-26.04-arm
@@ -60,6 +62,8 @@ jobs:
               should leave a share no shared device can hold Pending
               should route a share only the largest shared device can hold to its node
               should book no more of a node's shared devices than they hold under a burst of racing shares
+              should publish devices and report the reservation on a node whose kubelet reserves its partitions' CPUs
+              should publish nothing and report the missing reservation on a node whose kubelet reserves too little
     name: e2e (${{ matrix.lane }}, ${{ matrix.runner }})
     steps:
       - name: Checkout
