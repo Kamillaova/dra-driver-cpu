@@ -18,7 +18,10 @@ package e2e
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
@@ -33,6 +36,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/cpuset"
 )
@@ -179,7 +183,156 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 				"a claim of class %s does not share the CPUs of the containers without a claim", driverName)
 		})
 	})
+
+	// The lane's kubelets reserve the CPUs outside each profile's default
+	// partition, and e2e, with its reserved partition, needs more than
+	// e2e-wide: a node moved from e2e-wide to e2e misses its reservation.
+	ginkgo.Context("with the kubelet CPU reservation", func() {
+		ginkgo.It("should publish devices and report the reservation on a node whose kubelet reserves its partitions' CPUs", func(ctx context.Context) {
+			nodes, err := rootFxt.K8SClientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: driverconfig.ProfileLabel})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot list nodes")
+			checked := 0
+			for i := range nodes.Items {
+				node := &nodes.Items[i]
+				reserved := reservedCPUs(node)
+				if reserved == 0 {
+					continue
+				}
+				checked++
+				gomega.Eventually(func(g gomega.Gomega) {
+					current, err := rootFxt.K8SClientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+					g.Expect(err).ToNot(gomega.HaveOccurred())
+					g.Expect(nodeCondition(current, conditionReservationMissing)).To(gomega.HaveValue(gomega.And(
+						gomega.HaveField("Status", v1.ConditionFalse),
+						gomega.HaveField("Reason", "SufficientCPUReservation"),
+						gomega.HaveField("Message", fmt.Sprintf("kubelet reserves %d CPUs, %d required", reserved, reserved)),
+					)), "node %s", node.Name)
+					g.Expect(nodeDevices(ctx, g, rootFxt.K8SClientset, node.Name)).ToNot(gomega.BeEmpty(), "node %s publishes no device", node.Name)
+				}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+			}
+			if checked == 0 {
+				ginkgo.Skip("no node's partitions need a kubelet CPU reservation; the partitions lane declares a reserved partition where the host leaves two CPUs to default")
+			}
+		})
+
+		ginkgo.It("should publish nothing and report the missing reservation on a node whose kubelet reserves too little", ginkgo.Label("negative"), func(ctx context.Context) {
+			short, needed, want, ok := nodeShortOfProfile(ctx, rootFxt.K8SClientset)
+			if !ok {
+				ginkgo.Skip("no node runs a profile needing less kubelet CPU reservation than another; the partitions lane gives e2e a reserved partition where the host leaves two CPUs to default")
+			}
+			fixture.By("moving node %s to profile %q, which needs a reservation of %d CPUs", short.Name, want, needed)
+			restore := short.Labels[driverconfig.ProfileLabel]
+			ginkgo.DeferCleanup(func(ctx context.Context) {
+				relabelAndRestartDriver(ctx, rootFxt.K8SClientset, short.Name, restore)
+				clearStoppedCondition(ctx, rootFxt.K8SClientset, short.Name, conditionReservationMissing)
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(nodeDevices(ctx, g, rootFxt.K8SClientset, short.Name)).ToNot(gomega.BeEmpty())
+				}).WithTimeout(2*time.Minute).WithPolling(2*time.Second).Should(gomega.Succeed(), "node %s publishes no device back on profile %q", short.Name, restore)
+			})
+			relabelAndRestartDriver(ctx, rootFxt.K8SClientset, short.Name, want)
+
+			message := fmt.Sprintf("kubelet CPU reservation below %d: drain the node, then set `kubeReserved: {cpu: \"%d\"}` or `systemReserved: {cpu: \"%d\"}`; no %s devices are published until then",
+				needed, needed, needed, driverName)
+			gomega.Eventually(func(g gomega.Gomega) {
+				current, err := rootFxt.K8SClientset.CoreV1().Nodes().Get(ctx, short.Name, metav1.GetOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				g.Expect(nodeCondition(current, conditionReservationMissing)).To(gomega.HaveValue(gomega.And(
+					gomega.HaveField("Status", v1.ConditionTrue),
+					gomega.HaveField("Reason", "InsufficientCPUReservation"),
+					gomega.HaveField("Message", message),
+				)), "node %s", short.Name)
+				g.Expect(nodeDevices(ctx, g, rootFxt.K8SClientset, short.Name)).To(gomega.BeEmpty(), "node %s publishes devices without its reservation", short.Name)
+			}).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+		})
+	})
 })
+
+const conditionReservationMissing v1.NodeConditionType = "CPUReservationMissing"
+
+// reservedCPUs is the kubelet's CPU reservation on node, capacity less
+// allocatable, which the lane sets in whole CPUs.
+func reservedCPUs(node *v1.Node) int64 {
+	ginkgo.GinkgoHelper()
+	reserved := node.Status.Capacity.Cpu().MilliValue() - node.Status.Allocatable.Cpu().MilliValue()
+	gomega.Expect(reserved%1000).To(gomega.BeZero(), "node %s reserves %dm, not whole CPUs", node.Name, reserved)
+	return reserved / 1000
+}
+
+// nodeShortOfProfile finds a labelled node whose kubelet reserves less than
+// another profile's nodes do, and returns it, the reservation that profile
+// needs, and the profile.
+func nodeShortOfProfile(ctx context.Context, cs kubernetes.Interface) (*v1.Node, int64, string, bool) {
+	ginkgo.GinkgoHelper()
+	nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: driverconfig.ProfileLabel})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot list nodes")
+	needs := map[string]int64{}
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		needs[node.Labels[driverconfig.ProfileLabel]] = max(needs[node.Labels[driverconfig.ProfileLabel]], reservedCPUs(node))
+	}
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		for _, profile := range slices.Sorted(maps.Keys(needs)) {
+			if needs[profile] > reservedCPUs(node) {
+				return node, needs[profile], profile, true
+			}
+		}
+	}
+	return nil, 0, "", false
+}
+
+func nodeCondition(node *v1.Node, conditionType v1.NodeConditionType) *v1.NodeCondition {
+	for i := range node.Status.Conditions {
+		if node.Status.Conditions[i].Type == conditionType {
+			return &node.Status.Conditions[i]
+		}
+	}
+	return nil
+}
+
+// relabelAndRestartDriver selects profile on the node and restarts the driver
+// there, which reads the label only when it starts.
+func relabelAndRestartDriver(ctx context.Context, cs kubernetes.Interface, nodeName, profile string) {
+	ginkgo.GinkgoHelper()
+	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, driverconfig.ProfileLabel, profile)
+	_, err := cs.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot label node %s with profile %q", nodeName, profile)
+	restartDriverPod(ctx, cs, nodeName)
+}
+
+// restartDriverPod deletes the driver's pod on the node and waits for the
+// DaemonSet's next one to run.
+func restartDriverPod(ctx context.Context, cs kubernetes.Interface, nodeName string) {
+	ginkgo.GinkgoHelper()
+	old, err := e2epod.GetDRACPUPod(ctx, cs, nodeName)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	gomega.Expect(cs.CoreV1().Pods(old.Namespace).Delete(ctx, old.Name, metav1.DeleteOptions{})).To(gomega.Succeed())
+	gomega.Eventually(func(g gomega.Gomega) {
+		pods, err := cs.CoreV1().Pods(old.Namespace).List(ctx, metav1.ListOptions{LabelSelector: daemonSetLabel, FieldSelector: "spec.nodeName=" + nodeName})
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		g.Expect(pods.Items).To(gomega.ContainElement(gomega.And(
+			gomega.HaveField("UID", gomega.Not(gomega.Equal(old.UID))),
+			gomega.HaveField("Status.Phase", v1.PodRunning),
+		)), "no new driver pod runs on node %s", nodeName)
+	}).WithTimeout(driverPodPollTimeout).WithPolling(driverPodPollInterval).Should(gomega.Succeed())
+}
+
+// clearStoppedCondition removes a condition the driver wrote Unknown when it
+// stopped, and that the driver now running no longer keeps.
+func clearStoppedCondition(ctx context.Context, cs kubernetes.Interface, nodeName string, conditionType v1.NodeConditionType) {
+	ginkgo.GinkgoHelper()
+	gomega.Eventually(func(g gomega.Gomega) {
+		node, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		idx := slices.IndexFunc(node.Status.Conditions, func(c v1.NodeCondition) bool { return c.Type == conditionType })
+		if idx < 0 || node.Status.Conditions[idx].Reason != "DriverStopped" {
+			return
+		}
+		patch := fmt.Sprintf(`[{"op":"test","path":"/status/conditions/%d/type","value":%q},{"op":"remove","path":"/status/conditions/%d"}]`, idx, conditionType, idx)
+		_, err = cs.CoreV1().Nodes().Patch(ctx, nodeName, types.JSONPatchType, []byte(patch), metav1.PatchOptions{}, "status")
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+	}).WithTimeout(time.Minute).WithPolling(2 * time.Second).Should(gomega.Succeed())
+}
 
 // singleThreadPartition returns the first partition of v whose smt keeps one
 // online thread per core.
