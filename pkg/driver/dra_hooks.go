@@ -180,15 +180,103 @@ func claimRecord(claim *resourceapi.ResourceClaim, byRequest map[string]cpuset.C
 	return record
 }
 
-// addShare records a shared result under the request it belongs to.
-func addShare(shares map[string]store.RequestAllocation, alloc resourceapi.DeviceRequestAllocationResult, deviceCPUs cpuset.CPUSet) {
+// addShare records a shared result under the request it belongs to, capped
+// at its amount where it books one.
+func addShare(shares map[string]store.RequestAllocation, alloc resourceapi.DeviceRequestAllocationResult, deviceCPUs cpuset.CPUSet, capMilli int64) {
 	request := resourceclaim.BaseRequestRef(alloc.Request)
 	share := shares[request]
 	share.Request = request
 	share.Role = store.RoleShared
 	share.CPUs = share.CPUs.Union(deviceCPUs)
 	share.Devices = append(share.Devices, alloc.Device)
+	share.Cap = capMilli
 	shares[request] = share
+}
+
+// shareCap returns the cap of a shared result in millicores: its written
+// amount, 0 where it writes none or 0.
+func shareCap(claim *resourceapi.ResourceClaim, request, driverName string) int64 {
+	amount, ok := writtenCPUAmount(claim, request, driverName)
+	if !ok || amount.Sign() <= 0 {
+		return 0
+	}
+	return amount.MilliValue()
+}
+
+// checkCappedShares refuses a shared result capped at its amount whose
+// request may take more than one device, since a cgroup has one cpu.max, or
+// that shares the claim with another request of this driver, all of which
+// land in the one cgroup of the container using the claim.
+func (cp *CPUDriver) checkCappedShares(claim *resourceapi.ResourceClaim) error {
+	var requests []string
+	for _, alloc := range claim.Status.Allocation.Devices.Results {
+		if request := resourceclaim.BaseRequestRef(alloc.Request); alloc.Driver == cp.driverName && !slices.Contains(requests, request) {
+			requests = append(requests, request)
+		}
+	}
+	for _, alloc := range claim.Status.Allocation.Devices.Results {
+		if alloc.Driver != cp.driverName {
+			continue
+		}
+		if _, shared := cp.topology.sharedDevices[alloc.Device]; !shared || shareCap(claim, alloc.Request, cp.driverName) == 0 {
+			continue
+		}
+		amount, _ := writtenCPUAmount(claim, alloc.Request, cp.driverName)
+		if spread := requestSpread(claim, alloc.Request); spread != "" {
+			return fmt.Errorf("%s has limit of %s with %s; a limit can be applied to only one device: ask for one device", requestNoun(alloc.Request), amount.String(), spread)
+		}
+		capped := resourceclaim.BaseRequestRef(alloc.Request)
+		others := slices.DeleteFunc(slices.Clone(requests), func(request string) bool { return request == capped })
+		if len(others) == 1 {
+			return fmt.Errorf("%s has limit of %s, so it cannot be used together with request %q", requestNoun(alloc.Request), amount.String(), others[0])
+		}
+		if len(others) > 1 {
+			quoted := make([]string, 0, len(others))
+			for _, request := range others {
+				quoted = append(quoted, strconv.Quote(request))
+			}
+			return fmt.Errorf("%s has limit of %s, so it cannot be used together with requests %s", requestNoun(alloc.Request), amount.String(), strings.Join(quoted, ", "))
+		}
+	}
+	return nil
+}
+
+// requestNoun names a request, or the subrequest the scheduler picked.
+func requestNoun(request string) string {
+	if resourceclaim.BaseRequestRef(request) != request {
+		return fmt.Sprintf("subrequest %q", request)
+	}
+	return fmt.Sprintf("request %q", request)
+}
+
+// requestSpread says how the claim's request, or subrequest, a result belongs
+// to may take more than one device, or returns "" where it takes one.
+func requestSpread(claim *resourceapi.ResourceClaim, request string) string {
+	base := resourceclaim.BaseRequestRef(request)
+	for _, req := range claim.Spec.Devices.Requests {
+		if req.Name != base {
+			continue
+		}
+		if req.Exactly != nil {
+			return spreadOf(req.Exactly.AllocationMode, req.Exactly.Count)
+		}
+		for _, sub := range req.FirstAvailable {
+			if resourceclaim.CreateSubRequestRef(base, sub.Name) == request {
+				return spreadOf(sub.AllocationMode, sub.Count)
+			}
+		}
+	}
+	return ""
+}
+
+func spreadOf(mode resourceapi.DeviceAllocationMode, count int64) string {
+	switch {
+	case mode == resourceapi.DeviceAllocationModeAll:
+		return "`allocationMode: All`, which may take several devices"
+	case count > 1:
+		return fmt.Sprintf("`count: %d`", count)
+	}
+	return ""
 }
 
 // checkSharedAmount refuses a share that books another amount than its
@@ -311,6 +399,9 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 	if err := cp.checkResultsPublished(claim); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
+	if err := cp.checkCappedShares(claim); err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
 
 	var assignedCPUs cpuset.CPUSet
 	byRequest := make(map[string]cpuset.CPUSet)
@@ -325,7 +416,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			if err := cp.checkSharedAmount(claim, alloc); err != nil {
 				return kubeletplugin.PrepareResult{Err: err}
 			}
-			addShare(shares, alloc, deviceCPUs)
+			addShare(shares, alloc, deviceCPUs, shareCap(claim, alloc.Request, cp.driverName))
 			logger.V(4).Info("found shared CPU request", "device", alloc.Device)
 			continue
 		}
@@ -725,9 +816,8 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 				metadataAttrs[string(device.AttributeCPURequest)] = resourceapi.DeviceAttribute{
 					StringValue: new(quantity.String()),
 				}
-				// cpu.max's word for no limit: no request is capped.
 				metadataAttrs[string(device.AttributeCPULimit)] = resourceapi.DeviceAttribute{
-					StringValue: new("max"),
+					StringValue: new(cpuLimit(record, ref.Request)),
 				}
 			}
 			if cpus := requestCPUsOn(record, ref.Request, cp.deviceCPUs(allocResult.Device)); exclusive && cpusKnown && !cpus.IsEmpty() {
@@ -747,6 +837,17 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 	return kubeletplugin.PrepareResult{
 		Devices: preparedDevices,
 	}
+}
+
+// cpuLimit returns a request's cap as a quantity, or cpu.max's word for no
+// limit where it has none.
+func cpuLimit(record store.ClaimRecord, request string) string {
+	for _, held := range record.Requests {
+		if held.Request == request && held.Cap > 0 {
+			return resource.NewMilliQuantity(held.Cap, resource.DecimalSI).String()
+		}
+	}
+	return "max"
 }
 
 // metadataRef names the request a result's metadata describes, or the whole
@@ -838,6 +939,7 @@ func (cp *CPUDriver) writeClaimDevices(logger logr.Logger, claim *resourceapi.Re
 			CPUs:    request.CPUs,
 			Role:    request.Role,
 			Results: cp.resultRecords(claim, request.Request, request.Role),
+			Cap:     request.Cap,
 		})
 	}
 	for _, allocResult := range claim.Status.Allocation.Devices.Results {
