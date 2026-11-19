@@ -228,7 +228,12 @@ E2E_WIDE_PARTITIONS := {"name":"default"}$(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS)
 E2E_PARTITIONS := $(E2E_WIDE_PARTITIONS)$(if $(DRACPU_E2E_RESERVED_PARTITION_CPUS),$(comma)$(E2E_RESERVED_PARTITION))
 E2E_WIDE_RESERVE := $(call cpuset_size,$(DRACPU_E2E_NOSMT_PARTITION_CPUS))
 E2E_RESERVE := $(shell echo $$(( $(E2E_WIDE_RESERVE) + $(call cpuset_size,$(DRACPU_E2E_RESERVED_PARTITION_CPUS)) )))
-E2E_LANE_HELM_ARGS := --set-json 'driverConfig.profiles={"e2e":{"cpuPartitions":[$(E2E_PARTITIONS)]},"e2e-wide":{"cpuPartitions":[$(E2E_WIDE_PARTITIONS)]}}'
+# e2e-grown, which no node runs until a spec moves worker2 to it, gives the CPUs
+# of nosmt to a reserved partition, so that its CPUs outside default are
+# e2e-wide's and worker2's reservation still holds.
+E2E_GROWN_PARTITIONS := {"name":"default"},{"name":"grown","role":"reserved","cpuset":"$(DRACPU_E2E_NOSMT_PARTITION_CPUS)"}
+E2E_GROWN_PROFILE := $(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),$(comma)"e2e-grown":{"cpuPartitions":[$(E2E_GROWN_PARTITIONS)]})
+E2E_LANE_HELM_ARGS := --set-json 'driverConfig.profiles={"e2e":{"cpuPartitions":[$(E2E_PARTITIONS)]},"e2e-wide":{"cpuPartitions":[$(E2E_WIDE_PARTITIONS)]}$(E2E_GROWN_PROFILE)}'
 KIND_CI_LANE_CONFIG := $(or $(wildcard hack/ci/kind-ci-$(DRACPU_E2E_LANE).yaml),hack/ci/kind-ci.yaml)
 KIND_CI_CONFIG := $(if $(DRACPU_E2E_LANE),$(OUT_DIR)/kind-ci-$(DRACPU_E2E_LANE).yaml,hack/ci/kind-ci.yaml)
 # Adds the reservation to each node's kubeletExtraArgs, the nodes being the
