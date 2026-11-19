@@ -392,6 +392,119 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 			expectPartitionDegraded(ctx, cs, node.Name, v1.ConditionFalse, "PartitionsVerified", "the kernel has online the threads per core every CPU partition's smt declares")
 		})
 	})
+
+	// containerd closes every NRI connection when it restarts, and the driver
+	// connects again. While no driver is connected, containerd's default
+	// validator, which the lane enables, refuses a container that requires
+	// the driver's plugin. Keeping the driver off the node holds that gap open
+	// long enough for a pod to be created in it.
+	ginkgo.Context("when containerd restarts", func() {
+		var node *v1.Node
+
+		ginkgo.BeforeAll(func(ctx context.Context) {
+			var err error
+			node, err = e2enode.PickWorker(ctx, rootFxt.K8SClientset, 5*time.Second, 1*time.Minute, rootFxt.Log)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			if !cfgValues.effectiveFor(node).partitionsUsed() {
+				ginkgo.Skip("node " + node.Name + " uses no CPU partitions; create the cluster with DRACPU_E2E_LANE=partitions")
+			}
+			if !kindNodeReachable(ctx, node.Name) {
+				ginkgo.Skip("docker reaches no container of node " + node.Name + ", whose containerd the specs restart; run them on a kind cluster")
+			}
+		})
+
+		ginkgo.It("should connect to NRI again and keep the containers on their CPUs", func(ctx context.Context) {
+			cs := rootFxt.K8SClientset
+			fxt := rootFxt.WithPrefix("nri-reconnect")
+			gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(fxt.Teardown)
+
+			effective := cfgValues.effectiveFor(node)
+			defaultCPUs := defaultPartitionCPUs(ctx, fxt, dracpuTesterImage, node.Name, effective)
+			claimed := []*v1.Pod{createSharePod(ctx, fxt, dracpuTesterImage, node.Name, 500, "reconnect-share")}
+			if partition, ok := singleThreadPartition(effective); ok {
+				spec := makeResourceClaimSpec(1, true)
+				spec.Devices.Requests[0].Exactly.DeviceClassName = driverName + "." + partition.Name
+				claimed = append(claimed, createTesterPodWithClaimSpec(ctx, fxt, dracpuTesterImage, node.Name, spec, "reconnect-exclusive"))
+			}
+			for _, pod := range claimed {
+				gomega.Expect(e2epod.WaitToBeRunning(ctx, cs, pod.Namespace, pod.Name)).To(gomega.Succeed())
+			}
+			claimless := mustCreateBestEffortPod(ctx, fxt, node.Name, dracpuTesterImage)
+			before := map[string]string{}
+			for _, pod := range claimed {
+				before[pod.Name] = getTesterPodCPUAllocation(cs, ctx, pod).CPUAssigned.String()
+			}
+
+			fixture.By("restarting containerd in node %s", node.Name)
+			driverPod, err := e2epod.GetDRACPUPod(ctx, cs, node.Name)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			restarted := metav1.Now()
+			restartContainerd(ctx, node.Name)
+			expectDriverSynchronizedSince(ctx, cs, driverPod, restarted)
+
+			ginkgo.By("verifying the claims' containers keep their CPUs and the container without a claim runs on the default partition")
+			gomega.Consistently(func(g gomega.Gomega) {
+				for _, pod := range claimed {
+					g.Expect(getTesterPodCPUAllocation(cs, ctx, pod).CPUAssigned.String()).To(gomega.Equal(before[pod.Name]),
+						"pod %s moved after containerd restarted", pod.Name)
+				}
+				g.Expect(getTesterPodCPUAllocation(cs, ctx, claimless).CPUAssigned).To(cpusetmatchers.Equal(defaultCPUs),
+					"the container without a claim runs off the default partition")
+			}).WithTimeout(20 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("should hold a pod that requires the driver's NRI plugin until the driver is back", func(ctx context.Context) {
+			cs := rootFxt.K8SClientset
+			fxt := rootFxt.WithPrefix("nri-required-pod")
+			gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(fxt.Teardown)
+
+			leaveDaemonSetOff(ctx, cs, node.Name)
+			pod := makeTesterPodBestEffort(fxt.Namespace.Name, dracpuTesterImage)
+			pod = e2epod.PinToNode(pod, node.Name)
+			pod.Annotations = map[string]string{nriRequiredPluginsAnnotation: `["` + driverName + `"]`}
+			pod, err := cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			expectPodEvent(ctx, cs, pod, "Failed", nriPluginMissing)
+
+			fixture.By("giving node %s its driver back", node.Name)
+			restoreDaemonSetNodes(ctx, cs, node.Name)
+			gomega.Expect(e2epod.WaitToBeRunning(ctx, cs, pod.Namespace, pod.Name)).To(gomega.Succeed())
+		})
+
+		ginkgo.It("should refuse a pod without the toleration while the node requires the driver's NRI plugin, and never the driver's own", func(ctx context.Context) {
+			cs := rootFxt.K8SClientset
+			fxt := rootFxt.WithPrefix("nri-required-node")
+			gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(fxt.Teardown)
+
+			leaveDaemonSetOff(ctx, cs, node.Name)
+			fixture.By("requiring the driver's NRI plugin in node %s's containerd", node.Name)
+			ginkgo.DeferCleanup(func(ctx context.Context) {
+				editContainerdConfig(ctx, node.Name, `/required_plugins = \["`+driverName+`"\]/d`)
+				restartContainerd(ctx, node.Name)
+			})
+			editContainerdConfig(ctx, node.Name, `/\[plugins\."io\.containerd\.nri\.v1\.nri"\.default_validator\]/a\      required_plugins = ["`+driverName+`"]`)
+			restartContainerd(ctx, node.Name)
+
+			pod := e2epod.PinToNode(makeTesterPodBestEffort(fxt.Namespace.Name, dracpuTesterImage), node.Name)
+			pod, err := cs.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			expectPodEvent(ctx, cs, pod, "Failed", nriPluginMissing)
+
+			fixture.By("giving node %s its driver back, whose pod tolerates the missing plugin", node.Name)
+			restoreDaemonSetNodes(ctx, cs, node.Name)
+			driverPod, err := e2epod.GetDRACPUPod(ctx, cs, node.Name)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			events, err := cs.CoreV1().Events(driverPod.Namespace).List(ctx, metav1.ListOptions{
+				FieldSelector: "involvedObject.kind=Pod,involvedObject.name=" + driverPod.Name + ",reason=Failed",
+			})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			gomega.Expect(events.Items).To(gomega.BeEmpty(), "containerd refused the driver's own pod")
+			gomega.Expect(e2epod.WaitToBeRunning(ctx, cs, pod.Namespace, pod.Name)).To(gomega.Succeed())
+		})
+	})
 })
 
 const (
@@ -562,6 +675,69 @@ func expectDriverSynchronizedSince(ctx context.Context, cs kubernetes.Interface,
 		gomega.Expect(status.RestartCount).To(gomega.Equal(driverPod.Status.ContainerStatuses[i].RestartCount),
 			"the driver on node %s restarted instead of connecting to NRI again", driverPod.Spec.NodeName)
 	}
+}
+
+const (
+	nriRequiredPluginsAnnotation = "required-plugins.noderesource.dev"
+	// The default validator's refusal of a container whose required plugin is
+	// not connected (containerd/nri v0.12.0
+	// plugins/default-validator/default-validator.go:271-291).
+	nriPluginMissing = `required plugin "` + driverName + `" not present`
+)
+
+// defaultPartitionCPUs returns the node's online CPUs outside every core a
+// named partition lists, where containers without claims run.
+func defaultPartitionCPUs(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, effective driverConfigValues) cpuset.CPUSet {
+	ginkgo.GinkgoHelper()
+	infoPod := e2epod.PinToNode(discovery.MakePod(fxt.Namespace.Name, image), nodeName)
+	infoPod, err := e2epod.RunToCompletion(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot run the discovery pod")
+	data, err := e2epod.GetLogs(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get the discovery pod's logs")
+	var cpuInfo discovery.DRACPUInfo
+	gomega.Expect(unmarshalLatestReport(data, &cpuInfo)).To(gomega.Succeed())
+	coreOf := coresOf(cpuInfo)
+	cpus := makeCPUSetFromDiscoveredCPUInfo(cpuInfo)
+	for _, partition := range effective.CPUPartitions {
+		if partition.Name == device.DefaultPartitionName {
+			continue
+		}
+		listed, err := cpuset.Parse(partition.CPUSet)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse the cpuset of partition %q", partition.Name)
+		for _, cpu := range listed.List() {
+			cpus = cpus.Difference(coreOf[cpu])
+		}
+	}
+	return cpus
+}
+
+// leaveDaemonSetOff keeps the driver off the node until restoreDaemonSetNodes,
+// which the spec's cleanup runs too.
+func leaveDaemonSetOff(ctx context.Context, cs kubernetes.Interface, nodeName string) {
+	ginkgo.GinkgoHelper()
+	daemonSet, err := cs.AppsV1().DaemonSets(daemonSetNamespace).Get(ctx, "dracpu", metav1.GetOptions{})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get dracpu daemonset")
+	if daemonSet.Spec.Template.Spec.Affinity != nil {
+		ginkgo.Skip("the dracpu DaemonSet carries an affinity of its own, which this spec would replace")
+	}
+	fixture.By("leaving node %s out of the dracpu DaemonSet", nodeName)
+	ginkgo.DeferCleanup(restoreDaemonSetNodes, cs, nodeName)
+	patch := fmt.Sprintf(`{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"NotIn","values":[%q]}]}]}}}}}}}`, nodeName)
+	_, err = cs.AppsV1().DaemonSets(daemonSetNamespace).Patch(ctx, "dracpu", types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot patch the dracpu DaemonSet")
+	gomega.Eventually(func(g gomega.Gomega) {
+		pods, err := cs.CoreV1().Pods(daemonSetNamespace).List(ctx, metav1.ListOptions{LabelSelector: daemonSetLabel, FieldSelector: "spec.nodeName=" + nodeName})
+		g.Expect(err).ToNot(gomega.HaveOccurred())
+		g.Expect(pods.Items).To(gomega.BeEmpty(), "a driver pod is still on node %s", nodeName)
+	}).WithTimeout(driverPodPollTimeout).WithPolling(driverPodPollInterval).Should(gomega.Succeed())
+}
+
+// editContainerdConfig runs a sed script on the kind node's containerd
+// configuration; containerd reads it when it restarts.
+func editContainerdConfig(ctx context.Context, nodeName, script string) {
+	ginkgo.GinkgoHelper()
+	out, err := exec.CommandContext(ctx, "docker", "exec", nodeName, "sed", "-i", script, "/etc/containerd/config.toml").CombinedOutput()
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot edit containerd's configuration in node %s: %s", nodeName, out)
 }
 
 // restoreDaemonSetNodes drops the affinity the spec gave the dracpu DaemonSet,

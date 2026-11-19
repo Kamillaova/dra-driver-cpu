@@ -194,7 +194,9 @@ where their lane did not prepare the cluster.
   `reserved` partition `grown`; no node runs it until a spec moves `worker2` to it. The specs of
   the `nosmt` partition skip where the host has no core without an online sibling, which is any
   host whose cores all run two threads. The specs that restart containerd in a node run
-  `docker exec` on the kind node's container, and skip where `docker` cannot reach it.
+  `docker exec` on the kind node's container, and skip where `docker` cannot reach it. The driver's
+  pod carries `e2e.dra.cpu/tolerate-missing-nri-plugins: "true"`, the annotation the lane's
+  containerd lets a pod start with while a plugin it requires is missing.
 
 `.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner, and
 fails when a spec the runner's host can run was skipped.
