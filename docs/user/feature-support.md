@@ -51,7 +51,7 @@ Reference: [kubernetes 1.35.0](https://github.com/kubernetes/kubernetes/blob/v1.
 | DistributeCPUsAcrossCores | alpha    | inactive                   | none yet; postponed till k8s feature graduates to beta                 |                       |
 | DistributeCPUsAcrossNUMA  | beta     | active                     | see issue: https://github.com/kubernetes-sigs/dra-driver-cpu/issues/46 | see below for details |
 | PreferAlignByUnCoreCache  | beta     | active                     | builtin; enabled by default                                            |                       |
-| FullPCPUsOnly             | GA       | N/A                        | see issue: https://github.com/kubernetes-sigs/dra-driver-cpu/issues/45 |                       |
+| FullPCPUsOnly             | GA       | N/A                        | `fullPhysicalCPUsOnly: true` config option                             | see below for details |
 | StrictCPUReservation      | GA       | N/A                        | builtin; enabled by default                                            |                       |
 
 ### Distributing CPUs across NUMA nodes
@@ -89,6 +89,42 @@ exactly two distinct devices, and on a machine with 1 NUMA node it would fail
 because there is no second NUMA node to choose. If you need 15 CPUs, this
 exact single-request pattern cannot express a 7+8 split; you would need
 multiple requests with different capacities.
+
+### Whole physical cores
+
+With `fullPhysicalCPUsOnly: true` (see [Configuration](configuration.md#driverconfig-sub-fields)),
+the driver gives claims whole physical cores only: the logical CPUs of one core never go to two
+claims, nor to a claim and the containers without one. It requires `cpuDeviceMode: grouped`, and
+`reservedCPUs` must hold whole cores.
+
+A device whose cores all have two logical CPUs carries a request policy in whole cores (see
+[Device Attributes](device-attributes.md#with-whole-physical-cores)), so the scheduler rounds an
+amount up to whole cores: a claim for 3 CPUs is allocated 4. The driver refuses that claim when it
+prepares it, with `` request "cpus": amount 3 on exclusive request (class dra.cpu); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`) ``. The scheduler cannot see the refusal coming: it may allocate a claim whose amount is not
+a multiple of 2 on such a device although a node whose cores have one logical CPU could serve it.
+The pod then stays in `ContainerCreating` on that node, the kubelet retrying the preparation about
+once a minute, and the claim keeps its device allocated until the pod is deleted. Give such a claim
+a selector that keeps it on devices of one-thread cores:
+
+```yaml
+        selectors:
+        - cel:
+            expression: device.attributes["dra.cpu"].threadsPerCore == 1
+```
+
+A device whose cores differ in their number of logical CPUs, as on a hybrid CPU or where some
+siblings are offline, publishes `dra.cpu/threadsPerCore: 0` and no request policy, so the scheduler
+allocates the amount as written. The driver takes it as whole cores of either size, as many cores of
+two logical CPUs as the amount can use and cores of one for the rest, counted over the whole device.
+An odd amount is refused while none of the device's cores of one logical CPU is free, with
+`` request "cpus": 3 exclusive CPUs need a free core of 1 thread on device "cpudevnuma000", which has none (2 free cores of 2 threads; `fullPhysicalCPUsOnly: true`) ``. Claims prepared with no release between
+them fit in every order or in none, so this refusal follows a claim on the device that released its
+cores, and comes after the pod is bound, as the one above. A selector on
+`device.attributes["dra.cpu"].threadsPerCore == 1` or `== 2` keeps a claim on devices whose cores
+are all alike.
+
+With `allocator: external`, the cpuset the external scheduler writes for a request must hold whole
+cores.
 
 ## Exposing PCIe roots
 
