@@ -189,8 +189,11 @@ where their lane did not prepare the cluster.
   `lane-setup.sh pre` leaves at least two CPUs to `default`. Each kubelet reserves the CPUs outside
   its profile's `default` partition, as the driver requires before it publishes devices. The
   driver publishes the node allocatable mapping, which only the `default` partition's shared
-  devices carry. The specs of the `nosmt` partition skip where the host has no core without an
-  online sibling, which is any host whose cores all run two threads.
+  devices carry. Where `nosmt` is declared, a third profile, `e2e-grown`, gives its CPUs to a
+  `reserved` partition `grown`; no node runs it until a spec moves `worker2` to it. The specs of
+  the `nosmt` partition skip where the host has no core without an online sibling, which is any
+  host whose cores all run two threads. The specs that restart containerd in a node run
+  `docker exec` on the kind node's container, and skip where `docker` cannot reach it.
 
 `.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner, and
 fails when a spec the runner's host can run was skipped.

@@ -56,6 +56,7 @@ jobs:
               should give a claim on the partition's class CPUs of the partition without an online sibling
               should keep a container without a claim off the partition
               should give a claim on dra.cpu a share of the default partition
+              should stop the claim's containers and refuse them until the claim's pod is deleted
               should publish the default partition's devices with a shared request policy, and map only them
               should cap a share at its amount and give the amount in its metadata file
               should run a share that books no amount uncapped
