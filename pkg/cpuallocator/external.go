@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-logr/logr"
 	allocationapi "github.com/kubernetes-sigs/dra-driver-cpu/api/allocation"
+	topology "github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/dynamic-resource-allocation/resourceclaim"
@@ -28,9 +29,28 @@ import (
 )
 
 type External struct {
-	driverName   string
-	managedCPUs  cpuset.CPUSet
-	reservedCPUs cpuset.CPUSet
+	driverName    string
+	managedCPUs   cpuset.CPUSet
+	reservedCPUs  cpuset.CPUSet
+	wholeCoreTopo *topology.CPUTopology
+}
+
+// RequireWholeCores makes GetPreferredCPUs refuse an opaque cpuset that holds
+// part of a physical core of topo.
+func (alc *External) RequireWholeCores(topo *topology.CPUTopology) {
+	alc.wholeCoreTopo = topo
+}
+
+func (alc *External) validateWholeCores(opaqueCPUs cpuset.CPUSet) error {
+	if alc.wholeCoreTopo == nil {
+		return nil
+	}
+	complete := alc.wholeCoreTopo.CPUDetails.CompleteCores(opaqueCPUs)
+	if complete.Equals(opaqueCPUs) {
+		return nil
+	}
+	return fmt.Errorf("requested CPUs %s from preferred CPUs split physical cores, which fullPhysicalCPUsOnly forbids: add the siblings of %s or leave them out",
+		opaqueCPUs.String(), opaqueCPUs.Difference(complete).String())
 }
 
 func NewExternal(driverName string, managedCPUs, reservedCPUs cpuset.CPUSet) *External {
@@ -80,6 +100,9 @@ func (alc *External) GetPreferredCPUs(logger logr.Logger, allocation *resourceap
 		return cpuset.New(), err
 	}
 	if err := validateOpaqueCPUSet(preferred, alc.managedCPUs, alc.reservedCPUs, total); err != nil {
+		return cpuset.New(), err
+	}
+	if err := alc.validateWholeCores(preferred); err != nil {
 		return cpuset.New(), err
 	}
 	return preferred, nil

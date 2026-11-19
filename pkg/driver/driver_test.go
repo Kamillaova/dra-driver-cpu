@@ -309,6 +309,45 @@ func TestNewPublishesWholeCorePoliciesUnderFullPhysicalCPUsOnly(t *testing.T) {
 	}
 }
 
+func TestNewRefusesAReservationThatSplitsACoreUnderFullPhysicalCPUsOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		reserved             cpuset.CPUSet
+		fullPhysicalCPUsOnly bool
+		wantErr              string
+	}{
+		{
+			name:                 "one thread of a core",
+			reserved:             cpuset.New(0, 1, 9),
+			fullPhysicalCPUsOnly: true,
+			wantErr:              `reservedCPUs "0-1,9" splits physical cores, which fullPhysicalCPUsOnly does not allow: reserve the sibling threads of CPUs 0 too, or leave those CPUs out`,
+		},
+		{name: "whole cores", reserved: cpuset.New(0, 8), fullPhysicalCPUsOnly: true},
+		{name: "a CPU outside the topology splits nothing", reserved: cpuset.New(0, 8, 99), fullPhysicalCPUsOnly: true},
+		{name: "one thread of a core without the option", reserved: cpuset.New(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := Providers{
+				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: wholeCoreCPUInfos},
+				SysFS:   testSysFS(wholeCoreCPUInfos),
+			}
+			_, err := New(testr.New(t), prov, &Config{
+				DriverName:           testDriverName,
+				NodeName:             testNodeName,
+				ReservedCPUs:         tc.reserved,
+				CPUDeviceMode:        device.CPU_DEVICE_MODE_GROUPED,
+				CPUDeviceGroupBy:     device.GROUP_BY_NUMA_NODE,
+				FullPhysicalCPUsOnly: tc.fullPhysicalCPUsOnly,
+			})
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 // TestWaitForRegistration covers an unexported function, which we would normally
 // reach through its caller instead. CPUDriver.Start does a lot and takes no
 // injectable dependencies, so there is no seam to reach this behaviour from
