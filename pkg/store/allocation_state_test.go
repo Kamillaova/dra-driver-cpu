@@ -507,6 +507,70 @@ func TestAllocationStateReserveSharedPoolGuard(t *testing.T) {
 	}
 }
 
+// An overlapping assignment is refused naming each claim that holds the CPUs,
+// from its record, so a device allocated twice or a record the kubelet forgot
+// can be found from the refusal alone.
+func TestAllocationStateReserveNamesTheHolders(t *testing.T) {
+	const see = `; see "CPUs Held by Another Claim" in the driver's troubleshooting guide`
+	named := func(namespace, name string, cpus ...int) ClaimRecord {
+		return ClaimRecord{Namespace: namespace, Name: name, Requests: []RequestAllocation{{Request: "cpus", CPUs: cpuset.New(cpus...)}}}
+	}
+	tests := []struct {
+		name    string
+		setup   func(t *testing.T, s *AllocationState)
+		cpus    []int
+		wantErr string
+	}{
+		{
+			name: "a holder bound to a container",
+			setup: func(t *testing.T, s *AllocationState) {
+				require.NoError(t, s.Reserve(testr.New(t), "vm", named("ns", "vm-claim", 0, 1), false))
+				_, err := s.Bind(testr.New(t), "pod-uid", "app", []ClaimRequestRef{{ClaimUID: "vm"}}, nil)
+				require.NoError(t, err)
+			},
+			cpus:    []int{1, 2},
+			wantErr: `claim "new" has overlapping CPU assignment "1-2": claim ns/vm-claim (UID "vm") holds CPUs 1, bound to container "app" of pod "pod-uid"` + see,
+		},
+		{
+			name: "holders bound to no container, in order of claim UID",
+			setup: func(t *testing.T, s *AllocationState) {
+				require.NoError(t, s.Reserve(testr.New(t), "b", named("ns", "b-claim", 2), false))
+				require.NoError(t, s.Reserve(testr.New(t), "a", named("other", "a-claim", 0), false))
+			},
+			cpus:    []int{0, 2},
+			wantErr: `claim "new" has overlapping CPU assignment "0,2": claim other/a-claim (UID "a") holds CPUs 0, bound to no container; claim ns/b-claim (UID "b") holds CPUs 2, bound to no container` + see,
+		},
+		{
+			name: "a holder restored from upstream's spec has no name",
+			setup: func(t *testing.T, s *AllocationState) {
+				s.Restore(testr.New(t), "up", ClaimRecord{Requests: []RequestAllocation{{CPUs: cpuset.New(3)}}})
+			},
+			cpus:    []int{3},
+			wantErr: `claim "new" has overlapping CPU assignment "3": claim with UID "up" holds CPUs 3, bound to no container` + see,
+		},
+		{
+			name:    "CPUs no claim holds are refused as before",
+			setup:   func(*testing.T, *AllocationState) {},
+			cpus:    []int{9},
+			wantErr: `claim "new" has overlapping CPU assignment "9"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestAllocationState(testr.New(t), cpuset.New(0, 1, 2, 3), cpuset.New())
+			tc.setup(t, s)
+			prepared := s.GetPreparedCPUs()
+
+			err := s.Reserve(testr.New(t), "new", named("ns", "new-claim", tc.cpus...), false)
+			require.EqualError(t, err, tc.wantErr)
+			require.ErrorIs(t, err, ErrClaimOverlap)
+			_, recorded := s.GetClaimRecord("new")
+			require.False(t, recorded)
+			require.True(t, prepared.Equals(s.GetPreparedCPUs()))
+		})
+	}
+}
+
 func TestAllocationStateRestoreKeepsOverlappingClaimsUnbound(t *testing.T) {
 	logger := testr.New(t)
 	store := newTestAllocationState(logger, cpuset.New(0, 1, 2, 3, 4), cpuset.New())
