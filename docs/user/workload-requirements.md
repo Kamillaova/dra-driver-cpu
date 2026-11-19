@@ -202,8 +202,9 @@ CPU limit on the container, or a pod-level CPU limit it inherits, makes the kube
 own, which then caps the container instead of the claim, and with KEP-5517 on the kubelet adds the
 claim's mapped amount to that limit. A CPU limit can be set without anyone writing it in the pod: a
 namespace `LimitRange` with a `default` limit, a VerticalPodAutoscaler, or a mutating admission
-webhook can put one on every container. A CPU limit an in-place resize adds later replaces the cap
-the same way. A kubelet with `cpuCFSQuota: false` sends no quota even for a CPU limit, so there the
+webhook can put one on every container. When a container starts with such a quota while its claim
+asks for a cap, the driver posts a `CPULimitReplacesCap` Warning event on its pod and refuses
+nothing. A CPU limit an in-place resize adds later replaces the cap the same way, with no event. A kubelet with `cpuCFSQuota: false` sends no quota even for a CPU limit, so there the
 driver's cap stays.
 
 Limitation: one limit per cgroup. A request with a limit on the shared default CPUs must be alone in
