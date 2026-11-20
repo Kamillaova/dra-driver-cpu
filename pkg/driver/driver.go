@@ -704,6 +704,7 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	cp.seedAllocationStoreFromDisk(logger)
 	go cp.runWatchdog(ctx)
 	cp.eventBroadcaster, cp.eventRecorder = newEventRecorder(ctx, cp.kubeClient, cp.driverName, cp.nodeName)
+	cp.announcePlaceWindow(logger)
 
 	if err := cp.startNRI(ctx, asyncErr); err != nil {
 		return asyncErr, err
