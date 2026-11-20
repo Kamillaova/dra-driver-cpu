@@ -556,6 +556,15 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 			message: "device initialized",
 		}
 	}
+	// A degraded partition stays degraded for the driver's life, so its
+	// devices, published tainted or withheld, report it from the first report
+	// on: the kubelet shows it in the status of the pods holding them.
+	for name, partition := range cp.topology.degradedDevices {
+		cp.health.devices[name] = &deviceHealthEntry{
+			status:  kubeletplugin.HealthStatusUnhealthy,
+			message: fmt.Sprintf("partition %q is degraded (SiblingThreadsOnline); take its sibling threads offline", partition),
+		}
+	}
 
 	return nil
 }

@@ -214,6 +214,17 @@ naming each degraded partition and the CPUs to take offline; see
   A degraded `default` entry taints its shared devices, so no new pod with a `dra.cpu` claim lands on
   the node without the toleration; the pods already running stay.
 
+Either way, every device of a degraded partition reports itself unhealthy to the kubelet for as long
+as the driver runs, and the kubelet shows it in each pod holding such a device, under
+`status.containerStatuses[*].allocatedResourcesStatus`, as `health: Unhealthy` with the message
+`partition "spdk" is degraded (SiblingThreadsOnline); take its sibling threads offline`. This needs
+the kubelet's `ResourceHealthStatus` feature gate, and the message its `ResourceHealthStatusMessage`
+gate, both on by default from Kubernetes 1.36. Nothing is evicted for it.
+
+```bash
+kubectl get pod <pod> -o jsonpath='{range .status.containerStatuses[*]}{.name}{"\t"}{.allocatedResourcesStatus}{"\n"}{end}'
+```
+
 A claim tolerates the taint in its request, or in a `firstAvailable` subrequest:
 
 ```yaml

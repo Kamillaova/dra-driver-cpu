@@ -12,7 +12,7 @@
 - **Grouped Device Exposure**: uncore cache/NUMA/socket/machine aggregates are exposed as
   consumable capacity, reducing API objects and scaling to large systems. The driver also support a `individual` device exposure mode which is
   **deprecated**; see [Migrating from individual mode](opaque-cpuset-overrides.md#migrate-from-individual-mode).
-- **Device Health Reporting**: The driver reports per-device health to the kubelet via the DRA `WatchHealthStatus` gRPC API, reflected in `pod.status.containerStatuses[].allocatedResourcesStatus`. Devices are reported `Healthy` and go `Unknown` if the driver stops sending updates. `Unhealthy` is reserved for future use. See [Device Health Reporting](workload-requirements.md#device-health-reporting).
+- **Device Health Reporting**: The driver reports per-device health to the kubelet via the DRA `WatchHealthStatus` gRPC API, reflected in `pod.status.containerStatuses[].allocatedResourcesStatus`. Devices are reported `Healthy` and go `Unknown` if the driver stops sending updates. A degraded CPU partition's devices are reported `Unhealthy`. See [Device Health Reporting](workload-requirements.md#device-health-reporting).
 
 ## Not Supported
 
