@@ -315,13 +315,19 @@ func (cp *CPUDriver) buildThreadedTree(ctx context.Context, logger logr.Logger, 
 		logger.Info("building no threaded groups: the node runs cgroupThreadedMode false")
 		return nil
 	}
-	// A container created while the driver was away was never refused, and one
-	// group built for two claims is what the refusal keeps out.
-	if shared, found := containerClaimsOf(cp.allocationState, uids).sharedGroup(ctr.GetName()); found {
-		logger.Info("building no threaded groups: the container was created without the driver, which refuses it", "reason", shared.Error())
+	unseen, err := cp.createdUnseen(ctr)
+	if err != nil {
+		cp.metrics.RecordThreadedContainer(cp.cgroupThreadedMode, cpumetrics.ResultError)
+		return err
+	}
+	if unseen {
+		logger.Info("building no threaded groups: the driver did not see the container created, so it runs on its claims' CPUs without its groups and their limits")
 		return nil
 	}
 	root, err := cp.buildTree(ctr, uids)
+	if err == nil {
+		err = cp.linkThreadRoot(logger, ctr, root)
+	}
 	if err == nil {
 		err = cp.place(ctx, logger, ctr, uids, root)
 	}
@@ -401,6 +407,10 @@ func (cp *CPUDriver) repairThreadedTrees(repairs []threadedRepair) {
 		}
 		cp.podState.SetThreadRoot(r.sc.owner.PodUID, r.sc.container.GetName(), types.UID(r.sc.container.GetId()), root)
 		r.sc.logger.V(2).Info("repaired the container's threaded groups", "threadRoot", root)
+		if err := cp.linkThreadRoot(r.sc.logger, r.sc.container, root); err != nil {
+			r.sc.logger.Error(err, "the container's /var/run/dracpu/cgroup stays as it is until the driver synchronizes again")
+			cp.metrics.RecordThreadedContainer(cp.cgroupThreadedMode, cpumetrics.ResultLinkError)
+		}
 	}
 }
 
