@@ -185,6 +185,8 @@ where their lane did not prepare the cluster.
   lane as they stand, and the specs of the other lanes skip there.
 - `partitions` (label `partitions`): the driver with the profiles `e2e`, on the control plane and
   `worker`, and `e2e-wide`, on `worker2`, which `ci-kind-setup` labels with `dra.cpu/profile`.
+  `e2e-wide`'s `default` entry sets `allowExclusive`, so `worker2` gives a request with
+  `cpuConfig.exclusive: true` CPUs of its own, and the other nodes refuse it.
   Both hold the `default` partition and, where the host has a core without an online sibling,
   a partition `nosmt` of one such core. `e2e` also holds, where the host has a core with an online
   sibling, a partition `degraded` under `smt: false` of one thread of such a core, whose devices the
