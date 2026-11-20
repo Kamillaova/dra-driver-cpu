@@ -200,9 +200,14 @@ where their lane did not prepare the cluster.
   `docker exec` on the kind node's container, and skip where `docker` cannot reach it. The driver's
   pod carries `e2e.dra.cpu/tolerate-missing-nri-plugins: "true"`, the annotation the lane's
   containerd lets a pod start with while a plugin it requires is missing.
+- `gates-off` (label `gates-off`): the `partitions` lane's install on a cluster from
+  `hack/ci/kind-ci-gates-off.yaml`, which turns `DRANodeAllocatableResources` and `DRADeviceTaints`
+  off in every component. Its API server drops the node allocatable mapping and the degraded
+  partition's taint from the driver's ResourceSlices, and the specs check what the driver does
+  then. Each spec skips where the API server reports its gate on.
 
-`.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner, and
-fails when a spec the runner's host can run was skipped.
+`.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner and the
+`gates-off` lane on the x64 runner, and fails when a spec the runner's host can run was skipped.
 
 ### troubleshooting
 

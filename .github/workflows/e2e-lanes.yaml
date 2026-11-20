@@ -77,6 +77,14 @@ jobs:
               should connect to NRI again and keep the containers on their CPUs
               should hold a pod that requires the driver's NRI plugin until the driver is back
               should refuse a pod without the toleration while the node requires the driver's NRI plugin, and never the driver's own
+          # DRANodeAllocatableResources and DRADeviceTaints off; x64 for its
+          # core with an online sibling, which the degraded partition needs.
+          - lane: gates-off
+            runner: ubuntu-26.04
+            labels: gates-off
+            mustRun: |
+              should report the node-allocatable mapping dropped on every node that publishes it
+              should withhold the degraded partition's devices whose taint the API server dropped
     name: e2e (${{ matrix.lane }}, ${{ matrix.runner }})
     steps:
       - name: Checkout
