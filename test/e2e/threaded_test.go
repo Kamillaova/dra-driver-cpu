@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -52,7 +53,8 @@ import (
 
 const (
 	// The runtime handler of the kind configurations whose containers get a
-	// writable /sys/fs/cgroup, and the RuntimeClass the specs create for it.
+	// writable /sys/fs/cgroup, and the RuntimeClass the specs create for it,
+	// unless DRACPU_E2E_RUNTIME_HANDLER names another.
 	cgroupWritable = "cgroup-writable"
 	// The user the specs' containers run as, which the driver hands the files
 	// that move processes and threads to.
@@ -72,6 +74,7 @@ type (
 		Type           string                 `json:"type"`
 		SubtreeControl string                 `json:"subtreeControl"`
 		CPUs           string                 `json:"cpus"`
+		CPUsEffective  string                 `json:"cpusEffective"`
 		CPUMax         string                 `json:"cpuMax"`
 		Weight         string                 `json:"weight"`
 		Threads        []int                  `json:"threads"`
@@ -81,6 +84,7 @@ type (
 		Link       string       `json:"link"`
 		Resolved   string       `json:"resolved"`
 		InitCgroup string       `json:"initCgroup"`
+		ExecCgroup string       `json:"execCgroup"`
 		Root       cgroupView   `json:"root"`
 		Groups     []cgroupView `json:"groups"`
 	}
@@ -112,8 +116,9 @@ type threadedClaim struct {
 }
 
 // The threaded specs run on a node whose driver runs cgroupThreadedMode create
-// or place, their pods under the RuntimeClass cgroup-writable, which the kind
-// configurations declare, as an administrator would, and as non-root users.
+// or place, their pods under the RuntimeClass of threadedRuntimeHandler, whose
+// handler the kind configurations declare, as an administrator would, and as
+// non-root users.
 // They read the groups from inside the container, through the link
 // /var/run/dracpu/cgroup. Where the node's default partition gives exclusive
 // CPUs and shares, a claim holds both; on a node without partitions, only
@@ -128,7 +133,9 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 		effective         driverConfigValues
 		// shares reports whether targetNode's default partition gives shares
 		// and, flagged, exclusive CPUs.
-		shares bool
+		shares              bool
+		createdRuntimeClass bool
+		runtimeHandler      = threadedRuntimeHandler()
 	)
 
 	ginkgo.BeforeAll(func(ctx context.Context) {
@@ -167,17 +174,12 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 	})
 
 	ginkgo.BeforeEach(func(ctx context.Context) {
-		_, err := rootFxt.K8SClientset.NodeV1().RuntimeClasses().Create(ctx, &nodev1.RuntimeClass{
-			ObjectMeta: metav1.ObjectMeta{Name: cgroupWritable},
-			Handler:    cgroupWritable,
-		}, metav1.CreateOptions{})
-		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create RuntimeClass %s", cgroupWritable)
+		createdRuntimeClass = createRuntimeClass(ctx, rootFxt, runtimeHandler)
 	})
 
 	ginkgo.AfterEach(func(ctx context.Context) {
-		err := rootFxt.K8SClientset.NodeV1().RuntimeClasses().Delete(ctx, cgroupWritable, metav1.DeleteOptions{})
-		if !apierrors.IsNotFound(err) {
-			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot delete RuntimeClass %s", cgroupWritable)
+		if createdRuntimeClass {
+			deleteRuntimeClass(ctx, rootFxt, runtimeHandler)
 		}
 	})
 
@@ -187,18 +189,7 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 	// requests in one group and a third in its own.
 	baseClaim := func(place string) threadedClaim {
 		if shares {
-			spec := resourcev1.ResourceClaimSpec{Devices: resourcev1.DeviceClaim{Requests: []resourcev1.DeviceRequest{
-				exactCPURequest("vcpu", driverName, "1"),
-				exactCPURequest("vmm-cpu", driverName, "250m"),
-				exactCPURequest("io", driverName, "500m"),
-			}}}
-			spec.Devices.Config = []resourcev1.DeviceClaimConfiguration{
-				opaqueEntry([]string{"vcpu"}, map[string]any{"cpuConfig": map[string]any{"exclusive": true}}),
-				opaqueEntry([]string{"vmm-cpu"}, map[string]any{"cpuConfig": map[string]any{"limit": "500m"}}),
-				opaqueEntry([]string{"io"}, map[string]any{"cpuConfig": map[string]any{"limit": v1alpha1.LimitMax}}),
-				threadedEntry(place),
-			}
-			return threadedClaim{spec: spec, groups: map[string]string{"vcpu": "vcpu", "vmm-cpu": "vmm-cpu", "io": "io"}}
+			return vmClaim(place)
 		}
 		amount := "1"
 		if cfg.CPUDeviceMode != "grouped" {
@@ -217,25 +208,16 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 	}
 
 	// baseGroups returns what the groups of baseClaim hold, from the claim's
-	// own status. A share runs on the default partition's CPUs less every
-	// exclusive request's, and the groups weigh as
-	// docs/user/threaded-cgroups.md gives: 1 for exclusive CPUs, and for
-	// shares of 250m and 500m, 256 and 512 shares as the kubelet counts them,
-	// 5000 and 10000.
+	// own status.
 	baseGroups := func(ctx context.Context, fxt *fixture.Fixture, claim *resourcev1.ResourceClaim) map[string]expectedGroup {
 		ginkgo.GinkgoHelper()
-		exclusive := claimExclusiveCPUs(claim)
-		if !shares {
-			return map[string]expectedGroup{
-				"vcpu":   {cpus: exclusive["vcpu-a"].Union(exclusive["vcpu-b"]), cpuMax: "max 100000", weight: "1"},
-				"helper": {cpus: exclusive["helper"], cpuMax: "max 100000", weight: "1"},
-			}
+		if shares {
+			return vmGroups(ctx, fxt, dracpuTesterImage, targetNode.Name, effective, claim)
 		}
-		shared := defaultPartitionCPUs(ctx, fxt, dracpuTesterImage, targetNode.Name, effective).Difference(exclusive["vcpu"])
+		exclusive := claimExclusiveCPUs(claim)
 		return map[string]expectedGroup{
-			"vcpu":    {cpus: exclusive["vcpu"], cpuMax: "max 100000", weight: "1"},
-			"vmm-cpu": {cpus: shared, cpuMax: "50000 100000", weight: "5000"},
-			"io":      {cpus: shared, cpuMax: "max 100000", weight: "10000"},
+			"vcpu":   {cpus: exclusive["vcpu-a"].Union(exclusive["vcpu-b"]), cpuMax: "max 100000", weight: "1"},
+			"helper": {cpus: exclusive["helper"], cpuMax: "max 100000", weight: "1"},
 		}
 	}
 
@@ -246,7 +228,7 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 
 		c := baseClaim("")
 		claim := createThreadedClaim(ctx, fxt, "vm", c.spec)
-		pod := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, []string{"/dracputester"}, claim))
+		pod := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, runtimeHandler, []string{"/dracputester"}, claim))
 		claim = preparedClaim(ctx, fxt, claim)
 
 		tree := readThreadedTree(ctx, restConfig, fxt, pod)
@@ -271,7 +253,7 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 		}
 		c := baseClaim(place)
 		claim := createThreadedClaim(ctx, fxt, "vm", c.spec)
-		pod := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, []string{"/dracputester"}, claim))
+		pod := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, runtimeHandler, []string{"/dracputester"}, claim))
 		claim = preparedClaim(ctx, fxt, claim)
 
 		tree := readThreadedTree(ctx, restConfig, fxt, pod)
@@ -311,7 +293,7 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 			),
 		}
 		claim := createThreadedClaim(ctx, fxt, "spdk", spec)
-		pod := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, command, claim))
+		pod := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, runtimeHandler, command, claim))
 		claim = preparedClaim(ctx, fxt, claim)
 		pollCPUs := claimExclusiveCPUs(claim)["poll"]
 		gomega.Expect(pollCPUs.Size()).To(gomega.Equal(2), "request poll holds CPUs %s", pollCPUs)
@@ -405,7 +387,7 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 				),
 			}
 			claim := createThreadedClaim(ctx, fxt, "split", spec)
-			pod := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, []string{"/dracputester"}, claim))
+			pod := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, runtimeHandler, []string{"/dracputester"}, claim))
 			claim = preparedClaim(ctx, fxt, claim)
 
 			tree := readThreadedTree(ctx, restConfig, fxt, pod)
@@ -424,33 +406,14 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 
 		c := baseClaim("")
 		claim := createThreadedClaim(ctx, fxt, "vm", c.spec)
-		threaded := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, []string{"/dracputester"}, claim))
+		threaded := createThreadedPod(ctx, fxt, threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, runtimeHandler, []string{"/dracputester"}, claim))
 		claim = preparedClaim(ctx, fxt, claim)
 		unthreaded := createTesterPodWithClaimSpec(ctx, fxt, dracpuTesterImage, targetNode.Name, makeResourceClaimSpec(1, cfg.CPUDeviceMode == "grouped"), "unthreaded")
 		want := baseGroups(ctx, fxt, claim)
 		before := readThreadedTree(ctx, restConfig, fxt, threaded)
 		unthreadedCPUs := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, unthreaded).CPUAssigned
 
-		leaveDaemonSetOff(ctx, fxt.K8SClientset, targetNode.Name)
-		id := containerIDOf(threaded)
-		broken := "vcpu"
-		ginkgo.By("deleting group " + broken + " and pointing the link elsewhere while the driver is away")
-		dir := strings.TrimSpace(nodeShell(ctx, targetNode.Name, fmt.Sprintf("find %s -type d -path '*%s*' -name %s", cgroupMount, id, broken)))
-		gomega.Expect(dir).ToNot(gomega.BeEmpty(), "node %s has no cgroup %s of container %s", targetNode.Name, broken, id)
-		nodeShell(ctx, targetNode.Name, "rmdir "+dir)
-		linkFile := path.Join(kubeletRootDir(ctx, fxt), cgroupLinks, id, "cgroup")
-		nodeShell(ctx, targetNode.Name, "ln -sfn "+cgroupMount+"/elsewhere "+linkFile)
-		gomega.Expect(nodeShell(ctx, targetNode.Name, "test -e "+dir+" || echo gone")).To(gomega.ContainSubstring("gone"), "group %s was not deleted", broken)
-		gomega.Expect(strings.TrimSpace(nodeShell(ctx, targetNode.Name, "readlink "+linkFile))).To(gomega.Equal(cgroupMount+"/elsewhere"), "the link was not changed")
-
-		restoreDaemonSetNodes(ctx, fxt.K8SClientset, targetNode.Name)
-		ginkgo.By("finding the group and the link repaired once the driver has synchronized with the runtime")
-		gomega.Eventually(func(g gomega.Gomega) {
-			tree := readThreadedTree(ctx, restConfig, fxt, threaded)
-			g.Expect(tree.Link).To(gomega.Equal(before.Link))
-			g.Expect(groupsByName(tree)).To(gomega.HaveKey(broken))
-		}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(gomega.Succeed())
-		after := readThreadedTree(ctx, restConfig, fxt, threaded)
+		after := breakAndRepairTree(ctx, fxt, restConfig, targetNode.Name, threaded, "vcpu")
 		expectLinkTo(after, after.InitCgroup)
 		expectGroups(after, want)
 		gomega.Expect(after.InitCgroup).To(gomega.Equal(before.InitCgroup), "the driver moved the container's process")
@@ -466,6 +429,291 @@ var _ = ginkgo.Describe("Threaded cgroups", ginkgo.Label("threaded"), ginkgo.Ser
 		expectClaimGroups(ctx, restConfig, fxt, preparedClaim(ctx, fxt, claim), threaded, c.groups)
 	})
 })
+
+// On a crun lane the specs above run under crun, and these run the cases
+// crun's two annotations on the container's cgroup make. The thread root is
+// the cgroup the container's init runs in, below the container's cgroup:
+// crun's sub-cgroup under the systemd driver, container unless
+// run.oci.systemd.subgroup names another, and run.oci.delegate-cgroup's path
+// below that (crun 1.30.1 src/libcrun/cgroup-systemd.c:2017-2031,
+// src/libcrun/cgroup.c:475). The lanes install cgroupThreadedMode place.
+var _ = ginkgo.Describe("Threaded cgroups under crun", ginkgo.Label("threaded", "crun"), ginkgo.Serial, ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
+	var (
+		rootFxt             *fixture.Fixture
+		restConfig          *rest.Config
+		dracpuTesterImage   string
+		targetNode          *v1.Node
+		effective           driverConfigValues
+		cgroupDriver        string
+		createdRuntimeClass bool
+		runtimeHandler      = threadedRuntimeHandler()
+	)
+
+	ginkgo.BeforeAll(func(ctx context.Context) {
+		if !strings.HasPrefix(runtimeHandler, "crun") {
+			ginkgo.Skip("the threaded specs run under the runtime handler " + runtimeHandler + "; create the cluster with DRACPU_E2E_LANE=crun-systemd or crun-cgroupfs")
+		}
+		dracpuTesterImage = os.Getenv("DRACPU_E2E_TEST_IMAGE")
+		gomega.Expect(dracpuTesterImage).ToNot(gomega.BeEmpty(), "missing environment variable DRACPU_E2E_TEST_IMAGE")
+		var err error
+		rootFxt, err = fixture.ForGinkgo()
+		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create fixture")
+		restConfig, err = e2eclient.NewK8SConfig()
+		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create Kubernetes config")
+
+		cfg := getDriverConfig(ctx, rootFxt.K8SClientset)
+		if string(cfg.CgroupThreadedMode) != cgroupfs.ThreadedModePlace {
+			ginkgo.Skip("the driver runs cgroupThreadedMode " + cfg.CgroupThreadedMode.String() + "; the crun lanes install place")
+		}
+		nodes, err := rootFxt.K8SClientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: driverconfig.ProfileLabel + "=" + allowingProfile})
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		if len(nodes.Items) == 0 {
+			ginkgo.Skip("no node runs the profile " + allowingProfile + ", whose default partition gives exclusive CPUs and shares")
+		}
+		targetNode = &nodes.Items[0]
+		effective = cfg.effectiveFor(targetNode)
+		if !kindNodeReachable(ctx, targetNode.Name) {
+			ginkgo.Skip("docker reaches no container of node " + targetNode.Name + ", whose cgroups the specs read; run them on a kind cluster")
+		}
+		cgroupDriver = kubeletCgroupDriver(ctx, rootFxt, targetNode.Name)
+		rootFxt.Log.Info("using worker node", "nodeName", targetNode.Name, "cgroupDriver", cgroupDriver)
+	})
+
+	ginkgo.BeforeEach(func(ctx context.Context) {
+		createdRuntimeClass = createRuntimeClass(ctx, rootFxt, runtimeHandler)
+	})
+
+	ginkgo.AfterEach(func(ctx context.Context) {
+		if createdRuntimeClass {
+			deleteRuntimeClass(ctx, rootFxt, runtimeHandler)
+		}
+	})
+
+	ginkgo.It("should find the driver's own process in crun's sub-cgroup at start", func(ctx context.Context) {
+		if cgroupDriver != "systemd" {
+			ginkgo.Skip("crun makes a sub-cgroup under the systemd driver only")
+		}
+		driverPod, err := e2epod.GetDRACPUPod(ctx, rootFxt.K8SClientset, targetNode.Name)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		gomega.Expect(driverPod.Spec.RuntimeClassName).To(gomega.HaveValue(gomega.Equal(runtimeHandler)), "the driver's pod does not run under crun")
+		logs, err := e2epod.GetLogs(ctx, rootFxt.K8SClientset, driverPod)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred())
+		var found []string
+		for line := range strings.Lines(logs) {
+			if strings.Contains(line, "found the driver's process in the host's cgroup2 tree") {
+				if m := regexp.MustCompile(`cgroup="([^"]+)"`).FindStringSubmatch(line); m != nil {
+					found = append(found, m[1])
+				}
+			}
+		}
+		gomega.Expect(found).To(gomega.HaveLen(1), "the driver logged where it found its process %d times", len(found))
+		gomega.Expect(path.Base(found[0])).To(gomega.Equal("container"), "the driver found its process in %s", found[0])
+	})
+
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		systemdOnly bool
+		// below returns the thread root's path below the container's cgroup
+		// on the host, under the kubelet's cgroup driver.
+		below func(driver string) string
+		// root is the thread root as the container's cgroup namespace shows it.
+		root string
+	}{
+		{
+			name: "no annotation",
+			below: func(driver string) string {
+				if driver == "systemd" {
+					return "container"
+				}
+				return ""
+			},
+			root: "/",
+		},
+		{
+			name:        "run.oci.systemd.subgroup naming another sub-cgroup",
+			annotations: map[string]string{"run.oci.systemd.subgroup": "payload"},
+			systemdOnly: true,
+			below:       func(string) string { return "payload" },
+			root:        "/",
+		},
+		{
+			name:        "run.oci.delegate-cgroup naming a nested path",
+			annotations: map[string]string{"run.oci.delegate-cgroup": "outer/inner"},
+			below: func(driver string) string {
+				if driver == "systemd" {
+					return "container/outer/inner"
+				}
+				return "outer/inner"
+			},
+			root: "/outer/inner",
+		},
+	} {
+		ginkgo.It("should build, place and repair the groups under the init's cgroup with "+tc.name, func(ctx context.Context) {
+			if tc.systemdOnly && cgroupDriver != "systemd" {
+				ginkgo.Skip("crun reads run.oci.systemd.subgroup under the systemd driver only")
+			}
+			fxt := rootFxt.WithPrefix("threaded-crun")
+			gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(fxt.Teardown)
+
+			c := vmClaim("vmm-cpu")
+			claim := createThreadedClaim(ctx, fxt, "vm", c.spec)
+			pod := threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, runtimeHandler, []string{"/dracputester"}, claim)
+			pod.Annotations = tc.annotations
+			pod = createThreadedPod(ctx, fxt, pod)
+			claim = preparedClaim(ctx, fxt, claim)
+
+			// Under a delegate path an exec'd process joins the init's
+			// current cgroup, so a second container, whose claim names no
+			// place, shows it before any move. Its exclusive CPU leaves the
+			// first container's shares, so it runs before they are read.
+			_, delegated := tc.annotations["run.oci.delegate-cgroup"]
+			var other *v1.Pod
+			var otherExclusive cpuset.CPUSet
+			if delegated {
+				unplaced := createThreadedClaim(ctx, fxt, "unplaced", vmClaim("").spec)
+				other = threadedPod(fxt.Namespace.Name, dracpuTesterImage, targetNode.Name, runtimeHandler, []string{"/dracputester"}, unplaced)
+				other.Annotations = tc.annotations
+				other = createThreadedPod(ctx, fxt, other)
+				otherExclusive = claimExclusiveCPUs(preparedClaim(ctx, fxt, unplaced))["vcpu"]
+			}
+			want := vmGroups(ctx, fxt, dracpuTesterImage, targetNode.Name, effective, claim, otherExclusive)
+
+			tree := readThreadedTree(ctx, restConfig, fxt, pod)
+			placed := path.Join(tc.root, "vmm-cpu")
+			gomega.Expect(tree.InitCgroup).To(gomega.Equal(placed), "the container's init does not run in its place group")
+			expectLinkTo(tree, tc.root)
+			expectGroups(tree, want)
+			expectClaimGroups(ctx, restConfig, fxt, claim, pod, c.groups)
+
+			ginkgo.By("finding the thread root below the container's cgroup on the node")
+			id := containerIDOf(pod)
+			container := strings.TrimSpace(nodeShell(ctx, targetNode.Name, fmt.Sprintf("find %s -type d -name '*%s*'", cgroupMount, id)))
+			gomega.Expect(strings.Fields(container)).To(gomega.HaveLen(1), "node %s has not one cgroup named after container %s", targetNode.Name, id)
+			group := strings.TrimSpace(nodeShell(ctx, targetNode.Name, fmt.Sprintf("find %s -type d -name vcpu", container)))
+			gomega.Expect(path.Dir(group)).To(gomega.Equal(path.Join(container, tc.below(cgroupDriver))), "the thread root on node %s", targetNode.Name)
+
+			// An exec'd process joins the container's cgroup, crun's
+			// sub-cgroup under the systemd driver, and under a delegate
+			// path, which the container's cgroup refuses, the init's current
+			// cgroup (crun 1.30.1 src/libcrun/cgroup-setup.c:448-475).
+			execWant := "/"
+			if delegated {
+				execWant = placed
+				otherTree := readThreadedTree(ctx, restConfig, fxt, other)
+				gomega.Expect(otherTree.InitCgroup).To(gomega.Equal(tc.root), "the init of a claim without place left its thread root")
+				gomega.Expect(otherTree.ExecCgroup).To(gomega.Equal(tc.root), "an exec'd process before any move")
+			}
+			gomega.Expect(tree.ExecCgroup).To(gomega.Equal(execWant), "an exec'd process")
+
+			if cgroupDriver == "systemd" {
+				ginkgo.By("reloading systemd in node " + targetNode.Name)
+				nodeShell(ctx, targetNode.Name, "systemctl daemon-reload")
+				reloaded := readThreadedTree(ctx, restConfig, fxt, pod)
+				gomega.Expect(groupSettings(reloaded)).To(gomega.Equal(groupSettings(tree)), "systemd changed the groups' CPUs or limits")
+			}
+
+			after := breakAndRepairTree(ctx, fxt, restConfig, targetNode.Name, pod, "vcpu")
+			gomega.Expect(after.InitCgroup).To(gomega.Equal(placed), "the driver moved the container's process")
+			expectLinkTo(after, tc.root)
+			expectGroups(after, want)
+		})
+	}
+})
+
+// groupSettings returns each group's CPUs and cpu.max.
+func groupSettings(tree threadedTree) map[string][2]string {
+	settings := map[string][2]string{}
+	for _, g := range tree.Groups {
+		settings[g.Name] = [2]string{g.CPUs, g.CPUMax}
+	}
+	return settings
+}
+
+// kubeletCgroupDriver returns the cgroup driver of the node's kubelet, as
+// its configz endpoint reports it.
+func kubeletCgroupDriver(ctx context.Context, fxt *fixture.Fixture, nodeName string) string {
+	ginkgo.GinkgoHelper()
+	raw, err := fxt.K8SClientset.CoreV1().RESTClient().Get().AbsPath("/api/v1/nodes", nodeName, "proxy", "configz").DoRaw(ctx)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot read the kubelet configuration of node %s", nodeName)
+	var configz struct {
+		KubeletConfig struct {
+			CgroupDriver string `json:"cgroupDriver"`
+		} `json:"kubeletconfig"`
+	}
+	gomega.Expect(json.Unmarshal(raw, &configz)).To(gomega.Succeed())
+	gomega.Expect(configz.KubeletConfig.CgroupDriver).ToNot(gomega.BeEmpty(), "node %s reports no cgroup driver", nodeName)
+	return configz.KubeletConfig.CgroupDriver
+}
+
+// vmClaim is a VM's claim on a node whose default partition gives exclusive
+// CPUs and shares: its vCPU, its capped housekeeping and an uncapped share,
+// each in a group named after it.
+func vmClaim(place string) threadedClaim {
+	ginkgo.GinkgoHelper()
+	spec := resourcev1.ResourceClaimSpec{Devices: resourcev1.DeviceClaim{Requests: []resourcev1.DeviceRequest{
+		exactCPURequest("vcpu", driverName, "1"),
+		exactCPURequest("vmm-cpu", driverName, "250m"),
+		exactCPURequest("io", driverName, "500m"),
+	}}}
+	spec.Devices.Config = []resourcev1.DeviceClaimConfiguration{
+		opaqueEntry([]string{"vcpu"}, map[string]any{"cpuConfig": map[string]any{"exclusive": true}}),
+		opaqueEntry([]string{"vmm-cpu"}, map[string]any{"cpuConfig": map[string]any{"limit": "500m"}}),
+		opaqueEntry([]string{"io"}, map[string]any{"cpuConfig": map[string]any{"limit": v1alpha1.LimitMax}}),
+		threadedEntry(place),
+	}
+	return threadedClaim{spec: spec, groups: map[string]string{"vcpu": "vcpu", "vmm-cpu": "vmm-cpu", "io": "io"}}
+}
+
+// vmGroups returns what the groups of vmClaim hold on nodeName, beside the
+// exclusive CPUs of other claims. A share runs on the default partition's
+// CPUs less every exclusive request's, and the groups weigh as
+// docs/user/threaded-cgroups.md gives: 1 for exclusive CPUs, and for shares
+// of 250m and 500m, 256 and 512 shares as the kubelet counts them, 5000 and
+// 10000.
+func vmGroups(ctx context.Context, fxt *fixture.Fixture, image, nodeName string, effective driverConfigValues, claim *resourcev1.ResourceClaim, othersExclusive ...cpuset.CPUSet) map[string]expectedGroup {
+	ginkgo.GinkgoHelper()
+	vcpu := claimExclusiveCPUs(claim)["vcpu"]
+	shared := defaultPartitionCPUs(ctx, fxt, image, nodeName, effective).Difference(vcpu)
+	for _, cpus := range othersExclusive {
+		shared = shared.Difference(cpus)
+	}
+	return map[string]expectedGroup{
+		"vcpu":    {cpus: vcpu, cpuMax: "max 100000", weight: "1"},
+		"vmm-cpu": {cpus: shared, cpuMax: "50000 100000", weight: "5000"},
+		"io":      {cpus: shared, cpuMax: "max 100000", weight: "10000"},
+	}
+}
+
+// breakAndRepairTree keeps the driver off the node while it deletes the
+// pod's group broken, which must hold no thread, and points the pod's link
+// elsewhere, makes sure both happened, brings the driver back, and returns
+// the tree once the driver has repaired both.
+func breakAndRepairTree(ctx context.Context, fxt *fixture.Fixture, restConfig *rest.Config, nodeName string, pod *v1.Pod, broken string) threadedTree {
+	ginkgo.GinkgoHelper()
+	before := readThreadedTree(ctx, restConfig, fxt, pod)
+	leaveDaemonSetOff(ctx, fxt.K8SClientset, nodeName)
+	id := containerIDOf(pod)
+	ginkgo.By("deleting group " + broken + " and pointing the link elsewhere while the driver is away")
+	dir := strings.TrimSpace(nodeShell(ctx, nodeName, fmt.Sprintf("find %s -type d -path '*%s*' -name %s", cgroupMount, id, broken)))
+	gomega.Expect(dir).ToNot(gomega.BeEmpty(), "node %s has no cgroup %s of container %s", nodeName, broken, id)
+	nodeShell(ctx, nodeName, "rmdir "+dir)
+	linkFile := path.Join(kubeletRootDir(ctx, fxt), cgroupLinks, id, "cgroup")
+	nodeShell(ctx, nodeName, "ln -sfn "+cgroupMount+"/elsewhere "+linkFile)
+	gomega.Expect(nodeShell(ctx, nodeName, "test -e "+dir+" || echo gone")).To(gomega.ContainSubstring("gone"), "group %s was not deleted", broken)
+	gomega.Expect(strings.TrimSpace(nodeShell(ctx, nodeName, "readlink "+linkFile))).To(gomega.Equal(cgroupMount+"/elsewhere"), "the link was not changed")
+
+	restoreDaemonSetNodes(ctx, fxt.K8SClientset, nodeName)
+	ginkgo.By("finding the group and the link repaired once the driver has synchronized with the runtime")
+	gomega.Eventually(func(g gomega.Gomega) {
+		tree := readThreadedTree(ctx, restConfig, fxt, pod)
+		g.Expect(tree.Link).To(gomega.Equal(before.Link))
+		g.Expect(groupsByName(tree)).To(gomega.HaveKey(broken))
+		g.Expect(nodeShell(ctx, nodeName, "test -d "+dir+" && echo back || true")).To(gomega.ContainSubstring("back"), "group %s is not back where it was", broken)
+	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(gomega.Succeed())
+	return readThreadedTree(ctx, restConfig, fxt, pod)
+}
 
 func exactCPURequest(name, class, amount string) resourcev1.DeviceRequest {
 	request := resourcev1.DeviceRequest{Name: name, Exactly: &resourcev1.ExactDeviceRequest{DeviceClassName: class}}
@@ -518,13 +766,45 @@ func createThreadedClaim(ctx context.Context, fxt *fixture.Fixture, name string,
 	return claim
 }
 
+// threadedRuntimeHandler is the runtime handler the threaded specs run their
+// pods under, and the name of its RuntimeClass.
+func threadedRuntimeHandler() string {
+	if handler := os.Getenv("DRACPU_E2E_RUNTIME_HANDLER"); handler != "" {
+		return handler
+	}
+	return cgroupWritable
+}
+
+// createRuntimeClass creates a RuntimeClass of the handler's name, and reports
+// whether it did: a lane may have created it for pods of its own.
+func createRuntimeClass(ctx context.Context, fxt *fixture.Fixture, handler string) bool {
+	ginkgo.GinkgoHelper()
+	_, err := fxt.K8SClientset.NodeV1().RuntimeClasses().Create(ctx, &nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{Name: handler},
+		Handler:    handler,
+	}, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return false
+	}
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create RuntimeClass %s", handler)
+	return true
+}
+
+func deleteRuntimeClass(ctx context.Context, fxt *fixture.Fixture, name string) {
+	ginkgo.GinkgoHelper()
+	err := fxt.K8SClientset.NodeV1().RuntimeClasses().Delete(ctx, name, metav1.DeleteOptions{})
+	if !apierrors.IsNotFound(err) {
+		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot delete RuntimeClass %s", name)
+	}
+}
+
 // threadedPod runs command, as threadedUser and without privileges, under the
-// RuntimeClass cgroup-writable, in one container holding every claim.
-func threadedPod(ns, image, nodeName string, command []string, claims ...*resourcev1.ResourceClaim) *v1.Pod {
+// RuntimeClass runtimeClass, in one container holding every claim.
+func threadedPod(ns, image, nodeName, runtimeClass string, command []string, claims ...*resourcev1.ResourceClaim) *v1.Pod {
 	ginkgo.GinkgoHelper()
 	pod := makeTesterPodWithClaimsWithoutCPURequest(ns, image, nodeName, claims...)
 	pod.GenerateName = "tester-pod-threaded-"
-	pod.Spec.RuntimeClassName = new(cgroupWritable)
+	pod.Spec.RuntimeClassName = new(runtimeClass)
 	pod.Spec.SecurityContext = &v1.PodSecurityContext{RunAsUser: new(int64(threadedUser)), RunAsGroup: new(int64(threadedUser)), RunAsNonRoot: new(true)}
 	pod.Spec.Containers[0].Command = command
 	pod.Spec.Containers[0].SecurityContext = &v1.SecurityContext{
@@ -706,7 +986,9 @@ func expectGroups(tree threadedTree, want map[string]expectedGroup) {
 		}), "the owners of group %s's files", name)
 		all = all.Union(w.cpus)
 	}
-	gomega.Expect(cpuset.Parse(tree.Root.CPUs)).To(gomega.Equal(all), "the thread root's CPUs")
+	// A thread root below the container's cgroup, as crun makes one, may
+	// leave its own cpuset empty and run on the container's.
+	gomega.Expect(cpuset.Parse(tree.Root.CPUsEffective)).To(gomega.Equal(all), "the thread root's CPUs")
 	// The thread root's directory, cgroup.subtree_control and cgroup.threads
 	// are the runtime's: runc under the systemd driver hands them to the
 	// process's user where the cgroup mount is writable (v1.5.1

@@ -52,6 +52,7 @@ type cgroupReport struct {
 	Type           string               `json:"type"`
 	SubtreeControl string               `json:"subtreeControl"`
 	CPUs           string               `json:"cpus"`
+	CPUsEffective  string               `json:"cpusEffective"`
 	CPUMax         string               `json:"cpuMax"`
 	Weight         string               `json:"weight"`
 	Threads        []int                `json:"threads"`
@@ -62,6 +63,7 @@ type treeReport struct {
 	Link       string         `json:"link"`
 	Resolved   string         `json:"resolved"`
 	InitCgroup string         `json:"initCgroup"`
+	ExecCgroup string         `json:"execCgroup"`
 	Root       cgroupReport   `json:"root"`
 	Groups     []cgroupReport `json:"groups"`
 }
@@ -124,11 +126,15 @@ func readTree() (treeReport, error) {
 	if err != nil {
 		return treeReport{}, err
 	}
+	execCgroup, err := cgroupOf("/proc/self/cgroup")
+	if err != nil {
+		return treeReport{}, err
+	}
 	root, err := readCgroup(resolved, "")
 	if err != nil {
 		return treeReport{}, err
 	}
-	report := treeReport{Link: target, Resolved: resolved, InitCgroup: initCgroup, Root: root, Groups: []cgroupReport{}}
+	report := treeReport{Link: target, Resolved: resolved, InitCgroup: initCgroup, ExecCgroup: execCgroup, Root: root, Groups: []cgroupReport{}}
 	entries, err := os.ReadDir(resolved)
 	if err != nil {
 		return treeReport{}, err
@@ -152,6 +158,7 @@ func readCgroup(dir, name string) (cgroupReport, error) {
 		"cgroup.type":            &c.Type,
 		"cgroup.subtree_control": &c.SubtreeControl,
 		"cpuset.cpus":            &c.CPUs,
+		"cpuset.cpus.effective":  &c.CPUsEffective,
 		"cpu.max":                &c.CPUMax,
 		"cpu.weight":             &c.Weight,
 	} {
