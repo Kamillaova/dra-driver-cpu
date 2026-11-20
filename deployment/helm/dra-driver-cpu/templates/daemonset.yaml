@@ -88,6 +88,7 @@ spec:
                 fieldPath: spec.nodeName
         image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
+        terminationMessagePolicy: FallbackToLogsOnError
         ports:
           - name: healthz
             containerPort: {{ .Values.healthzPort }}
