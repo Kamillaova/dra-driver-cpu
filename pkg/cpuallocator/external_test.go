@@ -307,7 +307,40 @@ func TestExternalGetPreferredCPUs(t *testing.T) {
 					},
 				},
 			},
-			expectErr: true,
+			expectErr:         true,
+			expectErrContains: "request \"req\": `allocator: external` needs one cpuConfig.cpuset entry for this request",
+		},
+		{
+			name:        "error: an entry naming no CPUs is no cpuset entry",
+			managedCPUs: cpuset.New(0, 1, 2, 3),
+			allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Config: []resourceapi.DeviceAllocationConfiguration{
+						{
+							Source:   resourceapi.AllocationConfigSourceClaim,
+							Requests: []string{"req"},
+							DeviceConfiguration: resourceapi.DeviceConfiguration{
+								Opaque: &resourceapi.OpaqueDeviceConfiguration{
+									Driver:     "dra.cpu",
+									Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1alpha1","cpuConfig":{"limit":"max"}}`)},
+								},
+							},
+						},
+					},
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{
+							Request: "req",
+							Driver:  "dra.cpu",
+							Device:  "cpudev0",
+							ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{
+								resourceapi.QualifiedName(device.CPUResourceQualifiedName): *resource.NewQuantity(1, resource.DecimalSI),
+							},
+						},
+					},
+				},
+			},
+			expectErr:         true,
+			expectErrContains: "request \"req\": `allocator: external` needs one cpuConfig.cpuset entry for this request",
 		},
 		{
 			name:        "multi-result request: opaque size matches request total",
@@ -354,6 +387,46 @@ func TestExternalGetPreferredCPUs(t *testing.T) {
 			allocation: &resourceapi.AllocationResult{
 				Devices: resourceapi.DeviceAllocationResult{
 					Config: []resourceapi.DeviceAllocationConfiguration{
+						{
+							Source:   resourceapi.AllocationConfigSourceClaim,
+							Requests: []string{"req"},
+							DeviceConfiguration: resourceapi.DeviceConfiguration{
+								Opaque: &resourceapi.OpaqueDeviceConfiguration{
+									Driver:     "dra.cpu",
+									Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1alpha1","cpuConfig":{"cpuset":"2-5"}}`)},
+								},
+							},
+						},
+					},
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{
+							Request: "req",
+							Driver:  "dra.cpu",
+							Device:  "cpudevmachine",
+							ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{
+								resourceapi.QualifiedName(device.CPUResourceQualifiedName): *resource.NewQuantity(4, resource.DecimalSI),
+							},
+						},
+					},
+				},
+			},
+			expectedCPUs: cpuset.New(2, 3, 4, 5),
+		},
+		{
+			name:        "an entry naming no CPUs beside the cpuset entry is not counted",
+			managedCPUs: cpuset.New(0, 1, 2, 3, 4, 5),
+			allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Config: []resourceapi.DeviceAllocationConfiguration{
+						{
+							Source: resourceapi.AllocationConfigSourceClaim,
+							DeviceConfiguration: resourceapi.DeviceConfiguration{
+								Opaque: &resourceapi.OpaqueDeviceConfiguration{
+									Driver:     "dra.cpu",
+									Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1alpha1","cpuConfig":{"limit":"max"}}`)},
+								},
+							},
+						},
 						{
 							Source:   resourceapi.AllocationConfigSourceClaim,
 							Requests: []string{"req"},
@@ -579,7 +652,8 @@ func TestExternalGetPreferredCPUs(t *testing.T) {
 					},
 				},
 			},
-			expectErr: true,
+			expectErr:         true,
+			expectErrContains: `opaque config: request "req" is targeted by 2 configurations, must be targeted by exactly 1`,
 		},
 		{
 			name:        "unqualified cpu capacity key: opaque size matches request total",

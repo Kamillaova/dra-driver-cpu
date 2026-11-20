@@ -25,30 +25,43 @@ import (
 	"sigs.k8s.io/json"
 )
 
+// Config is one opaque configuration as the driver reads it.
+type Config struct {
+	// CPUs are the CPUs the configuration names, and HasCPUs whether it names
+	// any: a cpuset left out or empty is not a request for none.
+	CPUs    cpuset.CPUSet
+	HasCPUs bool
+	// Limit is the CPU limit as written, nil where the configuration sets none.
+	Limit *v1alpha1.Limit
+}
+
 // ParseOpaqueConfig decodes the raw opaque parameters into the driver's internal format
-// based on the apiVersion.
-func ParseOpaqueConfig(raw []byte) (cpuset.CPUSet, error) {
+// based on the apiVersion. Whether the configuration must name CPUs is left to
+// the caller that needs them.
+func ParseOpaqueConfig(raw []byte) (Config, error) {
 	var config v1alpha1.OpaqueConfig
 	strictErrs, err := json.UnmarshalStrict(raw, &config)
 	if err != nil {
-		return cpuset.CPUSet{}, fmt.Errorf("failed to unmarshal opaque config: %w", err)
+		return Config{}, fmt.Errorf("failed to unmarshal opaque config: %w", err)
 	}
 	if len(strictErrs) > 0 {
-		return cpuset.CPUSet{}, fmt.Errorf("opaque config: %w", runtime.NewStrictDecodingError(strictErrs))
+		return Config{}, fmt.Errorf("opaque config: %w", runtime.NewStrictDecodingError(strictErrs))
 	}
 
 	switch config.APIVersion {
 	case v1alpha1.APIVersion:
+		parsed := Config{Limit: config.CPUConfig.Limit}
 		if config.CPUConfig.CPUSet == "" {
-			return cpuset.CPUSet{}, fmt.Errorf("opaque config: cpuConfig.cpuset is empty or missing")
+			return parsed, nil
 		}
 		parsedSet, err := cpuset.Parse(config.CPUConfig.CPUSet)
 		if err != nil {
-			return cpuset.CPUSet{}, fmt.Errorf("opaque config: failed to parse cpuset %q: %w", config.CPUConfig.CPUSet, err)
+			return Config{}, fmt.Errorf("opaque config: failed to parse cpuset %q: %w", config.CPUConfig.CPUSet, err)
 		}
-		return parsedSet, nil
+		parsed.CPUs, parsed.HasCPUs = parsedSet, true
+		return parsed, nil
 
 	default:
-		return cpuset.CPUSet{}, fmt.Errorf("unsupported opaque config apiVersion: %q", config.APIVersion)
+		return Config{}, fmt.Errorf("unsupported opaque config apiVersion: %q", config.APIVersion)
 	}
 }

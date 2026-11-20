@@ -93,8 +93,12 @@ Go consumers of the opaque allocation configuration API must update their import
 - Schema types: `api/v1alpha1` moves to `api/allocation/v1alpha1`.
 - `ParseOpaqueConfig`: `api` moves to `api/allocation`.
 
-The serialized `v1alpha1` schema is unchanged; its parsing becomes strict, see
-[Strict opaque parameters](#strict-opaque-parameters).
+`ParseOpaqueConfig` now returns `allocation.Config` (`CPUs`, `HasCPUs`, `Limit`) instead of a
+`cpuset.CPUSet`, and no longer refuses parameters that name no cpuset: a caller that needs one
+checks `HasCPUs`.
+
+The serialized `v1alpha1` schema keeps its fields and gains `cpuConfig.limit`; its parsing becomes
+strict, see [Strict opaque parameters](#strict-opaque-parameters).
 
 #### Strict opaque parameters
 
