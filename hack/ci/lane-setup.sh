@@ -163,11 +163,79 @@ partitions_pre() {
 	[ -z "${reserved}" ] || echo "DRACPU_E2E_RESERVED_PARTITION_CPUS=${reserved}"
 }
 
+# crun 1.30.1's build with systemd support, and the SHA-256 its release's
+# CHECKSUMS gives for each.
+readonly CRUN_VERSION=1.30.1
+declare -rA CRUN_SHA256=(
+	[amd64]=86d1e6a0e76945975d3aebfab39cbc6a26eea15f1c3fc66b6776d19e5dc346a0
+	[arm64]=0ef30b0fbb494dc9c5303d46b091a84e27cb8ac99c985123fb1eb339854b69ea
+)
+readonly CRUN_HANDLER=crun-writable
+# crun's systemd driver talks to systemd through the system bus, which kind's
+# node image does not run; Debian's dbus at the version its release, trixie,
+# carries.
+readonly DBUS_VERSION=1.16.2-2
+
+crun_pre() {
+	partitions_pre
+	# The specs show crun's annotations under place, where the driver moves
+	# the container's process.
+	echo "DRACPU_E2E_THREADED_MODE=place"
+}
+
+# crun_post installs crun in every node of the cluster, and under systemd the
+# system bus it needs, checks that each kubelet runs the lane's cgroup driver,
+# and creates the RuntimeClass of the crun handler. Under systemd it also runs
+# the driver's own pod under crun.
+crun_post() {
+	local driver=$1
+	local cluster=${CLUSTER_NAME:?CLUSTER_NAME names the kind cluster}
+	local arch
+	case "$(uname -m)" in
+	x86_64) arch=amd64 ;;
+	aarch64 | arm64) arch=arm64 ;;
+	*) fail "no crun build for $(uname -m)" ;;
+	esac
+	local dir
+	dir=$(mktemp -d)
+	curl -fsSL -o "${dir}/crun" "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-${arch}"
+	echo "${CRUN_SHA256[${arch}]}  ${dir}/crun" | sha256sum -c - >&2 || fail "crun ${CRUN_VERSION} for ${arch} does not match its checksum"
+	chmod 0755 "${dir}/crun"
+	local node
+	for node in $(kind get nodes --name "${cluster}"); do
+		if [ "${driver}" = systemd ]; then
+			docker exec "${node}" sh -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends dbus=${DBUS_VERSION} && systemctl start dbus" >&2 ||
+				fail "cannot run the system bus in node ${node}"
+		fi
+		docker cp "${dir}/crun" "${node}:/usr/local/bin/crun"
+		docker exec "${node}" /usr/local/bin/crun --version >&2
+		grep -qx "cgroupDriver: ${driver}" <(docker exec "${node}" cat /var/lib/kubelet/config.yaml) ||
+			fail "the kubelet of node ${node} does not run the ${driver} cgroup driver"
+	done
+	rm -rf "${dir}"
+	kubectl apply -f - <<EOF2
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: ${CRUN_HANDLER}
+handler: ${CRUN_HANDLER}
+EOF2
+	if [ "${driver}" = systemd ]; then
+		# The chart has no value for it.
+		kubectl -n kube-system patch daemonset dracpu --type merge \
+			-p "{\"spec\":{\"template\":{\"spec\":{\"runtimeClassName\":\"${CRUN_HANDLER}\"}}}}"
+		kubectl -n kube-system rollout status daemonset dracpu --timeout=180s
+	fi
+}
+
 [ $# -eq 2 ] || fail "usage: $0 <lane> pre|post"
 lane=$1
 step=$2
 case "${lane}/${step}" in
 partitions/pre | gates-off/pre) partitions_pre ;;
 partitions/post | gates-off/post) ;;
+crun-systemd/pre | crun-cgroupfs/pre) crun_pre ;;
+crun-systemd/post) crun_post systemd ;;
+crun-cgroupfs/post) crun_post cgroupfs ;;
 *) fail "unknown lane or step: ${lane} ${step}" ;;
 esac
