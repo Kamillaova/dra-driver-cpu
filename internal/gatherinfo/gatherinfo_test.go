@@ -332,6 +332,45 @@ func TestRunReportsCPUPartitions(t *testing.T) {
 	}
 }
 
+func TestRunReportsProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{name: "default", config: "groupBy: socket\n", want: "null"},
+		{
+			name: "from the config file",
+			config: "profiles:\n" +
+				"  x3d:\n    cpuPartitions:\n    - name: default\n" +
+				"  r7625:\n    cpuPartitions:\n    - name: default\n      smt: false\n" +
+				"    - name: vms\n      role: exclusive\n      cpuset: \"2-3\"\n",
+			want: `{"r7625":{"cpuPartitions":[{"name":"default","smt":false},{"name":"vms","role":"exclusive","cpuset":"2-3"}]},` +
+				`"x3d":{"cpuPartitions":[{"name":"default"}]}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupFakeHostWithConfig(t, tc.config)
+
+			stdout, err := captureStdout(t, func() error {
+				return gatherinfo.Run([]string{"--stdout"}, gatherinfo.Options{}, logr.Discard())
+			})
+			if err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+
+			report := readReport(t, []byte(stdout))
+			got, err := json.Marshal(report.DriverConfig.Profiles)
+			if err != nil {
+				t.Fatalf("marshal profiles: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("profiles = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunRejectsStdoutWithOutputDir(t *testing.T) {
 	err := gatherinfo.Run([]string{"--stdout", "--output-dir=/tmp"}, gatherinfo.Options{}, logr.Discard())
 	if err == nil {
