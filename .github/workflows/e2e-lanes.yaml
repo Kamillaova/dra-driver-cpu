@@ -96,6 +96,35 @@ jobs:
             mustRun: |
               should report the node-allocatable mapping dropped on every node that publishes it
               should withhold the degraded partition's devices whose taint the API server dropped
+          # crun, which hack/ci/lane-setup.sh installs, runs the threaded
+          # specs' pods under each cgroup driver; arm64 for its cores of one
+          # thread, which the nosmt partition needs.
+          - lane: crun-systemd
+            runner: ubuntu-26.04-arm
+            labels: threaded || crun
+            mustRun: |
+              should build the claim's groups under the container's thread root, and hand their files to the container's user
+              should move the container's process into its place group
+              should let the workload move its pinned threads into their group, and leave its other threads in its control group
+              should name the group each alternative's CPUs landed in, and build no group that received none
+              should keep the trees and links across a driver restart, and repair a deleted group and a wrong link without moving or killing a container
+              should find the driver's own process in crun's sub-cgroup at start
+              should build, place and repair the groups under the init's cgroup with no annotation
+              should build, place and repair the groups under the init's cgroup with run.oci.systemd.subgroup naming another sub-cgroup
+              should build, place and repair the groups under the init's cgroup with run.oci.delegate-cgroup naming a nested path
+              should stop the claim's containers and refuse them until the claim's pod is deleted
+          - lane: crun-cgroupfs
+            runner: ubuntu-26.04-arm
+            labels: threaded || crun
+            mustRun: |
+              should build the claim's groups under the container's thread root, and hand their files to the container's user
+              should move the container's process into its place group
+              should let the workload move its pinned threads into their group, and leave its other threads in its control group
+              should name the group each alternative's CPUs landed in, and build no group that received none
+              should keep the trees and links across a driver restart, and repair a deleted group and a wrong link without moving or killing a container
+              should build, place and repair the groups under the init's cgroup with no annotation
+              should build, place and repair the groups under the init's cgroup with run.oci.delegate-cgroup naming a nested path
+              should stop the claim's containers and refuse them until the claim's pod is deleted
     name: e2e (${{ matrix.lane }}, ${{ matrix.runner }})
     steps:
       - name: Checkout
