@@ -191,6 +191,14 @@ The start is also refused, with the cause, when the driver cannot build the grou
 when the host's cgroup tree refuses a write. Each refusal counts in
 `dra_cpu_threaded_containers_total{result="error"}`, and the kubelet starts the container again.
 
+With `cgroupThreadedMode: place` the driver moves a threaded container's process into its place
+group only while the runtime waits for it. A container created or started while the driver is
+slower than the runtime's timeout for a plugin, or not connected, starts unplaced: in its thread
+root, on all its claim's CPUs and without its group's limit, until it restarts. The driver says so
+at start, in its log and in a `ThreadedPlacementBestEffort` Warning event on its Node. Requiring the
+driver's NRI plugin closes most of the disconnected half; see
+[Requiring the driver's NRI plugin](installation.md#requiring-the-drivers-nri-plugin).
+
 When an exclusive request takes CPUs of a default partition, or gives them back, the driver writes
 the CPUs of every threaded group holding a share there. A write that fails, for a container that is
 gone among others, is logged and counted in `dra_cpu_threaded_containers_total{result="rewrite_error"}`,

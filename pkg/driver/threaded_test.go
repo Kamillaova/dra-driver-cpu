@@ -41,6 +41,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -804,4 +805,31 @@ func (r *refusingTree) WriteFile(name string, data []byte) error {
 		return &fs.PathError{Op: "write", Path: name, Err: syscall.EROFS}
 	}
 	return r.writableTree.WriteFile(name, data)
+}
+
+// Under place the driver announces on its Node that a container may start
+// unplaced; under create it moves nothing, and says nothing.
+func TestAnnouncePlaceWindow(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		want []string
+	}{
+		{mode: "place", want: []string{"Warning ThreadedPlacementBestEffort `cgroupThreadedMode: place`: a container created while the driver is slow or disconnected may start unplaced, in its thread root, on all its claim's CPUs and without its group's limit, until it restarts"}},
+		{mode: "create"},
+		{mode: ""},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			d := sharingDriver(t, true, nil, nil)
+			d.cgroupThreadedMode = tc.mode
+			events := &capturingRecorder{}
+			d.eventRecorder = events
+			d.announcePlaceWindow(testr.New(t))
+			require.Equal(t, tc.want, events.lines())
+			for _, event := range events.events {
+				node, ok := event.object.(*corev1.Node)
+				require.True(t, ok, "the event is the Node's")
+				require.Equal(t, testNodeName, node.Name)
+			}
+		})
+	}
 }
