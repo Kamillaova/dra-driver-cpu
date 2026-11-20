@@ -167,7 +167,7 @@ partitions_pre() {
 lane=$1
 step=$2
 case "${lane}/${step}" in
-partitions/pre) partitions_pre ;;
-partitions/post) ;;
+partitions/pre | gates-off/pre) partitions_pre ;;
+partitions/post | gates-off/post) ;;
 *) fail "unknown lane or step: ${lane} ${step}" ;;
 esac
