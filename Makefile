@@ -118,6 +118,7 @@ DRACPU_E2E_RESERVED_CPUS ?= $(if $(DRACPU_E2E_LANE),,0)
 # Set by hack/ci/lane-setup.sh from the host's topology on a lane; a value
 # given here is kept.
 DRACPU_E2E_NOSMT_PARTITION_CPUS ?=
+DRACPU_E2E_DEGRADED_PARTITION_CPUS ?=
 DRACPU_E2E_RESERVED_PARTITION_CPUS ?=
 DRACPU_E2E_LABEL_FILTER ?=
 GINKGO_LABEL_FILTER_ARG :=
@@ -222,12 +223,18 @@ comma := ,
 # e2e-wide, on worker2, each node's kubelet reserving every CPU outside its
 # profile's default partition, as the driver requires before it publishes.
 cpuset_size = $(if $(1),$(shell echo '$(1)' | tr ',' '\n' | awk -F- '{ n += (NF == 2 ? $$2 - $$1 + 1 : 1) } END { print n }'),0)
+expand_cpus := awk -F- '{ for (c = $$1; c <= $$NF; c++) print c }'
+# The host's threads of every core a CPU of $(1) lies on.
+host_cores = $(if $(1),$(shell echo '$(1)' | tr ',' '\n' | $(expand_cpus) | while read -r c; do tr ',' '\n' < /sys/devices/system/cpu/cpu$$c/topology/core_cpus_list; done | $(expand_cpus) | sort -nu | paste -sd, -))
 E2E_NOSMT_PARTITION := {"name":"nosmt","role":"exclusive","cpuset":"$(DRACPU_E2E_NOSMT_PARTITION_CPUS)","smt":false}
 E2E_RESERVED_PARTITION := {"name":"reserved","role":"reserved","cpuset":"$(DRACPU_E2E_RESERVED_PARTITION_CPUS)"}
+E2E_DEGRADED_PARTITION := {"name":"degraded","role":"exclusive","cpuset":"$(DRACPU_E2E_DEGRADED_PARTITION_CPUS)","smt":false}
 E2E_WIDE_PARTITIONS := {"name":"default"}$(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),$(comma)$(E2E_NOSMT_PARTITION))
-E2E_PARTITIONS := $(E2E_WIDE_PARTITIONS)$(if $(DRACPU_E2E_RESERVED_PARTITION_CPUS),$(comma)$(E2E_RESERVED_PARTITION))
+E2E_PARTITIONS := $(E2E_WIDE_PARTITIONS)$(if $(DRACPU_E2E_RESERVED_PARTITION_CPUS),$(comma)$(E2E_RESERVED_PARTITION))$(if $(DRACPU_E2E_DEGRADED_PARTITION_CPUS),$(comma)$(E2E_DEGRADED_PARTITION))
 E2E_WIDE_RESERVE := $(call cpuset_size,$(DRACPU_E2E_NOSMT_PARTITION_CPUS))
-E2E_RESERVE := $(shell echo $$(( $(E2E_WIDE_RESERVE) + $(call cpuset_size,$(DRACPU_E2E_RESERVED_PARTITION_CPUS)) )))
+# The degraded partition's online siblings stay in it, so the reservation
+# counts every thread of its cores.
+E2E_RESERVE := $(shell echo $$(( $(E2E_WIDE_RESERVE) + $(call cpuset_size,$(DRACPU_E2E_RESERVED_PARTITION_CPUS)) + $(call cpuset_size,$(call host_cores,$(DRACPU_E2E_DEGRADED_PARTITION_CPUS))) )))
 # e2e-grown, which no node runs until a spec moves worker2 to it, gives the CPUs
 # of nosmt to a reserved partition, so that its CPUs outside default are
 # e2e-wide's and worker2's reservation still holds.
@@ -237,6 +244,7 @@ E2E_GROWN_PROFILE := $(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),$(comma)"e2e-grown"
 # default validator, so that a spec requiring the driver's plugin on a node
 # leaves the driver's own pod to start.
 E2E_LANE_HELM_ARGS := --set-json 'driverConfig.profiles={"e2e":{"cpuPartitions":[$(E2E_PARTITIONS)]},"e2e-wide":{"cpuPartitions":[$(E2E_WIDE_PARTITIONS)]}$(E2E_GROWN_PROFILE)}' \
+	--set driverConfig.taintDegradedPartitions=true \
 	--set-string 'podAnnotations.e2e\.dra\.cpu/tolerate-missing-nri-plugins=true'
 KIND_CI_LANE_CONFIG := $(or $(wildcard hack/ci/kind-ci-$(DRACPU_E2E_LANE).yaml),hack/ci/kind-ci.yaml)
 KIND_CI_CONFIG := $(if $(DRACPU_E2E_LANE),$(OUT_DIR)/kind-ci-$(DRACPU_E2E_LANE).yaml,hack/ci/kind-ci.yaml)

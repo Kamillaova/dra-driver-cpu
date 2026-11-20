@@ -70,6 +70,15 @@ core_of() {
 	fi
 }
 
+# The CPUs of every core a CPU of $1 lies on.
+cores_of() {
+	[ -n "$1" ] || return 0
+	local cpu
+	for cpu in $(expand_cpus "$1"); do
+		expand_cpus "$(core_of "${cpu}")"
+	done | sort -nu | paste -sd, -
+}
+
 # The threaded specs move pinned threads into threaded children of a claim's
 # group, which needs cpuset in a threaded subtree: fail here rather than let
 # them skip on a kernel without it.
@@ -105,9 +114,11 @@ partitions_pre() {
 	done
 
 	local nosmt=${DRACPU_E2E_NOSMT_PARTITION_CPUS:-}
+	local degraded=${DRACPU_E2E_DEGRADED_PARTITION_CPUS:-}
 	local reserved=${DRACPU_E2E_RESERVED_PARTITION_CPUS:-}
-	local left=$((${#online[@]} - $(count_cpus "${nosmt}") - $(count_cpus "${reserved}")))
+	local left=$((${#online[@]} - $(count_cpus "${nosmt}") - $(count_cpus "$(cores_of "${degraded}")") - $(count_cpus "${reserved}")))
 	local i
+	local -a threads
 	if [ -z "${nosmt}" ]; then
 		for ((i = ${#cores[@]} - 1; i >= 0; i--)); do
 			core=${cores[i]}
@@ -119,10 +130,25 @@ partitions_pre() {
 			fi
 		done
 	fi
+	# The degraded partition lists one thread of a core whose other threads are
+	# online, and takes the whole core out of default. It comes before reserved,
+	# so a host of two cores of two threads keeps one core in default.
+	if [ -z "${degraded}" ]; then
+		for ((i = ${#cores[@]} - 1; i >= 0; i--)); do
+			core=${cores[i]}
+			if [ "$(count_cpus "${core}")" -gt 1 ] && ! overlaps "${core}" "${reserved}" &&
+				[ $((left - $(count_cpus "${core}"))) -ge "${MIN_DEFAULT_CPUS}" ]; then
+				mapfile -t threads < <(expand_cpus "${core}")
+				degraded=${threads[0]}
+				left=$((left - $(count_cpus "${core}")))
+				break
+			fi
+		done
+	fi
 	if [ -z "${reserved}" ]; then
 		for ((i = ${#cores[@]} - 1; i >= 0; i--)); do
 			core=${cores[i]}
-			if ! overlaps "${core}" "${nosmt}" &&
+			if ! overlaps "${core}" "${nosmt}" && ! overlaps "${core}" "${degraded}" &&
 				[ $((left - $(count_cpus "${core}"))) -ge "${MIN_DEFAULT_CPUS}" ]; then
 				reserved=${core}
 				left=$((left - $(count_cpus "${core}")))
@@ -131,8 +157,9 @@ partitions_pre() {
 		done
 	fi
 
-	echo "lane-setup: nosmt partition '${nosmt}', reserved partition '${reserved}', ${left} CPUs left to default" >&2
+	echo "lane-setup: nosmt partition '${nosmt}', degraded partition '${degraded}', reserved partition '${reserved}', ${left} CPUs left to default" >&2
 	[ -z "${nosmt}" ] || echo "DRACPU_E2E_NOSMT_PARTITION_CPUS=${nosmt}"
+	[ -z "${degraded}" ] || echo "DRACPU_E2E_DEGRADED_PARTITION_CPUS=${degraded}"
 	[ -z "${reserved}" ] || echo "DRACPU_E2E_RESERVED_PARTITION_CPUS=${reserved}"
 }
 

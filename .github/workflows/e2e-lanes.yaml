@@ -30,12 +30,16 @@ jobs:
       matrix:
         include:
           # Two cores of two threads: no core without an online sibling, so
-          # no nosmt partition.
+          # no nosmt partition, and a degraded partition in place of reserved.
           - lane: partitions
             runner: ubuntu-26.04
             labels: partitions
             mustRun: |
               should publish on each node the partitions of its own profile
+              should publish the partition's devices tainted, with one thread per core
+              should report the partition degraded on its node
+              should leave a claim that does not tolerate the taint Pending
+              should pin a claim that tolerates the taint to the partition's thread
               should publish the default partition's devices with a shared request policy, and map only them
               should cap a share at its amount and give the amount in its metadata file
               should run a share that books no amount uncapped
