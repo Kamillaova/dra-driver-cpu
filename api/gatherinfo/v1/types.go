@@ -105,5 +105,6 @@ type CPUPartition struct {
 	Role   string `json:"role,omitempty"`
 	CPUSet string `json:"cpuset,omitempty"`
 	// SMT is the entry's smt value as written: true, false or a thread count.
-	SMT json.RawMessage `json:"smt,omitempty"`
+	SMT            json.RawMessage `json:"smt,omitempty"`
+	AllowExclusive bool            `json:"allowExclusive,omitempty"`
 }

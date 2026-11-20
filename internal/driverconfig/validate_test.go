@@ -253,6 +253,22 @@ func TestValidate(t *testing.T) {
 		expectedErr: true,
 		wantErr:     `partition "default": role is always default; remove it`,
 	}, {
+		name: "valid: allowExclusive on the default entry",
+		conf: partitioned(CPUPartition{Name: "default", AllowExclusive: true}, vms),
+	}, {
+		name: "valid: allowExclusive on a named partition of role default",
+		conf: partitioned(defaultEntry, CPUPartition{Name: "infra", Role: "default", CPUSet: "4-5", AllowExclusive: true}),
+	}, {
+		name:        "error: allowExclusive on an exclusive partition",
+		conf:        partitioned(defaultEntry, CPUPartition{Name: "vms", Role: "exclusive", CPUSet: "2-3", AllowExclusive: true}),
+		expectedErr: true,
+		wantErr:     `partition "vms": allowExclusive applies only to role default, and its role is "exclusive"; remove it`,
+	}, {
+		name:        "error: allowExclusive on a reserved partition",
+		conf:        partitioned(defaultEntry, CPUPartition{Name: "system", Role: "reserved", CPUSet: "0-1", AllowExclusive: true}),
+		expectedErr: true,
+		wantErr:     `partition "system": allowExclusive applies only to role default, and its role is "reserved"; remove it`,
+	}, {
 		name:        "error: a partition other than the default entry without a role",
 		conf:        partitioned(defaultEntry, CPUPartition{Name: "vms", CPUSet: "2-3"}),
 		expectedErr: true,

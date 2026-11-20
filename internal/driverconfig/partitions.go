@@ -38,6 +38,9 @@ type CPUPartition struct {
 	Role   string `json:"role,omitempty"`
 	CPUSet string `json:"cpuset,omitempty"`
 	SMT    *SMT   `json:"smt,omitempty"`
+	// AllowExclusive lets a request on a partition of role default take
+	// exclusive CPUs out of it. Defaults to false.
+	AllowExclusive bool `json:"allowExclusive,omitempty"`
 }
 
 // SMT is how many threads per core a partition expects the platform to leave
@@ -174,6 +177,12 @@ func (c Config) validateCPUPartitions() error {
 		}
 		if !device.IsPartitionRole(partition.Role) {
 			return fmt.Errorf("invalid role %q of partition %q: must be one of %q", partition.Role, partition.Name, device.PartitionRoles())
+		}
+		// Only a shared device leaves a request a choice between a share and
+		// CPUs of its own.
+		if shared := (device.Partition{Role: partition.Role}).PublishesSharedDevices(true); partition.AllowExclusive && !shared {
+			return fmt.Errorf("partition %q: allowExclusive applies only to role %s, and its role is %q; remove it",
+				partition.Name, device.PARTITION_ROLE_DEFAULT, partition.Role)
 		}
 		cpus, err := cpuset.Parse(partition.CPUSet)
 		if err != nil {

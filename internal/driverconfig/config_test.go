@@ -580,6 +580,15 @@ func TestResolve_CPUPartitions(t *testing.T) {
 			},
 		},
 		{
+			name:     "allowExclusive on the default entry",
+			file:     "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n  allowExclusive: true\n",
+			want:     []driverconfig.CPUPartition{{Name: "default", AllowExclusive: true}},
+			wantUsed: true,
+			wantPartitions: []device.Partition{
+				{Name: "default", CPUs: cpuset.New()},
+			},
+		},
+		{
 			name:     "smt true",
 			file:     "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\n  smt: true\n",
 			want:     []driverconfig.CPUPartition{{Name: "default", SMT: &driverconfig.SMT{Threads: 0}}},
@@ -676,6 +685,17 @@ func TestResolve_Profiles(t *testing.T) {
 		{name: "a profile's list null", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions: null\n", wantErr: noPartitions},
 		{name: "a profile's list a bare key", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions:\n", wantErr: noPartitions},
 		{name: "a profile's list empty", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions: []\n", wantErr: noPartitions},
+		{
+			name: "allowExclusive on a profile's default entry",
+			file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions:\n    - name: default\n      allowExclusive: true\n",
+			want: map[string]driverconfig.Profile{"r7625": {CPUPartitions: []driverconfig.CPUPartition{{Name: "default", AllowExclusive: true}}}},
+		},
+		{
+			name: "allowExclusive on a profile's exclusive partition",
+			file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions:\n    - name: default\n" +
+				"    - name: vms\n      role: exclusive\n      cpuset: \"2-3\"\n      allowExclusive: true\n",
+			wantErr: `profile "r7625": partition "vms": allowExclusive applies only to role default, and its role is "exclusive"; remove it`,
+		},
 		{
 			name:    "reservedCPUs inside a profile",
 			file:    "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    reservedCPUs: \"0,128\"\n",

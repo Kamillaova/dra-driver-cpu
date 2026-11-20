@@ -363,6 +363,11 @@ func TestRunReportsCPUPartitions(t *testing.T) {
 				"- name: vms\n  role: exclusive\n  cpuset: \"2-3\"\n",
 			want: `[{"name":"default","smt":false},{"name":"vms","role":"exclusive","cpuset":"2-3"}]`,
 		},
+		{
+			name:   "allowExclusive",
+			config: "cpuPartitions:\n- name: default\n  allowExclusive: true\n",
+			want:   `[{"name":"default","allowExclusive":true}]`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setupFakeHostWithConfig(t, tc.config)
@@ -401,6 +406,11 @@ func TestRunReportsProfiles(t *testing.T) {
 				"    - name: vms\n      role: exclusive\n      cpuset: \"2-3\"\n",
 			want: `{"r7625":{"cpuPartitions":[{"name":"default","smt":false},{"name":"vms","role":"exclusive","cpuset":"2-3"}]},` +
 				`"x3d":{"cpuPartitions":[{"name":"default"}]}}`,
+		},
+		{
+			name:   "allowExclusive in a profile",
+			config: "profiles:\n  x3d:\n    cpuPartitions:\n    - name: default\n      allowExclusive: true\n",
+			want:   `{"x3d":{"cpuPartitions":[{"name":"default","allowExclusive":true}]}}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
