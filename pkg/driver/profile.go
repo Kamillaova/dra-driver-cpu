@@ -138,6 +138,7 @@ func (cp *CPUDriver) configureFromProfile(ctx context.Context, nriErr <-chan err
 	}
 	cp.seedAllocationStoreFromDisk(logger)
 	cp.eventBroadcaster, cp.eventRecorder = newEventRecorder(ctx, cp.kubeClient, cp.driverName, cp.nodeName)
+	cp.announcePlaceWindow(logger)
 	return cp.leaveWindow(ctx)
 }
 
