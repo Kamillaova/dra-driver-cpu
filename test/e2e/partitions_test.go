@@ -186,6 +186,113 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 		})
 	})
 
+	// A degraded partition lists one thread of a core whose other threads are
+	// online. The lane declares one where the host has such a core, and has the
+	// driver publish its devices tainted.
+	ginkgo.Context("with a degraded partition", func() {
+		var (
+			targetNode    *v1.Node
+			partitionCPUs cpuset.CPUSet
+			siblings      cpuset.CPUSet
+		)
+
+		ginkgo.BeforeAll(func(ctx context.Context) {
+			var err error
+			targetNode, err = e2enode.PickWorker(ctx, rootFxt.K8SClientset, 5*time.Second, 1*time.Minute, rootFxt.Log)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			partition, ok := partitionNamed(cfgValues.effectiveFor(targetNode), degradedPartition)
+			if !ok {
+				ginkgo.Skip("node " + targetNode.Name + " runs no partition " + degradedPartition + "; the partitions lane declares one where the host has a core with an online sibling")
+			}
+			if !cfgValues.TaintDegradedPartitions {
+				ginkgo.Skip("the driver runs without taintDegradedPartitions, so partition " + degradedPartition + " publishes no devices")
+			}
+			partitionCPUs, err = cpuset.Parse(partition.CPUSet)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse the cpuset of partition %q", degradedPartition)
+
+			infraFxt := rootFxt.WithPrefix("infra-degraded")
+			gomega.Expect(infraFxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(infraFxt.Teardown)
+			coreOf := discoverCores(ctx, infraFxt, dracpuTesterImage, targetNode.Name)
+			siblings = cpuset.New()
+			for _, cpu := range partitionCPUs.List() {
+				siblings = siblings.Union(coreOf[cpu])
+			}
+			siblings = siblings.Difference(partitionCPUs)
+			gomega.Expect(siblings.IsEmpty()).To(gomega.BeFalse(), "partition %s (%s) has no online sibling", degradedPartition, partitionCPUs.String())
+		})
+
+		ginkgo.It("should publish the partition's devices tainted, with one thread per core", func(ctx context.Context) {
+			devices := devicesOfPartition(ctx, rootFxt.K8SClientset, targetNode.Name, degradedPartition)
+			gomega.Expect(devices).ToNot(gomega.BeEmpty(), "node %s publishes no device of partition %q", targetNode.Name, degradedPartition)
+			for _, dev := range devices {
+				gomega.Expect(dev.Taints).To(gomega.HaveExactElements(gomega.And(
+					gomega.HaveField("Key", device.DegradedTaintKey),
+					gomega.HaveField("Value", device.DegradedTaintValue),
+					gomega.HaveField("Effect", resourcev1.DeviceTaintEffectNoSchedule),
+					gomega.HaveField("TimeAdded", gomega.Not(gomega.BeNil())),
+				)), "device %s does not carry the degraded partition's taint, with the time the API server set", dev.Name)
+				gomega.Expect(dev.Attributes).To(gomega.HaveKeyWithValue(device.AttributeThreadsPerCore,
+					resourcev1.DeviceAttribute{IntValue: new(int64(1))}), "device %s does not report one thread per core", dev.Name)
+				gomega.Expect(dev.Attributes).To(gomega.HaveKeyWithValue(device.AttributeSMTEnabled,
+					resourcev1.DeviceAttribute{BoolValue: new(false)}), "device %s reports SMT enabled", dev.Name)
+			}
+		})
+
+		ginkgo.It("should report the partition degraded on its node", func(ctx context.Context) {
+			message := fmt.Sprintf("partitions are degraded while the kernel contradicts their smt: partition %q expects 1 online thread per core, and CPUs %s of its cores are online too; take those CPUs offline at boot, then restart the driver",
+				degradedPartition, siblings.String())
+			expectPartitionDegraded(ctx, rootFxt.K8SClientset, targetNode.Name, v1.ConditionTrue, "SiblingThreadsOnline", message)
+		})
+
+		ginkgo.It("should leave a claim that does not tolerate the taint Pending", ginkgo.Label("negative"), func(ctx context.Context) {
+			fxt := rootFxt.WithPrefix("degraded-untolerated")
+			gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(fxt.Teardown)
+
+			spec := makeResourceClaimSpec(1, true)
+			spec.Devices.Requests[0].Exactly.DeviceClassName = driverName + "." + degradedPartition
+			_, err := fxt.K8SClientset.ResourceV1().ResourceClaimTemplates(fxt.Namespace.Name).Create(ctx, &resourcev1.ResourceClaimTemplate{
+				ObjectMeta: metav1.ObjectMeta{Name: "degraded-untolerated"},
+				Spec:       resourcev1.ResourceClaimTemplateSpec{Spec: spec},
+			}, metav1.CreateOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create the claim template")
+			pod := makeTesterPodWithExclusiveCPUClaimWithoutCPURequest(fxt.Namespace.Name, dracpuTesterImage, "degraded-untolerated", targetNode.Name)
+			pod, err = fxt.K8SClientset.CoreV1().Pods(fxt.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot create the tester pod")
+
+			// The scheduler's DRA plugin finds no device the claim tolerates
+			// (kubernetes v1.37.0 pkg/scheduler/framework/plugins/dynamicresources/dynamicresources.go:1092).
+			expectPodEvent(ctx, fxt.K8SClientset, pod, "FailedScheduling", "cannot allocate all claims")
+			gomega.Consistently(func(g gomega.Gomega) {
+				current, err := fxt.K8SClientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				g.Expect(current.Status.Phase).To(gomega.Equal(v1.PodPending))
+				g.Expect(current.Spec.NodeName).To(gomega.BeEmpty(), "a claim that does not tolerate the taint was bound to a node")
+			}, 20*time.Second, 5*time.Second).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("should pin a claim that tolerates the taint to the partition's thread", func(ctx context.Context) {
+			fxt := rootFxt.WithPrefix("degraded-tolerated")
+			gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(fxt.Teardown)
+
+			spec := makeResourceClaimSpec(1, true)
+			spec.Devices.Requests[0].Exactly.DeviceClassName = driverName + "." + degradedPartition
+			spec.Devices.Requests[0].Exactly.Tolerations = []resourcev1.DeviceToleration{{
+				Key:      device.DegradedTaintKey,
+				Operator: resourcev1.DeviceTolerationOpEqual,
+				Value:    device.DegradedTaintValue,
+				Effect:   resourcev1.DeviceTaintEffectNoSchedule,
+			}}
+			pod := createTesterPodWithClaimSpec(ctx, fxt, dracpuTesterImage, targetNode.Name, spec, "degraded-tolerated")
+
+			assigned := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod).CPUAssigned
+			gomega.Expect(assigned).To(cpusetmatchers.Equal(partitionCPUs),
+				"the tolerating claim was given %s, not partition %s's %s", assigned.String(), degradedPartition, partitionCPUs.String())
+		})
+	})
+
 	// The lane's kubelets reserve the CPUs outside each profile's default
 	// partition, and e2e, with its reserved partition, needs more than
 	// e2e-wide: a node moved from e2e-wide to e2e misses its reservation.
@@ -222,6 +329,13 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 			if !ok {
 				ginkgo.Skip("no node runs a profile needing less kubelet CPU reservation than another; the partitions lane gives e2e a reserved partition where the host leaves two CPUs to default")
 			}
+			offline := cpuset.New()
+			if profile := cfgValues.Profiles[want]; slices.ContainsFunc(profile.CPUPartitions, limitsThreads) {
+				fxt := rootFxt.WithPrefix("reservation-short")
+				gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+				ginkgo.DeferCleanup(fxt.Teardown)
+				offline = expectedOffline(discoverCores(ctx, fxt, dracpuTesterImage, short.Name), profile.CPUPartitions)
+			}
 			fixture.By("moving node %s to profile %q, which needs a reservation of %d CPUs", short.Name, want, needed)
 			restore := short.Labels[driverconfig.ProfileLabel]
 			ginkgo.DeferCleanup(func(ctx context.Context) {
@@ -233,8 +347,7 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 			})
 			relabelAndRestartDriver(ctx, rootFxt.K8SClientset, short.Name, want)
 
-			message := fmt.Sprintf("kubelet CPU reservation below %d: drain the node, then set `kubeReserved: {cpu: \"%d\"}` or `systemReserved: {cpu: \"%d\"}`; no %s devices are published until then",
-				needed, needed, needed, driverName)
+			message := reservationShortMessage(needed, reservedCPUs(short), offline)
 			gomega.Eventually(func(g gomega.Gomega) {
 				current, err := rootFxt.K8SClientset.CoreV1().Nodes().Get(ctx, short.Name, metav1.GetOptions{})
 				g.Expect(err).ToNot(gomega.HaveOccurred())
@@ -600,10 +713,74 @@ func clearStoppedCondition(ctx context.Context, cs kubernetes.Interface, nodeNam
 }
 
 const (
-	wideProfile    = "e2e-wide"
-	grownProfile   = "e2e-grown"
-	grownPartition = "grown"
+	wideProfile       = "e2e-wide"
+	grownProfile      = "e2e-grown"
+	grownPartition    = "grown"
+	degradedPartition = "degraded"
 )
+
+// limitsThreads reports whether a named partition's smt asks for fewer online
+// threads per core than the hardware may have.
+func limitsThreads(partition driverconfig.CPUPartition) bool {
+	return partition.Name != device.DefaultPartitionName && partition.SMT != nil && partition.SMT.Threads > 0
+}
+
+// expectedOffline is the online threads of the cores the named partitions
+// list, beyond the threads listed, that their smt expects offline.
+func expectedOffline(coreOf map[int]cpuset.CPUSet, partitions []driverconfig.CPUPartition) cpuset.CPUSet {
+	ginkgo.GinkgoHelper()
+	offline := cpuset.New()
+	for _, partition := range partitions {
+		if !limitsThreads(partition) {
+			continue
+		}
+		listed, err := cpuset.Parse(partition.CPUSet)
+		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot parse the cpuset of partition %q", partition.Name)
+		for _, cpu := range listed.List() {
+			offline = offline.Union(coreOf[cpu].Difference(listed))
+		}
+	}
+	return offline
+}
+
+// reservationShortMessage is CPUReservationMissing's message on a node whose
+// kubelet reserves reserved CPUs where its partitions need needed, offline
+// holding the online threads their smt expects offline.
+func reservationShortMessage(needed, reserved int64, offline cpuset.CPUSet) string {
+	toSet := needed - int64(offline.Size())
+	settings := fmt.Sprintf("`kubeReserved: {cpu: \"%d\"}` or `systemReserved: {cpu: \"%d\"}`", toSet, toSet)
+	switch {
+	case offline.IsEmpty():
+		return fmt.Sprintf("kubelet CPU reservation below %d: drain the node, then set %s; no %s devices are published until then", needed, settings, driverName)
+	case reserved >= toSet:
+		return fmt.Sprintf("kubelet CPU reservation of %d needs CPUs %s offline: take them offline at boot", toSet, offline.String())
+	}
+	return fmt.Sprintf("kubelet CPU reservation below %d: drain the node, take CPUs %s offline at boot, then set %s; no %s devices are published until then",
+		needed, offline.String(), settings, driverName)
+}
+
+// discoverCores runs the discovery pod on the node and returns the core of
+// each online CPU.
+func discoverCores(ctx context.Context, fxt *fixture.Fixture, image, nodeName string) map[int]cpuset.CPUSet {
+	ginkgo.GinkgoHelper()
+	infoPod := e2epod.PinToNode(discovery.MakePod(fxt.Namespace.Name, image), nodeName)
+	infoPod, err := e2epod.RunToCompletion(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot run the discovery pod")
+	data, err := e2epod.GetLogs(ctx, fxt.K8SClientset, infoPod)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot get the discovery pod's logs")
+	var cpuInfo discovery.DRACPUInfo
+	gomega.Expect(unmarshalLatestReport(data, &cpuInfo)).To(gomega.Succeed())
+	return coresOf(cpuInfo)
+}
+
+// partitionNamed returns the partition of v named name.
+func partitionNamed(v driverConfigValues, name string) (driverconfig.CPUPartition, bool) {
+	i := slices.IndexFunc(v.CPUPartitions, func(p driverconfig.CPUPartition) bool { return p.Name == name })
+	if i < 0 {
+		return driverconfig.CPUPartition{}, false
+	}
+	return v.CPUPartitions[i], true
+}
 
 func expectPartitionDegraded(ctx context.Context, cs kubernetes.Interface, nodeName string, status v1.ConditionStatus, reason, message string) {
 	ginkgo.GinkgoHelper()
@@ -764,10 +941,11 @@ func restoreDaemonSetNodes(ctx context.Context, cs kubernetes.Interface, nodeNam
 }
 
 // singleThreadPartition returns the first partition of v whose smt keeps one
-// online thread per core.
+// online thread per core, other than the degraded partition, whose cores keep
+// an online sibling.
 func singleThreadPartition(v driverConfigValues) (driverconfig.CPUPartition, bool) {
 	for _, partition := range v.CPUPartitions {
-		if partition.SMT != nil && partition.SMT.Threads == 1 {
+		if partition.Name != degradedPartition && partition.SMT != nil && partition.SMT.Threads == 1 {
 			return partition, true
 		}
 	}
