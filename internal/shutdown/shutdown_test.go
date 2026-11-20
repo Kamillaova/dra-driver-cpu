@@ -19,12 +19,55 @@ package shutdown
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestWriteTerminationMessage(t *testing.T) {
+	const msg = "driver failed to initialize: `cgroupThreadedMode: create` needs the host's pid namespace"
+	for _, tc := range []struct {
+		name    string
+		mounted *string
+		wantErr error
+	}{
+		{
+			name:    "the empty file the kubelet mounts",
+			mounted: new(""),
+		},
+		{
+			name:    "a longer earlier message replaced",
+			mounted: new(msg + ", and an earlier message longer than this one"),
+		},
+		{
+			name:    "no file outside a pod, none created",
+			wantErr: fs.ErrNotExist,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "termination-log")
+			if tc.mounted != nil {
+				require.NoError(t, os.WriteFile(path, []byte(*tc.mounted), 0o600))
+			}
+
+			err := WriteTerminationMessage(path, msg)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+				require.NoFileExists(t, path)
+				return
+			}
+			require.NoError(t, err)
+			written, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, msg, string(written))
+		})
+	}
+}
 
 func TestBound(t *testing.T) {
 	fatal := errors.New("DRA gRPC server failed")
