@@ -310,6 +310,18 @@ request "vcpu": partition "spdk" is degraded (SiblingThreadsOnline) and its devi
   restarts. Enable the gate on the API server and restart the driver pod, or take the threads
   offline.
 
+The pods already holding a device of a degraded partition, prepared before the driver restarted or
+tolerating the taint, keep running, and each shows the device as unhealthy in its status, until the
+driver restarts with the partition no longer degraded:
+
+```bash
+kubectl get pod <pod> -o jsonpath='{range .status.containerStatuses[*]}{.name}{"\t"}{.allocatedResourcesStatus}{"\n"}{end}'
+```
+
+The entry for the device reads `health: Unhealthy` with the message
+`partition "spdk" is degraded (SiblingThreadsOnline); take its sibling threads offline`; see
+[A degraded partition](cpu-partitions.md#a-degraded-partition).
+
 The condition has a second cause, a `reserved` partition holding CPUs of a claim prepared before the
 partitions changed. The driver finds such claims at start, from the claims it restores, and keeps
 serving everything else. It kills the running containers of each such claim, refuses to create or
