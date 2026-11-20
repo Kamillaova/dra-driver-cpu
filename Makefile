@@ -138,6 +138,8 @@ DRACPU_E2E_ALLOCATOR ?= cpumanager
 # fullPhysicalCPUsOnly driverConfig option. DRACPU_E2E_RESERVED_CPUS must then
 # be empty or hold whole cores.
 DRACPU_E2E_FULL_PCPUS_ONLY ?= false
+# The driver's cgroupThreadedMode, which ci-kind-setup installs on every node.
+DRACPU_E2E_THREADED_MODE ?= create
 # Extra arguments passed to golangci-lint in the lint target.
 # For example, set GOLANGCI_LINT_EXTRA_ARGS=--fix to auto-fix issues.
 GOLANGCI_LINT_EXTRA_ARGS ?=
@@ -292,6 +294,7 @@ endif
 		--set driverConfig.allowFractionalCapacityRequests=true \
 		--set driverConfig.allocator=$(DRACPU_E2E_ALLOCATOR) \
 		--set driverConfig.fullPhysicalCPUsOnly=$(DRACPU_E2E_FULL_PCPUS_ONLY) \
+		--set driverConfig.cgroupThreadedMode=$(DRACPU_E2E_THREADED_MODE) \
 		$(if $(DRACPU_E2E_LANE),$(E2E_LANE_HELM_ARGS))
 	hack/ci/wait-resourcelices.sh
 

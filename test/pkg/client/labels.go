@@ -20,12 +20,14 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	nodev1client "k8s.io/client-go/kubernetes/typed/node/v1"
 	resourcev1client "k8s.io/client-go/kubernetes/typed/resource/v1"
 )
 
@@ -91,6 +93,13 @@ func (c *labelingClientset) CoreV1() corev1client.CoreV1Interface {
 	}
 }
 
+func (c *labelingClientset) NodeV1() nodev1client.NodeV1Interface {
+	return &labelingNodeV1{
+		NodeV1Interface: c.Interface.NodeV1(),
+		owner:           c,
+	}
+}
+
 func (c *labelingClientset) ResourceV1() resourcev1client.ResourceV1Interface {
 	return &labelingResourceV1{
 		ResourceV1Interface: c.Interface.ResourceV1(),
@@ -135,6 +144,28 @@ type labelingNamespaces struct {
 func (c *labelingNamespaces) Create(ctx context.Context, namespace *corev1.Namespace, opts metav1.CreateOptions) (*corev1.Namespace, error) {
 	addCreateLabel(namespace, c.owner.key, c.owner.value)
 	return c.NamespaceInterface.Create(ctx, namespace, opts)
+}
+
+type labelingNodeV1 struct {
+	nodev1client.NodeV1Interface
+	owner *labelingClientset
+}
+
+func (c *labelingNodeV1) RuntimeClasses() nodev1client.RuntimeClassInterface {
+	return &labelingRuntimeClasses{
+		RuntimeClassInterface: c.NodeV1Interface.RuntimeClasses(),
+		owner:                 c.owner,
+	}
+}
+
+type labelingRuntimeClasses struct {
+	nodev1client.RuntimeClassInterface
+	owner *labelingClientset
+}
+
+func (c *labelingRuntimeClasses) Create(ctx context.Context, runtimeClass *nodev1.RuntimeClass, opts metav1.CreateOptions) (*nodev1.RuntimeClass, error) {
+	addCreateLabel(runtimeClass, c.owner.key, c.owner.value)
+	return c.RuntimeClassInterface.Create(ctx, runtimeClass, opts)
 }
 
 type labelingResourceV1 struct {
