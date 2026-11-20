@@ -23,12 +23,12 @@ Recommended Kubernetes setup
 
 Other requirements:
 
-| Requirement           | Minimum                                                                                                                   |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Kernel cgroup version | **Cgroup v2**. The driver does not support cgroup v1.                                                                     |
-| Kernel build options  | `CONFIG_CPUSETS`, the cpuset controller; `CONFIG_CFS_BANDWIDTH` for a capped shared request                               |
-| Container runtime     | containerd **2.0** or CRI-O **1.30** (NRI and CDI enabled by default)                                                     |
-| Kubelet configuration | CPUManager disabled: `cpuManagerPolicy: none` — see [Configuration](configuration.md#kubelet-configuration-prerequisites) |
+| Requirement           | Minimum                                                                                                                                                                                                                                                                                                         |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Kernel cgroup version | **Cgroup v2**. The driver does not support cgroup v1.                                                                                                                                                                                                                                                           |
+| Kernel build options  | `CONFIG_CPUSETS`, the cpuset controller; `CONFIG_CFS_BANDWIDTH` for a capped shared request; `CONFIG_FAIR_GROUP_SCHED` under `cgroupThreadedMode` `create` and `place`, where a kernel without `CONFIG_RT_GROUP_SCHED`, or with it switched off, is advised; see [Threaded Cgroups](threaded-cgroups.md#kernel) |
+| Container runtime     | containerd **2.0** or CRI-O **1.30** (NRI and CDI enabled by default)                                                                                                                                                                                                                                           |
+| Kubelet configuration | CPUManager disabled: `cpuManagerPolicy: none` — see [Configuration](configuration.md#kubelet-configuration-prerequisites)                                                                                                                                                                                       |
 
 Optional features need additional cluster feature gates.
 All the driver options which depends on the availability of a Kubernetes feature controlled by a Feature Gate require a double opt-in mechanism.
@@ -216,6 +216,14 @@ a running pod.
 The driver needs node-level privileges: `hostNetwork: true`, and hostPath mounts for the NRI
 socket (`/var/run/nri`), the CDI spec directory (`/var/run/cdi`), and the kubelet plugin
 directories.
+
+Under `cgroupThreadedMode` `create` and `place` the chart also gives the driver's pod `hostPID`, a
+read-write mount of the host's `/sys/fs/cgroup` and, under `place`, `CAP_SYS_NICE`, `CAP_SYS_ADMIN`
+and `CAP_SYS_PTRACE`; see [Threaded cgroups: the driver's privileges](configuration.md#threaded-cgroups-the-drivers-privileges).
+The PodSecurity levels `baseline` and `restricted` refuse those, so the driver's namespace needs
+the level `privileged` there. Kubernetes' default PodSecurity configuration enforces no level, and
+admits the driver's pod anywhere; a cluster that enforces a default level admits it only in a
+namespace it exempts or labels `pod-security.kubernetes.io/enforce: privileged`.
 
 ## RBAC and admission policies
 
