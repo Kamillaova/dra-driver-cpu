@@ -52,6 +52,25 @@ type CPUConfig struct {
 	Exclusive *bool `json:"exclusive,omitempty"`
 }
 
+// ClaimPlacementStatusKind is the kind of ClaimPlacementStatus.
+const ClaimPlacementStatusKind = "ClaimPlacementStatus"
+
+// ClaimPlacementStatus is the data of the entry the driver writes in a
+// ResourceClaim's status for each of its allocation results:
+// claim.Status.Devices[*].Data.
+type ClaimPlacementStatus struct {
+	// APIVersion specifies the schema version. Should be "v1alpha1".
+	APIVersion string `json:"apiVersion"`
+	// Kind is ClaimPlacementStatusKind.
+	Kind string `json:"kind"`
+	// Partition is the CPU partition of the result's device, "default" on a
+	// node without partitions.
+	Partition string `json:"partition"`
+	// CPUSet is the CPUs an exclusive request holds on the device. A share's
+	// entry has none, since the CPUs it runs on change after it is prepared.
+	CPUSet string `json:"cpuset,omitempty"`
+}
+
 // LimitMax is the one way to write that a request has no CPU limit.
 const LimitMax Limit = "max"
 
