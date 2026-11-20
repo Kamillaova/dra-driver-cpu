@@ -23,9 +23,13 @@ import (
 	"time"
 
 	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceslice"
+	"k8s.io/utils/cpuset"
 )
 
 func newHealthTestDriver(deviceNames ...string) *CPUDriver {
@@ -184,6 +188,97 @@ func TestWatchHealthStatusStopsOnDriverStop(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("WatchHealthStatus did not return after stopHealthCh was closed")
+	}
+}
+
+type deviceHealthState struct {
+	status  kubeletplugin.HealthStatus
+	message string
+}
+
+func healthByDevice(report kubeletplugin.DeviceHealthReport) map[string]deviceHealthState {
+	byName := make(map[string]deviceHealthState, len(report.Devices))
+	for _, dev := range report.Devices {
+		byName[dev.DeviceName] = deviceHealthState{status: dev.Health, message: dev.Message}
+	}
+	return byName
+}
+
+// A degraded partition's devices report Unhealthy, saying what to do, in the
+// first report and every resend, whether they are published tainted, withheld,
+// or withheld once the API server dropped their taint; every other device
+// reports Healthy.
+func TestDegradedPartitionsReportUnhealthy(t *testing.T) {
+	originalInterval := healthResendInterval
+	healthResendInterval = 10 * time.Millisecond
+	defer func() { healthResendInterval = originalInterval }()
+
+	healthy := deviceHealthState{status: kubeletplugin.HealthStatusHealthy, message: "device initialized"}
+	unhealthy := func(partition string) deviceHealthState {
+		return deviceHealthState{status: kubeletplugin.HealthStatusUnhealthy,
+			message: `partition "` + partition + `" is degraded (SiblingThreadsOnline); take its sibling threads offline`}
+	}
+	spdkUnhealthy := map[string]deviceHealthState{"cpudevnuma000": healthy, "cpudevnuma000-vms": healthy, "cpudevnuma000-spdk": unhealthy("spdk")}
+	for _, tc := range []struct {
+		name     string
+		declared []device.Partition
+		taint    bool
+		dropped  bool
+		want     map[string]deviceHealthState
+	}{{
+		name:     "published tainted",
+		declared: spdkDegraded,
+		taint:    true,
+		want:     spdkUnhealthy,
+	}, {
+		name:     "withheld with taintDegradedPartitions off",
+		declared: spdkDegraded,
+		want:     spdkUnhealthy,
+	}, {
+		name:     "withheld after a dropped taint",
+		declared: spdkDegraded,
+		taint:    true,
+		dropped:  true,
+		want:     spdkUnhealthy,
+	}, {
+		name:     "the degraded default entry's shared device",
+		declared: defaultDegraded,
+		taint:    true,
+		want:     map[string]deviceHealthState{"cpudevnuma000": unhealthy("default"), "cpudevnuma000-vms": healthy},
+	}, {
+		name:     "no degraded partition",
+		declared: []device.Partition{{Name: device.DefaultPartitionName}, {Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)}},
+		taint:    true,
+		want:     map[string]deviceHealthState{"cpudevnuma000": healthy, "cpudevnuma000-vms": healthy},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newDegradedDriver(t, fake.NewClientset(testConditionNode(testReadyCond)), nil, tc.declared, tc.taint)
+			if tc.dropped {
+				d.draPlugin = &mockKubeletPlugin{}
+				d.HandleError(t.Context(), asTheLibraryReports(&resourceslice.DroppedFieldsError{
+					PoolName: testNodeName, DesiredSlice: droppedTaintSlice(true, false), ActualSlice: droppedTaintSlice(false, false),
+				}), "publishing ResourceSlices failed")
+				require.NoError(t, d.nodeConditions.sync(t.Context(), testr.New(t)))
+				require.True(t, d.taintsWithheld.Load(), "the degraded devices are withheld")
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			reports := make(chan kubeletplugin.DeviceHealthReport)
+			watched := make(chan error, 1)
+			go func() { watched <- d.WatchHealthStatus(ctx, reports) }()
+			go d.healthResendLoop(ctx)
+			for _, which := range []string{"the initial report", "a resend"} {
+				select {
+				case report := <-reports:
+					require.Equal(t, tc.want, healthByDevice(report), which)
+				case <-time.After(5 * time.Second):
+					t.Fatalf("no %s", which)
+				}
+			}
+			cancel()
+			require.NoError(t, <-watched)
+			<-d.health.resendDone
+		})
 	}
 }
 
