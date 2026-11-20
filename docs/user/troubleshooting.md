@@ -245,19 +245,24 @@ that carry the mapping, so the driver publishes no devices and logs the refusal.
 A partition's `smt` says how many threads per core the platform leaves online on the partition's
 cores; the driver only checks it. Where the kernel has more threads online on a partition's cores
 than its `smt` declares, the partition is degraded: it publishes no devices, so no claim can take
-its CPUs, and the rest of the node serves as usual. A partition that itself lists more threads of
-one core than its `smt` allows is refused at start instead, since taking the extra threads offline
-would leave it naming an offline CPU. Where the degraded partition is the `default`
-entry, its shared devices are the ones not published, and containers without claims keep running
-on its CPUs. The driver reports it in the condition `CPUPartitionDegraded` on its Node, on every
-node that uses `cpuPartitions`:
+its CPUs, and the rest of the node serves as usual. With `taintDegradedPartitions` on, it publishes
+its devices with a taint instead, so only a claim tolerating the taint can take its CPUs; see
+[A degraded partition](cpu-partitions.md#a-degraded-partition). A partition that itself lists more
+threads of one core than its `smt` allows is refused at start instead, since taking the extra
+threads offline would leave it naming an offline CPU. Where the degraded partition is the `default`
+entry, its shared devices are the ones not published, or tainted, and containers without claims keep
+running on its CPUs. The driver reports it in the condition `CPUPartitionDegraded` on its Node, on
+every node that uses `cpuPartitions`:
 
 ```bash
 kubectl get node <node> -o jsonpath='{.status.conditions[?(@.type=="CPUPartitionDegraded")]}'
 ```
 
 - `True`, reason `SiblingThreadsOnline`: the message names each degraded partition and the CPUs of
-  its cores that are online too. `dra_cpu_partition_verified` is `0` for each such partition.
+  its cores that are online too. It starts
+  `partitions publish no devices while the kernel contradicts their smt`, or, with
+  `taintDegradedPartitions` on, `partitions are degraded while the kernel contradicts their smt`.
+  `dra_cpu_partition_verified` is `0` for each such partition.
 - `False`, reason `PartitionsVerified`: the kernel has online the threads per core every
   partition's `smt` declares.
 - `Unknown`, reason `DriverStopped`: the driver has stopped and checks nothing.
@@ -265,6 +270,25 @@ kubectl get node <node> -o jsonpath='{.status.conditions[?(@.type=="CPUPartition
 The driver decides this at start, and the condition holds until the driver restarts. Take the CPUs
 the message names offline at boot, through the platform's configuration, then restart the driver
 pod. What the driver does with CPUs taken offline while it runs is undefined.
+
+Meanwhile the driver refuses to prepare a claim on a degraded partition's device, with one of:
+
+```text
+request "vcpu": partition "spdk" is degraded (SiblingThreadsOnline); tolerate dra.cpu/degraded=SiblingThreadsOnline:NoSchedule, or take its sibling threads offline
+request "vcpu": partition "spdk" is degraded (SiblingThreadsOnline) and its devices are not published (`taintDegradedPartitions: false`); take its sibling threads offline
+request "vcpu": partition "spdk" is degraded (SiblingThreadsOnline) and its devices are not published; take its sibling threads offline
+```
+
+- The first where the devices are published tainted and the claim's request does not tolerate the
+  taint, which a scheduler without the `DRADeviceTaints` feature gate lets through: add the
+  toleration to the request, or take the threads offline.
+- The second where `taintDegradedPartitions` is off, for a claim allocated the device before the
+  driver restarted: take the threads offline, then restart the driver pod.
+- The third once the API server has dropped the taint, which an API server without
+  `DRADeviceTaints` does: the driver then withholds the partition's devices, refuses every claim on
+  them, tolerating or not, and counts it in `dra_cpu_device_taints_dropped_total`, until it
+  restarts. Enable the gate on the API server and restart the driver pod, or take the threads
+  offline.
 
 The condition has a second cause, a `reserved` partition holding CPUs of a claim prepared before the
 partitions changed. The driver finds such claims at start, from the claims it restores, and keeps

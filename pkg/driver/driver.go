@@ -182,6 +182,15 @@ type CPUDriver struct {
 	// degradedPartitions are the partitions whose smt the kernel contradicts,
 	// each with the contradiction. Set in configure, read-only after that.
 	degradedPartitions map[string]string
+	// taintDegradedPartitions is whether the degraded partitions publish their
+	// devices tainted. Set in configure, read-only after that.
+	taintDegradedPartitions bool
+	// deviceTaintsDropped is never cleared: once the API server drops a field,
+	// the plugin library stops sending it until the driver restarts.
+	// taintsWithheld is set once the devices whose taint it dropped are
+	// withheld.
+	deviceTaintsDropped atomic.Bool
+	taintsWithheld      atomic.Bool
 	// reservedPartitions are the partitions of role reserved. Set in
 	// configure, read-only after that.
 	reservedPartitions []device.Partition
@@ -249,6 +258,10 @@ type deviceTopology struct {
 	// sharedDevices is the CPUs of each published device whose CPUs its
 	// claims share, by device name.
 	sharedDevices map[string]cpuset.CPUSet
+	// degradedDevices is the partition of each device of a partition whose
+	// smt the kernel contradicts, published tainted or withheld, by device
+	// name.
+	degradedDevices map[string]string
 }
 
 // Providers group the interfaces the CPUDriver depends on
@@ -299,6 +312,8 @@ type Config struct {
 	AssumeUnsolicitedUpdatesSafe bool
 	// AllowFractionalCapacityRequests is driverconfig.Config.AllowFractionalCapacityRequests.
 	AllowFractionalCapacityRequests bool
+	// TaintDegradedPartitions is driverconfig.Config.TaintDegradedPartitions.
+	TaintDegradedPartitions bool
 	// CancelRun cancels the context given to Start, which refuses to run
 	// without it. HandleError calls it with a cause wrapping ErrFatal, so that
 	// the caller stops the driver.
@@ -419,11 +434,14 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 			}
 		}
 	}
+	cp.taintDegradedPartitions = config.TaintDegradedPartitions
 	withheld := make(map[string]bool, len(degraded))
+	tainted := make(map[string]bool, len(degraded))
 	if len(config.CPUPartitions) > 0 {
 		for _, partition := range partitions {
 			_, contradicted := degraded[partition.Name]
-			withheld[partition.Name] = contradicted
+			withheld[partition.Name] = contradicted && !config.TaintDegradedPartitions
+			tainted[partition.Name] = contradicted && config.TaintDegradedPartitions
 			cp.metrics.SetPartitionVerified(partition.Name, !contradicted)
 		}
 	}
@@ -477,6 +495,7 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 		Partitions:                            partitions,
 		PartitionsUsed:                        len(config.CPUPartitions) > 0,
 		Withheld:                              withheld,
+		Tainted:                               tainted,
 		AllowFractionalCapacityRequests:       config.AllowFractionalCapacityRequests,
 	})
 	if err != nil {
@@ -508,10 +527,14 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 		cp.topology.sharedDevices[name] = cpus
 	}
 	cp.allocationState.SetSharedDevices(cp.topology.sharedDevices)
-	// Chunk devices into slices of at most devicesPerResourceSlice
-	for _, devices := range result.DevicesByPartition {
-		cp.topology.deviceSlices = append(cp.topology.deviceSlices, slices.Collect(slices.Chunk(devices, cp.devicesPerResourceSlice))...)
+	cp.topology.degradedDevices = make(map[string]string, len(result.WithheldDevices))
+	maps.Copy(cp.topology.degradedDevices, result.WithheldDevices)
+	for name, partition := range result.DevicePartitions {
+		if tainted[partition.Name] {
+			cp.topology.degradedDevices[name] = partition.Name
+		}
 	}
+	cp.topology.deviceSlices = device.ChunkDevices(result.DevicesByPartition, cp.devicesPerResourceSlice)
 	logger.Info("chunked devices into ResourceSlices", "numDevices", len(result.Devices),
 		"devicesPerResourceSlice", cp.devicesPerResourceSlice, "numResourceSlices", len(cp.topology.deviceSlices),
 		"exposePCIeRoots", config.ExposePCIeRoots)

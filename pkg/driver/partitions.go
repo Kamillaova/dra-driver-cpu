@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"slices"
@@ -63,7 +64,7 @@ func resolvePartitions(logger logr.Logger, sysfs fs.ReadLinkFS, topo *cpuinfo.CP
 	for _, partition := range partitions {
 		if reason := verifyThreadArity(topo.CPUDetails, partition); reason != "" {
 			degraded[partition.Name] = reason
-			logger.Info("CPU partition publishes no devices: the kernel contradicts its smt", "partition", partition.Name, "role", partition.Role, "cpus", partition.CPUs.String(), "reason", reason)
+			logger.Info("CPU partition degraded: the kernel contradicts its smt", "partition", partition.Name, "role", partition.Role, "cpus", partition.CPUs.String(), "reason", reason)
 			continue
 		}
 		logger.Info("resolved CPU partition", "partition", partition.Name, "role", partition.Role, "cpus", partition.CPUs.String())
@@ -218,15 +219,19 @@ func verifyOfflineAccounting(logger logr.Logger, details cpuinfo.CPUDetails, pre
 
 // partitionDegradedCondition reports the partitions whose smt the kernel
 // contradicts, decided at start, and the claims restored at start whose CPUs
-// a reserved partition holds, until each is unprepared.
+// a reserved partition holds, until each is unprepared. observe withholds the
+// degraded partitions' devices once the API server has dropped their taint.
 func (cp *CPUDriver) partitionDegradedCondition() nodeConditionSource {
 	return nodeConditionSource{
 		conditionType: conditionPartitionDegraded,
+		observe: func(ctx context.Context, logger logr.Logger, _ *corev1.Node) {
+			cp.withholdDroppedTaints(ctx, logger)
+		},
 		evaluate: func() nodeConditionValue {
 			held := cp.reservedHoldsMessage()
 			switch {
 			case len(cp.degradedPartitions) > 0:
-				message := partitionDegradedMessage(cp.degradedPartitions)
+				message := partitionDegradedMessage(cp.degradedPartitions, cp.taintDegradedPartitions)
 				if held != "" {
 					message += "; " + held
 				}
@@ -242,7 +247,7 @@ func (cp *CPUDriver) partitionDegradedCondition() nodeConditionSource {
 
 // partitionDegradedMessage is CPUPartitionDegraded's message for the degraded
 // partitions, in name order.
-func partitionDegradedMessage(degraded map[string]string) string {
+func partitionDegradedMessage(degraded map[string]string, tainted bool) string {
 	names := make([]string, 0, len(degraded))
 	for name := range degraded {
 		names = append(names, name)
@@ -251,6 +256,10 @@ func partitionDegradedMessage(degraded map[string]string) string {
 	reasons := make([]string, 0, len(names))
 	for _, name := range names {
 		reasons = append(reasons, degraded[name])
+	}
+	if tainted {
+		return "partitions are degraded while the kernel contradicts their smt: " + strings.Join(reasons, "; ") +
+			"; take those CPUs offline at boot, then restart the driver"
 	}
 	return "partitions publish no devices while the kernel contradicts their smt: " + strings.Join(reasons, "; ") +
 		"; take those CPUs offline at boot, then restart the driver"

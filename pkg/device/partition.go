@@ -20,6 +20,7 @@ import (
 	"slices"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/utils/cpuset"
 )
 
@@ -35,6 +36,23 @@ const (
 // DefaultPartitionName names the partition entry whose presence switches a
 // node into partitions. Its role is always PARTITION_ROLE_DEFAULT.
 const DefaultPartitionName = "default"
+
+const (
+	// DegradedTaintKey is the key of the taint on the devices of a partition
+	// whose smt the kernel contradicts.
+	DegradedTaintKey = "dra.cpu/degraded"
+	// DegradedTaintValue is that taint's value, the reason of the
+	// CPUPartitionDegraded Node condition.
+	DegradedTaintValue = "SiblingThreadsOnline"
+)
+
+// DegradedTaint returns the taint on the devices of a partition whose smt the
+// kernel contradicts.
+func DegradedTaint() resourceapi.DeviceTaint {
+	// TimeAdded is left to the API server, which sets it when it stores the
+	// slice; the plugin library keeps that value and reports no drop for it.
+	return resourceapi.DeviceTaint{Key: DegradedTaintKey, Value: DegradedTaintValue, Effect: resourceapi.DeviceTaintEffectNoSchedule}
+}
 
 // PartitionRoles returns the roles a partition entry may name.
 func PartitionRoles() []string {
