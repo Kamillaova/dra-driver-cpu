@@ -588,6 +588,16 @@ func TestCreateContainerJudgesThreadedClaims(t *testing.T) {
 		env:     append(claimEnv("a", "vcpu"), claimEnv("b", "vcpu")...),
 		wantErr: `container "app": claims "a" and "b" both have group "vcpu"; give the groups different names`,
 	}, {
+		name: "WC4: two threaded claims that both set place",
+		claims: []*resourceapi.ResourceClaim{
+			withConfig(claimWithResults("a", claimResult{request: "vcpu", written: "1", consumed: "1", device: "cpudevnuma000-vms"}),
+				resourceapi.AllocationConfigSourceClaim, nil, threadedParams(`{"enabled": true, "place": "vcpu"}`)),
+			withConfig(claimWithResults("b", claimResult{request: "io", written: "0", consumed: "0", device: "cpudevnuma000"}),
+				resourceapi.AllocationConfigSourceClaim, nil, threadedParams(`{"enabled": true, "place": "io"}`)),
+		},
+		env:     append(claimEnv("a", "vcpu"), claimEnv("b", "io")...),
+		wantErr: `container "app": claims "a" and "b" both set place; keep place in one claim`,
+	}, {
 		name: "two threaded claims whose groups differ",
 		claims: []*resourceapi.ResourceClaim{
 			withConfig(claimWithResults("a", claimResult{request: "vcpu", written: "1", consumed: "1", device: "cpudevnuma000-vms"}),
@@ -600,7 +610,7 @@ func TestCreateContainerJudgesThreadedClaims(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
 			d := sharingDriver(t, true, nil, nil)
-			d.cgroupThreadedMode = "create"
+			d.cgroupThreadedMode = "place"
 			events := &capturingRecorder{}
 			d.eventRecorder = events
 			results, err := d.PrepareResourceClaims(ctx, tc.claims)
@@ -724,7 +734,7 @@ func TestSynchronizeKeepsThreadedContainersUnderOlderRules(t *testing.T) {
 		claims: []*resourceapi.ResourceClaim{vmClaim("vm", `{"enabled": true}`),
 			claimWithResults("extra", claimResult{request: "io", written: "0", consumed: "0", device: "cpudevnuma000"})},
 		env:       append(claimEnv("vm", "vcpu", "vmm-cpu"), claimEnv("extra", "io")...),
-		wantRules: map[string]float64{"unthreaded_with_threaded": 1, "duplicate_group_name": 0},
+		wantRules: map[string]float64{"unthreaded_with_threaded": 1, "duplicate_group_name": 0, "duplicate_place": 0},
 		wantEvent: `Warning KeptUnderOlderRule container "app" was created under an older rule and keeps its claims until it is created again, when it is refused by rule unthreaded_with_threaded: claim "extra" is not threaded but shares the container with threaded claim "vm"`,
 	}, {
 		name: "two threaded claims giving one group name",
@@ -735,14 +745,25 @@ func TestSynchronizeKeepsThreadedContainersUnderOlderRules(t *testing.T) {
 				resourceapi.AllocationConfigSourceClaim, nil, threadedParams(`{"enabled": true}`)),
 		},
 		env:       append(claimEnv("a", "vcpu"), claimEnv("b", "vcpu")...),
-		wantRules: map[string]float64{"unthreaded_with_threaded": 0, "duplicate_group_name": 1},
+		wantRules: map[string]float64{"unthreaded_with_threaded": 0, "duplicate_group_name": 1, "duplicate_place": 0},
 		wantEvent: `Warning KeptUnderOlderRule container "app" was created under an older rule and keeps its claims until it is created again, when it is refused by rule duplicate_group_name: claims "a" and "b" both have group "vcpu"; it runs without its groups and their limits`,
+	}, {
+		name: "two threaded claims that both set place",
+		claims: []*resourceapi.ResourceClaim{
+			withConfig(claimWithResults("a", claimResult{request: "vcpu", written: "1", consumed: "1", device: "cpudevnuma000-vms"}),
+				resourceapi.AllocationConfigSourceClaim, nil, threadedParams(`{"enabled": true, "place": "vcpu"}`)),
+			withConfig(claimWithResults("b", claimResult{request: "io", written: "0", consumed: "0", device: "cpudevnuma000"}),
+				resourceapi.AllocationConfigSourceClaim, nil, threadedParams(`{"enabled": true, "place": "io"}`)),
+		},
+		env:       append(claimEnv("a", "vcpu"), claimEnv("b", "io")...),
+		wantRules: map[string]float64{"unthreaded_with_threaded": 0, "duplicate_group_name": 0, "duplicate_place": 1},
+		wantEvent: `Warning KeptUnderOlderRule container "app" was created under an older rule and keeps its claims until it is created again, when it is refused by rule duplicate_place: claims "a" and "b" both set place`,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
 			reg := prometheus.NewRegistry()
 			d := sharingDriver(t, true, nil, cpumetrics.New(reg))
-			d.cgroupThreadedMode = "create"
+			d.cgroupThreadedMode = "place"
 			d.ownCgroupFound = true
 			events := &capturingRecorder{}
 			d.eventRecorder = events
@@ -788,4 +809,99 @@ func TestSynchronizeGivesAThreadedShareNoQuota(t *testing.T) {
 	require.Len(t, updates, 1)
 	require.Equal(t, "0,2-4", updates[0].GetLinux().GetResources().GetCpu().GetCpus())
 	require.Nil(t, updates[0].GetLinux().GetResources().GetCpu().GetQuota(), "the cap is its group's, not the container's")
+}
+
+// expiringContext is a context whose deadline passes after its first check.
+type expiringContext struct {
+	context.Context
+	checks int
+}
+
+func (c *expiringContext) Err() error {
+	c.checks++
+	if c.checks > 1 {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// Under place, StartContainer moves the container's process into its claim's
+// place group, last, from the cgroup namespace of PID 1 where the startup
+// check found a move has to enter it, and moves nothing once the runtime has
+// stopped waiting.
+func TestStartContainerPlacesTheProcess(t *testing.T) {
+	const root = "kubepods/burstable/podvm/vm"
+	init := fmt.Sprintf("%d\n", vmInit)
+	for _, tc := range []struct {
+		name       string
+		mover      *fakeMover
+		expiring   bool
+		readOnly   bool
+		wantPlaced bool
+		wantErr    string
+	}{{
+		name:       "from the driver's own cgroup namespace",
+		wantPlaced: true,
+	}, {
+		name:       "from PID 1's cgroup namespace",
+		mover:      &fakeMover{},
+		wantPlaced: true,
+	}, {
+		name:     "after the runtime stopped waiting",
+		expiring: true,
+	}, {
+		name:     "a move the tree refuses",
+		readOnly: true,
+		wantErr:  `container "compute": move its process into group "vmm-cpu": write "4242" to kubepods/burstable/podvm/vm/vmm-cpu/cgroup.procs: write kubepods/burstable/podvm/vm/vmm-cpu/cgroup.procs: read-only file system`,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := newWritableTree(t, map[string]string{root: init})
+			reg := prometheus.NewRegistry()
+			d, pod := threadedDriver(t, "place", tree, reg)
+			if tc.mover != nil {
+				d.hostCgroups = tc.mover
+			}
+			var fsys cgroupfs.FS = tree
+			if tc.readOnly {
+				fsys = &refusingTree{writableTree: tree, refused: path.Join(root, "vmm-cpu", "cgroup.procs")}
+			}
+			d.cgroups = fsys
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			if tc.expiring {
+				ctx = &expiringContext{Context: ctx}
+			}
+			ctr := &api.Container{Id: "vm", Name: "compute", PodSandboxId: pod.Id, Pid: vmInit,
+				Env: claimEnv("vm", "vcpu", "vmm-cpu"), Linux: &api.LinuxContainer{CgroupsPath: "/" + root}}
+			err := d.StartContainer(ctx, pod, ctr)
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				require.Equal(t, 1.0, metricValue(t, reg, "dra_cpu_threaded_containers_total", map[string]string{"mode": "place", "result": "error"}))
+				return
+			}
+			require.NoError(t, err)
+			placed := tree.read(t, path.Join(root, "vmm-cpu", "cgroup.procs"))
+			if !tc.wantPlaced {
+				require.Empty(t, placed, "a process is never moved late")
+				require.Equal(t, root, d.podState.ThreadedContainers()["vm"].ThreadRoot, "its groups are built")
+				return
+			}
+			require.Equal(t, "4242", placed)
+			if tc.mover != nil {
+				require.Equal(t, []string{"4242 to " + path.Join(root, "vmm-cpu")}, tc.mover.moves)
+			}
+		})
+	}
+}
+
+// refusingTree refuses writes to one file, as a read-only mount does.
+type refusingTree struct {
+	*writableTree
+	refused string
+}
+
+func (r *refusingTree) WriteFile(name string, data []byte) error {
+	if name == r.refused {
+		return &fs.PathError{Op: "write", Path: name, Err: syscall.EROFS}
+	}
+	return r.writableTree.WriteFile(name, data)
 }

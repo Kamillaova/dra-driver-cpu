@@ -28,6 +28,7 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	"github.com/stretchr/testify/require"
@@ -42,15 +43,34 @@ type fakeProcess struct {
 	sharesErr error
 	enterErr  error
 	entered   bool
+	mover     *fakeMover
 }
 
 func (p *fakeProcess) MountInfo() ([]byte, error)               { return []byte(p.mountinfo), nil }
 func (p *fakeProcess) EffectiveCapabilities() (uint64, error)   { return p.capEff, p.capErr }
 func (p *fakeProcess) SharesInitCgroupNamespace() (bool, error) { return p.shares, p.sharesErr }
-func (p *fakeProcess) EnterInitCgroupNamespace() error {
+func (p *fakeProcess) EnterInitCgroupNamespace() (processMover, error) {
 	p.entered = true
-	return p.enterErr
+	if p.enterErr != nil {
+		return nil, p.enterErr
+	}
+	p.mover = &fakeMover{}
+	return p.mover, nil
 }
+
+// fakeMover records the moves made from the cgroup namespace of PID 1 and
+// makes them on the tree it is given.
+type fakeMover struct {
+	moves   []string
+	stopped bool
+}
+
+func (m *fakeMover) MoveProcess(fsys cgroupfs.FS, dir string, pid int) error {
+	m.moves = append(m.moves, fmt.Sprintf("%d to %s", pid, dir))
+	return cgroupfs.MoveProcess(fsys, dir, pid)
+}
+
+func (m *fakeMover) Stop() { m.stopped = true }
 
 // untouchedProcess fails the test on any read.
 type untouchedProcess struct{ t *testing.T }
@@ -67,9 +87,9 @@ func (p untouchedProcess) SharesInitCgroupNamespace() (bool, error) {
 	p.t.Error("cgroup namespace read")
 	return false, nil
 }
-func (p untouchedProcess) EnterInitCgroupNamespace() error {
+func (p untouchedProcess) EnterInitCgroupNamespace() (processMover, error) {
 	p.t.Error("cgroup namespace entered")
-	return nil
+	return nil, errors.ErrUnsupported
 }
 
 // readTree is a cgroup2 tree the driver only reads.
@@ -357,11 +377,17 @@ func TestNewChecksThreadedPrivileges(t *testing.T) {
 			require.Equal(t, tc.wantTrialMade, tc.process.entered, "the attempt to enter PID 1's cgroup namespace")
 			if tc.wantErr != "" {
 				require.EqualError(t, err, tc.wantErr)
+				if tc.process.mover != nil {
+					require.True(t, tc.process.mover.stopped, "a refused start stops the thread it entered the namespace on")
+				}
 				return
 			}
 			require.NoError(t, err)
 			require.Equal(t, tc.mode, d.cgroupThreadedMode)
-			require.Equal(t, tc.wantHostNS, d.cgroupHostNamespace)
+			require.Equal(t, tc.wantHostNS, d.hostCgroups != nil, "moves are made from PID 1's cgroup namespace")
+			if tc.wantHostNS {
+				require.Same(t, tc.process.mover, d.hostCgroups, "the thread that entered it at start makes every move")
+			}
 		})
 	}
 }
