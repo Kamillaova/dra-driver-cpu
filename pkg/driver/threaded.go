@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"os"
@@ -70,8 +71,9 @@ func claimName(record store.ClaimRecord, uid types.UID) string {
 
 // checkThreadedContainer reports whether a container holds a threaded claim,
 // refusing one that also holds a claim of this driver that is not threaded,
-// whose requests would sit in the thread root, and one whose threaded claims
-// give two groups one name, counting the groups their allocations build.
+// whose requests would sit in the thread root, one whose threaded claims give
+// two groups one name, counting the groups their allocations build, and one
+// whose threaded claims both set place, its process starting in one group.
 func checkThreadedContainer(container string, allocations *store.AllocationState, claims map[types.UID]draEnvClaim) (bool, error) {
 	var threaded, unthreaded []types.UID
 	records := make(map[types.UID]store.ClaimRecord, len(claims))
@@ -93,6 +95,16 @@ func checkThreadedContainer(container string, allocations *store.AllocationState
 	if len(unthreaded) > 0 {
 		return true, fmt.Errorf("container %q: claim %q is not threaded but shares the container with threaded claim %q; move its requests into the threaded claim or another container",
 			container, claimName(records[unthreaded[0]], unthreaded[0]), claimName(records[threaded[0]], threaded[0]))
+	}
+	var placing []types.UID
+	for _, uid := range threaded {
+		if records[uid].Layout.Place != "" {
+			placing = append(placing, uid)
+		}
+	}
+	if len(placing) > 1 {
+		return true, fmt.Errorf("container %q: claims %q and %q both set place; keep place in one claim",
+			container, claimName(records[placing[0]], placing[0]), claimName(records[placing[1]], placing[1]))
 	}
 	builtBy := map[string]types.UID{}
 	for _, uid := range threaded {
@@ -176,8 +188,11 @@ func (cp *CPUDriver) threadedGroupsOf(uids []types.UID) ([]cgroupfs.Group, error
 // container's cgroup is assumed: crun under the systemd driver and its
 // run.oci.delegate-cgroup annotation hold the init in a sub-cgroup of their
 // own. It hands the files that move processes and threads into the groups to
-// the user the init runs as, as the host sees it.
-func (cp *CPUDriver) buildThreadedTree(logger logr.Logger, pod *api.PodSandbox, ctr *api.Container, claims map[types.UID]draEnvClaim) error {
+// the user the init runs as, as the host sees it. Under place it then moves
+// the process into its claim's place group, unless the runtime has stopped
+// waiting: a process moved late would take its new group's cpuset over every
+// thread the workload pinned meanwhile (linux v7.2 kernel/sched/core.c:3207-3210).
+func (cp *CPUDriver) buildThreadedTree(ctx context.Context, logger logr.Logger, pod *api.PodSandbox, ctr *api.Container, claims map[types.UID]draEnvClaim) error {
 	uids := slices.Sorted(maps.Keys(claims))
 	if !slices.ContainsFunc(uids, func(uid types.UID) bool {
 		record, ok := cp.allocationState.GetClaimRecord(uid)
@@ -190,6 +205,9 @@ func (cp *CPUDriver) buildThreadedTree(logger logr.Logger, pod *api.PodSandbox, 
 		return nil
 	}
 	root, err := cp.buildTree(ctr, uids)
+	if err == nil {
+		err = cp.place(ctx, logger, ctr, uids, root)
+	}
 	if err != nil {
 		cp.metrics.RecordThreadedContainer(cp.cgroupThreadedMode, cpumetrics.ResultError)
 		return err
@@ -230,6 +248,40 @@ func (cp *CPUDriver) buildTree(ctr *api.Container, uids []types.UID) (string, er
 		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
 	}
 	return root, nil
+}
+
+// place moves the container's process into the place group of its threaded
+// claims, under place, from the cgroup namespace of PID 1 where the startup
+// check found that a move has to enter it. Writing a threaded group's
+// cgroup.procs moves every thread of the process (cgroup-v2.rst:396-397).
+func (cp *CPUDriver) place(ctx context.Context, logger logr.Logger, ctr *api.Container, uids []types.UID, root string) error {
+	if cp.cgroupThreadedMode != cgroupfs.ThreadedModePlace {
+		return nil
+	}
+	var group string
+	for _, uid := range uids {
+		if record, ok := cp.allocationState.GetClaimRecord(uid); ok && record.Layout != nil && record.Layout.Place != "" {
+			group = record.Layout.Place
+		}
+	}
+	if group == "" {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		logger.Info("not moving the container's process: the runtime stopped waiting for the driver, so it starts in its thread root", "group", group, "err", err.Error())
+		return nil
+	}
+	dir := path.Join(root, group)
+	pid := int(ctr.GetPid())
+	move := cgroupfs.MoveProcess
+	if cp.hostCgroups != nil {
+		move = cp.hostCgroups.MoveProcess
+	}
+	if err := move(cp.cgroups, dir, pid); err != nil {
+		return fmt.Errorf("container %q: move its process into group %q: %w", ctr.GetName(), group, err)
+	}
+	logger.V(2).Info("moved the container's process into its place group", "group", group)
+	return nil
 }
 
 // initOutside refuses a container whose init sits outside its cgroup's

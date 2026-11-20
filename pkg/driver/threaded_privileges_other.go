@@ -20,6 +20,6 @@ package driver
 
 import "errors"
 
-func (hostProcess) EnterInitCgroupNamespace() error {
-	return errors.ErrUnsupported
+func (hostProcess) EnterInitCgroupNamespace() (processMover, error) {
+	return nil, errors.ErrUnsupported
 }
