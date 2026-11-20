@@ -40,11 +40,28 @@ The Kubelet driver parses this configuration at prepare time from the claim's al
 
 The `opaque.parameters` field must conform to the following schema:
 
-| Field              | Type   | Description                                                                                |
-| :----------------- | :----- | :----------------------------------------------------------------------------------------- |
-| `apiVersion`       | string | Must be set to `v1alpha1`.                                                                 |
-| `cpuConfig`        | object | Container object for CPU configurations.                                                   |
-| `cpuConfig.cpuset` | string | Specifies the list of CPU cores in standard Linux cpuset format (e.g. `"2-5"`, `"0,4-6"`). |
+| Field              | Type             | Description                                                                                                                                                                        |
+| :----------------- | :--------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apiVersion`       | string           | Must be set to `v1alpha1`.                                                                                                                                                         |
+| `cpuConfig`        | object           | Container object for CPU configurations.                                                                                                                                           |
+| `cpuConfig.cpuset` | string           | Specifies the list of CPU cores in standard Linux cpuset format (e.g. `"2-5"`, `"0,4-6"`).                                                                                         |
+| `cpuConfig.limit`  | number or string | The CPU limit of a shared request: a quantity above zero, such as `500m` or `2`, or `max` for none. See [Capped Shared Requests](workload-requirements.md#capped-shared-requests). |
+
+A `cpuset` on a shared request, one on the `dra.cpu` class of a node with `cpuPartitions`, is
+undefined behavior.
+
+A `limit` is checked when the claim is prepared, and the claim is refused where:
+
+- it is zero, `0`, `0m` or `"0"`, unlike a container's CPU limit, where `0` means no limit: `max` is
+  the one way to write none; a negative or empty limit is refused the same way;
+- two config entries give it to one request, or to one alternative of a `firstAvailable` request, with
+  the same value or not;
+- the shared request has no `dra.cpu/cpu` amount, `0` being enough, or the limit is below it;
+- the request holds exclusive CPUs and the limit is not `max`, since a cap would throttle them;
+- it comes from a DeviceClass.
+
+Each alternative of a `firstAvailable` request is judged as a request, whichever one the scheduler
+picks.
 
 ## Example of a Fully Allocated ResourceClaim with Opaque Configuration
 

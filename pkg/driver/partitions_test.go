@@ -17,6 +17,7 @@ limitations under the License.
 package driver
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"maps"
@@ -29,6 +30,7 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/go-logr/logr/testr"
 	dracpuapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/admission"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
@@ -41,6 +43,7 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	nodeutil "k8s.io/component-helpers/node/util"
@@ -815,31 +818,31 @@ func TestPrepareRefusesACappedShareThatIsNotAlone(t *testing.T) {
 		name:    "a cap with count 2",
 		results: []claimResult{{request: "cpus", written: "1", consumed: "1", device: "cpudevnuma000"}},
 		edit:    spread(resourceapi.DeviceAllocationModeExactCount, 2),
-		wantErr: "request \"cpus\" has limit of 1 with `count: 2`; a limit can be applied to only one device: ask for one device",
+		wantErr: "request \"cpus\" has limit of 1 with `count: 2`; a limit can be applied to only one device: ask for one device, or remove the limit",
 	}, {
 		name:    "a cap with allocationMode: All on a node where one device matches",
 		results: []claimResult{{request: "cpus", written: "250m", consumed: "250m", device: "cpudevnuma000"}},
 		edit:    spread(resourceapi.DeviceAllocationModeAll, 0),
-		wantErr: "request \"cpus\" has limit of 250m with `allocationMode: All`, which may take several devices; a limit can be applied to only one device: ask for one device",
+		wantErr: "request \"cpus\" has limit of 250m with `allocationMode: All`, which may take several devices; a limit can be applied to only one device: ask for one device, or remove the limit",
 	}, {
 		name:    "a capped alternative with count 2",
 		results: []claimResult{{request: "cpus/shared", written: "250m", consumed: "250m", device: "cpudevnuma000"}},
 		edit:    spread(resourceapi.DeviceAllocationModeExactCount, 2),
-		wantErr: "subrequest \"cpus/shared\" has limit of 250m with `count: 2`; a limit can be applied to only one device: ask for one device",
+		wantErr: "subrequest \"cpus/shared\" has limit of 250m with `count: 2`; a limit can be applied to only one device: ask for one device, or remove the limit",
 	}, {
 		name: "a capped share beside an uncapped one",
 		results: []claimResult{
 			{request: "helper", consumed: "0", device: "cpudevnuma000"},
 			{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"},
 		},
-		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "helper"`,
+		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "helper": remove the limit`,
 	}, {
 		name: "a capped share beside exclusive CPUs",
 		results: []claimResult{
 			{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
 			{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"},
 		},
-		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu"`,
+		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu": remove the limit`,
 	}, {
 		name: "a capped share beside several requests, named in the claim's order",
 		results: []claimResult{
@@ -848,14 +851,14 @@ func TestPrepareRefusesACappedShareThatIsNotAlone(t *testing.T) {
 			{request: "helper", consumed: "0", device: "cpudevnuma000"},
 			{request: "io", consumed: "0", device: "cpudevnuma000"},
 		},
-		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with requests "vcpu", "helper", "io"`,
+		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with requests "vcpu", "helper", "io": remove the limit`,
 	}, {
 		name: "a picked capped alternative beside another request",
 		results: []claimResult{
 			{request: "helper/shared", written: "500m", consumed: "500m", device: "cpudevnuma000"},
 			{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
 		},
-		wantErr: `subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu"`,
+		wantErr: `subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu": remove the limit`,
 	}, {
 		name:    "an uncapped share spanning devices",
 		results: []claimResult{{request: "cpus", consumed: "0", device: "cpudevnuma000"}},
@@ -887,6 +890,204 @@ func TestPrepareRefusesACappedShareThatIsNotAlone(t *testing.T) {
 			require.NoError(t, results["share"].Err)
 			require.True(t, recorded)
 		})
+	}
+}
+
+// withConfig gives a test claim an opaque entry of this driver: in its spec
+// and, as the scheduler copies it, in its allocation, or in its allocation
+// alone where a DeviceClass gives it.
+func withConfig(claim *resourceapi.ResourceClaim, source resourceapi.AllocationConfigSource, requests []string, params string) *resourceapi.ResourceClaim {
+	config := resourceapi.DeviceConfiguration{Opaque: &resourceapi.OpaqueDeviceConfiguration{Driver: testDriverName, Parameters: runtime.RawExtension{Raw: []byte(params)}}}
+	if source == resourceapi.AllocationConfigSourceClaim {
+		claim.Spec.Devices.Config = append(claim.Spec.Devices.Config, resourceapi.DeviceClaimConfiguration{Requests: requests, DeviceConfiguration: config})
+	}
+	claim.Status.Allocation.Devices.Config = append(claim.Status.Allocation.Devices.Config, resourceapi.DeviceAllocationConfiguration{Source: source, Requests: requests, DeviceConfiguration: config})
+	return claim
+}
+
+func cpuLimitParams(value string) string {
+	return `{"apiVersion": "v1alpha1", "cpuConfig": {"limit": ` + value + `}}`
+}
+
+// A written limit replaces a share's amount as its cap, recorded and written
+// to its metadata file, and the claim checks run at Prepare as at apply.
+func TestPrepareAWrittenLimit(t *testing.T) {
+	claimSource := resourceapi.AllocationConfigSourceClaim
+	vmsClass := func(claim *resourceapi.ResourceClaim) {
+		claim.Spec.Devices.Requests[0].Exactly.DeviceClassName = "dra.cpu.vms"
+	}
+	pickOwnedBesideCappable := func(claim *resourceapi.ResourceClaim) {
+		claim.Spec.Devices.Requests[1].FirstAvailable = []resourceapi.DeviceSubRequest{
+			{Name: "shared", DeviceClassName: "dra.cpu", Capacity: &resourceapi.CapacityRequirements{Requests: map[resourceapi.QualifiedName]resource.Quantity{device.CPUResourceQualifiedName: resource.MustParse("500m")}}},
+			{Name: "owned", DeviceClassName: "dra.cpu.vms", Capacity: &resourceapi.CapacityRequirements{Requests: map[resourceapi.QualifiedName]resource.Quantity{device.CPUResourceQualifiedName: resource.MustParse("1")}}},
+		}
+	}
+	chartKinds := admission.ClassKinds(dracpuapi.DriverName, driverconfig.Config{CPUPartitions: []driverconfig.CPUPartition{
+		{Name: device.DefaultPartitionName},
+		{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE},
+	}})
+	for _, tc := range []struct {
+		name       string
+		results    []claimResult
+		source     resourceapi.AllocationConfigSource
+		limit      string
+		edit       func(*resourceapi.ResourceClaim)
+		classKinds map[string]admission.Kind
+		wantErr    string
+		wantCap    int64
+		wantLimit  string
+	}{{
+		name:      "a limit replaces the amount as the cap",
+		results:   []claimResult{{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"}},
+		limit:     `1`,
+		wantCap:   1000,
+		wantLimit: "1",
+	}, {
+		name:      "an amount of 0 with a limit",
+		results:   []claimResult{{request: "vmm-cpu", written: "0", consumed: "0", device: "cpudevnuma000"}},
+		limit:     `"500m"`,
+		wantCap:   500,
+		wantLimit: "500m",
+	}, {
+		name:      "limit max caps nothing",
+		results:   []claimResult{{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"}},
+		limit:     `"max"`,
+		wantLimit: "max",
+	}, {
+		name:      "a limit below a millicore is rounded up",
+		results:   []claimResult{{request: "vmm-cpu", written: "0", consumed: "0", device: "cpudevnuma000"}},
+		limit:     `"500u"`,
+		wantCap:   1,
+		wantLimit: "1m",
+	}, {
+		name:    "a limit of 0",
+		results: []claimResult{{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"}},
+		limit:   `0`,
+		wantErr: `request "vmm-cpu": invalid limit 0`,
+	}, {
+		name:    "a limit a DeviceClass gives",
+		results: []claimResult{{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"}},
+		source:  resourceapi.AllocationConfigSourceClass,
+		limit:   `"max"`,
+		wantErr: `DeviceClass "dra.cpu" sets cpuConfig.limit; set it in the claim`,
+	}, {
+		name:    "a numeric limit on an exclusive result of a class written by hand",
+		results: []claimResult{{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"}},
+		limit:   `1`,
+		wantErr: "request \"vcpu\": limit 1 on exclusive device \"cpudevnuma000-vms\"; only `limit: max` is allowed",
+	}, {
+		name:       "a numeric limit on an exclusive request of the chart's class",
+		results:    []claimResult{{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"}},
+		limit:      `1`,
+		edit:       vmsClass,
+		classKinds: chartKinds,
+		wantErr:    "request \"vcpu\": limit 1 on exclusive request (class dra.cpu.vms); only `limit: max` is allowed",
+	}, {
+		name:      "limit max on an exclusive request",
+		results:   []claimResult{{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"}},
+		limit:     `"max"`,
+		wantLimit: "max",
+	}, {
+		name: "every pick judged where the chart's classes are known",
+		results: []claimResult{
+			{request: "vcpu", written: "1", consumed: "1", device: "cpudevnuma000-vms"},
+			{request: "helper/owned", written: "1", consumed: "1", device: "cpudevnuma000-vms"},
+		},
+		edit:       func(claim *resourceapi.ResourceClaim) { vmsClass(claim); pickOwnedBesideCappable(claim) },
+		classKinds: chartKinds,
+		wantErr:    `subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu": remove the limit`,
+	}, {
+		name: "the picked alternative alone judged where they are not",
+		results: []claimResult{
+			{request: "vcpu", written: "1", consumed: "1", device: "cpudevnuma000-vms"},
+			{request: "helper/owned", written: "1", consumed: "1", device: "cpudevnuma000-vms"},
+		},
+		edit:      func(claim *resourceapi.ResourceClaim) { vmsClass(claim); pickOwnedBesideCappable(claim) },
+		wantLimit: "max",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := sharingDriver(t, true, nil, nil)
+			d.classKinds = tc.classKinds
+			claim := claimWithResults("limited", tc.results...)
+			if tc.edit != nil {
+				tc.edit(claim)
+			}
+			if tc.limit != "" {
+				source := tc.source
+				if source == "" {
+					source = claimSource
+				}
+				withConfig(claim, source, []string{tc.results[0].request}, cpuLimitParams(tc.limit))
+			}
+			results, err := d.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+			require.NoError(t, err)
+			record, recorded := d.allocationState.GetClaimRecord("limited")
+			if tc.wantErr != "" {
+				require.EqualError(t, results["limited"].Err, tc.wantErr)
+				require.False(t, recorded, "a refused claim leaves no record")
+				return
+			}
+			require.NoError(t, results["limited"].Err)
+			require.True(t, recorded)
+			require.Equal(t, tc.wantCap, record.Requests[0].Cap)
+			require.Equal(t, tc.wantLimit, *results["limited"].Devices[0].Metadata.Attributes[string(device.AttributeCPULimit)].StringValue)
+		})
+	}
+}
+
+// A firstAvailable request's limits are judged on every alternative, so the
+// claim is refused whichever one the scheduler allocated.
+func TestPrepareJudgesEveryAlternative(t *testing.T) {
+	alternatives := func(oneAmount string) []resourceapi.DeviceSubRequest {
+		amount := func(value string) *resourceapi.CapacityRequirements {
+			if value == "" {
+				return nil
+			}
+			return &resourceapi.CapacityRequirements{Requests: map[resourceapi.QualifiedName]resource.Quantity{device.CPUResourceQualifiedName: resource.MustParse(value)}}
+		}
+		return []resourceapi.DeviceSubRequest{
+			{Name: "two", DeviceClassName: dracpuapi.DriverName, Capacity: amount("250m")},
+			{Name: "one", DeviceClassName: dracpuapi.DriverName, Capacity: amount(oneAmount)},
+		}
+	}
+	type entry struct {
+		requests []string
+		limit    string
+	}
+	for _, tc := range []struct {
+		name      string
+		oneAmount string
+		entries   []entry
+		wantErr   string
+	}{{
+		name:      "WA29: a parent entry and an alternative's entry both giving a limit",
+		oneAmount: "500m",
+		entries:   []entry{{requests: []string{"cpus/two"}, limit: `"500m"`}, {requests: []string{"cpus"}, limit: `"1"`}},
+		wantErr:   `subrequest "cpus/two": cpuConfig.limit set by two config entries (#0 and #1); set it in one entry`,
+	}, {
+		name:    "WA30: a parent limit over an alternative without an amount",
+		entries: []entry{{requests: []string{"cpus"}, limit: `"500m"`}},
+		wantErr: `subrequest "cpus/one": limit without a request amount; add a dra.cpu/cpu capacity request, it can be zero`,
+	}} {
+		for _, picked := range []claimResult{
+			{request: "cpus/two", written: "250m", consumed: "250m", device: "cpudevnuma000"},
+			{request: "cpus/one", written: tc.oneAmount, consumed: cmp.Or(tc.oneAmount, "0"), device: "cpudevnuma000"},
+		} {
+			t.Run(tc.name+", "+picked.request+" allocated", func(t *testing.T) {
+				d := sharingDriver(t, true, nil, nil)
+				d.classKinds = admission.ClassKinds(dracpuapi.DriverName, driverconfig.Config{CPUPartitions: []driverconfig.CPUPartition{{Name: device.DefaultPartitionName}}})
+				claim := claimWithResults("alternatives", picked)
+				claim.Spec.Devices.Requests[0].FirstAvailable = alternatives(tc.oneAmount)
+				for _, e := range tc.entries {
+					withConfig(claim, resourceapi.AllocationConfigSourceClaim, e.requests, cpuLimitParams(e.limit))
+				}
+				results, err := d.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+				require.NoError(t, err)
+				require.EqualError(t, results["alternatives"].Err, tc.wantErr)
+				_, recorded := d.allocationState.GetClaimRecord("alternatives")
+				require.False(t, recorded, "a refused claim leaves no record")
+			})
+		}
 	}
 }
 
@@ -1368,22 +1569,22 @@ func TestCreateContainerCapsACappedShareAlone(t *testing.T) {
 	}, {
 		name:        "two capped shares",
 		env:         env("a_cpus", "b_cpus"),
-		wantErr:     `container "app": request "cpus" of claim "a" and request "cpus" of claim "b" both have limits, so they cannot be used together: use the claims in separate containers`,
+		wantErr:     `container "app": request "cpus" of claim "a" and request "cpus" of claim "b" both have limits, so they cannot be used together: use the claims in separate containers, or remove one of the limits`,
 		wantUnbound: []types.UID{"a", "b"},
 	}, {
 		name:        "a capped share beside an uncapped one",
 		env:         env("a_cpus", "uncapped_cpus"),
-		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so it cannot be used together with request "cpus" of claim "uncapped": use the claims in separate containers`,
+		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so it cannot be used together with request "cpus" of claim "uncapped": use the claims in separate containers, or remove the limit`,
 		wantUnbound: []types.UID{"a", "uncapped"},
 	}, {
 		name:        "a capped share beside exclusive CPUs",
 		env:         env("a_cpus", "vcpu_vcpu"),
-		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so it cannot be used together with request "vcpu" of claim "exclusive": use the claims in separate containers`,
+		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so it cannot be used together with request "vcpu" of claim "exclusive": use the claims in separate containers, or remove the limit`,
 		wantUnbound: []types.UID{"a", "vcpu"},
 	}, {
 		name:        "a capped share beside another request of its claim",
 		env:         env("older_vcpu", "older_vmm-cpu"),
-		wantErr:     `container "app": request "vmm-cpu" of claim "older" has limit of 250m, so it cannot be used together with request "vcpu" of claim "older": use the claims in separate containers`,
+		wantErr:     `container "app": request "vmm-cpu" of claim "older" has limit of 250m, so it cannot be used together with request "vcpu" of claim "older": use the claims in separate containers, or remove the limit`,
 		wantUnbound: []types.UID{"older"},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
