@@ -123,6 +123,7 @@ type Metrics struct {
 	mappingDropped             prometheus.Counter
 	partitionVerified          *prometheus.GaugeVec
 	nodeReservationOK          prometheus.Gauge
+	deviceTaintsDropped        prometheus.Counter
 }
 
 type metricKind string
@@ -257,8 +258,13 @@ var (
 	partitionVerifiedSpec = metricSpec{
 		name:   "dra_cpu_partition_verified",
 		kind:   metricGauge,
-		help:   "Whether the threads per core a CPU partition's smt declares are what the kernel has online (1), or the kernel contradicts them and the partition publishes no devices (0).",
+		help:   "Whether the threads per core a CPU partition's smt declares are what the kernel has online (1), or the kernel contradicts them and the partition publishes no devices, or tainted ones under taintDegradedPartitions (0).",
 		labels: []string{"partition"},
+	}
+	deviceTaintsDroppedSpec = metricSpec{
+		name: "dra_cpu_device_taints_dropped_total",
+		kind: metricCounter,
+		help: "Total number of times the driver withheld the devices of degraded CPU partitions because the API server dropped their taint.",
 	}
 	nodeReservationOKSpec = metricSpec{
 		name: "dra_cpu_node_reservation_ok",
@@ -288,6 +294,7 @@ var metricSpecs = []metricSpec{
 	misplacedClaimsSpec,
 	partitionVerifiedSpec,
 	nodeReservationOKSpec,
+	deviceTaintsDroppedSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -339,6 +346,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		misplacedClaims:            newCounter(misplacedClaimsSpec),
 		partitionVerified:          newGaugeVec(partitionVerifiedSpec),
 		nodeReservationOK:          newGauge(nodeReservationOKSpec),
+		deviceTaintsDropped:        newCounter(deviceTaintsDroppedSpec),
 	}
 
 	reg.MustRegister(
@@ -362,6 +370,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.misplacedClaims,
 		m.partitionVerified,
 		m.nodeReservationOK,
+		m.deviceTaintsDropped,
 	)
 	for _, rule := range rules {
 		m.containersKeptUnderOlder.WithLabelValues(string(rule))
@@ -502,6 +511,10 @@ func (m *Metrics) SetNodeReservationOK(ok bool) {
 	m.nodeReservationOK.Set(value)
 }
 
+func (m *Metrics) RecordDeviceTaintsDropped() {
+	m.deviceTaintsDropped.Inc()
+}
+
 func determineResult(err error) Result {
 	if err != nil {
 		return ResultError
@@ -531,3 +544,4 @@ func (noopRecorder) SetWatchdogStuck(time.Duration)                             
 func (noopRecorder) RecordNodeAllocatableMappingDropped()                         {}
 func (noopRecorder) SetPartitionVerified(string, bool)                            {}
 func (noopRecorder) SetNodeReservationOK(bool)                                    {}
+func (noopRecorder) RecordDeviceTaintsDropped()                                   {}
