@@ -143,6 +143,12 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 
 	defer func() { cp.metrics.RecordNRISynchronize(rerr, time.Since(startTime)) }()
 
+	// Returning the error keeps Prepare refused, the first Synchronize never
+	// having ended, while the driver stops.
+	if err := cp.checkOwnCgroupLocked(logger, containers); err != nil {
+		cp.cancelRun(fmt.Errorf("%w: %w", ErrFatal, err))
+		return nil, err
+	}
 	if cp.window != nil {
 		cp.window.keep(pods, containers)
 		cp.nriDisconnected.Store(false)
