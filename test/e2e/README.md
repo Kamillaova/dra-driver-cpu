@@ -116,7 +116,11 @@ honor these settings, where applicable.
 
 - `DRACPU_E2E_THREADED_MODE`: (optional, default `create`): the `driverConfig.cgroupThreadedMode`
   *the Makefile* `ci-kind-setup` target installs the driver with. `false` installs it without threaded
-  cgroups, and the specs labeled `threaded` skip.
+  cgroups, and the specs labeled `threaded` skip. The crun lanes install `place`.
+
+- `DRACPU_E2E_RUNTIME_HANDLER`: (optional, default `cgroup-writable`, `crun-writable` on a crun lane):
+  the containerd runtime handler the specs labeled `threaded` run their pods under, and the name
+  of the RuntimeClass they run them with.
 
 - `DRACPU_E2E_LANE`: (optional, default empty): the lane *the Makefile* `ci-kind-setup` target
   prepares; see [lanes](#lanes). Empty creates the cluster from `hack/ci/kind-ci.yaml` and installs
@@ -212,20 +216,32 @@ where their lane did not prepare the cluster.
   off in every component. Its API server drops the node allocatable mapping and the degraded
   partition's taint from the driver's ResourceSlices, and the specs check what the driver does
   then. Each spec skips where the API server reports its gate on.
+- `crun-systemd` and `crun-cgroupfs` (labels `threaded` and `crun`): the `partitions` lane's
+  install with `cgroupThreadedMode: place`, on a cluster from `hack/ci/kind-ci-crun-systemd.yaml`
+  or `hack/ci/kind-ci-crun-cgroupfs.yaml`, whose kubelet and runtime handlers run the systemd or
+  the cgroupfs driver. `lane-setup.sh post` copies crun 1.30.1, checked against its release's
+  checksum, into every node, checks that each kubelet runs the lane's cgroup driver, and creates
+  the RuntimeClass `crun-writable` of the containerd runtime handler that runs crun, gives its
+  containers a writable `/sys/fs/cgroup` and passes crun's annotations
+  `run.oci.systemd.subgroup` and `run.oci.delegate-cgroup` on. On `crun-systemd` it runs the
+  driver's own pod under crun too. The specs labeled `threaded` run their pods under crun, and
+  the specs labeled `crun` add the cases of crun's annotations and run the reserved-partition
+  spec's pod under crun.
 
 The specs labeled `threaded` run on every lane and without one, where the driver runs
-`cgroupThreadedMode` `create` or `place`. Every kind configuration declares a containerd runtime
-handler `cgroup-writable`, whose containers get a writable `/sys/fs/cgroup`, as an administrator
-gives a threaded workload; the specs run their pods under a RuntimeClass of that name, which they
-create and delete, as a user other than root and without privileges. Their claims hold exclusive
+`cgroupThreadedMode` `create` or `place`. Every kind configuration but the crun lanes' declares a
+containerd runtime handler `cgroup-writable`, whose containers get a writable `/sys/fs/cgroup`, as
+an administrator gives a threaded workload; the specs run their pods under a RuntimeClass of the
+handler's name, which they create and delete where no lane created it, as a user other than root
+and without privileges. Their claims hold exclusive
 CPUs and shares on a node whose `default` partition allows exclusive requests, `worker2` on a lane,
 and exclusive CPUs only on a node without partitions; the specs that need a share skip elsewhere,
 and so do the `place` cases where the driver runs `create`. The spec that breaks a tree while the
 driver is away runs `docker exec` on the kind node's container, and skips where `docker` cannot
 reach it.
 
-`.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner and the
-`gates-off` lane on the x64 runner, and fails when a spec the runner's host can run was skipped.
+`.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner, the
+`gates-off` lane on the x64 runner and the two crun lanes on the arm64 runner, and fails when a spec the runner's host can run was skipped.
 
 ### troubleshooting
 
