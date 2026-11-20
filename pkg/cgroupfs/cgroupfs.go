@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Root is where the host's cgroup2 tree is mounted into the driver.
@@ -94,6 +95,11 @@ func FindProcess(fsys fs.FS, dir string, pid int) (string, error) {
 			return nil
 		}
 		procs, err := fs.ReadFile(fsys, path.Join(name, procsFile))
+		// A threaded cgroup's cgroup.procs cannot be read: its processes
+		// belong to the thread root (cgroup-v2.rst:904-905).
+		if errors.Is(err, syscall.EOPNOTSUPP) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -107,6 +113,56 @@ func FindProcess(fsys fs.FS, dir string, pid int) (string, error) {
 		return "", fmt.Errorf("find pid %d below %s: %w", pid, dir, err)
 	}
 	return found, nil
+}
+
+// FindThreadRoot returns the cgroup of dir's subtree, dir included, whose
+// cgroup.type reads "domain threaded", the kernel's mark of a thread root
+// (cgroup-v2.rst:869-870), with a threaded child named one of names, or ""
+// where none does. A threaded cgroup is never one, nor anything below it.
+func FindThreadRoot(fsys fs.FS, dir string, names []string) (string, error) {
+	var found string
+	err := fs.WalkDir(fsys, dir, func(name string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		kind, err := cgroupType(fsys, name)
+		if err != nil {
+			return err
+		}
+		switch kind {
+		case "threaded":
+			return fs.SkipDir
+		case "domain threaded":
+		default:
+			return nil
+		}
+		for _, child := range names {
+			childKind, err := cgroupType(fsys, path.Join(name, child))
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if childKind == "threaded" {
+				found = name
+				return fs.SkipAll
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("find the thread root below %s: %w", dir, err)
+	}
+	return found, nil
+}
+
+func cgroupType(fsys fs.FS, dir string) (string, error) {
+	kind, err := fs.ReadFile(fsys, path.Join(dir, typeFile))
+	return strings.TrimSpace(string(kind)), err
 }
 
 // Dir turns the cgroups path a runtime reports into a directory under the
