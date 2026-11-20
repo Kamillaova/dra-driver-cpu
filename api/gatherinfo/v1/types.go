@@ -90,6 +90,7 @@ type DriverConfig struct {
 	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
 	AllowFractionalCapacityRequests       bool               `json:"allowFractionalCapacityRequests,omitempty"`
 	TaintDegradedPartitions               bool               `json:"taintDegradedPartitions,omitempty"`
+	CgroupThreadedMode                    string             `json:"cgroupThreadedMode,omitempty"`
 	CPUPartitions                         []CPUPartition     `json:"cpuPartitions,omitempty"`
 	Profiles                              map[string]Profile `json:"profiles,omitempty"`
 }
