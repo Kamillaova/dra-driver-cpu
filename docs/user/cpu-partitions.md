@@ -129,9 +129,11 @@ the flag, or with `false`, shares the device as before.
   off them; a container holding a share beside exclusive CPUs of its own keeps those. Once the claim
   is unprepared they move back: at once with `assumeUnsolicitedUpdatesSafe`, else at the next
   creation of a claim's first container or the next reconnect to the container runtime.
-- The request's metadata file names its CPUs in `dra.cpu/cpuset`, and `DRA_EXCLUSIVE_ASSIGNED_CPUSET`
-  lists them in its container. A share's metadata file names no CPUs, since they move; see
-  [Device Metadata](device-metadata.md).
+- The request's metadata file names its CPUs in `dra.cpu/cpuset`, its entry in the claim's status
+  says `partition: default` and names them in `cpuset`, and `DRA_EXCLUSIVE_ASSIGNED_CPUSET` lists them
+  in its container. A share's metadata file and claim status entry name no CPUs, since they move; see
+  [Device Metadata](device-metadata.md) and [How It Works](how-it-works.md). A reader of the claim
+  status that looks for `partition: vms`, as a VM operator may, does not see a flagged request.
 - A workload that reads its cpuset once at start, such as DPDK's control threads, must not hold a
   share on a partition that sets `allowExclusive`, since its CPUs change under it. Run it on a
   partition that leaves the flag `false`.

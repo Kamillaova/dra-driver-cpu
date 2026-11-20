@@ -211,6 +211,21 @@ Where the node cannot be rebooted, remove the claim's CDI spec,
 `/var/run/cdi/dra.k8s.io-cpu_claim-<claim UID>.json`, from a privileged pod on the node, then
 delete the driver pod: the new driver pod restores its records without that claim.
 
+## A Stalled Claim Status Write
+
+The driver writes a claim's status at the end of every preparation, within the kubelet's deadline of
+45 seconds for the call, and a failed write fails the preparation with:
+
+```text
+claim vms/vm-1 is prepared, but its status could not be written, and the kubelet retries: <the API server's error>
+```
+
+The kubelet retries the preparation, which keeps the CPUs the claim was given and writes the status
+again. While the API server answers reads but stalls writes, each preparation waits up to that
+deadline, and the kubelet's plugin library runs one preparation or unpreparation at a time, so the
+unpreparations queued behind it can time out at the kubelet too, and are retried. Containers keep
+starting meanwhile: the driver's runtime hooks never wait on the write.
+
 ## A Node-Allocatable Mapping the API Server Dropped
 
 With `publishNodeAllocatableResourceMapping: true` the driver publishes each device with a
