@@ -128,6 +128,20 @@ refuses() {
 	fi
 }
 
+# renders <name> <helm args...>; the render has to succeed.
+renders() {
+	local name=$1
+	shift
+	echo "render check: ${name}"
+	"${helm}" "${template_args[@]}" "$@" >"${tmp}/${name}.yaml"
+}
+
+# values <name> <yaml>; writes a values file and prints its path.
+values() {
+	printf '%s\n' "$2" >"${tmp}/$1-values.yaml"
+	echo "${tmp}/$1-values.yaml"
+}
+
 # Unset: the chart leaves the root to the driver, so there is no flag to check.
 accepts default '' "${default_root}" false
 
@@ -188,5 +202,57 @@ refuses miscased-key 'differs from kubeletRootDir only in case' \
 # than only showing that something far over it is refused.
 refuses over-budget 'over the 107-byte limit' \
 	--skip-schema-validation --set-string "kubeletRootDir=/$(printf 'x%.0s' {1..73})"
+
+# A cpuPartitions list switches a node into partitions only with the entry
+# "default", and the driver refuses a list naming partitions without it; the
+# chart refuses it at render with the driver's message.
+no_default='cpuPartitions names partitions but no partition "default": add `- name: default` to cpuPartitions to use partitions'
+refuses partitions-reserved-without-default "${no_default}" -f "$(values partitions-reserved-without-default '
+driverConfig:
+  cpuPartitions:
+  - name: system
+    role: reserved
+    cpuset: "0-1"')"
+refuses partitions-vms-without-default "${no_default}" -f "$(values partitions-vms-without-default '
+driverConfig:
+  cpuPartitions:
+  - name: vms
+    role: exclusive
+    cpuset: "2-3"')"
+renders partitions-default-entry -f "$(values partitions-default-entry '
+driverConfig:
+  cpuPartitions:
+  - name: default')"
+# An entry's thread count left null is the key left out.
+renders partitions-null-thread-count -f "$(values partitions-null-thread-count '
+driverConfig:
+  cpuPartitions:
+  - name: default
+    smt: null')"
+# The list left out, null and empty all mean no partitions.
+renders partitions-empty -f "$(values partitions-empty '
+driverConfig:
+  cpuPartitions: []')"
+renders partitions-null -f "$(values partitions-null '
+driverConfig:
+  cpuPartitions: null')"
+renders partitions-left-out -f "$(values partitions-left-out '
+driverConfig:
+  groupBy: socket')"
+# The external allocator and machine-wide grouping, which needs it, belong to
+# the mode without partitions.
+refuses partitions-allocator-external 'invalid allocator "external" with cpuPartitions: must be "cpumanager"' \
+	-f "$(values partitions-allocator-external '
+driverConfig:
+  allocator: external
+  cpuPartitions:
+  - name: default')"
+refuses partitions-groupby-machine 'invalid groupBy "machine" with cpuPartitions: needs allocator "external", which partitions do not use' \
+	-f "$(values partitions-groupby-machine '
+driverConfig:
+  groupBy: machine
+  allocator: external
+  cpuPartitions:
+  - name: default')"
 
 echo "render checks passed"
