@@ -52,6 +52,7 @@ func newMetricsTestDriverWithCPUInfos(t *testing.T, cpuInfos []cpuinfo.CPUInfo) 
 	reg := prometheus.NewRegistry()
 	recorder := cpumetrics.New(reg)
 	driver := &CPUDriver{
+		kubeClient: statusClient(),
 		driverName: testDriverName,
 		topology: deviceTopology{
 			Inventory: device.Inventory{
