@@ -1,0 +1,58 @@
+# Copyright The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Same as kind-ci.yaml, with DRANodeAllocatableResources and DRADeviceTaints
+# off. kind gives the gates to every component; the API server alone drops
+# the fields they guard from the driver's ResourceSlices.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+featureGates:
+  DRANodeAllocatableResources: false
+  DRADeviceTaints: false
+  DRADeviceTaintRules: false # depends on DRADeviceTaints, and is on by default from 1.37
+  DRAListTypeAttributes: true
+  DRAFractionalCapacityRange: true # lets the scheduler book a fractional amount of a shared device
+nodes:
+# Node images are not pinned here: kind takes the image from the --image flag,
+# which the Makefile sets to kindest/node:$(KIND_K8S_VERSION).
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    scheduler:
+        extraArgs:
+          v: "5"
+          vmodule: "allocator=6,dynamicresources=6" # structured/allocator.go, DRA scheduler plugin
+    controllerManager:
+        extraArgs:
+          v: "5"
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        v: "5"
+- role: worker
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        v: "5"
+- role: worker
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        v: "5"
