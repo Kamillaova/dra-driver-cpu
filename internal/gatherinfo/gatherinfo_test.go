@@ -323,6 +323,33 @@ func TestRunReportsTaintDegradedPartitions(t *testing.T) {
 	}
 }
 
+func TestRunReportsCgroupThreadedMode(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{name: "default", config: "groupBy: socket\n", want: ""},
+		{name: "from the config file", config: "cgroupThreadedMode: place\n", want: "place"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupFakeHostWithConfig(t, tc.config)
+
+			stdout, err := captureStdout(t, func() error {
+				return gatherinfo.Run([]string{"--stdout"}, gatherinfo.Options{}, logr.Discard())
+			})
+			if err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+
+			report := readReport(t, []byte(stdout))
+			if report.DriverConfig.CgroupThreadedMode != tc.want {
+				t.Fatalf("cgroupThreadedMode = %q, want %q", report.DriverConfig.CgroupThreadedMode, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunReportsAssumeUnsolicitedUpdatesSafe(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

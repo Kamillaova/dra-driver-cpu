@@ -262,6 +262,13 @@
         "burst": {
           "type": "integer"
         },
+        "cgroupThreadedMode": {
+          "enum": [
+            false,
+            "create",
+            "place"
+          ]
+        },
         "cpuDeviceMode": {
           "type": "string",
           "enum": [
