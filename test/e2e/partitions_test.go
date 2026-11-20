@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
@@ -473,7 +474,7 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 	// reserved partition: a node moved to it with a claim prepared there has a
 	// reserved partition holding the claim's CPUs.
 	ginkgo.Context("with a reserved partition grown over a prepared claim", func() {
-		ginkgo.It("should stop the claim's containers and refuse them until the claim's pod is deleted", func(ctx context.Context) {
+		ginkgo.It("should stop the claim's containers and refuse them until the claim's pod is deleted", ginkgo.Label("crun"), func(ctx context.Context) {
 			cs := rootFxt.K8SClientset
 			grown, ok := cfgValues.Profiles[grownProfile]
 			if !ok {
@@ -500,7 +501,17 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 			ginkgo.DeferCleanup(fxt.Teardown)
 			spec := makeResourceClaimSpec(1, true)
 			spec.Devices.Requests[0].Exactly.DeviceClassName = driverName + "." + partition.Name
-			pod := createTesterPodWithClaimSpec(ctx, fxt, dracpuTesterImage, node.Name, spec, "grown-claim")
+			// On a crun lane the container runs under crun, which the stop
+			// reaches as it reaches runc.
+			pod := makeTesterPodWithExclusiveCPUClaimWithoutCPURequest(fxt.Namespace.Name, dracpuTesterImage, "grown-claim", node.Name)
+			if handler := threadedRuntimeHandler(); strings.HasPrefix(handler, "crun") {
+				_, err := cs.NodeV1().RuntimeClasses().Get(ctx, handler, metav1.GetOptions{})
+				gomega.Expect(err).ToNot(gomega.HaveOccurred(), "the lane created no RuntimeClass %s", handler)
+				pod.Spec.RuntimeClassName = new(handler)
+			}
+			pod, _, err = e2epod.CreateSyncWithClaimTemplate(ctx, fxt.K8SClientset,
+				&resourcev1.ResourceClaimTemplate{ObjectMeta: metav1.ObjectMeta{Name: "grown-claim"}, Spec: resourcev1.ResourceClaimTemplateSpec{Spec: spec}}, pod)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "cannot run a tester pod on claim template grown-claim")
 			assigned := getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod).CPUAssigned
 			gomega.Expect(pod.Status.ResourceClaimStatuses).To(gomega.HaveLen(1))
 			claimName := *pod.Status.ResourceClaimStatuses[0].ResourceClaimName
