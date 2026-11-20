@@ -181,7 +181,8 @@ on - is configured through other Helm values, not through this file.
   does not have; the API server needs none. A scheduler without the gate books a fractional amount
   as whole CPUs, and the driver refuses to prepare the claim.
 - An exclusive request books whole CPUs with the option on or off: the driver refuses to prepare a
-  claim that writes a fractional amount for a request given an owned device.
+  claim that writes a fractional amount for a request given an owned device, or for one with
+  `cpuConfig.exclusive: true`.
 - Once the driver's minimum supported Kubernetes version has `DRAFractionalCapacityRange` on by
   default, fractional amounts are always allowed and the option is removed, after a release that
   deprecates it.
@@ -206,9 +207,14 @@ on - is configured through other Helm values, not through this file.
   takes a `name`, a `role`, which is `default`, `exclusive` or `reserved`, a `cpuset` naming its
   CPUs, and an optional `smt`: `true` for as many threads per core as the hardware has, `false` for
   one, or a thread count of at least 1.
-- The entry `- name: default` switches the node into partitions. It takes a name and `smt` only: its
-  role is always `default`, and its CPUs are the online threads of every core no other partition
-  names. A list that names partitions without it is refused when the configuration loads, and
+- An entry of role `default` also takes `allowExclusive`, `false` when left out: `true` lets a request
+  with `cpuConfig.exclusive: true` take CPUs of its own out of the partition; see
+  [Exclusive requests on a default partition](cpu-partitions.md#exclusive-requests-on-a-default-partition).
+  It is refused on the roles `exclusive` and `reserved` when the configuration loads.
+- The entry `- name: default` switches the node into partitions. It takes a name, `smt` and
+  `allowExclusive` only: its role is always `default`, and its CPUs are the online threads of every
+  core no other partition names. A list that names partitions without it is refused when the
+  configuration loads, and
   `helm install` and `helm upgrade` fail at render with the same message:
   `` cpuPartitions names partitions but no partition "default": add `- name: default` to cpuPartitions to use partitions ``.
   The key left out, `null` and `[]` all mean no partitions.
@@ -222,6 +228,9 @@ on - is configured through other Helm values, not through this file.
   `partition "vms" has role "exclusive" in profile "r7625" and "reserved" in profile "x3d"; a partition keeps one role in every profile`.
 - Write the list in a profile. A fleet-wide list keeps working and is deprecated, with every other
   way of running without profiles; see [Per-node profiles](#per-node-profiles).
+- Running without partitions, the list left out, `null` or `[]`, keeps working and is deprecated:
+  `cpuPartitions` holding `- name: default` replaces it; see
+  [CPU Partitions](cpu-partitions.md#what-dracpu-gives).
 
 For example, as a profile's list:
 
@@ -251,11 +260,12 @@ Every device the driver publishes carries the settings that decide whether the d
 claim, so that a claim's selector can keep it off the nodes that would refuse it after the
 scheduler placed it there. Each attribute is named as its setting and is always present.
 
-| Attribute                                 | Type   | Value                             | What the driver refuses to prepare                                                               |
-| ----------------------------------------- | ------ | --------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `dra.cpu/fullPhysicalCPUsOnly`            | bool   | `fullPhysicalCPUsOnly`            | When `true`, an amount that whole cores of the device do not make up                             |
-| `dra.cpu/allocator`                       | string | `cpumanager` or `external`        | In grouped mode, a `cpuConfig.cpuset` under `cpumanager`, a request without one under `external` |
-| `dra.cpu/allowFractionalCapacityRequests` | bool   | `allowFractionalCapacityRequests` | When `false`, an amount on a shared request that is not a whole number of CPUs                   |
+| Attribute                                 | Type   | Value                                                                       | What the driver refuses to prepare                                                               |
+| ----------------------------------------- | ------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `dra.cpu/fullPhysicalCPUsOnly`            | bool   | `fullPhysicalCPUsOnly`                                                      | When `true`, an amount that whole cores of the device do not make up                             |
+| `dra.cpu/allocator`                       | string | `cpumanager` or `external`                                                  | In grouped mode, a `cpuConfig.cpuset` under `cpumanager`, a request without one under `external` |
+| `dra.cpu/allowFractionalCapacityRequests` | bool   | `allowFractionalCapacityRequests`                                           | When `false`, an amount on a shared request that is not a whole number of CPUs                   |
+| `dra.cpu/allowExclusive`                  | bool   | `true` on an owned device, the partition's `allowExclusive` on a shared one | When `false`, a request with `cpuConfig.exclusive: true`                                         |
 
 See [Whole physical cores](feature-support.md#whole-physical-cores) and
 [Custom Opaque CPUSet Allocation Overrides](opaque-cpuset-overrides.md) for these refusals.
@@ -286,6 +296,15 @@ take one:
         selectors:
         - cel:
             expression: device.attributes["dra.cpu"].allowFractionalCapacityRequests
+```
+
+and a claim whose request sets `cpuConfig.exclusive: true` selects the devices that give it CPUs of
+its own:
+
+```yaml
+        selectors:
+        - cel:
+            expression: device.attributes["dra.cpu"].allowExclusive
 ```
 
 A selector that reads an attribute the device does not carry is a CEL runtime error, which fails

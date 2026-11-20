@@ -76,6 +76,19 @@ type Partition struct {
 	// ThreadsPerCore is the online threads per core the entry's smt asks for,
 	// and 0 when it accepts whatever the platform provides.
 	ThreadsPerCore int
+	// AllowExclusive lets a request with cpuConfig.exclusive take CPUs of its
+	// own out of a partition whose devices are shared.
+	AllowExclusive bool
+}
+
+// AllowsExclusiveRequests reports whether a request may hold CPUs of p alone:
+// on every partition whose devices are owned, and on one whose devices are
+// shared where AllowExclusive is set.
+func (p Partition) AllowsExclusiveRequests(partitionsUsed bool) bool {
+	if p.PublishesSharedDevices(partitionsUsed) {
+		return p.AllowExclusive
+	}
+	return p.PublishesOwnedDevices(partitionsUsed)
 }
 
 // PublishesOwnedDevices reports whether claims take CPUs of p for themselves.

@@ -16,6 +16,7 @@ limitations under the License.
 package store
 
 import (
+	"slices"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -30,6 +31,14 @@ type ContainerState struct {
 	containerUID types.UID
 	// resourceClaimUIDs is a list of resource claims associated with this container.
 	resourceClaimUIDs []types.UID
+	// claimRequests are the requests of those claims the container uses.
+	claimRequests []ClaimRequestRef
+}
+
+// SetClaimRequests records the requests of its claims the container uses,
+// before the state is stored.
+func (cs *ContainerState) SetClaimRequests(refs []ClaimRequestRef) {
+	cs.claimRequests = slices.Clone(refs)
 }
 
 // NewContainerState creates a new ContainerState.
@@ -131,6 +140,22 @@ func (s *PodState) GetContainersWithSharedCPUs() []types.UID {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.sharedCPUContainers.UnsortedList()
+}
+
+// ClaimRequestsByContainer returns, for every container that uses claims, the
+// requests it uses, by container UID.
+func (s *PodState) ClaimRequestsByContainer() map[types.UID][]ClaimRequestRef {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byContainer := make(map[types.UID][]ClaimRequestRef)
+	for _, assignments := range s.configs {
+		for _, state := range assignments {
+			if len(state.claimRequests) > 0 {
+				byContainer[state.containerUID] = slices.Clone(state.claimRequests)
+			}
+		}
+	}
+	return byContainer
 }
 
 func (s *PodState) Len() int {

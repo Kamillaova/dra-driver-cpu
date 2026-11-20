@@ -60,6 +60,10 @@ const (
 	AttributeFullPhysicalCPUsOnly            resourceapi.QualifiedName = "dra.cpu/fullPhysicalCPUsOnly"
 	AttributeAllocator                       resourceapi.QualifiedName = "dra.cpu/allocator"
 	AttributeAllowFractionalCapacityRequests resourceapi.QualifiedName = "dra.cpu/allowFractionalCapacityRequests"
+	// AttributeAllowExclusive is whether a request may take CPUs of its own
+	// from the device: true on an owned device, and on a shared device its
+	// partition's allowExclusive.
+	AttributeAllowExclusive resourceapi.QualifiedName = "dra.cpu/allowExclusive"
 	// AttributeCPUSet is a metadata-only attribute that names the CPUs a request
 	// holding exclusive CPUs was given on a device.
 	AttributeCPUSet resourceapi.QualifiedName = "dra.cpu/cpuset"
@@ -100,4 +104,12 @@ func addSettingAttributes(devices []resourceapi.Device, input BuildInput) {
 func addPartitionAttributes(attrs map[resourceapi.QualifiedName]resourceapi.DeviceAttribute, partition Partition) {
 	attrs[AttributePartition] = resourceapi.DeviceAttribute{StringValue: new(partition.Name)}
 	attrs[AttributeRole] = resourceapi.DeviceAttribute{StringValue: new(partition.Role)}
+}
+
+// addAllowExclusiveAttribute publishes on each of a partition's devices
+// whether Prepare gives a request CPUs of its own there.
+func addAllowExclusiveAttribute(devices []resourceapi.Device, partition Partition, partitionsUsed bool) {
+	for _, dev := range devices {
+		dev.Attributes[AttributeAllowExclusive] = resourceapi.DeviceAttribute{BoolValue: new(partition.AllowsExclusiveRequests(partitionsUsed))}
+	}
 }
