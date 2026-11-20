@@ -40,6 +40,7 @@ jobs:
               should report the partition degraded on its node
               should leave a claim that does not tolerate the taint Pending
               should pin a claim that tolerates the taint to the partition's thread
+              should show the partition's device unhealthy in a tolerating pod's status
               should publish the default partition's devices with a shared request policy, and map only them
               should cap a share at its amount and give the amount in its metadata file
               should run a share that books no amount uncapped
