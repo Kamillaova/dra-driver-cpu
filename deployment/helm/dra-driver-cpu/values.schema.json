@@ -266,6 +266,49 @@
             "individual"
           ]
         },
+        "cpuPartitions": {
+          "type": [
+            "null",
+            "array"
+          ],
+          "items": {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "cpuset": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "default",
+                  "exclusive",
+                  "reserved"
+                ]
+              },
+              "smt": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
         "fullPhysicalCPUsOnly": {
           "type": "boolean"
         },

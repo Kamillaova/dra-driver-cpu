@@ -141,3 +141,31 @@ conflicts.
 {{- end }}
 {{- toYaml $cfg -}}
 {{- end }}
+
+{{/*
+Refuses at render a driverConfig the driver refuses when it loads its
+configuration: a cpuPartitions list without the entry "default", and the
+groupBy and allocator values partitions do not use. The driver checks again
+and is the one that has to be right; the messages are the driver's. Included
+from every template that reads cpuPartitions.
+*/}}
+{{- define "dra-driver-cpu.checkCPUPartitions" -}}
+{{- $cfg := include "dra-driver-cpu.effectiveDriverConfig" . | fromYaml -}}
+{{- if $cfg.cpuPartitions -}}
+{{- $hasDefault := false -}}
+{{- range $cfg.cpuPartitions -}}
+{{- if and (kindIs "map" .) (eq (toString .name) "default") -}}
+{{- $hasDefault = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $hasDefault -}}
+{{- fail "cpuPartitions names partitions but no partition \"default\": add `- name: default` to cpuPartitions to use partitions" -}}
+{{- end -}}
+{{- if and (ne (toString $cfg.cpuDeviceMode) "individual") (eq (toString $cfg.groupBy) "machine") -}}
+{{- fail "invalid groupBy \"machine\" with cpuPartitions: needs allocator \"external\", which partitions do not use" -}}
+{{- end -}}
+{{- if eq (toString $cfg.allocator) "external" -}}
+{{- fail "invalid allocator \"external\" with cpuPartitions: must be \"cpumanager\"" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
