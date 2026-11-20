@@ -30,6 +30,7 @@ import (
 
 	"github.com/go-logr/logr"
 	dracpuapi "github.com/kubernetes-sigs/dra-driver-cpu/api"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/admission"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/buildinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/driverconfig"
@@ -229,6 +230,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		KubeletRootDir:                        cfg.KubeletRootDir,
 		Allocator:                             cfg.Allocator,
 		CPUPartitions:                         cpuPartitions,
+		ClassKinds:                            admission.ClassKinds(dracpuapi.DriverName, cfg),
 		CancelRun:                             cancel,
 		ProfileLabel:                          driverconfig.ProfileLabel,
 	}

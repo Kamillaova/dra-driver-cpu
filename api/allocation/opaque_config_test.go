@@ -19,6 +19,7 @@ package allocation
 import (
 	"testing"
 
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/allocation/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/utils/cpuset"
 )
@@ -27,18 +28,53 @@ func TestParseOpaqueConfig(t *testing.T) {
 	testCases := []struct {
 		name          string
 		rawJSON       string
-		expected      cpuset.CPUSet
+		expected      Config
 		expectedError string
 	}{
 		{
 			name:     "valid config",
 			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": "2-5"}}`,
-			expected: cpuset.New(2, 3, 4, 5),
+			expected: Config{CPUs: cpuset.New(2, 3, 4, 5), HasCPUs: true},
 		},
 		{
-			name:          "invalid - empty cpuset",
-			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": ""}}`,
-			expectedError: "opaque config: cpuConfig.cpuset is empty or missing",
+			name:     "an empty cpuset names no CPUs",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": ""}}`,
+			expected: Config{},
+		},
+		{
+			name:     "no cpuConfig",
+			rawJSON:  `{"apiVersion": "v1alpha1"}`,
+			expected: Config{},
+		},
+		{
+			name:     "a limit written as a string",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"limit": "500m"}}`,
+			expected: Config{Limit: new(v1alpha1.Limit("500m"))},
+		},
+		{
+			name:     "a limit written as a number keeps its text",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"limit": 0.50}}`,
+			expected: Config{Limit: new(v1alpha1.Limit("0.50"))},
+		},
+		{
+			name:     "no limit",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"limit": "max", "cpuset": "2"}}`,
+			expected: Config{CPUs: cpuset.New(2), HasCPUs: true, Limit: new(v1alpha1.LimitMax)},
+		},
+		{
+			name:     "a value that is no quantity is left to the caller",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"limit": ""}}`,
+			expected: Config{Limit: new(v1alpha1.Limit(""))},
+		},
+		{
+			name:     "a null limit is no limit",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"limit": null}}`,
+			expected: Config{},
+		},
+		{
+			name:          "invalid - a limit of another type",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"limit": true}}`,
+			expectedError: `failed to unmarshal opaque config: limit true is neither a quantity nor "max"`,
 		},
 		{
 			name:          "invalid - invalid cpuset format",
@@ -98,7 +134,7 @@ func TestParseOpaqueConfig(t *testing.T) {
 			if tc.expectedError != "" {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), tc.expectedError)
-				assert.True(t, result.IsEmpty())
+				assert.Equal(t, Config{}, result)
 			} else {
 				assert.NoError(t, err)
 				assert.Equal(t, tc.expected, result)

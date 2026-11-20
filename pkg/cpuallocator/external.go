@@ -127,7 +127,7 @@ func getOpaqueCPUSet(logger logr.Logger, driverName string, allocation *resource
 	// ConfigForResult applies the DRA spec matching rules: an empty 'requests' field
 	// targets all requests, and a parent request name also targets its subrequests.
 	configs := resourceclaim.ConfigForResult(allocation.Devices.Config, alloc)
-	var matchedConfig *resourceapi.DeviceAllocationConfiguration
+	var matchedCPUs cpuset.CPUSet
 	matchCount := 0
 
 	for i := range configs {
@@ -138,25 +138,24 @@ func getOpaqueCPUSet(logger logr.Logger, driverName string, allocation *resource
 		if config.Source != resourceapi.AllocationConfigSourceClaim {
 			return cpuset.New(), false, fmt.Errorf("opaque config: configuration from DeviceClass is not supported by this driver, custom cpusets must be defined per ResourceClaim request")
 		}
-		matchedConfig = config
+		// An entry that names no CPUs, such as one setting only a limit, is
+		// not a cpuset configuration.
+		parsed, err := allocationapi.ParseOpaqueConfig(config.Opaque.Parameters.Raw)
+		if err != nil {
+			return cpuset.New(), false, err
+		}
+		if !parsed.HasCPUs {
+			continue
+		}
+		matchedCPUs = parsed.CPUs
 		matchCount++
 	}
 
 	if matchCount != 1 {
 		return cpuset.New(), false, fmt.Errorf("opaque config: request %q is targeted by %d configurations, must be targeted by exactly 1", alloc.Request, matchCount)
 	}
-
-	// Return the matched config if found
-	if matchedConfig != nil && len(matchedConfig.Opaque.Parameters.Raw) > 0 {
-		parsedCPUSet, err := allocationapi.ParseOpaqueConfig(matchedConfig.Opaque.Parameters.Raw)
-		if err != nil {
-			return cpuset.New(), false, err
-		}
-		logger.V(4).Info("found cpuset override in opaque CPU set", "request", alloc.Request, "cpuset", parsedCPUSet.String())
-		return parsedCPUSet, true, nil
-	}
-
-	return cpuset.New(), false, nil
+	logger.V(4).Info("found cpuset override in opaque CPU set", "request", alloc.Request, "cpuset", matchedCPUs.String())
+	return matchedCPUs, true, nil
 }
 
 func validateOpaqueCPUSet(opaqueCPUs, managedCPUs, reservedCPUs cpuset.CPUSet, total int) error {

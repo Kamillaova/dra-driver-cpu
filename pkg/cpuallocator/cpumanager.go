@@ -18,6 +18,7 @@ package cpuallocator
 
 import (
 	"github.com/go-logr/logr"
+	allocationapi "github.com/kubernetes-sigs/dra-driver-cpu/api/allocation"
 	topology "github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpumanager"
 	resourceapi "k8s.io/api/resource/v1"
@@ -59,7 +60,13 @@ func (alc *CPUManager) GetPreferredCPUs(logger logr.Logger, allocation *resource
 		if config.Opaque == nil || config.Opaque.Driver != alc.driverName {
 			continue
 		}
-		return cpuset.New(), ErrUnsupportedPreferredCPUs
+		parsed, err := allocationapi.ParseOpaqueConfig(config.Opaque.Parameters.Raw)
+		if err != nil {
+			return cpuset.New(), err
+		}
+		if parsed.HasCPUs {
+			return cpuset.New(), ErrUnsupportedPreferredCPUs
+		}
 	}
 	return cpuset.New(), nil
 }

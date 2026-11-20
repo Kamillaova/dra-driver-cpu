@@ -31,6 +31,7 @@ import (
 
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/go-logr/logr"
+	"github.com/kubernetes-sigs/dra-driver-cpu/internal/admission"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuallocator"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
@@ -168,6 +169,7 @@ type CPUDriver struct {
 	// allowFractionalCapacityRequests is whether the shared devices book
 	// amounts in millicores.
 	allowFractionalCapacityRequests bool
+	classKinds                      map[string]admission.Kind
 	// wholeCorePicker is set under fullPhysicalCPUsOnly where the driver picks
 	// the CPUs itself, which an external allocator's cpuset leaves it no room to.
 	wholeCorePicker bool
@@ -314,6 +316,10 @@ type Config struct {
 	AllowFractionalCapacityRequests bool
 	// TaintDegradedPartitions is driverconfig.Config.TaintDegradedPartitions.
 	TaintDegradedPartitions bool
+	// ClassKinds is admission.ClassKinds of the whole configuration, every
+	// profile included, so that Prepare judges a claim as it is judged on any
+	// node.
+	ClassKinds map[string]admission.Kind
 	// CancelRun cancels the context given to Start, which refuses to run
 	// without it. HandleError calls it with a cause wrapping ErrFatal, so that
 	// the caller stops the driver.
@@ -363,6 +369,7 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		providers:           providers,
 		profileLabel:        config.ProfileLabel,
 		selectProfile:       config.SelectProfile,
+		classKinds:          config.ClassKinds,
 		profileReadTimeout:  profileReadTimeout,
 		profileReadInterval: profileReadInterval,
 

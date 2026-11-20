@@ -379,6 +379,46 @@ func TestExternalGetPreferredCPUs(t *testing.T) {
 			},
 			expectedCPUs: cpuset.New(2, 3, 4, 5),
 		},
+		{
+			name:        "an entry naming no CPUs beside the cpuset entry is not counted",
+			managedCPUs: cpuset.New(0, 1, 2, 3, 4, 5),
+			allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Config: []resourceapi.DeviceAllocationConfiguration{
+						{
+							Source: resourceapi.AllocationConfigSourceClaim,
+							DeviceConfiguration: resourceapi.DeviceConfiguration{
+								Opaque: &resourceapi.OpaqueDeviceConfiguration{
+									Driver:     "dra.cpu",
+									Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1alpha1","cpuConfig":{"limit":"max"}}`)},
+								},
+							},
+						},
+						{
+							Source:   resourceapi.AllocationConfigSourceClaim,
+							Requests: []string{"req"},
+							DeviceConfiguration: resourceapi.DeviceConfiguration{
+								Opaque: &resourceapi.OpaqueDeviceConfiguration{
+									Driver:     "dra.cpu",
+									Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1alpha1","cpuConfig":{"cpuset":"2-5"}}`)},
+								},
+							},
+						},
+					},
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{
+							Request: "req",
+							Driver:  "dra.cpu",
+							Device:  "cpudevmachine",
+							ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{
+								resourceapi.QualifiedName(device.CPUResourceQualifiedName): *resource.NewQuantity(4, resource.DecimalSI),
+							},
+						},
+					},
+				},
+			},
+			expectedCPUs: cpuset.New(2, 3, 4, 5),
+		},
 		// should never happen because they would mean we had a bug elsewhere: this responses is illegal, so we use forged illegal objects to ensure the code robustness
 		{
 			name:        "error: opaque size larger than request total",
