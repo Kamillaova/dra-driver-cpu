@@ -253,9 +253,10 @@ func makeCPUPartitionSnapshot(partitions []driverconfig.CPUPartition) ([]gatheri
 	snapshot := make([]gatherinfoapi.CPUPartition, 0, len(partitions))
 	for _, partition := range partitions {
 		entry := gatherinfoapi.CPUPartition{
-			Name:   partition.Name,
-			Role:   partition.Role,
-			CPUSet: partition.CPUSet,
+			Name:           partition.Name,
+			Role:           partition.Role,
+			CPUSet:         partition.CPUSet,
+			AllowExclusive: partition.AllowExclusive,
 		}
 		if partition.SMT != nil {
 			smt, err := json.Marshal(partition.SMT)
