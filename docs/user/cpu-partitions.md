@@ -12,9 +12,12 @@ the entry `- name: default`. The field itself is described in
   claims run on. The shared pool shrinks while a claim holds them and grows back after.
 - With partitions, `dra.cpu` gives a share of the `default` partition's CPUs: any number of claims
   hold one of its devices, each booking an amount, and their containers run on the device's CPUs
-  together with the containers without claims. Exclusive CPUs come only from the `exclusive`
-  partitions, each through its own class, `dra.cpu.<name>`. Nothing takes CPUs of the `default`
-  partition for itself, so the CPUs that containers without claims run on do not shrink.
+  together with the containers without claims. Exclusive CPUs come from the `exclusive` partitions,
+  each through its own class, `dra.cpu.<name>`, and, where the `default` entry sets
+  `allowExclusive`, from the `default` partition for the requests that ask for them; see
+  [Exclusive requests on a default partition](#exclusive-requests-on-a-default-partition). Without
+  it nothing takes CPUs of the `default` partition for itself, so the CPUs that containers without
+  claims run on do not shrink.
 
 The least configuration that uses partitions is `cpuPartitions: [{name: default}]`: the whole node
 is then one `default` partition of shared devices.
@@ -23,6 +26,12 @@ A node without partitions keeps upstream's mode, so that a configuration valid u
 does upstream. One mode for both kinds of node is possible only with another kind of device on nodes
 without partitions: there, an amount booked on `dra.cpu` is that many CPUs for the claim alone, and
 on a shared device it is a share of CPUs that its holders run on together.
+
+Running without partitions is deprecated: `cpuPartitions` holding `- name: default` replaces it. To
+keep upstream's exclusive CPUs carved out of the shared ones after the change, set
+`allowExclusive: true` on the `default` entry and `cpuConfig.exclusive: true` on the claims that
+need them. The driver logs nothing for it; see
+[Upgrading](upgrade.md#running-without-partitions).
 
 ## Roles
 
@@ -90,6 +99,60 @@ cpuPartitions:
 
 Under [profiles](configuration.md#per-node-profiles), every profile's list holds the entry, and a
 node whose cores are all alike names a declared profile that holds only `- name: default`.
+
+## Exclusive requests on a default partition
+
+A partition of role `default`, the `default` entry or a named one, lets its requests take CPUs of
+their own with `allowExclusive: true`; left out, it is `false`. The field means something only where
+devices are shared, so it is refused on the roles `exclusive` and `reserved` when the configuration
+loads, with, for example:
+
+```text
+partition "vms": allowExclusive applies only to role default, and its role is "exclusive"; remove it
+```
+
+```yaml
+cpuPartitions:
+  - name: default
+    allowExclusive: true
+```
+
+A request whose claim sets `cpuConfig.exclusive: true` then takes whole CPUs out of the shared device
+it is allocated, those no other exclusive request holds, the CPUs that earlier requests of its own
+claim took included; the driver picks them by topology, as on an owned device. A request without
+the flag, or with `false`, shares the device as before.
+
+- The scheduler books the request's amount on the shared device, as it books a share, so one count
+  covers both.
+- The CPUs leave the device's shared CPUs while the claim is prepared. When the claim's first
+  container is created, the containers without claims and every container holding a share are moved
+  off them; a container holding a share beside exclusive CPUs of its own keeps those. Once the claim
+  is unprepared they move back: at once with `assumeUnsolicitedUpdatesSafe`, else at the next
+  creation of a claim's first container or the next reconnect to the container runtime.
+- The request's metadata file names its CPUs in `dra.cpu/cpuset`, and `DRA_EXCLUSIVE_ASSIGNED_CPUSET`
+  lists them in its container. A share's metadata file names no CPUs, since they move; see
+  [Device Metadata](device-metadata.md).
+- A workload that reads its cpuset once at start, such as DPDK's control threads, must not hold a
+  share on a partition that sets `allowExclusive`, since its CPUs change under it. Run it on a
+  partition that leaves the flag `false`.
+
+The request is refused when the claim is prepared where:
+
+- the partition does not set the flag, with
+  `` request "cpus": partition "default" on node "worker-a" does not allow exclusive CPUs (`allowExclusive: false`) ``.
+  Every device carries `dra.cpu/allowExclusive`, so a claim selecting
+  `device.attributes["dra.cpu"].allowExclusive` lands only on nodes that accept it; see
+  [Settings published as device attributes](configuration.md#settings-published-as-device-attributes);
+- the take would leave the device no shared CPU: a cgroup whose cpuset is empty runs on its parent's
+  CPUs, the claim's exclusive ones included. The scheduler bounds the amounts on the whole node, not
+  per device, so it can place such a claim, and the driver refuses it after binding, naming the
+  claims that hold the device's other CPUs. Leave one CPU of the device shared;
+- it names no amount, or `0`, a fraction, or, under `fullPhysicalCPUsOnly`, an amount whole cores of
+  the device cannot make, with the texts of an exclusive request, such as
+  `` request "cpus": amount 3 on exclusive request (`cpuConfig.exclusive: true`); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`) ``;
+- it has a numeric `limit`, since a cap would throttle its CPUs; `limit: max` is accepted;
+- it has a `cpuConfig.cpuset`: with partitions the default allocator, which picks the CPUs itself,
+  is the only one.
 
 ## Preparing the machine
 
@@ -387,7 +450,9 @@ When the driver starts on partitions that changed under prepared claims:
 
 Moving a node from upstream's mode to `- name: default` is not a drop-in change: `dra.cpu` then
 gives shares where it gave exclusive CPUs. Move the claims that need CPUs of their own to an
-`exclusive` partition's class first.
+`exclusive` partition's class first, or set `allowExclusive: true` on the `default` entry and
+`cpuConfig.exclusive: true` on those claims, which keeps them exclusive on `dra.cpu`; see
+[Exclusive requests on a default partition](#exclusive-requests-on-a-default-partition).
 
 ## Device taint rules
 

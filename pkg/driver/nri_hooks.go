@@ -234,6 +234,7 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 		}
 		allGuaranteedCPUs := cpuset.New()
 		var claimUIDs []types.UID
+		var boundRefs []store.ClaimRequestRef
 		keptUnder := sets.New[cpumetrics.Rule]()
 		var broken []olderRule
 		for _, uid := range slices.Sorted(maps.Keys(sc.claims)) {
@@ -263,6 +264,7 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 			}
 			allGuaranteedCPUs = allGuaranteedCPUs.Union(cpus)
 			claimUIDs = append(claimUIDs, uid)
+			boundRefs = append(boundRefs, refs...)
 		}
 		members := boundMembers(sc, allocationState, claimUIDs)
 		var capped cappedBesideError
@@ -277,6 +279,7 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 		}
 
 		state := store.NewContainerState(sc.container.GetName(), types.UID(sc.container.GetId()), claimUIDs...)
+		state.SetClaimRequests(boundRefs)
 		if len(claimUIDs) > 0 && allGuaranteedCPUs.IsEmpty() {
 			noSharedCPUs = append(noSharedCPUs, sc.container.GetId())
 		} else if len(claimUIDs) > 0 {
@@ -863,6 +866,35 @@ func sharedContainerUpdatesFor(logger logr.Logger, allocations *store.Allocation
 	return updates, nil
 }
 
+// shareHolderUpdatesFor gives every container holding a shared request the
+// CPUs its requests hold now, exclusive ones included: a share runs on its
+// devices' CPUs less those exclusive requests take out of them, which change
+// as such requests are prepared and unprepared. Callers using the live driver
+// stores must hold stateMu.
+func shareHolderUpdatesFor(logger logr.Logger, allocations *store.AllocationState, pods *store.PodState, excludeID types.UID) []*api.ContainerUpdate {
+	byContainer := pods.ClaimRequestsByContainer()
+	var updates []*api.ContainerUpdate
+	for _, containerUID := range slices.Sorted(maps.Keys(byContainer)) {
+		if containerUID == excludeID {
+			continue
+		}
+		refs := byContainer[containerUID]
+		cpus, err := allocations.GetRequestAllocationUnion(refs...)
+		if err != nil {
+			logger.V(2).Info("not updating a container whose claims are no longer prepared", "containerID", containerUID, "err", err.Error())
+			continue
+		}
+		exclusive, err := allocations.GetExclusiveRequestUnion(refs...)
+		if err != nil || cpus.Equals(exclusive) {
+			continue
+		}
+		update := &api.ContainerUpdate{ContainerId: string(containerUID)}
+		update.SetLinuxCPUSetCPUs(cpus.String())
+		updates = append(updates, update)
+	}
+	return updates
+}
+
 // CreateContainer handles container creation requests from the NRI.
 func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) (radjust *api.ContainerAdjustment, rupdates []*api.ContainerUpdate, rerr error) {
 	defer cp.watchdog.track("CreateContainer")()
@@ -966,6 +998,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		}
 		logger.V(2).Info("guaranteed CPUs found", "cpus", guaranteedCPUs.String())
 		state := store.NewContainerState(ctr.GetName(), containerId, claimUIDs...)
+		state.SetClaimRequests(refs)
 		adjust.SetLinuxCPUSetCPUs(guaranteedCPUs.String())
 		if !exclusiveCPUs.IsEmpty() {
 			adjust.AddEnv(dracpuapi.EnvVarExclusiveAssignedCPUSet, exclusiveCPUs.String())
@@ -988,6 +1021,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 				cp.allocationState.Unbind(logger, updatedClaims...)
 				return nil, nil, fmt.Errorf("cannot update shared CPU pool after creating container %q in pod %q: %w", ctr.Name, pod.Uid, err)
 			}
+			updates = append(updates, shareHolderUpdatesFor(logger, cp.allocationState, cp.podState, containerId)...)
 		}
 		cp.podState.SetContainerState(podUID, state)
 	}

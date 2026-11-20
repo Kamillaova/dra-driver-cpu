@@ -39,6 +39,53 @@ func TestSetAndGetContainerState(t *testing.T) {
 	require.Equal(t, state, gotState)
 }
 
+func TestClaimRequestsByContainer(t *testing.T) {
+	refs := []ClaimRequestRef{{ClaimUID: "claim-a", Request: "cpus"}, {ClaimUID: "claim-b"}}
+	for _, tc := range []struct {
+		name   string
+		states map[types.UID]*ContainerState
+		want   map[types.UID][]ClaimRequestRef
+	}{{
+		name: "no container",
+		want: map[types.UID][]ClaimRequestRef{},
+	}, {
+		name: "a container without claims is left out",
+		states: map[types.UID]*ContainerState{
+			"pod-1": NewContainerState("plain", "plain-uid"),
+		},
+		want: map[types.UID][]ClaimRequestRef{},
+	}, {
+		name: "the requests of each container using claims, across pods",
+		states: map[types.UID]*ContainerState{
+			"pod-1": withRequests(NewContainerState("app", "app-uid", "claim-a", "claim-b"), refs),
+			"pod-2": withRequests(NewContainerState("vm", "vm-uid", "claim-c"), refs[:1]),
+		},
+		want: map[types.UID][]ClaimRequestRef{"app-uid": refs, "vm-uid": refs[:1]},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewPodState()
+			for podUID, state := range tc.states {
+				s.SetContainerState(podUID, state)
+			}
+			require.Equal(t, tc.want, s.ClaimRequestsByContainer())
+		})
+	}
+}
+
+func TestSetClaimRequestsKeepsItsOwnCopy(t *testing.T) {
+	refs := []ClaimRequestRef{{ClaimUID: "claim-a", Request: "cpus"}}
+	s := NewPodState()
+	s.SetContainerState("pod", withRequests(NewContainerState("app", "app-uid", "claim-a"), refs))
+	refs[0].Request = "changed"
+	s.ClaimRequestsByContainer()["app-uid"][0].Request = "changed"
+	require.Equal(t, map[types.UID][]ClaimRequestRef{"app-uid": {{ClaimUID: "claim-a", Request: "cpus"}}}, s.ClaimRequestsByContainer())
+}
+
+func withRequests(state *ContainerState, refs []ClaimRequestRef) *ContainerState {
+	state.SetClaimRequests(refs)
+	return state
+}
+
 func TestRemoveContainerState(t *testing.T) {
 	store := NewPodState()
 	podUID := types.UID("pod-uid-1")

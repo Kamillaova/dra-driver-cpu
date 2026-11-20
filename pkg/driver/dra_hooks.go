@@ -241,7 +241,7 @@ func (cp *CPUDriver) checkClassConfig(claim *resourceapi.ResourceClaim) error {
 			if err != nil {
 				return err
 			}
-			if parsed.Limit != nil {
+			if parsed.Limit != nil || parsed.Exclusive != nil {
 				return fmt.Errorf("DeviceClass %q: %s configuration is not allowed in a class; move it into the claim", requestDeviceClass(claim, alloc.Request), cp.driverName)
 			}
 		}
@@ -255,9 +255,10 @@ func (cp *CPUDriver) checkClassConfig(claim *resourceapi.ResourceClaim) error {
 func (cp *CPUDriver) kindOf(claim *resourceapi.ResourceClaim) func(ref, class string) (admission.Kind, bool) {
 	return func(ref, class string) (admission.Kind, bool) {
 		if kind, ok := cp.classKinds[class]; ok {
+			kind.Node = cp.nodeName
 			return kind, true
 		}
-		var kind admission.Kind
+		kind := admission.Kind{Node: cp.nodeName}
 		allocated := false
 		for _, alloc := range claim.Status.Allocation.Devices.Results {
 			if alloc.Driver != cp.driverName || alloc.Request != ref {
@@ -268,6 +269,9 @@ func (cp *CPUDriver) kindOf(claim *resourceapi.ResourceClaim) func(ref, class st
 				kind.Shared = true
 			} else if !kind.Owned {
 				kind.Owned, kind.Exclusive = true, cp.exclusiveWhere(claim, alloc)
+				if cp.topology.partitionCPUs != nil {
+					kind.OwnedClass = class
+				}
 			}
 		}
 		return kind, allocated
@@ -413,7 +417,22 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 		if alloc.Driver != cp.driverName {
 			continue
 		}
-		if deviceCPUs, ok := cp.topology.sharedDevices[alloc.Device]; ok {
+		isShare, err := cp.sharesResult(claim, alloc)
+		if err != nil {
+			return kubeletplugin.PrepareResult{Err: err}
+		}
+		deviceCPUs, shared := cp.topology.sharedDevices[alloc.Device]
+		if shared && !isShare {
+			cur, err := cp.takeFromSharedDevice(logger, claim, alloc, deviceCPUs, allocatableCPUs.Difference(assignedCPUs))
+			if err != nil {
+				return kubeletplugin.PrepareResult{Err: err}
+			}
+			assignedCPUs = assignedCPUs.Union(cur)
+			addRequestCPUs(byRequest, alloc, cur)
+			logger.V(2).Info("CPU assignment from a shared device", "device", alloc.Device, "assigned", cur.String(), "allAssigned", assignedCPUs.String())
+			continue
+		}
+		if isShare {
 			if err := cp.checkSharedAmount(claim, alloc); err != nil {
 				return kubeletplugin.PrepareResult{Err: err}
 			}
@@ -522,6 +541,66 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 	return result
 }
 
+// sharesResult reports whether a result is a share: one on a shared device
+// whose request does not set `cpuConfig.exclusive: true`.
+func (cp *CPUDriver) sharesResult(claim *resourceapi.ResourceClaim, alloc resourceapi.DeviceRequestAllocationResult) (bool, error) {
+	if _, shared := cp.topology.sharedDevices[alloc.Device]; !shared {
+		return false, nil
+	}
+	for _, config := range resourceclaim.ConfigForResult(claim.Status.Allocation.Devices.Config, alloc) {
+		if config.Opaque == nil || config.Opaque.Driver != cp.driverName {
+			continue
+		}
+		parsed, err := allocationapi.ParseOpaqueConfig(config.Opaque.Parameters.Raw)
+		if err != nil {
+			return false, err
+		}
+		if parsed.Exclusive != nil {
+			return !*parsed.Exclusive, nil
+		}
+	}
+	return true, nil
+}
+
+// takeFromSharedDevice gives a result with `cpuConfig.exclusive: true` whole
+// CPUs of its own out of a shared device, from those no exclusive request
+// holds. The device keeps one CPU for its shares: a cgroup whose cpuset.cpus
+// is empty runs on its parent's CPUs, the claim's exclusive ones included.
+func (cp *CPUDriver) takeFromSharedDevice(logger logr.Logger, claim *resourceapi.ResourceClaim, alloc resourceapi.DeviceRequestAllocationResult, deviceCPUs, free cpuset.CPUSet) (cpuset.CPUSet, error) {
+	partition := cp.topology.sharedPartitions[alloc.Device]
+	if !partition.AllowExclusive {
+		return cpuset.New(), fmt.Errorf("request %q: partition %q on node %q does not allow exclusive CPUs (`allowExclusive: false`)",
+			alloc.Request, partition.Name, cp.nodeName)
+	}
+	if _, ok := writtenCPUAmount(claim, alloc.Request, cp.driverName); !ok {
+		return cpuset.New(), fmt.Errorf("request %q: exclusive CPUs need an amount; add a whole-number dra.cpu/cpu capacity request", alloc.Request)
+	}
+	if err := cp.checkWholeAmount(claim, alloc); err != nil {
+		return cpuset.New(), err
+	}
+	count, err := device.ConsumedCPUCount(alloc, cp.driverName)
+	if err != nil {
+		return cpuset.New(), err
+	}
+	if err := cp.checkWholeCoreAmount(claim, alloc, count); err != nil {
+		return cpuset.New(), err
+	}
+	preferred, err := cp.cpuAllocator.GetPreferredCPUs(logger, claim.Status.Allocation, alloc)
+	if err != nil {
+		return cpuset.New(), err
+	}
+	available := free.Intersection(deviceCPUs)
+	cpus, err := cp.takeCPUsForDevice(logger, alloc, deviceCPUs, available, preferred, count)
+	if err := cp.shortageHeldBy(err, alloc.Device, deviceCPUs, available, count); err != nil {
+		return cpuset.New(), err
+	}
+	if available.Difference(cpus).IsEmpty() {
+		return cpuset.New(), heldBy(fmt.Errorf("request %q: %d exclusive CPUs would leave device %q no shared CPU; ask for fewer, a device keeps one CPU for its shares",
+			alloc.Request, count, alloc.Device), cp.allocationState.Holders(deviceCPUs))
+	}
+	return cpus, nil
+}
+
 // checkWholeAmount refuses a written amount an exclusive result cannot book:
 // it books whole CPUs, at least one, whatever the scheduler rounded it up to.
 func (cp *CPUDriver) checkWholeAmount(claim *resourceapi.ResourceClaim, alloc resourceapi.DeviceRequestAllocationResult) error {
@@ -544,10 +623,13 @@ func (cp *CPUDriver) checkWholeAmount(claim *resourceapi.ResourceClaim, alloc re
 	return exclusiveRefusal(alloc.Request, "amount "+written.String(), cp.exclusiveWhere(claim, alloc), advice)
 }
 
-// exclusiveWhere names what makes a result exclusive: its device where
-// partitions decide each device's role, and its class where every device is
-// owned.
+// exclusiveWhere names what makes a result exclusive: the flag on a shared
+// device, its device where partitions decide each device's role, and its class
+// where every device is owned.
 func (cp *CPUDriver) exclusiveWhere(claim *resourceapi.ResourceClaim, alloc resourceapi.DeviceRequestAllocationResult) string {
+	if _, shared := cp.topology.sharedDevices[alloc.Device]; shared {
+		return admission.FlaggedExclusive().Exclusive
+	}
 	if cp.topology.partitionCPUs != nil {
 		return fmt.Sprintf("exclusive device %q", alloc.Device)
 	}
@@ -809,8 +891,11 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 				metadataAttrs[string(k)] = v
 			}
 			ref := metadataRef(claim.UID, record, allocResult.Request)
-			_, shared := cp.topology.sharedDevices[allocResult.Device]
-			exclusive := !shared && cp.allocationState.HoldsExclusiveCPUsOf(ref)
+			shares, err := cp.sharesResult(claim, allocResult)
+			if err != nil {
+				return kubeletplugin.PrepareResult{Err: err}
+			}
+			exclusive := !shares && cp.allocationState.HoldsExclusiveCPUsOf(ref)
 			if quantity, ok := device.LookupConsumedCapacity(allocResult.ConsumedCapacity, cp.driverName); ok && exclusive {
 				allocatedCount := quantity.Value()
 				metadataAttrs[string(device.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{
@@ -939,11 +1024,15 @@ func (cp *CPUDriver) writeClaimDevices(logger logr.Logger, claim *resourceapi.Re
 		deviceName := getCDIRequestDeviceName(claim.UID, request.Request)
 		envByDevice[deviceName] = fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claim.UID, request.Request, cdiEnvDynamicValue)
 		deviceByRequest[request.Request] = cdiparser.QualifiedName(cdiVendor, cdiClass, deviceName)
+		results, err := cp.resultRecords(claim, request.Request, request.Role)
+		if err != nil {
+			return nil, err
+		}
 		cdiRecord.Requests = append(cdiRecord.Requests, cdiRequestRecord{
 			Request: request.Request,
 			CPUs:    request.CPUs,
 			Role:    request.Role,
-			Results: cp.resultRecords(claim, request.Request, request.Role),
+			Results: results,
 			Cap:     request.Cap,
 		})
 	}
@@ -959,14 +1048,18 @@ func (cp *CPUDriver) writeClaimDevices(logger logr.Logger, claim *resourceapi.Re
 	return deviceByRequest, nil
 }
 
-// resultRecords returns the results of a request on the devices of a role.
-func (cp *CPUDriver) resultRecords(claim *resourceapi.ResourceClaim, request string, role store.Role) []cdiResultRecord {
+// resultRecords returns the results of a request that hold its CPUs in role.
+func (cp *CPUDriver) resultRecords(claim *resourceapi.ResourceClaim, request string, role store.Role) ([]cdiResultRecord, error) {
 	var results []cdiResultRecord
 	for _, allocResult := range claim.Status.Allocation.Devices.Results {
 		if allocResult.Driver != cp.driverName || resourceclaim.BaseRequestRef(allocResult.Request) != request {
 			continue
 		}
-		if _, shared := cp.topology.sharedDevices[allocResult.Device]; shared != (role == store.RoleShared) {
+		shares, err := cp.sharesResult(claim, allocResult)
+		if err != nil {
+			return nil, err
+		}
+		if shares != (role == store.RoleShared) {
 			continue
 		}
 		result := cdiResultRecord{Device: allocResult.Device}
@@ -975,7 +1068,7 @@ func (cp *CPUDriver) resultRecords(claim *resourceapi.ResourceClaim, request str
 		}
 		results = append(results, result)
 	}
-	return results
+	return results, nil
 }
 
 // UnprepareResourceClaims is called by the kubelet to unprepare the resources for a claim.

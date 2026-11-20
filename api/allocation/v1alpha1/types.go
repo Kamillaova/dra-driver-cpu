@@ -46,6 +46,10 @@ type CPUConfig struct {
 	// Limit caps the CPU time of a shared request: a quantity above zero, or
 	// LimitMax for no cap. Left out, a shared request is capped at its amount.
 	Limit *Limit `json:"limit,omitempty"`
+	// Exclusive asks, on a partition of role default that allows it, for CPUs
+	// of the request's own rather than a share. Left out, a request is shared
+	// on a node with partitions and exclusive on one without.
+	Exclusive *bool `json:"exclusive,omitempty"`
 }
 
 // LimitMax is the one way to write that a request has no CPU limit.

@@ -115,6 +115,7 @@ func (c Config) Partitions() ([]device.Partition, error) {
 			Role:           partition.Role,
 			CPUs:           cpus,
 			ThreadsPerCore: threads,
+			AllowExclusive: partition.AllowExclusive,
 		})
 	}
 	return partitions, nil
