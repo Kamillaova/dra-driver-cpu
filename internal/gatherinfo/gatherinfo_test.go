@@ -17,6 +17,7 @@ limitations under the License.
 package gatherinfo_test
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -290,6 +291,42 @@ func TestRunReportsAssumeUnsolicitedUpdatesSafe(t *testing.T) {
 			report := readReport(t, []byte(stdout))
 			if report.DriverConfig.AssumeUnsolicitedUpdatesSafe != tc.want {
 				t.Fatalf("assumeUnsolicitedUpdatesSafe = %v, want %v", report.DriverConfig.AssumeUnsolicitedUpdatesSafe, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunReportsCPUPartitions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{name: "default", config: "groupBy: socket\n", want: "null"},
+		{
+			name: "from the config file",
+			config: "cpuPartitions:\n- name: default\n  smt: false\n" +
+				"- name: vms\n  role: exclusive\n  cpuset: \"2-3\"\n",
+			want: `[{"name":"default","smt":false},{"name":"vms","role":"exclusive","cpuset":"2-3"}]`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupFakeHostWithConfig(t, tc.config)
+
+			stdout, err := captureStdout(t, func() error {
+				return gatherinfo.Run([]string{"--stdout"}, gatherinfo.Options{}, logr.Discard())
+			})
+			if err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+
+			report := readReport(t, []byte(stdout))
+			got, err := json.Marshal(report.DriverConfig.CPUPartitions)
+			if err != nil {
+				t.Fatalf("marshal cpuPartitions: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("cpuPartitions = %s, want %s", got, tc.want)
 			}
 		})
 	}
