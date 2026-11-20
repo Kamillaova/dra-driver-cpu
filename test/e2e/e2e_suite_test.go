@@ -356,6 +356,8 @@ type driverConfigValues struct {
 	AllowFractionalCapacityRequests       bool   `json:"allowFractionalCapacityRequests,omitempty"`
 	TaintDegradedPartitions               bool   `json:"taintDegradedPartitions,omitempty"`
 
+	CgroupThreadedMode driverconfig.ThreadedMode `json:"cgroupThreadedMode,omitempty"`
+
 	CPUPartitions []driverconfig.CPUPartition     `json:"cpuPartitions,omitempty"`
 	Profiles      map[string]driverconfig.Profile `json:"profiles,omitempty"`
 }

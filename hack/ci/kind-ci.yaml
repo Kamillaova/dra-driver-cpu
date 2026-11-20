@@ -17,6 +17,28 @@ featureGates:
   DRANodeAllocatableResources: true # requires a 1.37+ node image
   DRAListTypeAttributes: true
   DRAFractionalCapacityRange: true # lets the scheduler book a fractional amount of a shared device
+# The runtime handler cgroup-writable gives its containers a writable
+# /sys/fs/cgroup, as an administrator gives a threaded workload, which moves its
+# threads into its groups; the threaded specs run their pods under it. It
+# copies the runc handler's settings, so its cgroup driver is the kubelet's.
+# kind applies only the patch whose version matches the node image's file.
+containerdConfigPatches:
+- |-
+  version = 2
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cgroup-writable]
+    runtime_type = "io.containerd.runc.v2"
+    base_runtime_spec = "/etc/containerd/cri-base.json"
+    cgroup_writable = true
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.cgroup-writable.options]
+      SystemdCgroup = true
+- |-
+  version = 3
+  [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.cgroup-writable]
+    runtime_type = "io.containerd.runc.v2"
+    base_runtime_spec = "/etc/containerd/cri-base.json"
+    cgroup_writable = true
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.cgroup-writable.options]
+      SystemdCgroup = true
 nodes:
 # Node images are not pinned here: kind takes the image from the --image flag,
 # which the Makefile sets to kindest/node:$(KIND_K8S_VERSION).

@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -63,6 +64,18 @@ func TestCreateInjectsTestResourceLabel(t *testing.T) {
 			},
 			read: func(ctx context.Context, cs kubernetes.Interface) (metav1.Object, error) {
 				return cs.CoreV1().Namespaces().Get(ctx, "namespace", metav1.GetOptions{})
+			},
+		},
+		{
+			name: "runtime class",
+			create: func(ctx context.Context, cs kubernetes.Interface) (metav1.Object, error) {
+				return cs.NodeV1().RuntimeClasses().Create(ctx, &nodev1.RuntimeClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "runtime-class"},
+					Handler:    "handler",
+				}, metav1.CreateOptions{})
+			},
+			read: func(ctx context.Context, cs kubernetes.Interface) (metav1.Object, error) {
+				return cs.NodeV1().RuntimeClasses().Get(ctx, "runtime-class", metav1.GetOptions{})
 			},
 		},
 		{
