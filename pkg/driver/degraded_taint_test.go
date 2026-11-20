@@ -59,7 +59,7 @@ var degradedToleration = resourceapi.DeviceToleration{Key: "dra.cpu/degraded", O
 
 func newDegradedDriver(t *testing.T, client *fake.Clientset, reg *prometheus.Registry, declared []device.Partition, taint bool) *CPUDriver {
 	t.Helper()
-	providers := Providers{CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos}, SysFS: partitionSysFS()}
+	providers := Providers{K8SClient: statusClient(), CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos}, SysFS: partitionSysFS()}
 	if client != nil {
 		providers.K8SClient = client
 	}

@@ -232,8 +232,9 @@ func TestNewWithPartitions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := prometheus.NewRegistry()
 			d, err := New(testr.New(t), Providers{
-				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
-				SysFS:   tc.sysfs,
+				K8SClient: statusClient(),
+				CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+				SysFS:     tc.sysfs,
 			}, &Config{
 				DriverName:       testDriverName,
 				NodeName:         testNodeName,
@@ -325,8 +326,9 @@ func TestSeedCountsMisplacedClaims(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := prometheus.NewRegistry()
 			d, err := New(testr.New(t), Providers{
-				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
-				SysFS:   partitionSysFS(),
+				K8SClient: statusClient(),
+				CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+				SysFS:     partitionSysFS(),
 			}, &Config{
 				DriverName:       testDriverName,
 				NodeName:         testNodeName,
@@ -357,8 +359,9 @@ func TestPrepareTakesCPUsFromTheDevicePartition(t *testing.T) {
 	} {
 		t.Run(tc.groupBy, func(t *testing.T) {
 			d, err := New(testr.New(t), Providers{
-				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
-				SysFS:   partitionSysFS(),
+				K8SClient: statusClient(),
+				CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+				SysFS:     partitionSysFS(),
 			}, &Config{
 				DriverName:       testDriverName,
 				NodeName:         testNodeName,
@@ -511,8 +514,9 @@ func TestContainersWithoutClaimsRunOnTheDefaultPartition(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
 			d, err := New(testr.New(t), Providers{
-				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
-				SysFS:   partitionSysFS(),
+				K8SClient: statusClient(),
+				CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+				SysFS:     partitionSysFS(),
 			}, &Config{
 				DriverName:       testDriverName,
 				NodeName:         testNodeName,
@@ -594,8 +598,9 @@ func TestCreateContainerRefusesContainersWithoutClaimsWhereNoDefaultCPUIsLeft(t 
 			} else {
 				var err error
 				d, err = New(testr.New(t), Providers{
-					CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
-					SysFS:   partitionSysFS(),
+					K8SClient: statusClient(),
+					CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+					SysFS:     partitionSysFS(),
 				}, &Config{
 					DriverName:       testDriverName,
 					NodeName:         testNodeName,
@@ -628,8 +633,9 @@ func TestCreateContainerRefusesContainersWithoutClaimsWhereNoDefaultCPUIsLeft(t 
 func sharingDriver(t *testing.T, fractional bool, onDisk map[types.UID]cdiClaimRecord, recorder Recorder) *CPUDriver {
 	t.Helper()
 	d, err := New(testr.New(t), Providers{
-		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
-		SysFS:   partitionSysFS(),
+		K8SClient: statusClient(),
+		CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mixedCoreCPUInfos},
+		SysFS:     partitionSysFS(),
 	}, &Config{
 		DriverName:                      testDriverName,
 		NodeName:                        testNodeName,
@@ -1672,8 +1678,9 @@ func TestPrepareRefusesExclusiveFalseOnAnOwnedDevice(t *testing.T) {
 func partitionDriver(t *testing.T, infos []cpuinfo.CPUInfo, partitions []device.Partition, fullPhysicalCPUsOnly bool, onDisk map[types.UID]cdiClaimRecord) *CPUDriver {
 	t.Helper()
 	d, err := New(testr.New(t), Providers{
-		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
-		SysFS:   partitionSysFS(),
+		K8SClient: statusClient(),
+		CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: infos},
+		SysFS:     partitionSysFS(),
 	}, &Config{
 		DriverName:           testDriverName,
 		NodeName:             testNodeName,
