@@ -151,6 +151,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	}
 	if cp.window != nil {
 		cp.window.keep(pods, containers)
+		cp.sweepCgroupLinks(logger, containers)
 		cp.nriDisconnected.Store(false)
 		logger.Info("keeping the runtime's containers for when the node's profile is read", "label", cp.profileLabel)
 		return nil, nil
@@ -159,6 +160,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	if err != nil {
 		return nil, err
 	}
+	cp.sweepCgroupLinks(logger, containers)
 	cp.nriDisconnected.Store(false)
 	if cp.resynced != nil {
 		close(cp.resynced)
@@ -1103,6 +1105,31 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 				cp.allocationState.Unbind(logger, updatedClaims...)
 				return nil, nil, fmt.Errorf("cannot update shared CPU pool after creating container %q in pod %q: %w", ctr.Name, pod.Uid, err)
 			}
+		}
+		// The link directory is made last, so that a refusal leaves none behind.
+		if threaded && threadedModeOn(cp.cgroupThreadedMode) {
+			if err := ctx.Err(); err != nil {
+				cp.allocationState.Unbind(logger, updatedClaims...)
+				return nil, nil, err
+			}
+			if !containerID.MatchString(ctr.GetId()) {
+				logger.Info("no /var/run/dracpu: the runtime's id for the container is not a container id")
+			} else {
+				dir, mount, err := cp.makeCgroupLinkDir(ctr.GetId())
+				defer func() {
+					if rerr != nil {
+						cp.removeCgroupLinkDir(logger, ctr.GetId())
+					}
+				}()
+				if err != nil {
+					cp.allocationState.Unbind(logger, updatedClaims...)
+					return nil, nil, fmt.Errorf("cannot create container %q in pod %q: %w", ctr.Name, pod.Uid, err)
+				}
+				logger.V(2).Info("mounting the container's link directory", "dir", dir, "mount", cgroupLinkMount)
+				adjust.AddMount(mount)
+			}
+		}
+		if len(updatedClaims) > 0 {
 			cp.rewriteThreadedShares(logger)
 		}
 		cp.podState.SetContainerState(podUID, state)
@@ -1194,6 +1221,7 @@ func (cp *CPUDriver) RemoveContainer(ctx context.Context, pod *api.PodSandbox, c
 	logger.V(2).Info("begin: RemoveContainer")
 	defer logger.V(2).Info("end: RemoveContainer")
 
+	cp.removeCgroupLinkDir(logger, ctr.GetId())
 	if cp.window != nil {
 		cp.window.drop(ctr.GetId())
 		return nil

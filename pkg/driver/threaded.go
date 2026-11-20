@@ -323,6 +323,9 @@ func (cp *CPUDriver) buildThreadedTree(ctx context.Context, logger logr.Logger, 
 	}
 	root, err := cp.buildTree(ctr, uids)
 	if err == nil {
+		err = cp.linkThreadRoot(logger, ctr, root)
+	}
+	if err == nil {
 		err = cp.place(ctx, logger, ctr, uids, root)
 	}
 	if err != nil {
@@ -401,6 +404,10 @@ func (cp *CPUDriver) repairThreadedTrees(repairs []threadedRepair) {
 		}
 		cp.podState.SetThreadRoot(r.sc.owner.PodUID, r.sc.container.GetName(), types.UID(r.sc.container.GetId()), root)
 		r.sc.logger.V(2).Info("repaired the container's threaded groups", "threadRoot", root)
+		if err := cp.linkThreadRoot(r.sc.logger, r.sc.container, root); err != nil {
+			r.sc.logger.Error(err, "the container's /var/run/dracpu/cgroup stays as it is until the driver synchronizes again")
+			cp.metrics.RecordThreadedContainer(cp.cgroupThreadedMode, cpumetrics.ResultLinkError)
+		}
 	}
 }
 

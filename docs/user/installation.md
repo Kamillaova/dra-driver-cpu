@@ -332,6 +332,11 @@ without a driver that pod stays `Terminating`.
    kubectl label nodes --all dra.cpu/profile-
    ```
 
+1. On nodes that ran `cgroupThreadedMode: create` or `place`, remove the directory
+   `cgroup-links` from the driver's plugin directory, `/var/lib/kubelet/plugins/dra.cpu/` under the
+   default `kubeletRootDir`. It holds a directory for each threaded container the driver saw, and
+   nothing removes it once the driver is gone.
+
 Pods that are running keep their current cpusets, but nothing manages pinning or the shared
 pool anymore.
 

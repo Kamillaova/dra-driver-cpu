@@ -39,6 +39,10 @@ const (
 	// ResultRepairError is a running threaded container whose groups the
 	// driver failed to find or repair when it synchronized with the runtime.
 	ResultRepairError Result = "repair_error"
+	// ResultLinkError is a threaded container's link to its thread root, or
+	// its link directory, that the driver failed to write or remove when it
+	// synchronized with the runtime.
+	ResultLinkError Result = "link_error"
 )
 
 func (r Result) String() string {
@@ -53,6 +57,8 @@ func (r Result) String() string {
 		return string(ResultRewriteError)
 	case ResultRepairError:
 		return string(ResultRepairError)
+	case ResultLinkError:
+		return string(ResultLinkError)
 	default:
 		return string(ResultUnknown)
 	}
@@ -294,7 +300,7 @@ var (
 	threadedContainersSpec = metricSpec{
 		name:   "dra_cpu_threaded_containers_total",
 		kind:   metricCounter,
-		help:   "Total number of threaded containers whose groups the NRI StartContainer callback built (success) or failed to build, refusing the start (error), of threaded groups whose CPUs the driver failed to rewrite (rewrite_error), and of running threaded containers whose groups the NRI Synchronize callback failed to find or repair (repair_error).",
+		help:   "Total number of threaded containers whose groups the NRI StartContainer callback built (success) or failed to build, refusing the start (error), of threaded groups whose CPUs the driver failed to rewrite (rewrite_error), of running threaded containers whose groups the NRI Synchronize callback failed to find or repair (repair_error), and of links to a thread root or link directories it failed to write or remove (link_error).",
 		labels: []string{"mode", "result"},
 	}
 )
