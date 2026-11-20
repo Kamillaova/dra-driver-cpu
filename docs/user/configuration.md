@@ -421,6 +421,33 @@ Running without profiles, the node's CPUs named, if at all, by the fleet-wide `r
 `- name: default`, with every node labelled. So is running one Helm release per kind of node; see
 [Installing with Helm](installation.md#installing-with-helm).
 
+### Threaded cgroups: the startup check
+
+With `cgroupThreadedMode` set to `create` or `place`, the driver writes the host's cgroup2 tree
+through the mount at `/sys/fs/cgroup` in its container, and checks that it can before it serves
+anything. It exits with an error naming the mount and the mode when:
+
+- the mount at `/sys/fs/cgroup` is not of type `cgroup2`: the threaded modes do not support cgroup
+  v1;
+- the mount is read-only, as the runtime's own cgroup mount is in a container whose runtime handler
+  does not set `cgroup_writable`; a read-only bind of the host's tree is read-only even where the
+  host mounts the tree read-write;
+- at its first synchronization with the runtime, the runtime lists no container whose process is
+  the driver's, or the mount does not show the driver's process at or below that container's
+  cgroup: the driver then runs outside the host's pid namespace (`hostPID`), or the mount is not
+  the host's cgroup2 tree.
+
+With `place` the driver also moves processes of other containers. Where the host mounts cgroup2 with
+`nsdelegate` and the driver runs in a cgroup namespace of its own, the kernel allows that only from
+the host's cgroup namespace, so the driver enters it once at start, as each move does. Opening
+`/proc/1/ns/cgroup` needs `CAP_SYS_PTRACE` and entering it `CAP_SYS_ADMIN`, and the error names the
+capabilities the driver's container lacks. With both granted, a user namespace or a security module
+refused: containerd's default AppArmor profile allows ptrace only between processes of its own
+profile, and so can refuse the driver's open of PID 1's namespace. Run the driver in the host's user
+namespace, with an AppArmor profile that allows the open, such as `Unconfined`.
+
+With `cgroupThreadedMode: false` the driver checks none of this.
+
 ### Helm: deprecated args values vs driverConfig
 
 `driverConfig` is the Helm value that generates the config file described above (a single map
