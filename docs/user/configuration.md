@@ -213,7 +213,8 @@ on - is configured through other Helm values, not through this file.
   holds the container's first process, the container's own cgroup or, under crun, a cgroup below it,
   and hands the files that move processes and threads into them to the user that process runs as.
   It moves no process: the workload moves itself into its group, then places its threads. It needs
-  the host's cgroup v2 hierarchy read-write and the host's pid namespace; see
+  the host's cgroup v2 hierarchy read-write and the host's pid namespace, which the chart gives it;
+  see [Threaded cgroups: the driver's privileges](#threaded-cgroups-the-drivers-privileges) and
   [Threaded cgroups: the startup check](#threaded-cgroups-the-startup-check).
 - `place`: as `create`, and the driver then moves the container's process into the group its claim
   names in `cgroupConfig.threaded.place`, before the container's process runs, so that the workload
@@ -457,6 +458,34 @@ Running without profiles, the node's CPUs named, if at all, by the fleet-wide `r
 `- name: default`, with every node labelled. So is running one Helm release per kind of node; see
 [Installing with Helm](installation.md#installing-with-helm).
 
+### Threaded cgroups: the driver's privileges
+
+The chart gives the driver's pod the host access `driverConfig.cgroupThreadedMode` needs, and none
+under `false`:
+
+- `create`: the host's `/sys/fs/cgroup`, mounted read-write at `/sys/fs/cgroup` in the driver's
+  container, which the driver writes, and `hostPID: true`, the host's pid namespace, in which the
+  driver reads the user a container's first process runs as and finds its own process among the
+  runtime's containers.
+- `place`: as `create`, and the capabilities `SYS_NICE`, `SYS_ADMIN` and `SYS_PTRACE`. Moving another
+  container's process into its place group, whose CPUs differ from those of the cgroup it leaves,
+  needs `CAP_SYS_NICE` on every node: the kernel refuses the move otherwise for a process whose
+  permitted capabilities are not all among the driver's, as those of a container running as root, a
+  privileged one or one with an added capability are. Where the host mounts cgroup2 with
+  `nsdelegate` and the driver runs in a cgroup namespace of its own, the move takes the host's
+  cgroup namespace, which the driver enters through `/proc/1/ns/cgroup`: opening it needs
+  `CAP_SYS_PTRACE`, and entering it `CAP_SYS_ADMIN`.
+
+The container is not privileged, but the access is wide. With `hostPID` the driver, which runs as
+root with the runtime's default capabilities, can read through `/proc/<pid>` the filesystem, the
+environment and the open files of every container that runs as root or in a user namespace, and can
+signal any process on the node. Under `place`, `CAP_SYS_PTRACE` lets it read those of every process
+on the node, the host's own included, `CAP_SYS_NICE` lets it change the CPU affinity, the scheduling
+policy and the priority of every process, and with `CAP_SYS_ADMIN` it can enter every process's
+namespaces, and through PID 1 the host's filesystem and mount namespace: in practice, root on the
+node. A driver installed without the chart needs the same; the startup check below names what is
+missing.
+
 ### Threaded cgroups: the startup check
 
 With `cgroupThreadedMode` set to `create` or `place`, the driver writes the host's cgroup2 tree
@@ -492,7 +521,7 @@ The check at start names every problem it finds in one error, the mount's state 
 capabilities, for example:
 
 ```text
-`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at /sys/fs/cgroup, CAP_SYS_NICE, CAP_SYS_PTRACE and CAP_SYS_ADMIN: /sys/fs/cgroup is mounted read-only; the driver lacks CAP_SYS_ADMIN; fix its pod, or set `cgroupThreadedMode: false`
+`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at /sys/fs/cgroup, CAP_SYS_NICE, CAP_SYS_PTRACE and CAP_SYS_ADMIN: /sys/fs/cgroup is mounted read-only; the driver lacks CAP_SYS_ADMIN; install the driver with the chart, which sets these for the mode, fix its pod, or set `cgroupThreadedMode: false`
 ```
 
 The checks at the first synchronization each depend on the one before, and are reported one at a
