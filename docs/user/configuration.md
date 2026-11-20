@@ -186,6 +186,46 @@ on - is configured through other Helm values, not through this file.
   default, fractional amounts are always allowed and the option is removed, after a release that
   deprecates it.
 
+`cpuPartitions` (list of partitions, default: none)
+
+- Splits the node's CPUs into named partitions; see [CPU Partitions](cpu-partitions.md). Each entry
+  takes a `name`, a `role`, which is `default`, `exclusive` or `reserved`, a `cpuset` naming its
+  CPUs, and an optional `smt`: `true` for as many threads per core as the hardware has, `false` for
+  one, or a thread count of at least 1.
+- The entry `- name: default` switches the node into partitions. It takes a name and `smt` only: its
+  role is always `default`, and its CPUs are the online threads of every core no other partition
+  names. A list that names partitions without it is refused when the configuration loads, and
+  `helm install` and `helm upgrade` fail at render with the same message:
+  `` cpuPartitions names partitions but no partition "default": add `- name: default` to cpuPartitions to use partitions ``.
+  The key left out, `null` and `[]` all mean no partitions.
+- A partition name is a DNS label of at most 46 characters, declared once in a list, and a CPU
+  belongs to one partition.
+- Beside a list that uses partitions, `reservedCPUs` is refused with
+  `invalid reservedCPUs "0-3": partitions replace it; declare a partition with role "reserved" instead`,
+  and so are `cpuDeviceMode: individual`, `allocator: external` and `groupBy: machine`.
+- One partition name keeps one role in every profile, since its class, `dra.cpu.<name>`, is one
+  class on every node. A configuration that gives it two is refused, and fails at render, with:
+  `partition "vms" has role "exclusive" in profile "r7625" and "reserved" in profile "x3d"; a partition keeps one role in every profile`.
+- Write the list in a profile. A fleet-wide list keeps working and is deprecated, with every other
+  way of running without profiles; see [Per-node profiles](#per-node-profiles).
+
+For example, as a profile's list:
+
+```yaml
+# values.yaml
+driverConfig:
+  profiles:
+    r7625:
+      cpuPartitions:
+        - name: default
+        - name: vms
+          role: exclusive
+          cpuset: "16-127,144-255"
+        - name: system
+          role: reserved
+          cpuset: "0,128"
+```
+
 `profiles` (map of profile name to profile, default: none)
 
 - How each kind of node partitions its CPUs, by name. A node runs the profile its

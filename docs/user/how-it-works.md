@@ -1,13 +1,14 @@
 # How it Works
 
 The driver is deployed as a DaemonSet. A single executable implements the DRA
-and NRI interfaces, and it owns the node-local CPU allocation state.
-Exactly one active driver instance is expected to manage each node.
-The driver manages all the available CPUs except those configured as reserved.
-The driver manages a single CPU pool, and partitioning that pool is currently
-unsupported.
-The singleton invariant is not currently enforced by the driver and must be
-guaranteed by the deployment.
+and NRI interfaces and owns the node's CPU allocation state, so each node runs
+one driver instance. A second instance on a node fails at start, since the
+driver's port is taken; two chart releases on different ports are not
+detected, so give each release its own `nodeSelector` or `affinity` (see
+[Installing with Helm](installation.md#installing-with-helm)). Without
+[CPU partitions](cpu-partitions.md), the driver hands out every CPU but the
+reserved ones, as one pool; with them, each partition's role decides who uses
+which CPUs.
 
 The lifecycle of a claim, from pod creation to a pinned container:
 
