@@ -91,9 +91,12 @@ const (
 	// RuleDuplicateGroupName refuses a container whose threaded claims give two
 	// groups one name.
 	RuleDuplicateGroupName Rule = "duplicate_group_name"
+	// RuleDuplicatePlace refuses a container whose threaded claims both set
+	// place.
+	RuleDuplicatePlace Rule = "duplicate_place"
 )
 
-var rules = []Rule{RulePartialHolder, RuleLimitWithOthers, RuleUnthreadedWithThreaded, RuleDuplicateGroupName}
+var rules = []Rule{RulePartialHolder, RuleLimitWithOthers, RuleUnthreadedWithThreaded, RuleDuplicateGroupName, RuleDuplicatePlace}
 
 // Descriptor describes a custom driver metric for programmatic introspection.
 type Descriptor struct {
