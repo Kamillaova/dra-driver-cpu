@@ -59,6 +59,7 @@ func (cp *CPUDriver) claimStatus(logger logr.Logger, claim *resourceapi.Resource
 		if !cpus.IsEmpty() {
 			data.CPUSet = cpus.String()
 		}
+		data.Group = requestGroup(record, metadataRef(claim.UID, record, result.Request).Request)
 		raw, err := json.Marshal(data)
 		if err != nil {
 			return nil, fmt.Errorf("encode the status of device %q: %w", result.Device, err)

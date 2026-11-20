@@ -319,11 +319,11 @@ func TestCheckClaim(t *testing.T) {
 		name:     "a limit replacing the amount as the cap, beside another request",
 		requests: []testRequest{{name: "vmm-cpu", class: "dra.cpu", amount: "250m"}, {name: "vcpu", class: "dra.cpu.vms", amount: "2"}},
 		entries:  []testEntry{{requests: []string{"vmm-cpu"}, params: limit(`1`)}},
-		wantErr:  `request "vmm-cpu" has limit of 1, so it cannot be used together with request "vcpu": remove the limit`,
+		wantErr:  `request "vmm-cpu" has limit of 1, so it cannot be used together with request "vcpu": use cgroupConfig.threaded, or remove the limit`,
 	}, {
 		name:     "an amount alone beside several requests",
 		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, {name: "vmm-cpu", class: "dra.cpu", amount: "250m"}, {name: "helper", class: "dra.cpu"}, {name: "io", class: "dra.cpu"}},
-		wantErr:  `request "vmm-cpu" has limit of 250m, so it cannot be used together with requests "vcpu", "helper", "io": remove the limit`,
+		wantErr:  `request "vmm-cpu" has limit of 250m, so it cannot be used together with requests "vcpu", "helper", "io": use cgroupConfig.threaded, or remove the limit`,
 	}, {
 		name:     "limit max beside another request",
 		requests: []testRequest{{name: "vmm-cpu", class: "dra.cpu", amount: "250m"}, {name: "vcpu", class: "dra.cpu.vms", amount: "2"}},
@@ -334,7 +334,7 @@ func TestCheckClaim(t *testing.T) {
 			{name: "vcpu", class: "dra.cpu.vms", amount: "2"},
 			{name: "helper", alternatives: []testRequest{{name: "shared", class: "dra.cpu", amount: "500m"}, {name: "owned", class: "dra.cpu.vms", amount: "1"}}},
 		},
-		wantErr: `subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu": remove the limit`,
+		wantErr: `subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu": use cgroupConfig.threaded, or remove the limit`,
 	}, {
 		name:     "two alternatives of one request are never beside each other",
 		requests: []testRequest{{name: "cpus", alternatives: []testRequest{{name: "small", class: "dra.cpu", amount: "250m"}, {name: "large", class: "dra.cpu", amount: "500m"}}}},
@@ -390,7 +390,7 @@ func TestCheckClaim(t *testing.T) {
 		name:     "a capped share beside a flagged request",
 		requests: []testRequest{{name: "cpus", class: "dra.cpu", amount: "2"}, {name: "vmm-cpu", class: "dra.cpu", amount: "250m"}},
 		entries:  []testEntry{{requests: []string{"cpus"}, params: exclusive(`true`)}},
-		wantErr:  `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "cpus": remove the limit`,
+		wantErr:  `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "cpus": use cgroupConfig.threaded, or remove the limit`,
 	}, {
 		name:     "exclusive false on a shared class",
 		requests: cpus("500m"),
@@ -432,6 +432,239 @@ func TestCheckClaim(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
+		})
+	}
+}
+
+func threaded(block string) string {
+	return `{"apiVersion": "v1alpha1", "cgroupConfig": {"threaded": ` + block + `}}`
+}
+
+func TestCheckClaimThreaded(t *testing.T) {
+	vm := []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, {name: "vmm-cpu", class: "dra.cpu", amount: "250m"}}
+	split := `{"enabled": true, "place": "vmm-cpu", "groups": [{"name": "vcpu", "requests": ["vcpu"]}, {"name": "vmm-cpu", "requests": ["vmm-cpu"]}]}`
+	helper := func(shared, owned string) testRequest {
+		return testRequest{name: "helper", alternatives: []testRequest{{name: "shared", class: "dra.cpu", amount: shared}, {name: owned, class: "dra.cpu.vms", amount: "2"}}}
+	}
+	mixed := testRequest{name: "helper", alternatives: []testRequest{{name: "cpu", class: "dra.cpu", amount: "250m"}, {name: "gpu", class: "gpu.example.com"}}}
+	for _, tc := range []struct {
+		name     string
+		kindOf   func(ref, class string) (Kind, bool)
+		requests []testRequest
+		entries  []testEntry
+		wantErr  string
+	}{{
+		name:     "the VM's split",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(split)}},
+	}, {
+		name:     "an entry listing every request means one listing none",
+		requests: vm,
+		entries:  []testEntry{{requests: []string{"vcpu", "vmm-cpu"}, params: threaded(split)}},
+	}, {
+		name:     "one group per request without a groups list",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "place": "vmm-cpu"}`)}},
+	}, {
+		name:     "WB9: a layout without enabled: true is inert, the claim judged unsplit",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(`{"place": "vmm-cpu", "groups": [{"name": "vcpu", "requests": ["vcpu"]}, {"name": "vmm-cpu", "requests": ["vmm-cpu"]}]}`)}},
+		wantErr:  `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu": use cgroupConfig.threaded, or remove the limit`,
+	}, {
+		name:     "an all-zero block in a scoped entry is no entry",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, {name: "vmm-cpu", class: "dra.cpu", amount: "0"}},
+		entries:  []testEntry{{requests: []string{"vmm-cpu"}, params: threaded(`{}`)}},
+	}, {
+		name:     "WA1: two groups with one name",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "place": "vmm-cpu", "groups": [{"name": "vcpu", "requests": ["vcpu"]}, {"name": "vcpu", "requests": ["vmm-cpu"]}]}`)}},
+		wantErr:  `group "vcpu" appears twice in cgroupConfig.threaded.groups; group names must be unique`,
+	}, {
+		name:     "WA2: one request in two groups",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "place": "b", "groups": [{"name": "a", "requests": ["vcpu", "vmm-cpu"]}, {"name": "b", "requests": ["vmm-cpu"]}]}`)}},
+		wantErr:  `request "vmm-cpu": in groups "a" and "b"; a request belongs to one group`,
+	}, {
+		name:     "WA3: a groups list that leaves a request out",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "place": "vmm-cpu", "groups": [{"name": "vmm-cpu", "requests": ["vmm-cpu"]}]}`)}},
+		wantErr:  `request "vcpu": in no group of cgroupConfig.threaded.groups; add it to a group, or drop groups for one group per request`,
+	}, {
+		name:     "WA4: place names no group",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "place": "vmm"}`)}},
+		wantErr:  `cgroupConfig.threaded.place "vmm": no such group (groups: vcpu, vmm-cpu)`,
+	}, {
+		name:     "WA5: an empty groups list",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": []}`)}},
+		wantErr:  "cgroupConfig.threaded.groups: empty; list the groups, or drop it for one group per request",
+	}, {
+		name:     "an empty groups list in an inert block",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}},
+		entries:  []testEntry{{params: threaded(`{"groups": []}`)}},
+		wantErr:  "cgroupConfig.threaded.groups: empty; list the groups, or drop it for one group per request",
+	}, {
+		name: "WA6: a group naming one alternative and no group reaching the other",
+		requests: []testRequest{{name: "cpus", alternatives: []testRequest{
+			{name: "two", class: "dra.cpu", count: 2}, {name: "one", class: "dra.cpu", count: 1}}}},
+		entries: []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "cpus", "requests": ["cpus/two"]}]}`)}},
+		wantErr: `subrequest "cpus/one": in no group of cgroupConfig.threaded.groups; add it or its request "cpus" to a group, or drop groups for one group per request`,
+	}, {
+		name:     "WA8: cgroupConfig scoped to some of the claim's requests",
+		requests: vm,
+		entries:  []testEntry{{requests: []string{"vmm-cpu"}, params: threaded(`{"enabled": true}`)}},
+		wantErr:  `cgroupConfig: applies to the whole claim; drop "requests" from its config entry, or list every request (vcpu, vmm-cpu)`,
+	}, {
+		name:     "WA43: an inert block in a scoped entry",
+		requests: vm,
+		entries:  []testEntry{{requests: []string{"vmm-cpu"}, params: threaded(`{"place": "vmm-cpu"}`)}},
+		wantErr:  `cgroupConfig: applies to the whole claim; drop "requests" from its config entry, or list every request (vcpu, vmm-cpu)`,
+	}, {
+		name: "WA21: a capped request sharing a group with owned CPUs",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"},
+			{name: "vmm-cpu", class: "dra.cpu", amount: "250m"}},
+		entries: []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "all", "requests": ["vcpu", "vmm-cpu"]}]}`)}},
+		wantErr: `group "all": request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu": give it its own group`,
+	}, {
+		name: "a capped request beside several requests in a group",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"},
+			{name: "vmm-cpu", class: "dra.cpu", amount: "250m"}, {name: "helper", class: "dra.cpu"}},
+		entries: []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "all", "requests": ["vcpu", "vmm-cpu", "helper"]}]}`)}},
+		wantErr: `group "all": request "vmm-cpu" has limit of 250m, so it cannot be used together with requests "vcpu", "helper": give it its own group`,
+	}, {
+		name:     "a capped request on several devices in its own group",
+		requests: []testRequest{{name: "cpus", class: "dra.cpu", amount: "1", count: 2}},
+		entries:  []testEntry{{params: threaded(`{"enabled": true}`)}},
+		wantErr:  "request \"cpus\" has limit of 1 with `count: 2`; a limit can be applied to only one device: ask for one device, or remove the limit",
+	}, {
+		name:     "uncapped shares beside owned CPUs in a group",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, {name: "io", class: "dra.cpu"}},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "all", "requests": ["vcpu", "io"]}]}`)}},
+	}, {
+		name:     "WA31: a group name that is not a DNS label",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "VCpu", "requests": ["vcpu"]}, {"name": "vmm-cpu", "requests": ["vmm-cpu"]}]}`)}},
+		wantErr:  `group "VCpu": not a DNS label; use lower-case letters, digits and "-"`,
+	}, {
+		name:     "a group with no requests",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "vcpu", "requests": []}]}`)}},
+		wantErr:  `group "vcpu": no requests; name its requests, or drop the group`,
+	}, {
+		name:     "a group naming no request of the claim",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(`{"groups": [{"name": "vcpu", "requests": ["vcpus"]}]}`)}},
+		wantErr:  `group "vcpu": "vcpus" is no request of the claim`,
+	}, {
+		name:     "WA38: a mixed request's dra.cpu alternative in no group",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, mixed},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "vcpu", "requests": ["vcpu"]}, {"name": "gpu", "requests": ["helper/gpu"]}]}`)}},
+		wantErr:  `subrequest "helper/cpu": in no group of cgroupConfig.threaded.groups; add it or its request "helper" to a group, or drop groups for one group per request`,
+	}, {
+		name: "WA39: place names a group that names no request whole",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"},
+			{name: "helper", alternatives: []testRequest{{name: "cpu", class: "dra.cpu"}, {name: "gpu", class: "gpu.example.com"}}}},
+		entries: []testEntry{{params: threaded(`{"enabled": true, "place": "helper", "groups": [{"name": "vcpu", "requests": ["vcpu", "helper/cpu"]}, {"name": "helper", "requests": ["helper/gpu"]}]}`)}},
+		wantErr: `cgroupConfig.threaded.place "helper": group "helper" names no request whole nor every alternative of one, and is not built where none of its alternatives is allocated; place a group that names a request`,
+	}, {
+		name:     "place on a group naming every alternative of a request",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, helper("0", "owned")},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "place": "helper", "groups": [{"name": "vcpu", "requests": ["vcpu"]}, {"name": "helper", "requests": ["helper/shared", "helper/owned"]}]}`)}},
+	}, {
+		name: "WA40: a request and one of its own alternatives in two groups",
+		requests: []testRequest{{name: "cpus", alternatives: []testRequest{
+			{name: "two", class: "dra.cpu", count: 2}, {name: "one", class: "dra.cpu", count: 1}}}},
+		entries: []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "a", "requests": ["cpus"]}, {"name": "b", "requests": ["cpus/two"]}]}`)}},
+		wantErr: `subrequest "cpus/two": in groups "a", through its request "cpus", and "b"; name a request or its alternatives, not both`,
+	}, {
+		name: "a request and one of its own alternatives in one group",
+		requests: []testRequest{{name: "cpus", alternatives: []testRequest{
+			{name: "two", class: "dra.cpu", count: 2}, {name: "one", class: "dra.cpu", count: 1}}}},
+		entries: []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "a", "requests": ["cpus", "cpus/two"]}]}`)}},
+		wantErr: `subrequest "cpus/two": in group "a" through its request "cpus" and by its own name; name a request or its alternatives, not both`,
+	}, {
+		name:     "WA42: a capped alternative in a group with another request",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, helper("500m", "owned")},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "vcpu", "requests": ["vcpu", "helper"]}]}`)}},
+		wantErr:  `group "vcpu": subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu": give it its own group`,
+	}, {
+		name:     "WB26: one request's alternatives split across groups",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, helper("500m", "owned")},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "vcpu", "requests": ["vcpu", "helper/owned"]}, {"name": "helper", "requests": ["helper/shared"]}]}`)}},
+	}, {
+		name:     "two alternatives of one request in one group are never beside each other",
+		requests: []testRequest{helper("500m", "owned")},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "helper", "requests": ["helper"]}]}`)}},
+	}, {
+		name:     "WB22: a group naming another driver's request",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, {name: "gpu", class: "gpu.example.com"}},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "all", "requests": ["vcpu", "gpu"]}]}`)}},
+	}, {
+		name:     "WB27: an entry scoped to a mixed request reaches every dra.cpu result",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, mixed},
+		entries:  []testEntry{{requests: []string{"vcpu", "helper"}, params: threaded(`{"enabled": true}`)}},
+	}, {
+		name:     "WB30: place on a group naming a mixed request whole passes the claim's check",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, mixed},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "place": "helper", "groups": [{"name": "vcpu", "requests": ["vcpu"]}, {"name": "helper", "requests": ["helper"]}]}`)}},
+	}, {
+		name: "WB28: a request known by its allocation alone in no group",
+		kindOf: func(ref, class string) (Kind, bool) {
+			if class == "hand-written" {
+				return Kind{Shared: true, FromAllocation: true}, true
+			}
+			kind, ok := fleetKinds[class]
+			return kind, ok
+		},
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}, {name: "extra", class: "hand-written"}},
+		entries:  []testEntry{{params: threaded(`{"enabled": true, "groups": [{"name": "vcpu", "requests": ["vcpu"]}]}`)}},
+		wantErr:  `request "extra" is in no group; add it to cgroupConfig.threaded.groups`,
+	}, {
+		name:     "WA46: two entries carrying the same cgroupConfig",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(split)}, {params: threaded(split)}},
+		wantErr:  "cgroupConfig set by two config entries (#0 and #1); set it in one entry",
+	}, {
+		name:     "WA47: two entries carrying different cgroupConfig",
+		requests: vm,
+		entries:  []testEntry{{params: threaded(split)}, {requests: []string{"vcpu", "vmm-cpu"}, params: threaded(`{"enabled": true}`)}},
+		wantErr:  "cgroupConfig set by two config entries (#0 and #1); set it in one entry",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			kindOf := tc.kindOf
+			if kindOf == nil {
+				kindOf = byClass(fleetKinds)
+			}
+			err := CheckClaim(testSpec(tc.requests, tc.entries...), testDriverName, kindOf)
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestGroupOf(t *testing.T) {
+	listed := v1alpha1.ThreadedConfig{Enabled: true, Groups: []v1alpha1.ThreadedGroup{
+		{Name: "vcpu", Requests: []string{"vcpu", "helper/owned"}}, {Name: "helper", Requests: []string{"helper/shared"}}}}
+	for _, tc := range []struct {
+		block     v1alpha1.ThreadedConfig
+		ref       string
+		wantGroup string
+		wantOK    bool
+	}{
+		{block: listed, ref: "vcpu", wantGroup: "vcpu", wantOK: true},
+		{block: listed, ref: "helper/owned", wantGroup: "vcpu", wantOK: true},
+		{block: listed, ref: "helper/shared", wantGroup: "helper", wantOK: true},
+		{block: listed, ref: "io"},
+		{block: v1alpha1.ThreadedConfig{Enabled: true}, ref: "helper/shared", wantGroup: "helper", wantOK: true},
+	} {
+		t.Run(tc.ref, func(t *testing.T) {
+			group, ok := GroupOf(tc.block, tc.ref)
+			require.Equal(t, tc.wantOK, ok)
+			require.Equal(t, tc.wantGroup, group)
 		})
 	}
 }

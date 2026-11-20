@@ -30,7 +30,7 @@ import (
 
 func TestDescriptors(t *testing.T) {
 	descriptors := Descriptors()
-	require.Len(t, descriptors, 21)
+	require.Len(t, descriptors, 22)
 
 	names := make([]string, 0, len(descriptors))
 	for _, desc := range descriptors {
@@ -62,6 +62,7 @@ func TestDescriptors(t *testing.T) {
 		"dra_cpu_partition_verified",
 		"dra_cpu_node_reservation_ok",
 		"dra_cpu_device_taints_dropped_total",
+		"dra_cpu_threaded_containers_total",
 	}, names)
 	require.Equal(t, []string{"result"}, descriptors[4].Labels)
 	require.Equal(t, []string{"result"}, descriptors[5].Labels)
@@ -148,7 +149,12 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	require.InDelta(t, 0, testutil.ToFloat64(m.nodeReservationOK), 0.01)
 	m.SetNodeReservationOK(true)
 	m.RecordDeviceTaintsDropped()
+	m.RecordThreadedContainer("place", ResultSuccess)
+	m.RecordThreadedContainer("place", ResultRewriteError)
+	m.RecordThreadedContainer("place", ResultRewriteError)
 
+	require.InDelta(t, 1, testutil.ToFloat64(m.threadedContainers.WithLabelValues("place", "success")), 0.01)
+	require.InDelta(t, 2, testutil.ToFloat64(m.threadedContainers.WithLabelValues("place", "rewrite_error")), 0.01)
 	require.InDelta(t, 2, testutil.ToFloat64(m.allocatedCPUs), 0.01)
 	require.InDelta(t, 6, testutil.ToFloat64(m.availableCPUs), 0.01)
 	require.InDelta(t, 1, testutil.ToFloat64(m.reservedCPUs), 0.01)
@@ -184,6 +190,7 @@ func TestDescriptorsMatchRegisteredCollectors(t *testing.T) {
 	m.RecordUnprepare(ResultError, time.Second)
 	m.RecordClaimAllocatedCPUs(1)
 	m.SetPartitionVerified("default", true)
+	m.RecordThreadedContainer("create", ResultSuccess)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -228,6 +235,7 @@ func TestNoopRecorder(t *testing.T) {
 		recorder.SetPartitionVerified("vms", true)
 		recorder.SetNodeReservationOK(false)
 		recorder.RecordDeviceTaintsDropped()
+		recorder.RecordThreadedContainer("create", ResultError)
 	})
 }
 
