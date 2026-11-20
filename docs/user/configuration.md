@@ -201,7 +201,7 @@ on - is configured through other Helm values, not through this file.
   default, degraded partitions are always tainted and the option is removed, after a release that
   deprecates it.
 
-`cgroupThreadedMode` (`false` or `create`, default: `false`)
+`cgroupThreadedMode` (`false`, `create` or `place`, default: `false`)
 
 - Whether the driver splits the cgroup of a container whose claim sets
   `cgroupConfig.threaded.enabled: true` into threaded groups, one per request, or per entry of
@@ -215,6 +215,13 @@ on - is configured through other Helm values, not through this file.
   It moves no process: the workload moves itself into its group, then places its threads. It needs
   the host's cgroup v2 hierarchy read-write and the host's pid namespace; see
   [Threaded cgroups: the startup check](#threaded-cgroups-the-startup-check).
+- `place`: as `create`, and the driver then moves the container's process into the group its claim
+  names in `cgroupConfig.threaded.place`, before the container's process runs, so that the workload
+  only places its threads. A claim without `place` gets what `create` gives. The driver moves a
+  process only while the runtime still waits for it, never once the container runs. The move needs
+  `CAP_SYS_NICE`. Where the host's cgroup2 mount carries `nsdelegate` and the driver runs in a cgroup
+  namespace of its own, it makes the move from the host's cgroup namespace, which also needs
+  `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE`.
 - Write `false` as the boolean. A YAML 1.1 reader, which reads the configuration file, takes an
   unquoted `off` or `no` as `false` too, while a quoted `"off"` is refused when the configuration
   loads: `invalid cgroupThreadedMode "off": must be false, "create" or "place"`.
