@@ -153,10 +153,12 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	m.RecordThreadedContainer("place", ResultRewriteError)
 	m.RecordThreadedContainer("place", ResultRewriteError)
 	m.RecordThreadedContainer("place", ResultRepairError)
+	m.RecordThreadedContainer("place", ResultLinkError)
 
 	require.InDelta(t, 1, testutil.ToFloat64(m.threadedContainers.WithLabelValues("place", "success")), 0.01)
 	require.InDelta(t, 2, testutil.ToFloat64(m.threadedContainers.WithLabelValues("place", "rewrite_error")), 0.01)
 	require.InDelta(t, 1, testutil.ToFloat64(m.threadedContainers.WithLabelValues("place", "repair_error")), 0.01)
+	require.InDelta(t, 1, testutil.ToFloat64(m.threadedContainers.WithLabelValues("place", "link_error")), 0.01)
 	require.InDelta(t, 2, testutil.ToFloat64(m.allocatedCPUs), 0.01)
 	require.InDelta(t, 6, testutil.ToFloat64(m.availableCPUs), 0.01)
 	require.InDelta(t, 1, testutil.ToFloat64(m.reservedCPUs), 0.01)
