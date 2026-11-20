@@ -12,6 +12,7 @@
 - **Grouped Device Exposure**: uncore cache/NUMA/socket/machine aggregates are exposed as
   consumable capacity, reducing API objects and scaling to large systems. The driver also support a `individual` device exposure mode which is
   **deprecated**; see [Migrating from individual mode](opaque-cpuset-overrides.md#migrate-from-individual-mode).
+- **Threaded Cgroups**: under `cgroupThreadedMode` `create` or `place`, a claim splits its container's cgroup into threaded groups, each with its own CPUs, limit and weight, for the workload to place its threads in; under runc and crun, its systemd sub-cgroup and `run.oci.delegate-cgroup` included. youki is not supported, and sysbox-runc is not supported and not tested. See [Threaded Cgroups](threaded-cgroups.md).
 - **Device Health Reporting**: The driver reports per-device health to the kubelet via the DRA `WatchHealthStatus` gRPC API, reflected in `pod.status.containerStatuses[].allocatedResourcesStatus`. Devices are reported `Healthy` and go `Unknown` if the driver stops sending updates. A degraded CPU partition's devices are reported `Unhealthy`. See [Device Health Reporting](workload-requirements.md#device-health-reporting).
 
 ## Not Supported
