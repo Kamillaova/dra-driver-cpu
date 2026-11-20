@@ -93,6 +93,22 @@ checkUpdateStrategy() {
 		-expected-update-strategy "${want}"
 }
 
+# checkThreadedMode <name> <mode> [helm args...]; the host access the chart
+# renders for driverConfig.cgroupThreadedMode. Every other case expects false,
+# which renders none.
+checkThreadedMode() {
+	local name=$1 want=$2
+	shift 2
+
+	echo "threaded mode render check: ${name}"
+	"${helm}" "${template_args[@]}" "$@" >"${tmp}/${name}.yaml"
+	go test -count=1 ./test/render/ -args \
+		-manifest "${tmp}/${name}.yaml" \
+		-expected-root "${default_root}" \
+		-expect-root-flag=false \
+		-expected-threaded-mode "${want}"
+}
+
 # checkAdmissionPolicies <name> <expect-policies> <fullname> [helm args...]; the
 # admission policies, their bindings and the verbs they confine render with
 # rbac.create alone, matching the release's own service account.
@@ -190,6 +206,10 @@ checkUpdateStrategy on-delete '{"type":"OnDelete"}' \
 checkUpdateStrategy rolling-update '{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":"10%"}}' \
 	--set 'updateStrategy.type=RollingUpdate' \
 	--set-string 'updateStrategy.rollingUpdate.maxUnavailable=10%'
+
+checkThreadedMode threaded-false false --set 'driverConfig.cgroupThreadedMode=false'
+checkThreadedMode threaded-create create --set-string 'driverConfig.cgroupThreadedMode=create'
+checkThreadedMode threaded-place place --set-string 'driverConfig.cgroupThreadedMode=place'
 
 checkAdmissionPolicies admission-policies true test-dra-driver-cpu
 checkAdmissionPolicies admission-policies-fullname true cpu \
