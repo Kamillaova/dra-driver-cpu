@@ -229,8 +229,11 @@ host_cores = $(if $(1),$(shell echo '$(1)' | tr ',' '\n' | $(expand_cpus) | whil
 E2E_NOSMT_PARTITION := {"name":"nosmt","role":"exclusive","cpuset":"$(DRACPU_E2E_NOSMT_PARTITION_CPUS)","smt":false}
 E2E_RESERVED_PARTITION := {"name":"reserved","role":"reserved","cpuset":"$(DRACPU_E2E_RESERVED_PARTITION_CPUS)"}
 E2E_DEGRADED_PARTITION := {"name":"degraded","role":"exclusive","cpuset":"$(DRACPU_E2E_DEGRADED_PARTITION_CPUS)","smt":false}
-E2E_WIDE_PARTITIONS := {"name":"default"}$(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),$(comma)$(E2E_NOSMT_PARTITION))
-E2E_PARTITIONS := $(E2E_WIDE_PARTITIONS)$(if $(DRACPU_E2E_RESERVED_PARTITION_CPUS),$(comma)$(E2E_RESERVED_PARTITION))$(if $(DRACPU_E2E_DEGRADED_PARTITION_CPUS),$(comma)$(E2E_DEGRADED_PARTITION))
+E2E_NOSMT_PARTITIONS := $(if $(DRACPU_E2E_NOSMT_PARTITION_CPUS),$(comma)$(E2E_NOSMT_PARTITION))
+# Only worker2's default partition lets requests take CPUs of their own, so
+# the other nodes refuse them.
+E2E_WIDE_PARTITIONS := {"name":"default","allowExclusive":true}$(E2E_NOSMT_PARTITIONS)
+E2E_PARTITIONS := {"name":"default"}$(E2E_NOSMT_PARTITIONS)$(if $(DRACPU_E2E_RESERVED_PARTITION_CPUS),$(comma)$(E2E_RESERVED_PARTITION))$(if $(DRACPU_E2E_DEGRADED_PARTITION_CPUS),$(comma)$(E2E_DEGRADED_PARTITION))
 E2E_WIDE_RESERVE := $(call cpuset_size,$(DRACPU_E2E_NOSMT_PARTITION_CPUS))
 # The degraded partition's online siblings stay in it, so the reservation
 # counts every thread of its cores.

@@ -47,6 +47,8 @@ jobs:
               should run a share whose limit is max uncapped
               should cap a share of 0 at its written limit
               should refuse a container holding a second capped share
+              should give a flagged request CPUs of its own and move the other containers off them until it is deleted
+              should refuse a flagged request on a node whose default partition does not allow it
               should leave a share no shared device can hold Pending
               should route a share only the largest shared device can hold to its node
               should book no more of a node's shared devices than they hold under a burst of racing shares
@@ -74,6 +76,8 @@ jobs:
               should run a share whose limit is max uncapped
               should cap a share of 0 at its written limit
               should refuse a container holding a second capped share
+              should give a flagged request CPUs of its own and move the other containers off them until it is deleted
+              should refuse a flagged request on a node whose default partition does not allow it
               should leave a share no shared device can hold Pending
               should route a share only the largest shared device can hold to its node
               should book no more of a node's shared devices than they hold under a burst of racing shares
