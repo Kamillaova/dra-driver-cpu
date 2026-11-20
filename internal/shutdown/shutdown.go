@@ -18,9 +18,28 @@ package shutdown
 
 import (
 	"context"
+	"errors"
+	"os"
 	"sync"
 	"time"
 )
+
+// TerminationMessagePath is where the kubelet mounts a container's termination
+// message file unless the pod sets another path (k8s.io/api@v0.37.0
+// core/v1/types.go:3277-3284).
+const TerminationMessagePath = "/dev/termination-log"
+
+// WriteTerminationMessage writes msg to the termination message file at path,
+// which the kubelet reports as the container's last state. It creates no
+// file: outside a pod there is none to write.
+func WriteTerminationMessage(path, msg string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString(msg)
+	return errors.Join(err, f.Close())
+}
 
 // Timeout bounds a graceful shutdown. It leaves room for the steps the
 // shutdown waits for and stays below the 30s the kubelet waits before it
