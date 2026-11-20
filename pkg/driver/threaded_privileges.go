@@ -101,7 +101,7 @@ func checkThreadedPrivileges(probe ProcessProbe, mode, mountPoint string) (proce
 	}
 	mount, found := findMount(mountinfo, mountPoint)
 	if !found {
-		return nil, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: nothing is mounted at %s; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
+		return nil, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: nothing is mounted at %s; install the driver with the chart, which mounts it for the mode, mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
 			mode, mountPoint, mountPoint)
 	}
 	if mount.fsType != "cgroup2" {
@@ -123,7 +123,7 @@ func checkThreadedPrivileges(probe ProcessProbe, mode, mountPoint string) (proce
 	}
 	if !enter {
 		if readOnly {
-			return nil, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: %s is mounted read-only; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
+			return nil, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: %s is mounted read-only; install the driver with the chart, which mounts it for the mode, mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
 				mode, mountPoint, mountPoint)
 		}
 		return nil, nil //nolint:nilnil // no mover: moves are written from the driver's own cgroup namespace
@@ -153,13 +153,13 @@ func enterHostCgroupNamespace(probe ProcessProbe, mountPoint string, readOnly bo
 	}
 	switch {
 	case missing != "" && readOnly:
-		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_PTRACE and CAP_SYS_ADMIN: %s is mounted read-only; the driver lacks %s; fix its pod, or set `cgroupThreadedMode: false`",
+		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_PTRACE and CAP_SYS_ADMIN: %s is mounted read-only; the driver lacks %s; install the driver with the chart, which sets these for the mode, fix its pod, or set `cgroupThreadedMode: false`",
 			mountPoint, mountPoint, missing)
 	case missing != "":
-		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_PTRACE and CAP_SYS_ADMIN: the driver lacks %s; fix its pod, or set `cgroupThreadedMode: false`",
+		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_PTRACE and CAP_SYS_ADMIN: the driver lacks %s; install the driver with the chart, which sets these for the mode, fix its pod, or set `cgroupThreadedMode: false`",
 			mountPoint, missing)
 	case readOnly:
-		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_PTRACE and CAP_SYS_ADMIN: %s is mounted read-only; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
+		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_PTRACE and CAP_SYS_ADMIN: %s is mounted read-only; install the driver with the chart, which mounts it for the mode, mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
 			mountPoint, mountPoint)
 	case refused:
 		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs to enter the host's cgroup namespace: it was refused though the driver holds CAP_SYS_PTRACE and CAP_SYS_ADMIN (%w); run the driver in the host's user namespace, under an AppArmor profile that allows it",
@@ -256,7 +256,7 @@ func (cp *CPUDriver) checkOwnCgroupLocked(logger logr.Logger, containers []*api.
 		return int64(ctr.GetPid()) == int64(pid)
 	})
 	if i < 0 {
-		return fmt.Errorf("`cgroupThreadedMode: %s` needs the host's pid namespace: the runtime lists no container running the driver's pid %d; add `hostPID: true` to its pod",
+		return fmt.Errorf("`cgroupThreadedMode: %s` needs the host's pid namespace: the runtime lists no container running the driver's pid %d; install the driver with the chart, which sets this for the mode, or add `hostPID: true` to its pod",
 			cp.cgroupThreadedMode, pid)
 	}
 	cgroupsPath := containers[i].GetLinux().GetCgroupsPath()
@@ -267,12 +267,12 @@ func (cp *CPUDriver) checkOwnCgroupLocked(logger logr.Logger, containers []*api.
 	}
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return fmt.Errorf("`cgroupThreadedMode: %s` needs the host's /sys/fs/cgroup: it does not show the driver's cgroup %q; mount the host's /sys/fs/cgroup in its pod",
+		return fmt.Errorf("`cgroupThreadedMode: %s` needs the host's /sys/fs/cgroup: it does not show the driver's cgroup %q; install the driver with the chart, which mounts it for the mode, or mount the host's /sys/fs/cgroup in its pod",
 			cp.cgroupThreadedMode, cgroupsPath)
 	case err != nil:
 		return fmt.Errorf("`cgroupThreadedMode: %s`: %w", cp.cgroupThreadedMode, err)
 	case found == "":
-		return fmt.Errorf("`cgroupThreadedMode: %s` needs the host's /sys/fs/cgroup: it does not show the driver's pid %d in its cgroup %q; mount the host's /sys/fs/cgroup in its pod",
+		return fmt.Errorf("`cgroupThreadedMode: %s` needs the host's /sys/fs/cgroup: it does not show the driver's pid %d in its cgroup %q; install the driver with the chart, which mounts it for the mode, or mount the host's /sys/fs/cgroup in its pod",
 			cp.cgroupThreadedMode, pid, cgroupsPath)
 	}
 	cp.ownCgroupFound = true

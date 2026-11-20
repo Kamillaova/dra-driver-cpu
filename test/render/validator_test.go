@@ -69,6 +69,7 @@ var (
 	expectFlag    = flag.Bool("expect-root-flag", false, "whether the chart should pass "+rootFlag)
 	checkOverride = flag.Bool("check-hostname-override", false, "whether to judge how the node name reaches the driver")
 	wantStrategy  = flag.String("expected-update-strategy", "{}", "the spec.updateStrategy the chart must render, as JSON; {} for none")
+	threadedMode  = flag.String("expected-threaded-mode", "false", "the cgroupThreadedMode whose host access the chart must render: false, create or place")
 
 	chart         = flag.String("chart", "", "path to a whole rendered chart")
 	expectPolicy  = flag.Bool("expect-admission-policies", true, "whether the chart should render the admission policies and the ClusterRole")
@@ -128,6 +129,9 @@ func TestRenderedDaemonSet(t *testing.T) {
 		}
 	}
 	if err := checkUpdateStrategy(ds, *wantStrategy); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkThreadedAccess(ds, *threadedMode); err != nil {
 		t.Fatal(err)
 	}
 	if *checkOverride {
@@ -372,6 +376,78 @@ func checkUpdateStrategy(ds *appsv1.DaemonSet, want string) error {
 		return fmt.Errorf("encode the rendered updateStrategy: %w", err)
 	}
 	return fmt.Errorf("updateStrategy = %s, want %s", got, want)
+}
+
+// checkThreadedAccess judges the host access cgroupThreadedMode needs: under
+// create and place the host's cgroup2 tree read-write at the path the driver
+// writes and the host's pid namespace, under place also the two capabilities
+// that enter PID 1's cgroup namespace, and under false none of it.
+func checkThreadedAccess(ds *appsv1.DaemonSet, mode string) error {
+	if mode != "false" && mode != "create" && mode != "place" {
+		return fmt.Errorf("-expected-threaded-mode %q: want false, create or place", mode)
+	}
+	c, err := driver(ds)
+	if err != nil {
+		return err
+	}
+	threaded := mode != "false"
+	var errs []error
+	if ds.Spec.Template.Spec.HostPID != threaded {
+		errs = append(errs, fmt.Errorf("hostPID = %t under %s, want %t", ds.Spec.Template.Spec.HostPID, mode, threaded))
+	}
+	var mounts []corev1.VolumeMount
+	for _, m := range c.VolumeMounts {
+		if m.MountPath == "/sys/fs/cgroup" {
+			mounts = append(mounts, m)
+		}
+	}
+	switch {
+	case !threaded && len(mounts) != 0:
+		errs = append(errs, fmt.Errorf("%d mounts at /sys/fs/cgroup under false, want none", len(mounts)))
+	case threaded && len(mounts) != 1:
+		errs = append(errs, fmt.Errorf("%d mounts at /sys/fs/cgroup under %s, want one", len(mounts), mode))
+	case threaded:
+		if err := checkCgroupMount(ds, mounts[0]); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	var added []corev1.Capability
+	if sc := c.SecurityContext; sc != nil && sc.Capabilities != nil {
+		added = sc.Capabilities.Add
+	}
+	var want []corev1.Capability
+	if mode == "place" {
+		want = []corev1.Capability{"SYS_ADMIN", "SYS_PTRACE"}
+	}
+	if !slices.Equal(added, want) {
+		errs = append(errs, fmt.Errorf("capabilities added under %s = %v, want %v", mode, added, want))
+	}
+	if sc := c.SecurityContext; sc != nil && sc.Privileged != nil && *sc.Privileged {
+		errs = append(errs, errors.New("the driver's container is privileged"))
+	}
+	return errors.Join(errs...)
+}
+
+func checkCgroupMount(ds *appsv1.DaemonSet, m corev1.VolumeMount) error {
+	if m.ReadOnly {
+		return fmt.Errorf("mount %q at /sys/fs/cgroup is read-only", m.Name)
+	}
+	if m.SubPath != "" || m.SubPathExpr != "" {
+		return fmt.Errorf("mount %q at /sys/fs/cgroup carries a subPath", m.Name)
+	}
+	for _, v := range ds.Spec.Template.Spec.Volumes {
+		if v.Name != m.Name {
+			continue
+		}
+		if v.HostPath == nil || v.HostPath.Path != "/sys/fs/cgroup" {
+			return fmt.Errorf("volume %q is not the host's /sys/fs/cgroup", m.Name)
+		}
+		if v.HostPath.Type == nil || *v.HostPath.Type != corev1.HostPathDirectory {
+			return fmt.Errorf("volume %q has hostPath type %s, want %q", m.Name, typeOf(v.HostPath), corev1.HostPathDirectory)
+		}
+		return nil
+	}
+	return fmt.Errorf("no volume %q", m.Name)
 }
 
 // TestRenderedChart judges the admission policies, or the DeviceClasses. Their CEL is the API

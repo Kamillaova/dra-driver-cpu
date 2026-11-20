@@ -13,6 +13,8 @@
 # limitations under the License.
 {{- $effectiveDriverConfig := include "dra-driver-cpu.effectiveDriverConfig" . | fromYaml }}
 {{- $kubeletRoot := include "dra-driver-cpu.kubeletRootDir" . }}
+{{- $threadedMode := toString (get $effectiveDriverConfig "cgroupThreadedMode") }}
+{{- $threaded := or (eq $threadedMode "create") (eq $threadedMode "place") }}
 {{- include "dra-driver-cpu.checkCPUPartitions" . }}
 ---
 apiVersion: apps/v1
@@ -50,6 +52,9 @@ spec:
         {{- end }}
     spec:
       hostNetwork: true
+      {{- if $threaded }}
+      hostPID: true
+      {{- end }}
       priorityClassName: system-node-critical
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
@@ -89,6 +94,13 @@ spec:
         image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         terminationMessagePolicy: FallbackToLogsOnError
+        {{- if eq $threadedMode "place" }}
+        securityContext:
+          capabilities:
+            add:
+            - SYS_ADMIN
+            - SYS_PTRACE
+        {{- end }}
         ports:
           - name: healthz
             containerPort: {{ .Values.healthzPort }}
@@ -118,6 +130,10 @@ spec:
           mountPath: /var/run/nri
         - name: cdi-dir
           mountPath: /var/run/cdi
+        {{- if $threaded }}
+        - name: host-cgroup
+          mountPath: /sys/fs/cgroup
+        {{- end }}
         {{- with .Values.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -142,6 +158,12 @@ spec:
         hostPath:
           path: /var/run/cdi
           type: DirectoryOrCreate
+      {{- if $threaded }}
+      - name: host-cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+          type: Directory
+      {{- end }}
       {{- with .Values.extraVolumes }}
       {{- toYaml . | nindent 6 }}
       {{- end }}

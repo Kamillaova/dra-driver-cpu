@@ -126,8 +126,8 @@ func TestNewChecksThreadedPrivileges(t *testing.T) {
 	const (
 		needsMount = "`cgroupThreadedMode: create` needs the host's cgroup v2 hierarchy mounted read-write at /sys/fs/cgroup: "
 		needsAll   = "`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at /sys/fs/cgroup, CAP_SYS_PTRACE and CAP_SYS_ADMIN: "
-		mountFix   = "; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`"
-		allFix     = "; fix its pod, or set `cgroupThreadedMode: false`"
+		mountFix   = "; install the driver with the chart, which mounts it for the mode, mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`"
+		allFix     = "; install the driver with the chart, which sets these for the mode, fix its pod, or set `cgroupThreadedMode: false`"
 		refused    = "`cgroupThreadedMode: place` needs to enter the host's cgroup namespace: it was refused though the driver holds CAP_SYS_PTRACE and CAP_SYS_ADMIN (%s); run the driver in the host's user namespace, under an AppArmor profile that allows it"
 	)
 	openRefused := &fs.PathError{Op: "open", Path: "/proc/1/ns/cgroup", Err: syscall.EACCES}
@@ -398,7 +398,7 @@ func TestSynchronizeFindsTheDriversOwnProcess(t *testing.T) {
 			mode:       "create",
 			containers: []*api.Container{driverContainer(1, "/"+runcCgroup)},
 			tree:       fstest.MapFS{runcCgroup + "/cgroup.procs": {Data: []byte(procs)}},
-			wantErr: []string{fmt.Sprintf("`cgroupThreadedMode: create` needs the host's pid namespace: the runtime lists no container running the driver's pid %d; add `hostPID: true` to its pod",
+			wantErr: []string{fmt.Sprintf("`cgroupThreadedMode: create` needs the host's pid namespace: the runtime lists no container running the driver's pid %d; install the driver with the chart, which sets this for the mode, or add `hostPID: true` to its pod",
 				pid)},
 		},
 		{
@@ -406,7 +406,7 @@ func TestSynchronizeFindsTheDriversOwnProcess(t *testing.T) {
 			mode:       "place",
 			containers: []*api.Container{driverContainer(pid, "/"+runcCgroup)},
 			tree:       fstest.MapFS{"cgroup.procs": {Data: []byte(procs)}},
-			wantErr:    []string{"`cgroupThreadedMode: place` needs the host's /sys/fs/cgroup: it does not show the driver's cgroup \"/kubepods/besteffort/poddrv/driver\"; mount the host's /sys/fs/cgroup in its pod"},
+			wantErr:    []string{"`cgroupThreadedMode: place` needs the host's /sys/fs/cgroup: it does not show the driver's cgroup \"/kubepods/besteffort/poddrv/driver\"; install the driver with the chart, which mounts it for the mode, or mount the host's /sys/fs/cgroup in its pod"},
 		},
 		{
 			name:       "a mount not showing the driver's process in its cgroup",
@@ -416,7 +416,7 @@ func TestSynchronizeFindsTheDriversOwnProcess(t *testing.T) {
 				runcCgroup + "/cgroup.procs": {Data: []byte("17\n")},
 				"cgroup.procs":               {Data: []byte(procs)},
 			},
-			wantErr: []string{fmt.Sprintf("`cgroupThreadedMode: create` needs the host's /sys/fs/cgroup: it does not show the driver's pid %d in its cgroup \"/kubepods/besteffort/poddrv/driver\"; mount the host's /sys/fs/cgroup in its pod",
+			wantErr: []string{fmt.Sprintf("`cgroupThreadedMode: create` needs the host's /sys/fs/cgroup: it does not show the driver's pid %d in its cgroup \"/kubepods/besteffort/poddrv/driver\"; install the driver with the chart, which mounts it for the mode, or mount the host's /sys/fs/cgroup in its pod",
 				pid)},
 		},
 		{
