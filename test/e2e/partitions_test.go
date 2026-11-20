@@ -291,6 +291,42 @@ var _ = ginkgo.Describe("CPU partitions", ginkgo.Label("partitions"), ginkgo.Ser
 			gomega.Expect(assigned).To(cpusetmatchers.Equal(partitionCPUs),
 				"the tolerating claim was given %s, not partition %s's %s", assigned.String(), degradedPartition, partitionCPUs.String())
 		})
+
+		ginkgo.It("should show the partition's device unhealthy in a tolerating pod's status", func(ctx context.Context) {
+			fxt := rootFxt.WithPrefix("degraded-health")
+			gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(fxt.Teardown)
+
+			spec := makeResourceClaimSpec(1, true)
+			spec.Devices.Requests[0].Exactly.DeviceClassName = driverName + "." + degradedPartition
+			spec.Devices.Requests[0].Exactly.Tolerations = []resourcev1.DeviceToleration{{
+				Key:      device.DegradedTaintKey,
+				Operator: resourcev1.DeviceTolerationOpEqual,
+				Value:    device.DegradedTaintValue,
+				Effect:   resourcev1.DeviceTaintEffectNoSchedule,
+			}}
+			pod := createTesterPodWithClaimSpec(ctx, fxt, dracpuTesterImage, targetNode.Name, spec, "degraded-health")
+
+			// The kubelet copies the driver's device health into the status of
+			// the containers holding the device, with its message where
+			// ResourceHealthStatusMessage is on (kubernetes v1.37.0
+			// pkg/kubelet/cm/dra/manager.go:1024-1036).
+			message := fmt.Sprintf("partition %q is degraded (SiblingThreadsOnline); take its sibling threads offline", degradedPartition)
+			gomega.Eventually(func(g gomega.Gomega) {
+				current, err := fxt.K8SClientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+				var health []v1.ResourceHealth
+				for _, status := range current.Status.ContainerStatuses {
+					for _, resource := range status.AllocatedResourcesStatus {
+						health = append(health, resource.Resources...)
+					}
+				}
+				g.Expect(health).To(gomega.ContainElement(gomega.And(
+					gomega.HaveField("Health", v1.ResourceHealthStatusUnhealthy),
+					gomega.HaveField("Message", gomega.HaveValue(gomega.Equal(message))),
+				)), "pod %s shows no device of partition %q unhealthy", e2epod.Identify(pod), degradedPartition)
+			}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(gomega.Succeed())
+		})
 	})
 
 	// The lane's kubelets reserve the CPUs outside each profile's default

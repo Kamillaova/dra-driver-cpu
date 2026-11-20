@@ -289,5 +289,5 @@ For integrations that model native `cpu`, use the Kubernetes node-allocatable DR
 The driver reports the health of every device it manages to the kubelet over the DRA `WatchHealthStatus` gRPC API, so the kubelet can reflect it in `pod.status.containerStatuses[].allocatedResourcesStatus`.
 
 - `Healthy`: the default state. The driver has not observed any failure for this device.
-- `Unhealthy`: reserved for failures attributable to the device itself. The driver does not currently report this for any condition. A claim that fails to prepare (for example, a CDI spec write error) surfaces as a claim error instead, not a device health change.
+- `Unhealthy`: reserved for failures attributable to the device itself. The driver reports it for every device of a degraded partition, one whose `smt` the kernel contradicts, for as long as the driver runs; see [A degraded partition](cpu-partitions.md#a-degraded-partition). A claim that fails to prepare (for example, a CDI spec write error) surfaces as a claim error instead, not a device health change.
 - `Unknown`: reported by the kubelet itself and not the driver, when it stops receiving health updates for a device within its lease window (for example, if the driver process is down).
