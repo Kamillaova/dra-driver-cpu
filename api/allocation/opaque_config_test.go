@@ -60,6 +60,36 @@ func TestParseOpaqueConfig(t *testing.T) {
 			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig":`,
 			expectedError: "failed to unmarshal opaque config",
 		},
+		{
+			name:          "invalid - unknown key in cpuConfig",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": "2-5", "limt": "500m"}}`,
+			expectedError: `opaque config: strict decoding error: unknown field "cpuConfig.limt"`,
+		},
+		{
+			name:          "invalid - unknown top-level key",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": "2-5"}, "memConfig": {}}`,
+			expectedError: `opaque config: strict decoding error: unknown field "memConfig"`,
+		},
+		{
+			name:          "invalid - cpuset in another casing",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"CPUSet": "2-5"}}`,
+			expectedError: `opaque config: strict decoding error: unknown field "cpuConfig.CPUSet"`,
+		},
+		{
+			name:          "invalid - apiVersion in another casing",
+			rawJSON:       `{"APIVersion": "v1alpha1", "cpuConfig": {"cpuset": "2-5"}}`,
+			expectedError: `opaque config: strict decoding error: unknown field "APIVersion"`,
+		},
+		{
+			name:          "invalid - cpuset written twice",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"cpuset": "abc", "cpuset": "2-5"}}`,
+			expectedError: `opaque config: strict decoding error: duplicate field "cpuConfig.cpuset"`,
+		},
+		{
+			name:          "invalid - every problem named",
+			rawJSON:       `{"apiVersion": "v1alpha1", "apiVersion": "v1alpha1", "cpuConfig": {"cpuset": "2-5", "Cpuset": "2-5"}}`,
+			expectedError: `opaque config: strict decoding error: duplicate field "apiVersion", unknown field "cpuConfig.Cpuset"`,
+		},
 	}
 
 	for _, tc := range testCases {

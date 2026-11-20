@@ -93,7 +93,18 @@ Go consumers of the opaque allocation configuration API must update their import
 - Schema types: `api/v1alpha1` moves to `api/allocation/v1alpha1`.
 - `ParseOpaqueConfig`: `api` moves to `api/allocation`.
 
-The serialized `v1alpha1` schema and parsing behavior are unchanged.
+The serialized `v1alpha1` schema is unchanged; its parsing becomes strict, see
+[Strict opaque parameters](#strict-opaque-parameters).
+
+#### Strict opaque parameters
+
+The driver now refuses `dra.cpu` opaque parameters that carry a key the `v1alpha1` schema does not
+name, a key in another casing than the schema's, or a key written twice. Before, it ignored the
+first, read the second as the field it folds to and kept the last value of the third. Only the
+external allocator (`allocator: external`) reads the parameters, the default allocator refusing
+every `dra.cpu` opaque entry, so only claims prepared under the external allocator are affected:
+such a claim now fails to prepare, with an error naming the key. Before upgrading, fix the key
+where the parameters are written, in the claim, its template, or the scheduler that adds them.
 
 #### Per-request CDI variables
 
