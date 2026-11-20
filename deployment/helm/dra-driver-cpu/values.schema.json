@@ -280,6 +280,9 @@
               "name"
             ],
             "properties": {
+              "allowExclusive": {
+                "type": "boolean"
+              },
               "cpuset": {
                 "type": "string"
               },
@@ -346,6 +349,9 @@
                     "name"
                   ],
                   "properties": {
+                    "allowExclusive": {
+                      "type": "boolean"
+                    },
                     "cpuset": {
                       "type": "string"
                     },
