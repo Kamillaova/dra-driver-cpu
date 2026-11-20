@@ -26,6 +26,13 @@ import (
 	"k8s.io/utils/cpuset"
 )
 
+// The values the driver's cgroupThreadedMode setting takes besides false, its
+// default.
+const (
+	ThreadedModeCreate = "create"
+	ThreadedModePlace  = "place"
+)
+
 const (
 	typeFile           = "cgroup.type"
 	procsFile          = "cgroup.procs"

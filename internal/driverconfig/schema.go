@@ -44,6 +44,20 @@ var schemaEnums = map[string][]any{
 	"allocator":     {cpuallocator.ModeCPUManager, cpuallocator.ModeExternal},
 }
 
+// schemaFields replace the inferred schema of a field whose Go type describes
+// less than the file accepts.
+var schemaFields = map[string]*jsonschema.Schema{
+	"cgroupThreadedMode": {Enum: threadedModeEnum()},
+}
+
+func threadedModeEnum() []any {
+	enum := []any{false}
+	for _, mode := range threadedModes {
+		enum = append(enum, mode)
+	}
+	return enum
+}
+
 // schemaListEnums are the allowed values for a field of a list field's item,
 // which schemaEnums cannot express: it keys on the name of the list.
 var schemaListEnums = map[string]map[string][]any{
@@ -108,6 +122,13 @@ func GenerateDriverConfigSchema() ([]byte, error) {
 			return nil, fmt.Errorf("schemaEnums has entry %q but Config has no matching field", jsonKey)
 		}
 		prop.Enum = enum
+	}
+
+	for jsonKey, replacement := range schemaFields {
+		if _, ok := schema.Properties[jsonKey]; !ok {
+			return nil, fmt.Errorf("schemaFields has entry %q but Config has no matching field", jsonKey)
+		}
+		schema.Properties[jsonKey] = replacement.CloneSchemas()
 	}
 
 	for jsonKey, enums := range schemaListEnums {

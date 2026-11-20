@@ -399,6 +399,7 @@ func TestDefault(t *testing.T) {
 	assert.False(t, d.AssumeUnsolicitedUpdatesSafe)
 	assert.False(t, d.AllowFractionalCapacityRequests)
 	assert.False(t, d.TaintDegradedPartitions)
+	assert.Empty(t, d.CgroupThreadedMode)
 }
 
 // TestResolve_TaintDegradedPartitions: the option comes from the file, a key
@@ -429,6 +430,64 @@ func TestResolve_TaintDegradedPartitions(t *testing.T) {
 			assert.Equal(t, tc.want, result.TaintDegradedPartitions)
 		})
 	}
+}
+
+// TestResolve_CgroupThreadedMode: the mode comes from the file as false, create
+// or place, a key left out or null keeps false, YAML's unquoted off is false,
+// every device mode accepts each value with or without partitions and
+// profiles, any other value is refused, and so is the key in a profile, since
+// every node of a cluster runs one mode. The dump writes the mode as the file
+// does.
+func TestResolve_CgroupThreadedMode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		file    string
+		want    driverconfig.ThreadedMode
+		written string
+		wantErr string
+	}{
+		{name: "left out", file: "apiVersion: v1alpha1\n", want: "", written: "false"},
+		{name: "null", file: "apiVersion: v1alpha1\ncgroupThreadedMode: null\n", want: "", written: "false"},
+		{name: "false", file: "apiVersion: v1alpha1\ncgroupThreadedMode: false\n", want: "", written: "false"},
+		{name: "off, unquoted", file: "apiVersion: v1alpha1\ncgroupThreadedMode: off\n", want: "", written: "false"},
+		{name: "create", file: "apiVersion: v1alpha1\ncgroupThreadedMode: create\n", want: "create", written: "create"},
+		{name: "place", file: "apiVersion: v1alpha1\ncgroupThreadedMode: place\n", want: "place", written: "place"},
+		{name: "place in individual mode", file: "apiVersion: v1alpha1\ncpuDeviceMode: individual\ncgroupThreadedMode: place\n", want: "place", written: "place"},
+		{name: "create with partitions", file: "apiVersion: v1alpha1\ncpuPartitions:\n- name: default\ncgroupThreadedMode: create\n", want: "create", written: "create"},
+		{name: "place with profiles", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cpuPartitions:\n    - name: default\ncgroupThreadedMode: place\n", want: "place", written: "place"},
+		{name: "true", file: "apiVersion: v1alpha1\ncgroupThreadedMode: true\n", wantErr: `invalid cgroupThreadedMode true: must be false, "create" or "place"`},
+		{name: "off, quoted", file: "apiVersion: v1alpha1\ncgroupThreadedMode: \"off\"\n", wantErr: `invalid cgroupThreadedMode "off": must be false, "create" or "place"`},
+		{name: "an unknown mode", file: "apiVersion: v1alpha1\ncgroupThreadedMode: garbage\n", wantErr: `invalid cgroupThreadedMode "garbage": must be false, "create" or "place"`},
+		{name: "an empty string", file: "apiVersion: v1alpha1\ncgroupThreadedMode: \"\"\n", wantErr: `invalid cgroupThreadedMode "": must be false, "create" or "place"`},
+		{name: "a number", file: "apiVersion: v1alpha1\ncgroupThreadedMode: 1\n", wantErr: `invalid cgroupThreadedMode 1: must be false, "create" or "place"`},
+		{name: "a mode in a profile", file: "apiVersion: v1alpha1\nprofiles:\n  r7625:\n    cgroupThreadedMode: place\n    cpuPartitions:\n    - name: default\n", wantErr: `unknown field "cgroupThreadedMode"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgFile := writeFile(t, t.TempDir(), "config.yaml", tc.file)
+
+			result, err := driverconfig.Resolve(testr.New(t), []driverconfig.Source{
+				driverconfig.FromFile(cfgFile),
+			})
+
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, result.CgroupThreadedMode)
+			assert.Contains(t, result.Dump(), "\ncgroupThreadedMode: "+tc.written+"\n")
+		})
+	}
+
+	raw, err := driverconfig.GenerateDriverConfigSchema()
+	require.NoError(t, err)
+	var schema struct {
+		Properties struct {
+			CgroupThreadedMode map[string]any `json:"cgroupThreadedMode"`
+		} `json:"properties"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &schema))
+	assert.Equal(t, map[string]any{"enum": []any{false, "create", "place"}}, schema.Properties.CgroupThreadedMode)
 }
 
 // TestResolve_AssumeUnsolicitedUpdatesSafe: the option comes from the file, and

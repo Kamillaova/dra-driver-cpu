@@ -17,8 +17,12 @@ limitations under the License.
 package driverconfig
 
 import (
+	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"sigs.k8s.io/yaml"
 )
 
@@ -64,12 +68,61 @@ type Config struct {
 	// contradicts publishes its devices with a taint rather than none.
 	// Defaults to false.
 	TaintDegradedPartitions bool `json:"taintDegradedPartitions,omitempty"`
+	// CgroupThreadedMode sets what the driver writes to the host's cgroup2
+	// tree for claims asking for threaded cgroups: false, create or place.
+	// Defaults to false.
+	CgroupThreadedMode ThreadedMode `json:"cgroupThreadedMode,omitempty"`
 	// CPUPartitions splits the node's CPUs into named partitions. Left out,
 	// null and empty all mean the node uses no partitions.
 	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
 	// Profiles holds a cpuPartitions list per kind of node, by name. Left out,
 	// null and empty all mean the configuration declares no profiles.
 	Profiles map[string]Profile `json:"profiles,omitempty"`
+}
+
+// ThreadedMode is the value of cgroupThreadedMode: false, its default, held as
+// the empty string, or one of threadedModes. False takes the place of a string
+// "off" because the file's YAML 1.1 reader reads an unquoted off as false
+// (go.yaml.in/yaml/v2 v2.4.4 resolve.go:42).
+type ThreadedMode string
+
+// threadedModes are the strings cgroupThreadedMode takes. One list, since the
+// decoder and the generated schema must accept the same set.
+var threadedModes = []string{cgroupfs.ThreadedModeCreate, cgroupfs.ThreadedModePlace}
+
+// MarshalJSON writes the mode as a configuration file holds it.
+func (m ThreadedMode) MarshalJSON() ([]byte, error) {
+	if m == "" {
+		return []byte("false"), nil
+	}
+	return json.Marshal(string(m))
+}
+
+// UnmarshalJSON reads false and the strings of threadedModes, and leaves the
+// mode as it is for null, as for every other key set to null.
+func (m *ThreadedMode) UnmarshalJSON(data []byte) error {
+	value := strings.TrimSpace(string(data))
+	switch value {
+	case "null":
+		return nil
+	case "false":
+		*m = ""
+		return nil
+	}
+	var mode string
+	if err := json.Unmarshal(data, &mode); err == nil && slices.Contains(threadedModes, mode) {
+		*m = ThreadedMode(mode)
+		return nil
+	}
+	return fmt.Errorf("invalid cgroupThreadedMode %s: must be false, %q or %q", value, cgroupfs.ThreadedModeCreate, cgroupfs.ThreadedModePlace)
+}
+
+// String writes the mode as a configuration file holds it.
+func (m ThreadedMode) String() string {
+	if m == "" {
+		return "false"
+	}
+	return string(m)
 }
 
 // LogValues returns key-value pairs for structured logging of the config.
@@ -92,6 +145,7 @@ func (c Config) LogValues() []any {
 		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
 		"allowFractionalCapacityRequests", c.AllowFractionalCapacityRequests,
 		"taintDegradedPartitions", c.TaintDegradedPartitions,
+		"cgroupThreadedMode", c.CgroupThreadedMode,
 		"cpuPartitions", c.CPUPartitions,
 		"profiles", c.Profiles,
 	}
@@ -117,6 +171,7 @@ type dumpConfig struct {
 	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe"`
 	AllowFractionalCapacityRequests       bool               `json:"allowFractionalCapacityRequests"`
 	TaintDegradedPartitions               bool               `json:"taintDegradedPartitions"`
+	CgroupThreadedMode                    ThreadedMode       `json:"cgroupThreadedMode"`
 	CPUPartitions                         []CPUPartition     `json:"cpuPartitions"`
 	Profiles                              map[string]Profile `json:"profiles"`
 }
