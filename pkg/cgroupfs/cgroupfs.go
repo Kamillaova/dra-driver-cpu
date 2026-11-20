@@ -27,16 +27,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-
-	"k8s.io/utils/cpuset"
 )
 
 // Root is where the host's cgroup2 tree is mounted into the driver.
 const Root = "/sys/fs/cgroup"
-
-// cpusetFile is the CPUs the kernel is really running the cgroup's tasks on,
-// which is the cpuset after intersection with every ancestor's.
-const cpusetFile = "cpuset.cpus.effective"
 
 // FS is the cgroup2 tree, narrowed to the calls the driver makes.
 type FS interface {
@@ -83,24 +77,6 @@ func (h *hostFS) WriteFile(name string, data []byte) error {
 
 func (h *hostFS) Chown(name string, uid, gid int) error {
 	return h.root.Chown(name, uid, gid)
-}
-
-// CPUSet reads the CPUs a container is really confined to. cgroupsPath is what
-// the runtime reported for it over NRI.
-func CPUSet(fsys fs.FS, cgroupsPath string) (cpuset.CPUSet, error) {
-	dir, err := Dir(cgroupsPath)
-	if err != nil {
-		return cpuset.New(), err
-	}
-	raw, err := fs.ReadFile(fsys, path.Join(dir, cpusetFile))
-	if err != nil {
-		return cpuset.New(), fmt.Errorf("read %s of %q: %w", cpusetFile, cgroupsPath, err)
-	}
-	cpus, err := cpuset.Parse(strings.TrimSpace(string(raw)))
-	if err != nil {
-		return cpuset.New(), fmt.Errorf("parse %s of %q: %w", cpusetFile, cgroupsPath, err)
-	}
-	return cpus, nil
 }
 
 // FindProcess returns the cgroup of dir's subtree, dir included, whose

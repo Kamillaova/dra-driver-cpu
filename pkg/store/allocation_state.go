@@ -197,6 +197,19 @@ type RequestAllocation struct {
 	Devices []string
 	// Cap is the CPU time a shared request may use, in millicores, 0 for none.
 	Cap int64
+	// Amount is what a shared request books on its devices, in millicores.
+	Amount int64
+	// Group is the threaded group the request's CPUs land in, in a claim
+	// whose Layout is set.
+	Group string
+}
+
+// Layout is how a threaded claim splits the cgroup of the container using it:
+// each request's group is its RequestAllocation's.
+type Layout struct {
+	// Place is the group the container's process starts in, under
+	// cgroupThreadedMode place; empty for none.
+	Place string
 }
 
 // ClaimRequestRef names one request of a claim, or the whole claim where
@@ -215,6 +228,8 @@ type ClaimRecord struct {
 	Namespace string
 	Name      string
 	Requests  []RequestAllocation
+	// Layout is set for a claim whose cgroupConfig.threaded is enabled.
+	Layout *Layout
 }
 
 // CPUs returns the CPUs the claim's exclusive requests hold.
@@ -234,6 +249,7 @@ type claimAllocation struct {
 	namespace string
 	name      string
 	owner     OwnerIdent
+	layout    *Layout
 }
 
 func newClaimAllocation(record ClaimRecord) claimAllocation {
@@ -241,19 +257,28 @@ func newClaimAllocation(record ClaimRecord) claimAllocation {
 	slices.SortFunc(sorted, func(a, b RequestAllocation) int {
 		return cmp.Or(strings.Compare(a.Request, b.Request), strings.Compare(string(a.Role), string(b.Role)))
 	})
-	return claimAllocation{cpus: record.CPUs(), requests: sorted, namespace: record.Namespace, name: record.Name}
+	return claimAllocation{cpus: record.CPUs(), requests: sorted, namespace: record.Namespace, name: record.Name, layout: cloneLayout(record.Layout)}
 }
 
 func (ca claimAllocation) record() ClaimRecord {
-	return ClaimRecord{Namespace: ca.namespace, Name: ca.name, Requests: cloneRequests(ca.requests)}
+	return ClaimRecord{Namespace: ca.namespace, Name: ca.name, Requests: cloneRequests(ca.requests), Layout: cloneLayout(ca.layout)}
 }
 
 func cloneRequests(requests []RequestAllocation) []RequestAllocation {
 	cloned := make([]RequestAllocation, len(requests))
 	for i, request := range requests {
-		cloned[i] = RequestAllocation{Request: request.Request, CPUs: request.CPUs.Clone(), Role: request.Role, Devices: slices.Clone(request.Devices), Cap: request.Cap}
+		cloned[i] = RequestAllocation{Request: request.Request, CPUs: request.CPUs.Clone(), Role: request.Role, Devices: slices.Clone(request.Devices),
+			Cap: request.Cap, Amount: request.Amount, Group: request.Group}
 	}
 	return cloned
+}
+
+func cloneLayout(layout *Layout) *Layout {
+	if layout == nil {
+		return nil
+	}
+	cloned := *layout
+	return &cloned
 }
 
 // request returns the allocations of a request: one, or where its results
@@ -270,7 +295,8 @@ func (ca claimAllocation) request(name string) []RequestAllocation {
 
 func (ca claimAllocation) sameRequests(requests []RequestAllocation) bool {
 	return slices.EqualFunc(ca.requests, requests, func(a, b RequestAllocation) bool {
-		return a.Request == b.Request && a.CPUs.Equals(b.CPUs) && a.Role == b.Role && slices.Equal(a.Devices, b.Devices) && a.Cap == b.Cap
+		return a.Request == b.Request && a.CPUs.Equals(b.CPUs) && a.Role == b.Role && slices.Equal(a.Devices, b.Devices) && a.Cap == b.Cap &&
+			a.Amount == b.Amount && a.Group == b.Group
 	})
 }
 
@@ -285,6 +311,7 @@ func (ca claimAllocation) Acquire(owner OwnerIdent) (claimAllocation, bool) {
 		namespace: ca.namespace,
 		name:      ca.name,
 		owner:     owner,
+		layout:    cloneLayout(ca.layout),
 	}, true
 }
 
@@ -296,6 +323,7 @@ func (ca claimAllocation) Release() claimAllocation {
 		namespace: ca.namespace,
 		name:      ca.name,
 		// intentional empty owner
+		layout: cloneLayout(ca.layout),
 	}
 }
 
@@ -309,6 +337,7 @@ func (ca claimAllocation) Clone() claimAllocation {
 			PodUID:        ca.owner.PodUID,
 			ContainerName: ca.owner.ContainerName,
 		},
+		layout: cloneLayout(ca.layout),
 	}
 }
 

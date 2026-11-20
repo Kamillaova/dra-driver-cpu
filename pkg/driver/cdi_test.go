@@ -313,6 +313,52 @@ func TestClaimRecordCapRoundTrip(t *testing.T) {
 	require.Equal(t, int64(1500), read.storeRecord().Requests[0].Cap)
 }
 
+func TestClaimRecordLayoutRoundTrip(t *testing.T) {
+	consumed := resource.MustParse("250m")
+	written := cdiClaimRecord{Namespace: "ns", Name: "vm-claim", Layout: &store.Layout{Place: "vmm-cpu"}, Requests: []cdiRequestRecord{
+		{Request: "vcpu", CPUs: cpuset.New(2, 3), Results: []cdiResultRecord{{Device: "cpudevnuma000-vms"}}, Group: "vcpu"},
+		{Request: "vmm-cpu", CPUs: cpuset.New(0, 1), Role: store.RoleShared, Results: []cdiResultRecord{{Device: "cpudevnuma000", Consumed: &consumed}}, Cap: 500, Group: "vmm-cpu"},
+	}}
+	encoded, err := encodeClaimRecord(written)
+	require.NoError(t, err)
+	require.Contains(t, encoded, `"layout":{"place":"vmm-cpu"}`)
+	read, err := decodeClaimRecord(encoded)
+	require.NoError(t, err)
+	require.Equal(t, written, read)
+	record := read.storeRecord()
+	require.Equal(t, &store.Layout{Place: "vmm-cpu"}, record.Layout)
+	require.Equal(t, []string{"vcpu", "vmm-cpu"}, []string{record.Requests[0].Group, record.Requests[1].Group})
+	require.Equal(t, int64(250), record.Requests[1].Amount, "a share's amount is what its results booked")
+
+	unthreaded, err := encodeClaimRecord(cdiClaimRecord{Namespace: "ns", Name: "plain", Requests: []cdiRequestRecord{{Request: "cpus", CPUs: cpuset.New(2)}}})
+	require.NoError(t, err)
+	require.NotContains(t, unthreaded, "layout")
+	require.NotContains(t, unthreaded, "group")
+
+	for _, tc := range []struct {
+		name    string
+		value   string
+		wantErr string
+	}{{
+		name:    "a group without a layout",
+		value:   `{"namespace":"ns","name":"c","placements":[{"request":"cpus","cpus":"2","group":"cpus"}]}`,
+		wantErr: `dra.cpu/record records request "cpus" with group "cpus", which a request has exactly where the claim has a layout`,
+	}, {
+		name:    "a layout and a request without a group",
+		value:   `{"namespace":"ns","name":"c","layout":{},"placements":[{"request":"cpus","cpus":"2"}]}`,
+		wantErr: `dra.cpu/record records request "cpus" with group "", which a request has exactly where the claim has a layout`,
+	}, {
+		name:    "a place no group is",
+		value:   `{"namespace":"ns","name":"c","layout":{"place":"vmm"},"placements":[{"request":"cpus","cpus":"2","group":"cpus"}]}`,
+		wantErr: `dra.cpu/record records place "vmm", which no request's group is`,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeClaimRecord(tc.value)
+			require.EqualError(t, err, tc.wantErr)
+		})
+	}
+}
+
 func TestListClaims(t *testing.T) {
 	logger := testr.New(t)
 	mgr, err := NewCdiManager(logger, testDriverName, t.TempDir())

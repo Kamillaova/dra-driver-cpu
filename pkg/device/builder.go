@@ -154,6 +154,9 @@ type BuildInput struct {
 	// an amount in millicores rather than in whole CPUs. Every device
 	// publishes it.
 	AllowFractionalCapacityRequests bool
+	// CgroupThreadedMode is the driver's cgroupThreadedMode as every device
+	// publishes it: off, create or place.
+	CgroupThreadedMode string
 }
 
 type BuildResult struct {

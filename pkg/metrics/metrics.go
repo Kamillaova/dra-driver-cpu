@@ -33,6 +33,9 @@ const (
 	ResultSuccess Result = "success"
 	ResultError   Result = "error"
 	ResultUnknown Result = "unknown"
+	// ResultRewriteError is a threaded group whose CPUs the driver failed to
+	// rewrite after an exclusive request took or gave back CPUs.
+	ResultRewriteError Result = "rewrite_error"
 )
 
 func (r Result) String() string {
@@ -43,6 +46,8 @@ func (r Result) String() string {
 		return string(ResultError)
 	case ResultUnknown:
 		return string(ResultUnknown)
+	case ResultRewriteError:
+		return string(ResultRewriteError)
 	default:
 		return string(ResultUnknown)
 	}
@@ -80,9 +85,15 @@ const (
 	// RuleLimitWithOthers refuses a container that holds a request with a
 	// limit together with another request.
 	RuleLimitWithOthers Rule = "limit_with_others"
+	// RuleUnthreadedSecondClaim refuses a container that holds a claim that is
+	// not threaded beside a threaded one.
+	RuleUnthreadedSecondClaim Rule = "unthreaded_second_claim"
+	// RuleDuplicateGroupName refuses a container whose threaded claims give two
+	// groups one name.
+	RuleDuplicateGroupName Rule = "duplicate_group_name"
 )
 
-var rules = []Rule{RulePartialHolder, RuleLimitWithOthers}
+var rules = []Rule{RulePartialHolder, RuleLimitWithOthers, RuleUnthreadedSecondClaim, RuleDuplicateGroupName}
 
 // Descriptor describes a custom driver metric for programmatic introspection.
 type Descriptor struct {
@@ -124,6 +135,7 @@ type Metrics struct {
 	partitionVerified          *prometheus.GaugeVec
 	nodeReservationOK          prometheus.Gauge
 	deviceTaintsDropped        prometheus.Counter
+	threadedContainers         *prometheus.CounterVec
 }
 
 type metricKind string
@@ -271,6 +283,12 @@ var (
 		kind: metricGauge,
 		help: "Whether the kubelet reserves the CPUs the node's partitions keep from pods without claims (1), or reserves fewer, so the node publishes no devices and refuses every Prepare (0).",
 	}
+	threadedContainersSpec = metricSpec{
+		name:   "dra_cpu_threaded_containers_total",
+		kind:   metricCounter,
+		help:   "Total number of threaded containers whose groups the NRI StartContainer callback built (success) or failed to build, refusing the start (error), and of threaded groups whose CPUs the driver failed to rewrite (rewrite_error).",
+		labels: []string{"mode", "result"},
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -295,6 +313,7 @@ var metricSpecs = []metricSpec{
 	partitionVerifiedSpec,
 	nodeReservationOKSpec,
 	deviceTaintsDroppedSpec,
+	threadedContainersSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -347,6 +366,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		partitionVerified:          newGaugeVec(partitionVerifiedSpec),
 		nodeReservationOK:          newGauge(nodeReservationOKSpec),
 		deviceTaintsDropped:        newCounter(deviceTaintsDroppedSpec),
+		threadedContainers:         newCounterVec(threadedContainersSpec),
 	}
 
 	reg.MustRegister(
@@ -371,6 +391,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.partitionVerified,
 		m.nodeReservationOK,
 		m.deviceTaintsDropped,
+		m.threadedContainers,
 	)
 	for _, rule := range rules {
 		m.containersKeptUnderOlder.WithLabelValues(string(rule))
@@ -515,6 +536,10 @@ func (m *Metrics) RecordDeviceTaintsDropped() {
 	m.deviceTaintsDropped.Inc()
 }
 
+func (m *Metrics) RecordThreadedContainer(mode string, result Result) {
+	m.threadedContainers.WithLabelValues(mode, result.String()).Inc()
+}
+
 func determineResult(err error) Result {
 	if err != nil {
 		return ResultError
@@ -545,3 +570,4 @@ func (noopRecorder) RecordNodeAllocatableMappingDropped()                       
 func (noopRecorder) SetPartitionVerified(string, bool)                            {}
 func (noopRecorder) SetNodeReservationOK(bool)                                    {}
 func (noopRecorder) RecordDeviceTaintsDropped()                                   {}
+func (noopRecorder) RecordThreadedContainer(string, Result)                       {}

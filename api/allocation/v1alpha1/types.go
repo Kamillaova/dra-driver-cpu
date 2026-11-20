@@ -37,6 +37,41 @@ type OpaqueConfig struct {
 	APIVersion string `json:"apiVersion"`
 	// CPUConfig holds CPU-specific configuration settings.
 	CPUConfig CPUConfig `json:"cpuConfig"`
+	// CgroupConfig holds the cgroup layout of the container using the claim.
+	CgroupConfig CgroupConfig `json:"cgroupConfig"`
+}
+
+// CgroupConfig holds the cgroup layout of the container using the claim. It
+// applies to the whole claim.
+type CgroupConfig struct {
+	// Threaded splits the container's cgroup into threaded groups.
+	Threaded ThreadedConfig `json:"threaded"`
+}
+
+// ThreadedConfig splits the cgroup of the container using the claim into
+// threaded groups, one cgroup each, whose threads the workload places itself.
+// Its zero value is the block left out.
+type ThreadedConfig struct {
+	// Enabled switches the split on. Left out, the block changes nothing.
+	Enabled bool `json:"enabled,omitempty"`
+	// Place is the group the container's process starts in, on a node whose
+	// cgroupThreadedMode is place.
+	Place string `json:"place,omitempty"`
+	// Groups is the complete list of groups. Left out, each request gets a
+	// group named after it; an empty list is refused.
+	Groups []ThreadedGroup `json:"groups,omitempty"`
+}
+
+// IsZero reports whether the block is left out or written with zero values.
+func (c ThreadedConfig) IsZero() bool {
+	return !c.Enabled && c.Place == "" && c.Groups == nil
+}
+
+// ThreadedGroup is one threaded group and the requests, or alternatives of a
+// firstAvailable request, whose CPUs it holds.
+type ThreadedGroup struct {
+	Name     string   `json:"name"`
+	Requests []string `json:"requests"`
 }
 
 // CPUConfig holds CPU-specific configuration settings.
@@ -69,6 +104,9 @@ type ClaimPlacementStatus struct {
 	// CPUSet is the CPUs an exclusive request holds on the device. A share's
 	// entry has none, since the CPUs it runs on change after it is prepared.
 	CPUSet string `json:"cpuset,omitempty"`
+	// Group is the threaded group the result's CPUs land in, in a claim that
+	// sets cgroupConfig.threaded.enabled.
+	Group string `json:"group,omitempty"`
 }
 
 // LimitMax is the one way to write that a request has no CPU limit.
