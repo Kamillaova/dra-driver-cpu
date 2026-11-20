@@ -35,9 +35,9 @@ var groupings = []string{
 	device.GROUP_BY_UNCORE_CACHE,
 }
 
-// Validate checks that enum fields hold recognised values, that
-// kubeletRootDir is non-empty and absolute, and that qps and burst are
-// positive. The root is required rather than optional because the hostPath
+// Validate checks that enum fields hold recognised values, that cpuPartitions
+// is well formed, that kubeletRootDir is non-empty and absolute, and that qps
+// and burst are positive. The root is required rather than optional because the hostPath
 // mounts render from the same value.
 // Config files bypass the flag.Value validators, so Resolve calls this after merging.
 func (c Config) Validate() error {
@@ -51,6 +51,9 @@ func (c Config) Validate() error {
 	if c.Allocator != cpuallocator.ModeExternal && c.Allocator != cpuallocator.ModeCPUManager {
 		return fmt.Errorf("invalid allocator %q: must be %q or %q",
 			c.Allocator, cpuallocator.ModeExternal, cpuallocator.ModeCPUManager)
+	}
+	if err := c.validateCPUPartitions(); err != nil {
+		return err
 	}
 	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED && c.GroupBy == device.GROUP_BY_MACHINE && c.Allocator != cpuallocator.ModeExternal {
 		return fmt.Errorf("invalid allocator %q with groupBy %q: must be %q", c.Allocator, device.GROUP_BY_MACHINE, cpuallocator.ModeExternal)
