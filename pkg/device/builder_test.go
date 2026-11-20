@@ -565,6 +565,7 @@ func TestBuildUncoreCacheDevices(t *testing.T) {
 					device.AttributeAllowFractionalCapacityRequests,
 					device.AttributePartition,
 					device.AttributeRole,
+					device.AttributeAllowExclusive,
 				}, slices.Collect(maps.Keys(dev.Attributes)), "device %q attributes", dev.Name)
 				require.Equalf(t, want.cacheID, *dev.Attributes[device.AttributeCacheL3ID].IntValue, "device %q cacheL3ID", dev.Name)
 				require.Equalf(t, want.numaNode, *dev.Attributes[deviceattribute.StandardDeviceAttributeNUMANode].IntValue, "device %q numaNode", dev.Name)
@@ -596,10 +597,10 @@ func TestBuildGroupedDeviceAttributeCount(t *testing.T) {
 		layout device.Layout
 		want   int
 	}{
-		{layout: device.LayoutNUMANode, want: 15},
-		{layout: device.LayoutSocket, want: 12},
-		{layout: device.LayoutMachine, want: 11},
-		{layout: device.LayoutUncoreCache, want: 16},
+		{layout: device.LayoutNUMANode, want: 16},
+		{layout: device.LayoutSocket, want: 13},
+		{layout: device.LayoutMachine, want: 12},
+		{layout: device.LayoutUncoreCache, want: 17},
 	} {
 		res, err := device.Build(device.BuildInput{
 			Inventory: device.Inventory{
@@ -1216,6 +1217,73 @@ func TestBuildSharedDevices(t *testing.T) {
 				require.Emptyf(t, dev.Taints, "device %q taints", dev.Name)
 				require.Equalf(t, mapped, dev.NodeAllocatableResources != nil, "device %q mapping", dev.Name)
 			}
+		})
+	}
+}
+
+func TestBuildPublishesAllowExclusive(t *testing.T) {
+	topo := coreTopology(true, onNUMANode0, twoThreadCores(4)...)
+	for _, tc := range []struct {
+		name           string
+		layout         device.Layout
+		declared       []device.Partition
+		partitionsUsed bool
+		want           map[string]bool
+	}{
+		{
+			name:   "individual mode, every device owned",
+			layout: device.LayoutIndividual,
+			want: map[string]bool{
+				"cpudev000": true, "cpudev001": true, "cpudev002": true, "cpudev003": true,
+				"cpudev004": true, "cpudev005": true, "cpudev006": true, "cpudev007": true,
+			},
+		},
+		{
+			name:   "grouped without partitions, every device owned",
+			layout: device.LayoutUncoreCache,
+			want:   map[string]bool{"cpudevcache000": true},
+		},
+		{
+			name:   "shared devices by their partition's flag, owned devices always",
+			layout: device.LayoutUncoreCache,
+			declared: []device.Partition{
+				{Name: device.DefaultPartitionName, AllowExclusive: true},
+				{Name: "infra", Role: device.PARTITION_ROLE_DEFAULT, CPUs: cpuset.New(1, 5)},
+				{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(2, 6)},
+			},
+			partitionsUsed: true,
+			want:           map[string]bool{"cpudevcache000": true, "cpudevcache000-infra": false, "cpudevcache000-vms": true},
+		},
+		{
+			name:   "the default entry left without the flag",
+			layout: device.LayoutUncoreCache,
+			declared: []device.Partition{
+				{Name: device.DefaultPartitionName},
+				{Name: "infra", Role: device.PARTITION_ROLE_DEFAULT, CPUs: cpuset.New(1, 5), AllowExclusive: true},
+			},
+			partitionsUsed: true,
+			want:           map[string]bool{"cpudevcache000": false, "cpudevcache000-infra": true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := device.BuildInput{
+				Inventory:      device.Inventory{CPUTopology: topo, ReservedCPUs: cpuset.New()},
+				Layout:         tc.layout,
+				PCIeRootMapper: store.NewPCIeRootMapper(),
+				PartitionsUsed: tc.partitionsUsed,
+			}
+			if tc.partitionsUsed {
+				input.Partitions = device.ResolvePartitions(tc.declared, topo.CPUDetails, cpuset.New())
+			}
+			res, err := device.Build(input)
+			require.NoError(t, err)
+			got := make(map[string]bool, len(res.Devices))
+			for _, dev := range res.Devices {
+				allow := dev.Attributes[device.AttributeAllowExclusive]
+				require.NotNilf(t, allow.BoolValue, "device %q must publish allowExclusive as a bool", dev.Name)
+				got[dev.Name] = *allow.BoolValue
+			}
+			require.Equal(t, tc.want, got)
 		})
 	}
 }

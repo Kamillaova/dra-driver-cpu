@@ -40,6 +40,18 @@ type Kind struct {
 	Owned  bool
 	// Exclusive says, in a refusal, what makes an owned request exclusive.
 	Exclusive string
+	// OwnedClass names, in a refusal of `cpuConfig.exclusive: false`, the
+	// class whose devices are owned where partitions are used.
+	OwnedClass string
+	// Node names, in the same refusal, the node that runs without
+	// partitions.
+	Node string
+}
+
+// FlaggedExclusive is the kind of a request on shared devices that sets
+// `cpuConfig.exclusive: true`, which takes CPUs of its own from them.
+func FlaggedExclusive() Kind {
+	return Kind{Owned: true, Exclusive: "exclusive request (`cpuConfig.exclusive: true`)"}
 }
 
 // ClassKinds returns the kind of every DeviceClass the chart renders for cfg,
@@ -64,7 +76,7 @@ func ClassKinds(driverName string, cfg driverconfig.Config) map[string]Kind {
 			case partition.Role == device.PARTITION_ROLE_DEFAULT:
 				kinds[class] = Kind{Shared: true}
 			case partition.Role == device.PARTITION_ROLE_EXCLUSIVE:
-				kinds[class] = Kind{Owned: true, Exclusive: fmt.Sprintf("exclusive request (class %s)", class)}
+				kinds[class] = Kind{Owned: true, Exclusive: fmt.Sprintf("exclusive request (class %s)", class), OwnedClass: class}
 			}
 		}
 	}
@@ -94,6 +106,7 @@ type judged struct {
 	hasAmount bool
 	spread    string
 	limit     *v1alpha1.Limit
+	exclusive *bool
 }
 
 // noun names the request, or the alternative the scheduler may pick.
@@ -173,6 +186,30 @@ func CheckClaim(spec *resourceapi.ResourceClaimSpec, driverName string, kindOf f
 		}
 	}
 
+	for i := range requests {
+		var flagged []entry
+		for _, e := range entries {
+			if e.config.Exclusive != nil && e.reaches(requests[i].ref) {
+				flagged = append(flagged, e)
+			}
+		}
+		if len(flagged) > 1 {
+			return fmt.Errorf("%s: cpuConfig.exclusive set by two config entries (#%d and #%d); set it in one entry", requests[i].noun(), flagged[0].index, flagged[1].index)
+		}
+		if len(flagged) == 1 {
+			requests[i].exclusive = flagged[0].config.Exclusive
+		}
+	}
+
+	for i := range requests {
+		if err := checkExclusiveFlag(requests[i], driverName); err != nil {
+			return err
+		}
+		if requests[i].kind.Shared && requests[i].exclusive != nil && *requests[i].exclusive {
+			requests[i].kind = FlaggedExclusive()
+		}
+	}
+
 	for _, j := range requests {
 		if err := checkLimit(j); err != nil {
 			return err
@@ -233,6 +270,20 @@ func spreadOf(mode resourceapi.DeviceAllocationMode, count int64) string {
 		return fmt.Sprintf("`count: %d`", count)
 	}
 	return ""
+}
+
+// checkExclusiveFlag refuses `cpuConfig.exclusive: false` where the request's
+// devices are owned, which give no share to ask for.
+func checkExclusiveFlag(j judged, driverName string) error {
+	if j.exclusive == nil || *j.exclusive || !j.kind.Owned {
+		return nil
+	}
+	if j.kind.OwnedClass != "" {
+		return fmt.Errorf("%s: `cpuConfig.exclusive: false`, but class %s gives exclusive CPUs only; drop cpuConfig.exclusive, or use a shared class such as %s",
+			j.noun(), j.kind.OwnedClass, driverName)
+	}
+	return fmt.Errorf("%s: `cpuConfig.exclusive: false`, but node %q runs without partitions, where %s gives exclusive CPUs only; add `- name: default` to cpuPartitions, or drop cpuConfig.exclusive",
+		j.noun(), j.kind.Node, driverName)
 }
 
 // checkLimit refuses a numeric limit on owned CPUs, which it would throttle,

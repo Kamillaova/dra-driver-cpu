@@ -33,6 +33,9 @@ type Config struct {
 	HasCPUs bool
 	// Limit is the CPU limit as written, nil where the configuration sets none.
 	Limit *v1alpha1.Limit
+	// Exclusive is cpuConfig.exclusive as written, nil where the configuration
+	// leaves it out.
+	Exclusive *bool
 }
 
 // ParseOpaqueConfig decodes the raw opaque parameters into the driver's internal format
@@ -50,7 +53,7 @@ func ParseOpaqueConfig(raw []byte) (Config, error) {
 
 	switch config.APIVersion {
 	case v1alpha1.APIVersion:
-		parsed := Config{Limit: config.CPUConfig.Limit}
+		parsed := Config{Limit: config.CPUConfig.Limit, Exclusive: config.CPUConfig.Exclusive}
 		if config.CPUConfig.CPUSet == "" {
 			return parsed, nil
 		}
