@@ -91,6 +91,7 @@ The driver allocates the specified cores directly (after validating that they ar
 > [!IMPORTANT]
 > **Validation Rules:**
 >
+> - **Strict Keys**: Keys are case-sensitive. A key the schema above does not name, a key in another casing, or a key written twice fails the preparation.
 > - The `cpuset` value must be specified in standard Linux cpuset format representing ranges and/or individual cores (e.g. `"2-5"`, `"1-10,15"`).
 > - **Per-Request Configurations Only**: In `status.allocation.devices.config[]`, every configuration block's `requests` array must map to exactly one request in the claim. We do not support multiple claim requests mapping to the same cpuset config.
 > - **ResourceClaim Source**: Opaque configurations must originate from the `ResourceClaim`. Configurations defined in DeviceClass (`spec.config[]`) are not supported and will result in a validation error. Since a configuration in the `DeviceClass` applies to all claims referencing it, configuring a `cpuset` there would assign the same CPUs to multiple claims, failing allocation due to conflict between claims.

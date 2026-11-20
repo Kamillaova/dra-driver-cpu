@@ -17,19 +17,24 @@ limitations under the License.
 package allocation
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/api/allocation/v1alpha1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/cpuset"
+	"sigs.k8s.io/json"
 )
 
 // ParseOpaqueConfig decodes the raw opaque parameters into the driver's internal format
 // based on the apiVersion.
 func ParseOpaqueConfig(raw []byte) (cpuset.CPUSet, error) {
 	var config v1alpha1.OpaqueConfig
-	if err := json.Unmarshal(raw, &config); err != nil {
+	strictErrs, err := json.UnmarshalStrict(raw, &config)
+	if err != nil {
 		return cpuset.CPUSet{}, fmt.Errorf("failed to unmarshal opaque config: %w", err)
+	}
+	if len(strictErrs) > 0 {
+		return cpuset.CPUSet{}, fmt.Errorf("opaque config: %w", runtime.NewStrictDecodingError(strictErrs))
 	}
 
 	switch config.APIVersion {
