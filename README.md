@@ -114,6 +114,7 @@ See our [backward compatibility policy](docs/user/upgrade.md#backward-compatibil
 - [Feature Support](docs/user/feature-support.md) - supported/unsupported features.
 - [Matching Kubelet CPU Manager Options](docs/user/feature-support.md#matching-cpu-manager-options) - kubelet cpumanager policy options and their driver equivalents.
 - [Workload Configuration Requirements](docs/user/workload-requirements.md) - how to set pod/container CPU requests alongside DRA claims.
+- [Threaded Cgroups](docs/user/threaded-cgroups.md) - splitting a container's cgroup into threaded groups for the workload to place its threads in.
 - [Custom Opaque CPUSet Allocation Overrides](docs/user/opaque-cpuset-overrides.md) - implement explicit core assignment when the external allocator integration is enabled; recommended upgrade path for users of `individual` mode.
 - [Metrics](docs/user/metrics.md) - Prometheus metrics exposed by the driver.
 - [Device Attributes and Selectors](docs/user/device-attributes.md) - selectable device attributes, CEL selector examples, and sample `ResourceSlice` output in each mode.
@@ -126,6 +127,7 @@ See our [backward compatibility policy](docs/user/upgrade.md#backward-compatibil
 - [Linting](docs/dev/linting.md) - running and auto-fixing lint issues.
 - [Logging Guidelines](docs/dev/logging.md)
 - [Configuration Guidelines](docs/dev/configuration.md) - about adding more tunables to the driver
+- [Writing the Host's Cgroup Tree](docs/dev/cgroup-writes.md) - why the threaded modes write cgroupfs directly, and the privileges they need
 - [Deep dive: PCI/PCIe root buses on Linux](docs/dev/pci-bus-linux-sysfs.md)
 - [Deep dive: Linux topology reporting](docs/dev/topology-linux-sysfs.md)
 
