@@ -257,7 +257,8 @@ func TestPrepareThreadedClaims(t *testing.T) {
 }
 
 // writableTree is a cgroup2 tree in memory: mkdir makes a cgroup's files, a
-// write to a file the tree lacks fails, and chown records the owner.
+// child turned threaded makes its parent a thread root (cgroup-v2.rst:377-379),
+// a write to a file the tree lacks fails, and chown records the owner.
 type writableTree struct {
 	fstest.MapFS
 	owners map[string]cgroupfs.Owner
@@ -284,9 +285,10 @@ func (w *writableTree) Mkdir(name string, perm fs.FileMode) error {
 		return &fs.PathError{Op: "mkdir", Path: name, Err: fs.ErrExist}
 	}
 	w.MapFS[name] = &fstest.MapFile{Mode: fs.ModeDir | perm}
-	for _, file := range []string{"cgroup.procs", "cgroup.threads", "cgroup.type", "cgroup.subtree_control", "cpuset.cpus", "cpu.max", "cpu.weight"} {
+	for _, file := range []string{"cgroup.procs", "cgroup.threads", "cgroup.subtree_control", "cpuset.cpus", "cpu.max", "cpu.weight"} {
 		w.MapFS[path.Join(name, file)] = &fstest.MapFile{}
 	}
+	w.MapFS[path.Join(name, "cgroup.type")] = &fstest.MapFile{Data: []byte("domain")}
 	return nil
 }
 
@@ -296,6 +298,11 @@ func (w *writableTree) WriteFile(name string, data []byte) error {
 		return &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
 	}
 	file.Data = slices.Clone(data)
+	if path.Base(name) == "cgroup.type" && string(data) == "threaded" {
+		if parent, ok := w.MapFS[path.Join(path.Dir(path.Dir(name)), "cgroup.type")]; ok && string(parent.Data) == "domain" {
+			parent.Data = []byte("domain threaded")
+		}
+	}
 	return nil
 }
 
@@ -788,6 +795,231 @@ func TestSynchronizeKeepsThreadedContainersUnderOlderRules(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Synchronize finds each running threaded container's thread root by the
+// kernel's mark and one of its groups, wherever the process sits, makes the
+// groups that are missing and hands their files to the user the process runs
+// as now; where it finds none it builds the groups where the init is, moving
+// no process. A repair that fails is logged and counted, and fails nothing.
+func TestSynchronizeRepairsThreadedTrees(t *testing.T) {
+	const (
+		runcCgroup = "kubepods/burstable/podvm/vm"
+		crunScope  = "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podvm.slice/cri-containerd-vm.scope"
+	)
+	init := fmt.Sprintf("%d\n", vmInit)
+	started := cgroupfs.Owner{UID: 2038693885, GID: 2038693886}
+	now := cgroupfs.Owner{UID: 65532, GID: 65533}
+	for _, tc := range []struct {
+		name        string
+		mode        string
+		cgroupsPath string
+		procs       map[string]string
+		state       api.ContainerState
+		started     bool
+		damage      func(tree *writableTree)
+		wantRoot    string
+		wantMade    []string
+		wantKept    []string
+		wantPlaced  bool
+		wantErrors  float64
+	}{{
+		name:        "a tree missing one group",
+		mode:        "create",
+		cgroupsPath: "/" + runcCgroup,
+		procs:       map[string]string{runcCgroup: init},
+		started:     true,
+		damage: func(tree *writableTree) {
+			for name := range tree.MapFS {
+				if strings.HasPrefix(name, runcCgroup+"/vmm-cpu") {
+					delete(tree.MapFS, name)
+				}
+			}
+			tree.MapFS[runcCgroup+"/vcpu/cpuset.cpus"].Data = []byte("0-5")
+		},
+		wantRoot: runcCgroup,
+		wantMade: []string{"vmm-cpu"},
+		wantKept: []string{"vcpu"},
+	}, {
+		name:        "a thread root below the container's cgroup, the process in its place group",
+		mode:        "place",
+		cgroupsPath: "kubepods-burstable-podvm.slice:cri-containerd:vm",
+		procs:       map[string]string{crunScope: "", crunScope + "/container": init},
+		started:     true,
+		damage: func(tree *writableTree) {
+			tree.MapFS[crunScope+"/container/cgroup.procs"].Data = nil
+			for name := range tree.MapFS {
+				if strings.HasPrefix(name, crunScope+"/container/vcpu") {
+					delete(tree.MapFS, name)
+				}
+			}
+		},
+		wantRoot:   crunScope + "/container",
+		wantMade:   []string{"vcpu"},
+		wantKept:   []string{"vmm-cpu"},
+		wantPlaced: true,
+	}, {
+		name:        "a container whose start the driver missed",
+		mode:        "place",
+		cgroupsPath: "/" + runcCgroup,
+		procs:       map[string]string{runcCgroup: init},
+		wantRoot:    runcCgroup,
+		wantMade:    []string{"vcpu", "vmm-cpu"},
+	}, {
+		name:        "a missed start whose init is outside the container's cgroup",
+		mode:        "place",
+		cgroupsPath: "/" + runcCgroup,
+		procs:       map[string]string{runcCgroup: "", "kubepods/elsewhere": init},
+		wantErrors:  1,
+	}, {
+		name:        "a created container, which has no cgroup yet",
+		mode:        "place",
+		cgroupsPath: "/" + runcCgroup,
+		procs:       map[string]string{runcCgroup: ""},
+		state:       api.ContainerState_CONTAINER_CREATED,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			tree := newWritableTree(t, tc.procs)
+			reg := prometheus.NewRegistry()
+			d, pod := threadedDriver(t, tc.mode, tree, reg)
+			d.ownCgroupFound = true
+			state := tc.state
+			if state == api.ContainerState_CONTAINER_UNKNOWN {
+				state = api.ContainerState_CONTAINER_RUNNING
+			}
+			vm := &api.Container{Id: "vm", Name: "compute", PodSandboxId: pod.Id, Pid: vmInit, Env: claimEnv("vm", "vcpu", "vmm-cpu"), State: state,
+				Linux: &api.LinuxContainer{CgroupsPath: tc.cgroupsPath, Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-5"}}}}
+			if tc.started {
+				require.NoError(t, d.StartContainer(ctx, pod, vm))
+				tc.damage(tree)
+			}
+			d.providers.Processes = fakeProcesses{
+				status: map[int]string{vmInit: fmt.Sprintf("Uid:\t1\t1\t1\t%d\nGid:\t1\t1\t1\t%d\n", now.UID, now.GID)},
+				cgroup: map[int]string{vmInit: "0::/kubepods/elsewhere\n"},
+			}
+
+			_, err := d.Synchronize(ctx, []*api.PodSandbox{pod}, []*api.Container{vm})
+			require.NoError(t, err, "a repair never fails Synchronize")
+			require.Equal(t, tc.wantErrors, counterOrZero(t, reg, "dra_cpu_threaded_containers_total", map[string]string{"mode": tc.mode, "result": "repair_error"}))
+			if tc.wantRoot == "" {
+				require.Empty(t, d.podState.ThreadedContainers())
+				for name := range tree.MapFS {
+					require.NotContains(t, name, "vcpu", "no group is built")
+				}
+				return
+			}
+			require.Equal(t, tc.wantRoot, d.podState.ThreadedContainers()["vm"].ThreadRoot)
+			for _, want := range []struct{ group, cpus, max, weight string }{
+				{group: "vcpu", cpus: "1,5", max: "max 100000", weight: "1"},
+				{group: "vmm-cpu", cpus: "0,2-4", max: "25000 100000", weight: "10000"},
+			} {
+				child := path.Join(tc.wantRoot, want.group)
+				require.Equal(t, "threaded", tree.read(t, path.Join(child, "cgroup.type")), want.group)
+				require.Equal(t, want.cpus, tree.read(t, path.Join(child, "cpuset.cpus")), want.group)
+				require.Equal(t, want.max, tree.read(t, path.Join(child, "cpu.max")), want.group)
+				require.Equal(t, want.weight, tree.read(t, path.Join(child, "cpu.weight")), want.group)
+			}
+			for _, group := range tc.wantMade {
+				child := path.Join(tc.wantRoot, group)
+				require.Equal(t, now, tree.owners[path.Join(child, "cgroup.threads")], "a group made now is handed to the process's user now: %s", group)
+				require.Equal(t, now, tree.owners[path.Join(child, "cgroup.procs")], group)
+			}
+			for _, group := range tc.wantKept {
+				require.Equal(t, started, tree.owners[path.Join(tc.wantRoot, group, "cgroup.threads")], "a group that was there keeps its owner: %s", group)
+			}
+			placed := tree.read(t, path.Join(tc.wantRoot, "vmm-cpu", "cgroup.procs"))
+			if tc.wantPlaced {
+				require.Equal(t, "4242", placed)
+			} else {
+				require.Empty(t, placed, "Synchronize moves no process")
+			}
+		})
+	}
+}
+
+// counterOrZero reads a counter whose series is made on its first count.
+func counterOrZero(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.Metric {
+			if metricLabelsMatch(metric, labels) {
+				return metricSampleValue(metric)
+			}
+		}
+	}
+	return 0
+}
+
+// A created container the kubelet never started and its running retry share
+// a name: Synchronize keeps the running one's state, in either order, and
+// repairs its groups alone.
+func TestSynchronizeKeepsTheRunningContainerOfAName(t *testing.T) {
+	const root = "kubepods/burstable/podvm/retry"
+	for _, order := range []string{"orphan first", "retry first"} {
+		t.Run(order, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			tree := newWritableTree(t, map[string]string{root: fmt.Sprintf("%d\n", vmInit)})
+			d, pod := threadedDriver(t, "create", tree, nil)
+			d.ownCgroupFound = true
+			orphan := &api.Container{Id: "orphan", Name: "compute", PodSandboxId: pod.Id, Env: claimEnv("vm", "vcpu", "vmm-cpu"), State: api.ContainerState_CONTAINER_CREATED,
+				Linux: &api.LinuxContainer{CgroupsPath: "/kubepods/burstable/podvm/orphan"}}
+			retry := &api.Container{Id: "retry", Name: "compute", PodSandboxId: pod.Id, Pid: vmInit, Env: claimEnv("vm", "vcpu", "vmm-cpu"), State: api.ContainerState_CONTAINER_RUNNING,
+				Linux: &api.LinuxContainer{CgroupsPath: "/" + root, Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-5"}}}}
+			listed := []*api.Container{orphan, retry}
+			if order == "retry first" {
+				listed = []*api.Container{retry, orphan}
+			}
+			_, err := d.Synchronize(ctx, []*api.PodSandbox{pod}, listed)
+			require.NoError(t, err)
+			state := d.podState.GetContainerState("pod", "compute")
+			require.NotNil(t, state)
+			require.True(t, state.MatchesContainer("compute", "retry"), "the running container's state is kept")
+			require.Equal(t, map[types.UID]store.ThreadedContainer{"retry": {ThreadRoot: root, ClaimRequests: []store.ClaimRequestRef{
+				{ClaimUID: "vm", Request: "vcpu"}, {ClaimUID: "vm", Request: "vmm-cpu"}}}}, d.podState.ThreadedContainers())
+			owner, bound := d.allocationState.Owner("vm")
+			require.True(t, bound)
+			require.Equal(t, store.OwnerIdent{PodUID: "pod", ContainerName: "compute"}, owner)
+		})
+	}
+}
+
+// Synchronize repairs nothing for a container kept under the rule against two
+// claims giving one group name: one group built for both is what the rule
+// keeps out.
+func TestSynchronizeRepairsNoSharedGroup(t *testing.T) {
+	ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+	const root = "kubepods/burstable/podvm/app"
+	tree := newWritableTree(t, map[string]string{root: fmt.Sprintf("%d\n", vmInit)})
+	d := sharingDriver(t, true, nil, nil)
+	d.cgroupThreadedMode = "create"
+	d.cgroups = tree
+	d.ownCgroupFound = true
+	d.eventRecorder = &capturingRecorder{}
+	d.providers.Processes = fakeProcesses{status: map[int]string{vmInit: vmInitStatus}}
+	results, err := d.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{
+		withConfig(claimWithResults("a", claimResult{request: "vcpu", written: "1", consumed: "1", device: "cpudevnuma000-vms"}),
+			resourceapi.AllocationConfigSourceClaim, nil, threadedParams(`{"enabled": true}`)),
+		withConfig(claimWithResults("b", claimResult{request: "vcpu", written: "1", consumed: "1", device: "cpudevnuma000-vms"}),
+			resourceapi.AllocationConfigSourceClaim, nil, threadedParams(`{"enabled": true}`)),
+	})
+	require.NoError(t, err)
+	for uid, result := range results {
+		require.NoError(t, result.Err, "claim %s", uid)
+	}
+	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "vm", Namespace: "vms"}
+	ctr := &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Pid: vmInit, Env: append(claimEnv("a", "vcpu"), claimEnv("b", "vcpu")...),
+		State: api.ContainerState_CONTAINER_RUNNING, Linux: &api.LinuxContainer{CgroupsPath: "/" + root}}
+	_, err = d.Synchronize(ctx, []*api.PodSandbox{pod}, []*api.Container{ctr})
+	require.NoError(t, err)
+	_, built := tree.MapFS[path.Join(root, "vcpu")]
+	require.False(t, built, "no group is built for both claims")
+	require.Empty(t, d.podState.ThreadedContainers())
 }
 
 // Synchronize writes no quota for a threaded claim's capped share, which its
