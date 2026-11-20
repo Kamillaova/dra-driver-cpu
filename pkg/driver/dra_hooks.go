@@ -31,6 +31,7 @@ import (
 	allocationapi "github.com/kubernetes-sigs/dra-driver-cpu/api/allocation"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/admission"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/coreselect"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuallocator"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
@@ -172,8 +173,9 @@ func (cp *CPUDriver) reserveResourceClaimAllocation(logger logr.Logger, claimUID
 }
 
 // claimRecord records a request's exclusive CPUs and its share apart where
-// its results lie on owned and shared devices both, each by its own role.
-func claimRecord(claim *resourceapi.ResourceClaim, byRequest map[string]cpuset.CPUSet, shares map[string]store.RequestAllocation) store.ClaimRecord {
+// its results lie on owned and shared devices both, each by its own role, and
+// in a threaded claim the group each request's CPUs land in.
+func claimRecord(claim *resourceapi.ResourceClaim, byRequest map[string]cpuset.CPUSet, shares map[string]store.RequestAllocation, layout threadedLayout) store.ClaimRecord {
 	record := store.ClaimRecord{Namespace: claim.Namespace, Name: claim.Name}
 	for _, request := range slices.Sorted(maps.Keys(byRequest)) {
 		record.Requests = append(record.Requests, store.RequestAllocation{Request: request, CPUs: byRequest[request]})
@@ -184,12 +186,18 @@ func claimRecord(claim *resourceapi.ResourceClaim, byRequest map[string]cpuset.C
 	slices.SortFunc(record.Requests, func(a, b store.RequestAllocation) int {
 		return cmp.Or(strings.Compare(a.Request, b.Request), strings.Compare(string(a.Role), string(b.Role)))
 	})
+	if layout.groups != nil {
+		record.Layout = &store.Layout{Place: layout.place}
+		for i := range record.Requests {
+			record.Requests[i].Group = layout.groups[record.Requests[i].Request]
+		}
+	}
 	return record
 }
 
 // addShare records a shared result under the request it belongs to, capped
 // at its amount where it books one.
-func addShare(shares map[string]store.RequestAllocation, alloc resourceapi.DeviceRequestAllocationResult, deviceCPUs cpuset.CPUSet, capMilli int64) {
+func (cp *CPUDriver) addShare(shares map[string]store.RequestAllocation, alloc resourceapi.DeviceRequestAllocationResult, deviceCPUs cpuset.CPUSet, capMilli int64) {
 	request := resourceclaim.BaseRequestRef(alloc.Request)
 	share := shares[request]
 	share.Request = request
@@ -197,7 +205,58 @@ func addShare(shares map[string]store.RequestAllocation, alloc resourceapi.Devic
 	share.CPUs = share.CPUs.Union(deviceCPUs)
 	share.Devices = append(share.Devices, alloc.Device)
 	share.Cap = capMilli
+	if consumed, ok := device.LookupConsumedCapacity(alloc.ConsumedCapacity, cp.driverName); ok {
+		share.Amount += consumed.MilliValue()
+	}
 	shares[request] = share
+}
+
+// threadedLayout is the split of a threaded claim's container on one
+// allocation: the group each request's CPUs land in, and the group its
+// process starts in. groups is nil for a claim that is not threaded.
+type threadedLayout struct {
+	groups map[string]string
+	place  string
+}
+
+// claimLayout judges the claim's threaded block and the node's mode, and
+// returns the group each request's results land in. A group no result reaches
+// is not built, so place may not name one.
+func (cp *CPUDriver) claimLayout(claim *resourceapi.ResourceClaim) (threadedLayout, error) {
+	block, err := admission.Threaded(&claim.Spec, cp.driverName, cp.kindOf(claim))
+	if err != nil || !block.Enabled {
+		return threadedLayout{}, err
+	}
+	switch {
+	case !threadedModeOn(cp.cgroupThreadedMode):
+		return threadedLayout{}, fmt.Errorf("node %q runs `cgroupThreadedMode: false`; threaded cgroups need create or place", cp.nodeName)
+	case block.Place != "" && cp.cgroupThreadedMode == cgroupfs.ThreadedModeCreate:
+		return threadedLayout{}, fmt.Errorf("cgroupConfig.threaded.place %q: node %q runs `cgroupThreadedMode: create`, which moves no process; drop place", block.Place, cp.nodeName)
+	}
+	layout := threadedLayout{groups: map[string]string{}, place: block.Place}
+	for _, result := range claim.Status.Allocation.Devices.Results {
+		if result.Driver != cp.driverName {
+			continue
+		}
+		if group, ok := admission.GroupOf(block, result.Request); ok {
+			layout.groups[resourceclaim.BaseRequestRef(result.Request)] = group
+		}
+	}
+	if block.Place != "" && !slices.Contains(slices.Collect(maps.Values(layout.groups)), block.Place) {
+		return threadedLayout{}, fmt.Errorf("cgroupConfig.threaded.place %q: group %q received no result on this allocation and is not built; place a group that names a request", block.Place, block.Place)
+	}
+	return layout, nil
+}
+
+// requestGroup returns the threaded group a request's CPUs land in, "" where
+// its claim is not threaded.
+func requestGroup(record store.ClaimRecord, request string) string {
+	for _, held := range record.Requests {
+		if held.Request == request {
+			return held.Group
+		}
+	}
+	return ""
 }
 
 // shareCap returns the cap of a shared result in millicores: its numeric
@@ -228,10 +287,12 @@ func (cp *CPUDriver) shareCap(claim *resourceapi.ResourceClaim, alloc resourceap
 	return amount.MilliValue(), nil
 }
 
-// checkClassConfig refuses a limit or the exclusive flag a DeviceClass
-// gives: a class is shared by every claim that names it, and its config
-// cannot be changed per claim.
+// checkClassConfig refuses a cgroupConfig a DeviceClass gives, and in
+// grouped mode, where Prepare reads them, a limit or the exclusive flag: a
+// class is shared by every claim that names it, and its config cannot be
+// changed per claim.
 func (cp *CPUDriver) checkClassConfig(claim *resourceapi.ResourceClaim) error {
+	grouped := cp.cpuDeviceMode == device.CPU_DEVICE_MODE_GROUPED
 	for _, alloc := range claim.Status.Allocation.Devices.Results {
 		if alloc.Driver != cp.driverName {
 			continue
@@ -244,11 +305,14 @@ func (cp *CPUDriver) checkClassConfig(claim *resourceapi.ResourceClaim) error {
 			if err != nil {
 				return err
 			}
-			if parsed.Limit != nil {
+			if grouped && parsed.Limit != nil {
 				return fmt.Errorf("DeviceClass %q sets cpuConfig.limit; set it in the claim", requestDeviceClass(claim, alloc.Request))
 			}
-			if parsed.Exclusive != nil {
+			if grouped && parsed.Exclusive != nil {
 				return fmt.Errorf("DeviceClass %q sets cpuConfig.exclusive; set it in the claim", requestDeviceClass(claim, alloc.Request))
+			}
+			if !parsed.Threaded.IsZero() {
+				return fmt.Errorf("DeviceClass %q sets cgroupConfig; set it in the claim", requestDeviceClass(claim, alloc.Request))
 			}
 		}
 	}
@@ -264,7 +328,7 @@ func (cp *CPUDriver) kindOf(claim *resourceapi.ResourceClaim) func(ref, class st
 			kind.Node = cp.nodeName
 			return kind, true
 		}
-		kind := admission.Kind{Node: cp.nodeName}
+		kind := admission.Kind{Node: cp.nodeName, FromAllocation: true}
 		allocated := false
 		for _, alloc := range claim.Status.Allocation.Devices.Results {
 			if alloc.Driver != cp.driverName || alloc.Request != ref {
@@ -413,6 +477,10 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 	if err := cp.checkClassConfig(claim); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
+	layout, err := cp.claimLayout(claim)
+	if err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
 
 	var assignedCPUs cpuset.CPUSet
 	byRequest := make(map[string]cpuset.CPUSet)
@@ -446,7 +514,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			if err != nil {
 				return kubeletplugin.PrepareResult{Err: err}
 			}
-			addShare(shares, alloc, deviceCPUs, capMilli)
+			cp.addShare(shares, alloc, deviceCPUs, capMilli)
 			logger.V(4).Info("found shared CPU request", "device", alloc.Device)
 			continue
 		}
@@ -530,7 +598,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 		return kubeletplugin.PrepareResult{}
 	}
 
-	record := claimRecord(claim, byRequest, shares)
+	record := claimRecord(claim, byRequest, shares, layout)
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
@@ -889,9 +957,16 @@ func (cp *CPUDriver) prepareIndividualResourceClaimLocked(logger logr.Logger, cl
 			Err: heldBy(fmt.Errorf("claim %s/%s has overlapping device assignment with other claims", claim.Namespace, claim.Name), cp.allocationState.Holders(claimCPUSet)),
 		}
 	}
+	if err := cp.checkClassConfig(claim); err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+	layout, err := cp.claimLayout(claim)
+	if err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
 
 	// Reserve before CDI I/O so concurrent Prepare calls cannot select the same CPUs.
-	record := claimRecord(claim, byRequest, nil)
+	record := claimRecord(claim, byRequest, nil, layout)
 	if err := cp.reserveResourceClaimAllocation(logger, claim.UID, record); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
@@ -953,6 +1028,9 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 				metadataAttrs[string(device.AttributeCPUSet)] = resourceapi.DeviceAttribute{
 					StringValue: new(exclusiveCPUs.String()),
 				}
+			}
+			if group := requestGroup(record, ref.Request); group != "" {
+				metadataAttrs[string(device.AttributeGroup)] = resourceapi.DeviceAttribute{StringValue: new(group)}
 			}
 			preparedDevice.Metadata = &kubeletplugin.DeviceMetadata{
 				Attributes: metadataAttrs,
@@ -1076,7 +1154,7 @@ func (cp *CPUDriver) writeClaimDevices(logger logr.Logger, claim *resourceapi.Re
 	}
 
 	envByDevice := make(map[string]string, len(record.Requests))
-	cdiRecord := cdiClaimRecord{Namespace: record.Namespace, Name: record.Name}
+	cdiRecord := cdiClaimRecord{Namespace: record.Namespace, Name: record.Name, Layout: record.Layout}
 	for _, request := range record.Requests {
 		deviceName := getCDIRequestDeviceName(claim.UID, request.Request)
 		envByDevice[deviceName] = fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claim.UID, request.Request, cdiEnvDynamicValue)
@@ -1091,6 +1169,7 @@ func (cp *CPUDriver) writeClaimDevices(logger logr.Logger, claim *resourceapi.Re
 			Role:    request.Role,
 			Results: results,
 			Cap:     request.Cap,
+			Group:   request.Group,
 		})
 	}
 	for _, allocResult := range claim.Status.Allocation.Devices.Results {

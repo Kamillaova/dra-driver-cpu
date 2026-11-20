@@ -3330,6 +3330,7 @@ func metadataFromCPUInfo(cpu cpuinfo.CPUInfo, smtEnabled bool) *kubeletplugin.De
 		string(devattr.AttributeFullPhysicalCPUsOnly):            {BoolValue: new(false)},
 		string(devattr.AttributeAllocator):                       {StringValue: new(cpuallocator.ModeCPUManager)},
 		string(devattr.AttributeAllowFractionalCapacityRequests): {BoolValue: new(false)},
+		string(devattr.AttributeCgroupThreadedMode):              {StringValue: new("off")},
 		string(devattr.AttributePartition):                       {StringValue: new(devattr.DefaultPartitionName)},
 		string(devattr.AttributeRole):                            {StringValue: new(devattr.PARTITION_ROLE_DEFAULT)},
 		string(devattr.AttributeAllowExclusive):                  {BoolValue: new(true)},
@@ -3407,6 +3408,7 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 	attrs[string(devattr.AttributeFullPhysicalCPUsOnly)] = resourceapi.DeviceAttribute{BoolValue: new(false)}
 	attrs[string(devattr.AttributeAllocator)] = resourceapi.DeviceAttribute{StringValue: new(allocator)}
 	attrs[string(devattr.AttributeAllowFractionalCapacityRequests)] = resourceapi.DeviceAttribute{BoolValue: new(false)}
+	attrs[string(devattr.AttributeCgroupThreadedMode)] = resourceapi.DeviceAttribute{StringValue: new("off")}
 	attrs[string(devattr.AttributePartition)] = resourceapi.DeviceAttribute{StringValue: new(devattr.DefaultPartitionName)}
 	attrs[string(devattr.AttributeRole)] = resourceapi.DeviceAttribute{StringValue: new(devattr.PARTITION_ROLE_DEFAULT)}
 	attrs[string(devattr.AttributeAllowExclusive)] = resourceapi.DeviceAttribute{BoolValue: new(true)}

@@ -201,6 +201,25 @@ on - is configured through other Helm values, not through this file.
   default, degraded partitions are always tainted and the option is removed, after a release that
   deprecates it.
 
+`cgroupThreadedMode` (`false` or `create`, default: `false`)
+
+- Whether the driver splits the cgroup of a container whose claim sets
+  `cgroupConfig.threaded.enabled: true` into threaded groups, one per request, or per entry of
+  `cgroupConfig.threaded.groups`, each with its own CPUs, limit and weight, so that the workload can
+  place each of its threads in the group it belongs to.
+- `false`: the driver writes no cgroup, and refuses to prepare a claim with
+  `cgroupConfig.threaded.enabled: true`.
+- `create`: when a threaded container starts, the driver builds its groups under the cgroup that
+  holds the container's first process, the container's own cgroup or, under crun, a cgroup below it,
+  and hands the files that move processes and threads into them to the user that process runs as.
+  It moves no process: the workload moves itself into its group, then places its threads. It needs
+  the host's cgroup v2 hierarchy read-write and the host's pid namespace; see
+  [Threaded cgroups: the startup check](#threaded-cgroups-the-startup-check).
+- Write `false` as the boolean. A YAML 1.1 reader, which reads the configuration file, takes an
+  unquoted `off` or `no` as `false` too, while a quoted `"off"` is refused when the configuration
+  loads: `invalid cgroupThreadedMode "off": must be false, "create" or "place"`.
+- One value for every node: profiles do not carry it.
+
 `cpuPartitions` (list of partitions, default: none)
 
 - Splits the node's CPUs into named partitions; see [CPU Partitions](cpu-partitions.md). Each entry
@@ -260,12 +279,13 @@ Every device the driver publishes carries the settings that decide whether the d
 claim, so that a claim's selector can keep it off the nodes that would refuse it after the
 scheduler placed it there. Each attribute is named as its setting and is always present.
 
-| Attribute                                 | Type   | Value                                                                       | What the driver refuses to prepare                                                               |
-| ----------------------------------------- | ------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `dra.cpu/fullPhysicalCPUsOnly`            | bool   | `fullPhysicalCPUsOnly`                                                      | When `true`, an amount that whole cores of the device do not make up                             |
-| `dra.cpu/allocator`                       | string | `cpumanager` or `external`                                                  | In grouped mode, a `cpuConfig.cpuset` under `cpumanager`, a request without one under `external` |
-| `dra.cpu/allowFractionalCapacityRequests` | bool   | `allowFractionalCapacityRequests`                                           | When `false`, an amount on a shared request that is not a whole number of CPUs                   |
-| `dra.cpu/allowExclusive`                  | bool   | `true` on an owned device, the partition's `allowExclusive` on a shared one | When `false`, a request with `cpuConfig.exclusive: true`                                         |
+| Attribute                                 | Type   | Value                                                                       | What the driver refuses to prepare                                                                    |
+| ----------------------------------------- | ------ | --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `dra.cpu/fullPhysicalCPUsOnly`            | bool   | `fullPhysicalCPUsOnly`                                                      | When `true`, an amount that whole cores of the device do not make up                                  |
+| `dra.cpu/allocator`                       | string | `cpumanager` or `external`                                                  | In grouped mode, a `cpuConfig.cpuset` under `cpumanager`, a request without one under `external`      |
+| `dra.cpu/allowFractionalCapacityRequests` | bool   | `allowFractionalCapacityRequests`                                           | When `false`, an amount on a shared request that is not a whole number of CPUs                        |
+| `dra.cpu/allowExclusive`                  | bool   | `true` on an owned device, the partition's `allowExclusive` on a shared one | When `false`, a request with `cpuConfig.exclusive: true`                                              |
+| `dra.cpu/cgroupThreadedMode`              | string | `off`, `create` or `place`                                                  | `cgroupConfig.threaded.enabled: true` on `off`, and with it `cgroupConfig.threaded.place` on `create` |
 
 See [Whole physical cores](feature-support.md#whole-physical-cores) and
 [Custom Opaque CPUSet Allocation Overrides](opaque-cpuset-overrides.md) for these refusals.
@@ -305,6 +325,15 @@ its own:
         selectors:
         - cel:
             expression: device.attributes["dra.cpu"].allowExclusive
+```
+
+and a claim that sets `cgroupConfig.threaded.enabled: true` selects the nodes that build threaded
+groups:
+
+```yaml
+        selectors:
+        - cel:
+            expression: device.attributes["dra.cpu"].cgroupThreadedMode != "off"
 ```
 
 A selector that reads an attribute the device does not carry is a CEL runtime error, which fails

@@ -250,11 +250,13 @@ func TestAllocationStateRequestsSurviveBindAndUnbind(t *testing.T) {
 	logger := testr.New(t)
 	store := newTestAllocationState(logger, cpuset.New(0, 1, 2, 3), cpuset.New())
 	requests := []RequestAllocation{
-		{Request: "vcpus", CPUs: cpuset.New(0, 1)},
-		{Request: "helpers", CPUs: cpuset.New(2)},
-		{Request: "housekeeping", CPUs: cpuset.New(3), Role: RoleShared, Devices: []string{"cpudevnuma000"}, Cap: 250},
+		{Request: "vcpus", CPUs: cpuset.New(0, 1), Group: "vcpu"},
+		{Request: "helpers", CPUs: cpuset.New(2), Group: "vcpu"},
+		{Request: "housekeeping", CPUs: cpuset.New(3), Role: RoleShared, Devices: []string{"cpudevnuma000"}, Cap: 250, Amount: 100, Group: "vmm-cpu"},
 	}
-	require.NoError(t, store.Reserve(logger, "vm", ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: requests}, false))
+	layout := &Layout{Place: "vmm-cpu"}
+	require.NoError(t, store.Reserve(logger, "vm", ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: requests, Layout: layout}, false))
+	layout.Place = "changed"
 	byRequest := map[ClaimRequestRef]cpuset.CPUSet{
 		{ClaimUID: "vm", Request: "vcpus"}:   cpuset.New(0, 1),
 		{ClaimUID: "vm", Request: "helpers"}: cpuset.New(2),
@@ -264,8 +266,10 @@ func TestAllocationStateRequestsSurviveBindAndUnbind(t *testing.T) {
 		require.True(t, ok)
 		return record
 	}
-	want := ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []RequestAllocation{requests[1], requests[2], requests[0]}}
-	require.Equal(t, want, recorded(store), "the record reads back sorted by request")
+	want := ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []RequestAllocation{requests[1], requests[2], requests[0]}, Layout: &Layout{Place: "vmm-cpu"}}
+	require.Equal(t, want, recorded(store), "the record reads back sorted by request, its layout copied")
+	recorded(store).Layout.Place = "changed"
+	require.Equal(t, want, recorded(store), "a record read back is a copy")
 
 	_, err := store.Bind(logger, "pod", "app", nil, byRequest)
 	require.NoError(t, err)

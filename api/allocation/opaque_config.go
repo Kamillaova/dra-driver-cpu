@@ -36,6 +36,9 @@ type Config struct {
 	// Exclusive is cpuConfig.exclusive as written, nil where the configuration
 	// leaves it out.
 	Exclusive *bool
+	// Threaded is cgroupConfig.threaded as written, its zero value where the
+	// configuration leaves it out.
+	Threaded v1alpha1.ThreadedConfig
 }
 
 // ParseOpaqueConfig decodes the raw opaque parameters into the driver's internal format
@@ -53,7 +56,7 @@ func ParseOpaqueConfig(raw []byte) (Config, error) {
 
 	switch config.APIVersion {
 	case v1alpha1.APIVersion:
-		parsed := Config{Limit: config.CPUConfig.Limit, Exclusive: config.CPUConfig.Exclusive}
+		parsed := Config{Limit: config.CPUConfig.Limit, Exclusive: config.CPUConfig.Exclusive, Threaded: config.CgroupConfig.Threaded}
 		if config.CPUConfig.CPUSet == "" {
 			return parsed, nil
 		}
