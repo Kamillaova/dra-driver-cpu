@@ -109,6 +109,7 @@ See our [backward compatibility policy](docs/user/upgrade.md#backward-compatibil
 - [Installation](docs/user/installation.md) - compatibility, runtime setup, security, uninstall, and migration from `install.yaml`.
 - [Upgrade](docs/user/upgrade.md) - backward compatibility policy and release-specific upgrade actions. Read this before upgrading the driver!
 - [Configuration](docs/user/configuration.md) - the config file schema, command-line flags, and kubelet prerequisites.
+- [CPU Partitions](docs/user/cpu-partitions.md) - partition roles, the `default` entry, machine preparation, the kubelet reservation, and changing a node's partitions.
 - [How it Works](docs/user/how-it-works.md) - driver architecture, CDI, and NRI integration.
 - [Feature Support](docs/user/feature-support.md) - supported/unsupported features.
 - [Matching Kubelet CPU Manager Options](docs/user/feature-support.md#matching-cpu-manager-options) - kubelet cpumanager policy options and their driver equivalents.
