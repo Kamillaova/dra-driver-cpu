@@ -3,9 +3,10 @@
 The driver is deployed as a DaemonSet. A single executable implements the DRA
 and NRI interfaces, and it owns the node-local CPU allocation state.
 Exactly one active driver instance is expected to manage each node.
-The driver manages all the available CPUs except those configured as reserved.
-The driver manages a single CPU pool, and partitioning that pool is currently
-unsupported.
+Without [CPU partitions](cpu-partitions.md), the driver manages all the
+available CPUs except those configured as reserved, as a single pool. With
+them, each partition's role decides which CPUs claims and containers without
+claims use.
 The singleton invariant is not currently enforced by the driver and must be
 guaranteed by the deployment.
 
