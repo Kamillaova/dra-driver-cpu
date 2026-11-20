@@ -144,13 +144,15 @@ conflicts.
 
 {{/*
 Refuses at render a driverConfig the driver refuses when it loads its
-configuration: a cpuPartitions list without the entry "default", and the
-groupBy and allocator values partitions do not use. The driver checks again
-and is the one that has to be right; the messages are the driver's. Included
-from every template that reads cpuPartitions.
+configuration: a cpuPartitions list without the entry "default", fleet-wide or
+in a profile, a profile without partitions, a partition name given two roles
+in different profiles, and the groupBy and allocator values partitions do not
+use. The driver checks again and is the one that has to be right; the messages
+are the driver's. Included from every template that reads cpuPartitions.
 */}}
 {{- define "dra-driver-cpu.checkCPUPartitions" -}}
 {{- $cfg := include "dra-driver-cpu.effectiveDriverConfig" . | fromYaml -}}
+{{- $noDefault := "cpuPartitions names partitions but no partition \"default\": add `- name: default` to cpuPartitions to use partitions" -}}
 {{- if $cfg.cpuPartitions -}}
 {{- $hasDefault := false -}}
 {{- range $cfg.cpuPartitions -}}
@@ -159,13 +161,55 @@ from every template that reads cpuPartitions.
 {{- end -}}
 {{- end -}}
 {{- if not $hasDefault -}}
-{{- fail "cpuPartitions names partitions but no partition \"default\": add `- name: default` to cpuPartitions to use partitions" -}}
+{{- fail $noDefault -}}
 {{- end -}}
 {{- if and (ne (toString $cfg.cpuDeviceMode) "individual") (eq (toString $cfg.groupBy) "machine") -}}
 {{- fail "invalid groupBy \"machine\" with cpuPartitions: needs allocator \"external\", which partitions do not use" -}}
 {{- end -}}
 {{- if eq (toString $cfg.allocator) "external" -}}
 {{- fail "invalid allocator \"external\" with cpuPartitions: must be \"cpumanager\"" -}}
+{{- end -}}
+{{- end -}}
+{{- if $cfg.profiles -}}
+{{- if and (ne (toString $cfg.cpuDeviceMode) "individual") (eq (toString $cfg.groupBy) "machine") -}}
+{{- fail "invalid groupBy \"machine\" with profiles: needs allocator \"external\", which partitions do not use" -}}
+{{- end -}}
+{{- if eq (toString $cfg.allocator) "external" -}}
+{{- fail "invalid allocator \"external\" with profiles: must be \"cpumanager\"" -}}
+{{- end -}}
+{{- /* range visits the profiles in the order of their names, as the driver does. */ -}}
+{{- $roles := dict -}}
+{{- range $name, $profile := $cfg.profiles -}}
+{{- $partitions := list -}}
+{{- if kindIs "map" $profile -}}
+{{- $partitions = $profile.cpuPartitions | default list -}}
+{{- end -}}
+{{- if not $partitions -}}
+{{- fail (printf "profile %q has no partitions; add `- name: default` to its cpuPartitions" $name) -}}
+{{- end -}}
+{{- $hasDefault := false -}}
+{{- range $partitions -}}
+{{- if and (kindIs "map" .) (eq (toString .name) "default") -}}
+{{- $hasDefault = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $hasDefault -}}
+{{- fail (printf "profile %q: %s" $name $noDefault) -}}
+{{- end -}}
+{{- range $partitions -}}
+{{- if and (kindIs "map" .) (ne (toString .name) "default") -}}
+{{- $partition := toString .name -}}
+{{- $role := toString (.role | default "") -}}
+{{- if hasKey $roles $partition -}}
+{{- $first := get $roles $partition -}}
+{{- if ne $first.role $role -}}
+{{- fail (printf "partition %q has role %q in profile %q and %q in profile %q; a partition keeps one role in every profile" $partition $first.role $first.profile $role $name) -}}
+{{- end -}}
+{{- else -}}
+{{- $_ := set $roles $partition (dict "profile" $name "role" $role) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
