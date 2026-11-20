@@ -18,12 +18,14 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/kubernetes-sigs/dra-driver-cpu/api/allocation/v1alpha1"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	e2eclient "github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/client"
 	"github.com/kubernetes-sigs/dra-driver-cpu/test/pkg/fixture"
@@ -36,6 +38,7 @@ import (
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )
 
@@ -137,6 +140,29 @@ var _ = ginkgo.Describe("Shared default devices", ginkgo.Label("partitions"), gi
 		expectShareMetadata(ctx, restConfig, fxt, pod, "0", "max")
 	})
 
+	for _, tc := range []struct {
+		name, amount, limit, cpuMax, cpuLimit, cpuRequest string
+	}{
+		{name: "replace the amount with a written limit as the cap", amount: "500m", limit: "1", cpuMax: "100000 100000", cpuRequest: "500m", cpuLimit: "1"},
+		{name: "run a share whose limit is max uncapped", amount: "500m", limit: "max", cpuMax: "max 100000", cpuRequest: "500m", cpuLimit: "max"},
+		{name: "cap a share of 0 at its written limit", amount: "0", limit: "500m", cpuMax: "50000 100000", cpuRequest: "0", cpuLimit: "500m"},
+	} {
+		ginkgo.It("should "+tc.name, func(ctx context.Context) {
+			fxt := rootFxt.WithPrefix("share-limit")
+			gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
+			ginkgo.DeferCleanup(fxt.Teardown)
+
+			spec := makeResourceClaimSpec(1, true)
+			spec.Devices.Requests[0].Exactly.Capacity.Requests[device.CPUResourceQualifiedName] = resource.MustParse(tc.amount)
+			withCPULimit(&spec, tc.limit)
+			pod := createTesterPodWithClaimSpec(ctx, fxt, dracpuTesterImage, targetNode.Name, spec, "share-limit")
+
+			gomega.Expect(getTesterPodCPUAllocation(fxt.K8SClientset, ctx, pod).CPUMax).To(gomega.Equal(tc.cpuMax),
+				"a share of %s with limit %s runs under another quota", tc.amount, tc.limit)
+			expectShareMetadata(ctx, restConfig, fxt, pod, tc.cpuRequest, tc.cpuLimit)
+		})
+	}
+
 	ginkgo.It("should refuse a container holding a second capped share", ginkgo.Label("negative"), func(ctx context.Context) {
 		fxt := rootFxt.WithPrefix("share-two-caps")
 		gomega.Expect(fxt.Setup(ctx)).To(gomega.Succeed())
@@ -163,6 +189,19 @@ var _ = ginkgo.Describe("Shared default devices", ginkgo.Label("partitions"), gi
 		gomega.Expect(createContainerError(ctx, fxt, pod)).To(gomega.ContainSubstring(want))
 	})
 })
+
+// withCPULimit gives the spec's first request a cpuConfig.limit.
+func withCPULimit(spec *resourcev1.ResourceClaimSpec, limit string) {
+	ginkgo.GinkgoHelper()
+	raw, err := json.Marshal(v1alpha1.OpaqueConfig{APIVersion: v1alpha1.APIVersion, CPUConfig: v1alpha1.CPUConfig{Limit: new(v1alpha1.Limit(limit))}})
+	gomega.Expect(err).ToNot(gomega.HaveOccurred())
+	spec.Devices.Config = append(spec.Devices.Config, resourcev1.DeviceClaimConfiguration{
+		Requests: []string{spec.Devices.Requests[0].Name},
+		DeviceConfiguration: resourcev1.DeviceConfiguration{Opaque: &resourcev1.OpaqueDeviceConfiguration{
+			Driver: driverName, Parameters: runtime.RawExtension{Raw: raw},
+		}},
+	})
+}
 
 // expectShareMetadata checks the metadata file of a pod's share: it names no
 // CPUs and counts none, since a share's CPUs move, and gives the booked amount

@@ -43,6 +43,9 @@ jobs:
               should publish the default partition's devices with a shared request policy, and map only them
               should cap a share at its amount and give the amount in its metadata file
               should run a share that books no amount uncapped
+              should replace the amount with a written limit as the cap
+              should run a share whose limit is max uncapped
+              should cap a share of 0 at its written limit
               should refuse a container holding a second capped share
               should leave a share no shared device can hold Pending
               should route a share only the largest shared device can hold to its node
@@ -67,6 +70,9 @@ jobs:
               should publish the default partition's devices with a shared request policy, and map only them
               should cap a share at its amount and give the amount in its metadata file
               should run a share that books no amount uncapped
+              should replace the amount with a written limit as the cap
+              should run a share whose limit is max uncapped
+              should cap a share of 0 at its written limit
               should refuse a container holding a second capped share
               should leave a share no shared device can hold Pending
               should route a share only the largest shared device can hold to its node
