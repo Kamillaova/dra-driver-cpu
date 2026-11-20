@@ -72,6 +72,31 @@ func TestParseOpaqueConfig(t *testing.T) {
 			expected: Config{},
 		},
 		{
+			name:     "exclusive true",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": true}}`,
+			expected: Config{Exclusive: new(true)},
+		},
+		{
+			name:     "exclusive false is kept apart from the key left out",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": false}}`,
+			expected: Config{Exclusive: new(false)},
+		},
+		{
+			name:     "a null exclusive is the key left out",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": null}}`,
+			expected: Config{},
+		},
+		{
+			name:          "invalid - exclusive of another type",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": "yes"}}`,
+			expectedError: "failed to unmarshal opaque config",
+		},
+		{
+			name:          "invalid - exclusive in another casing",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"Exclusive": true}}`,
+			expectedError: `opaque config: strict decoding error: unknown field "cpuConfig.Exclusive"`,
+		},
+		{
 			name:          "invalid - a limit of another type",
 			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"limit": true}}`,
 			expectedError: `failed to unmarshal opaque config: limit true is neither a quantity nor "max"`,

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -47,6 +48,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	nodeutil "k8s.io/component-helpers/node/util"
+	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/utils/cpuset"
 )
 
@@ -1151,6 +1153,518 @@ func TestPrepareAMixedRequest(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, wantRecord, record.Requests, "restored")
 	requireContainer(t, restarted)
+}
+
+const exclusiveParams = `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": true}}`
+
+// allowingDriver is a driver on mixedCoreCPUInfos whose default entry, CPUs
+// 0 and 4, one core, and 2 and 3, a core each, sets allowExclusive to allow.
+func allowingDriver(t *testing.T, allow, fullPhysicalCPUsOnly bool, onDisk map[types.UID]cdiClaimRecord) *CPUDriver {
+	t.Helper()
+	return partitionDriver(t, mixedCoreCPUInfos, []device.Partition{
+		{Name: device.DefaultPartitionName, AllowExclusive: allow},
+		{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)},
+	}, fullPhysicalCPUsOnly, onDisk)
+}
+
+// A request with `cpuConfig.exclusive: true` takes whole CPUs of its own out
+// of a shared device whose partition allows it, from those no exclusive
+// request holds, earlier results of its own claim included, up to every CPU of
+// the device.
+func TestPrepareTakesExclusiveCPUsFromADefaultPartition(t *testing.T) {
+	holdingTwoAndThree := map[types.UID]cdiClaimRecord{"held": {Namespace: "vms", Name: "held", Requests: []cdiRequestRecord{
+		{Request: "cpus", CPUs: cpuset.New(2, 3), Results: []cdiResultRecord{{Device: "cpudevnuma000"}}},
+	}}}
+	for _, tc := range []struct {
+		name           string
+		disallowed     bool
+		whole          bool
+		twoThreadCores bool
+		onDisk         map[types.UID]cdiClaimRecord
+		results        []claimResult
+		flagged        []string
+		params         string
+		source         resourceapi.AllocationConfigSource
+		want           []store.RequestAllocation
+		wantErr        string
+	}{{
+		name:    "two CPUs",
+		results: []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}},
+		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(2, 3)}},
+	}, {
+		name:    "three, leaving one CPU to share",
+		results: []claimResult{{request: "cpus", written: "3", consumed: "3", device: "cpudevnuma000"}},
+		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 2, 3)}},
+	}, {
+		name:    "every CPU of the device",
+		results: []claimResult{{request: "cpus", written: "4", consumed: "4", device: "cpudevnuma000"}},
+		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 2, 3, 4)}},
+	}, {
+		name:    "the last CPUs of the device, after an earlier request of the claim",
+		results: []claimResult{{request: "a", written: "2", consumed: "2", device: "cpudevnuma000"}, {request: "b", written: "2", consumed: "2", device: "cpudevnuma000"}},
+		want:    []store.RequestAllocation{{Request: "a", CPUs: cpuset.New(2, 3)}, {Request: "b", CPUs: cpuset.New(0, 4)}},
+	}, {
+		name:    "two requests of one claim on one device",
+		results: []claimResult{{request: "a", written: "2", consumed: "2", device: "cpudevnuma000"}, {request: "b", written: "1", consumed: "1", device: "cpudevnuma000"}},
+		want:    []store.RequestAllocation{{Request: "a", CPUs: cpuset.New(2, 3)}, {Request: "b", CPUs: cpuset.New(0)}},
+	}, {
+		name:    "a share beside a flagged request on one device",
+		results: []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}, {request: "vmm-cpu", consumed: "0", device: "cpudevnuma000"}},
+		flagged: []string{"cpus"},
+		want: []store.RequestAllocation{
+			{Request: "cpus", CPUs: cpuset.New(2, 3)},
+			{Request: "vmm-cpu", CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Devices: []string{"cpudevnuma000"}},
+		},
+	}, {
+		name:    "a CPU another claim holds is not taken",
+		onDisk:  holdingTwoAndThree,
+		results: []claimResult{{request: "cpus", written: "1", consumed: "1", device: "cpudevnuma000"}},
+		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0)}},
+	}, {
+		name:    "every CPU another claim does not hold",
+		onDisk:  holdingTwoAndThree,
+		results: []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}},
+		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 4)}},
+	}, {
+		name:    "whole cores of either size under fullPhysicalCPUsOnly",
+		whole:   true,
+		results: []claimResult{{request: "cpus", written: "3", consumed: "3", device: "cpudevnuma000"}},
+		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 2, 4)}},
+	}, {
+		name:    "WC14: an odd amount while no core of one thread is free",
+		whole:   true,
+		onDisk:  holdingTwoAndThree,
+		results: []claimResult{{request: "cpus", written: "1", consumed: "1", device: "cpudevnuma000"}},
+		wantErr: "request \"cpus\": 1 exclusive CPUs need a free core of 1 thread on device \"cpudevnuma000\", which has none (1 free cores of 2 threads; `fullPhysicalCPUsOnly: true`): claims holding the device's cores of 1 thread: claim vms/held (UID \"held\") holds CPUs 2-3, bound to no container; see \"CPUs Held by Another Claim\" in the driver's troubleshooting guide",
+	}, {
+		name:       "a partition that does not allow it",
+		disallowed: true,
+		results:    []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}},
+		wantErr:    "request \"cpus\": partition \"default\" on node \"" + testNodeName + "\" does not allow exclusive CPUs (`allowExclusive: false`)",
+	}, {
+		name:    "no amount",
+		results: []claimResult{{request: "cpus", consumed: "0", device: "cpudevnuma000"}},
+		wantErr: "request \"cpus\": no amount on exclusive request (`cpuConfig.exclusive: true`); ask for at least 1",
+	}, {
+		name:           "no amount on cores of 2 threads under fullPhysicalCPUsOnly",
+		twoThreadCores: true,
+		results:        []claimResult{{request: "cpus", consumed: "0", device: "cpudevnuma000"}},
+		wantErr:        "request \"cpus\": no amount on exclusive request (`cpuConfig.exclusive: true`); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`)",
+	}, {
+		name:    "an amount of 0",
+		results: []claimResult{{request: "cpus", written: "0", consumed: "0", device: "cpudevnuma000"}},
+		wantErr: "request \"cpus\": amount 0 on exclusive request (`cpuConfig.exclusive: true`); ask for at least 1",
+	}, {
+		name:    "WA25: a fractional amount",
+		results: []claimResult{{request: "cpus", written: "1500m", consumed: "2", device: "cpudevnuma000"}},
+		wantErr: "request \"cpus\": amount 1500m on exclusive request (`cpuConfig.exclusive: true`); ask for a whole number of CPUs",
+	}, {
+		name:    "WA26: a numeric limit",
+		results: []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}},
+		params:  `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": true, "limit": "2"}}`,
+		wantErr: "request \"cpus\": limit 2 on exclusive request (`cpuConfig.exclusive: true`); only `limit: max` is allowed",
+	}, {
+		name:    "limit max",
+		results: []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}},
+		params:  `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": true, "limit": "max"}}`,
+		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(2, 3)}},
+	}, {
+		name:    "WB24: a cpuset, which the default allocator does not take",
+		results: []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}},
+		params:  `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": true, "cpuset": "0,4"}}`,
+		wantErr: `request "cpus": cpuConfig.cpuset is not supported with cpuPartitions; the default allocator chooses the CPUs itself`,
+	}, {
+		name:    "the flag from a DeviceClass",
+		results: []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}},
+		source:  resourceapi.AllocationConfigSourceClass,
+		wantErr: `DeviceClass "dra.cpu" sets cpuConfig.exclusive; set it in the claim`,
+	}, {
+		name:    "exclusive false is a share",
+		results: []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}},
+		params:  `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": false}}`,
+		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Devices: []string{"cpudevnuma000"}, Cap: 2000}},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := allowingDriver(t, !tc.disallowed, tc.whole, tc.onDisk)
+			if tc.twoThreadCores {
+				d = partitionDriver(t, wholeCoreCPUInfos, []device.Partition{{Name: device.DefaultPartitionName, AllowExclusive: true}}, true, nil)
+			}
+			params := cmp.Or(tc.params, exclusiveParams)
+			source := cmp.Or(tc.source, resourceapi.AllocationConfigSourceClaim)
+			claim := withConfig(claimWithResults("claim", tc.results...), source, tc.flagged, params)
+			before := d.allocationState.GetPreparedCPUs()
+			results, err := d.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+			require.NoError(t, err)
+			record, recorded := d.allocationState.GetClaimRecord("claim")
+			if tc.wantErr != "" {
+				require.EqualError(t, results["claim"].Err, tc.wantErr)
+				require.False(t, recorded, "a refused claim leaves no record")
+				return
+			}
+			require.NoError(t, results["claim"].Err)
+			require.True(t, recorded)
+			require.Equal(t, tc.want, record.Requests)
+			taken := record.CPUs()
+			require.Truef(t, before.Union(taken).Equals(d.allocationState.GetPreparedCPUs()), "the exclusive CPUs are reserved, got %s", d.allocationState.GetPreparedCPUs())
+			require.Truef(t, cpuset.New(0, 2, 3, 4).Difference(before).Difference(taken).Equals(d.allocationState.GetClaimlessCPUs()),
+				"containers without claims leave the exclusive CPUs, got %s", d.allocationState.GetClaimlessCPUs())
+
+			written := d.cdiMgr.(*mockCdiMgr).records["claim"]
+			for _, prepared := range results["claim"].Devices {
+				attrs := prepared.Metadata.Attributes
+				request := prepared.Requests[0]
+				cpus := cpusOfRequest(record, request, store.RoleExclusive)
+				if cpus.IsEmpty() {
+					require.NotContains(t, attrs, string(device.AttributeCPUSet), "request %q", request)
+					continue
+				}
+				require.Equal(t, cpus.String(), *attrs[string(device.AttributeCPUSet)].StringValue, "request %q", request)
+				require.Equal(t, int64(cpus.Size()), *attrs[string(device.AttributeAllocatedNumCPUs)].IntValue, "request %q", request)
+				require.Equal(t, "max", *attrs[string(device.AttributeCPULimit)].StringValue, "request %q", request)
+				for _, onDisk := range written.Requests {
+					if onDisk.Request == request {
+						require.Equal(t, store.RoleExclusive, onDisk.Role, "request %q's CDI record", request)
+						require.Equal(t, []cdiResultRecord{{Device: "cpudevnuma000", Consumed: new(resource.MustParse(strconv.Itoa(cpus.Size())))}}, onDisk.Results, "request %q's CDI record", request)
+					}
+				}
+			}
+
+			encoded, err := encodeClaimRecord(written)
+			require.NoError(t, err)
+			decoded, err := decodeClaimRecord(encoded)
+			require.NoError(t, err)
+			onDisk := map[types.UID]cdiClaimRecord{"claim": decoded}
+			maps.Copy(onDisk, tc.onDisk)
+			restarted := allowingDriver(t, true, tc.whole, onDisk)
+			restored, ok := restarted.allocationState.GetClaimRecord("claim")
+			require.True(t, ok)
+			require.Equal(t, tc.want, restored.Requests, "restored")
+		})
+	}
+}
+
+// cpusOfRequest returns the CPUs a record gives a request in role.
+func cpusOfRequest(record store.ClaimRecord, request string, role store.Role) cpuset.CPUSet {
+	for _, held := range record.Requests {
+		if held.Request == request && held.Role == role {
+			return held.CPUs
+		}
+	}
+	return cpuset.New()
+}
+
+// A take moves the containers without claims and every share holder off the
+// CPUs it takes when its claim's first container is created, a share holder
+// keeping its own exclusive CPUs, and the worker gives them back once the
+// claim is unprepared.
+func TestATakeMovesShareHoldersAndGivesBack(t *testing.T) {
+	ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+	d := allowingDriver(t, true, false, nil)
+	runtime := &fakeRuntime{}
+	d.containerUpdater = runtime
+	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "vms"}
+	env := func(claim, request string) string {
+		return fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claim, request, cdiEnvDynamicValue)
+	}
+	create := func(t *testing.T, id string, env ...string) (string, map[string]string) {
+		t.Helper()
+		adjust, updates, err := d.CreateContainer(ctx, pod, &api.Container{Id: id, Name: id, PodSandboxId: pod.Id, Env: env})
+		require.NoError(t, err)
+		sent := map[string]string{}
+		for _, update := range updates {
+			sent[update.GetContainerId()] = update.GetLinux().GetResources().GetCpu().GetCpus()
+		}
+		return adjust.GetLinux().GetResources().GetCpu().GetCpus(), sent
+	}
+	prepare := func(t *testing.T, claims ...*resourceapi.ResourceClaim) {
+		t.Helper()
+		results, err := d.PrepareResourceClaims(ctx, claims)
+		require.NoError(t, err)
+		for uid, result := range results {
+			require.NoError(t, result.Err, "claim %s", uid)
+		}
+	}
+
+	prepare(t,
+		claimWithResults("share", claimResult{request: "vmm-cpu", consumed: "0", device: "cpudevnuma000"}),
+		claimWithResults("mixed",
+			claimResult{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
+			claimResult{request: "vmm-cpu", consumed: "0", device: "cpudevnuma000"}))
+	cpus, _ := create(t, "plain")
+	require.Equal(t, "0,2-4", cpus)
+	cpus, _ = create(t, "holder", env("share", "vmm-cpu"))
+	require.Equal(t, "0,2-4", cpus)
+	cpus, _ = create(t, "vm", env("mixed", "vcpu"), env("mixed", "vmm-cpu"))
+	require.Equal(t, "0-5", cpus)
+
+	prepare(t, withConfig(claimWithResults("excl", claimResult{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}),
+		resourceapi.AllocationConfigSourceClaim, nil, exclusiveParams))
+	cpus, sent := create(t, "app", env("excl", "cpus"))
+	require.Equal(t, "2-3", cpus)
+	require.Equal(t, map[string]string{"plain": "0,4", "holder": "0,4", "vm": "0-1,4-5"}, sent, "the take moves every container off its CPUs")
+
+	_, err := d.StopContainer(ctx, pod, &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id})
+	require.NoError(t, err)
+	unprepared, err := d.UnprepareResourceClaims(ctx, []kubeletplugin.NamespacedObject{{UID: "excl"}})
+	require.NoError(t, err)
+	require.NoError(t, unprepared["excl"])
+	d.reconcileSharedContainers(testr.New(t))
+	require.Equal(t, []map[string]string{{"plain": "0,2-4", "holder": "0,2-4", "vm": "0-5"}}, runtime.sent, "the give-back widens them again")
+}
+
+// takeOfEveryCPU is a claim whose flagged request takes all four CPUs of
+// allowingDriver's shared device.
+func takeOfEveryCPU() *resourceapi.ResourceClaim {
+	return withConfig(claimWithResults("excl", claimResult{request: "cpus", written: "4", consumed: "4", device: "cpudevnuma000"}),
+		resourceapi.AllocationConfigSourceClaim, nil, exclusiveParams)
+}
+
+// A container that needs a shared device's CPUs while a take holds every one
+// of them is refused when it is created, as upstream refuses a container
+// without claims while claims hold every shared CPU, and comes up once the
+// take is released.
+func TestContainersCreatedAfterATakeOfEveryCPU(t *testing.T) {
+	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "vms"}
+	for _, tc := range []struct {
+		name    string
+		claim   *resourceapi.ResourceClaim
+		env     []string
+		wantErr string
+	}{{
+		name:    "a container without claims",
+		wantErr: `cannot create shared container "ctr" in pod "pod": no shared CPUs available`,
+	}, {
+		name:    "a container holding a share of 0, the only share beside such a take",
+		claim:   claimWithResults("share", claimResult{request: "vmm-cpu", consumed: "0", device: "cpudevnuma000"}),
+		env:     []string{fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, "share", "vmm-cpu", cdiEnvDynamicValue)},
+		wantErr: `cannot create container "ctr" in pod "pod": every CPU of the devices its shared requests use is held by an exclusive claim`,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			d := allowingDriver(t, true, false, nil)
+			claims := []*resourceapi.ResourceClaim{takeOfEveryCPU()}
+			if tc.claim != nil {
+				claims = append(claims, tc.claim)
+			}
+			results, err := d.PrepareResourceClaims(ctx, claims)
+			require.NoError(t, err)
+			for uid, result := range results {
+				require.NoError(t, result.Err, "claim %s", uid)
+			}
+			app := &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: []string{fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, "excl", "cpus", cdiEnvDynamicValue)}}
+			_, _, err = d.CreateContainer(ctx, pod, app)
+			require.NoError(t, err)
+
+			ctr := &api.Container{Id: "ctr", Name: "ctr", PodSandboxId: pod.Id, Env: tc.env}
+			_, _, err = d.CreateContainer(ctx, pod, ctr)
+			require.EqualError(t, err, tc.wantErr)
+
+			_, err = d.StopContainer(ctx, pod, app)
+			require.NoError(t, err)
+			unprepared, err := d.UnprepareResourceClaims(ctx, []kubeletplugin.NamespacedObject{{UID: "excl"}})
+			require.NoError(t, err)
+			require.NoError(t, unprepared["excl"])
+			adjust, _, err := d.CreateContainer(ctx, pod, ctr)
+			require.NoError(t, err, "the container comes up once the take is released")
+			require.Equal(t, "0,2-4", adjust.GetLinux().GetResources().GetCpu().GetCpus())
+		})
+	}
+}
+
+// A running container that a take would leave no CPU refuses the take at
+// Prepare, as upstream refuses it while containers without claims would be
+// left none, a holder of a share counted as they are. A holder of exclusive
+// CPUs beside its share is moved onto those alone, as one created after the
+// take gets them. A take reserved beside such a holder all the same has its
+// first container refused, since sent no CPUs the holder would keep the
+// take's, and the take's container comes up once the holder is gone.
+func TestARunningShareHolderRefusesATakeOfEveryCPU(t *testing.T) {
+	const exhausts = `claim "excl" would exhaust the shared CPU pool while shared containers are running`
+	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "vms"}
+	env := func(claim, request string) string {
+		return fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claim, request, cdiEnvDynamicValue)
+	}
+	shareAlone := func() *resourceapi.ResourceClaim {
+		return claimWithResults("held", claimResult{request: "vmm-cpu", consumed: "0", device: "cpudevnuma000"})
+	}
+	for _, tc := range []struct {
+		name           string
+		claim          *resourceapi.ResourceClaim
+		env            []string
+		pastPrepare    bool
+		wantCPUs       string
+		wantPrepareErr string
+		wantMovedTo    string
+	}{{
+		name:           "a container without claims",
+		wantCPUs:       "0,2-4",
+		wantPrepareErr: exhausts,
+	}, {
+		name:           "a holder of a share alone",
+		claim:          shareAlone(),
+		env:            []string{env("held", "vmm-cpu")},
+		wantCPUs:       "0,2-4",
+		wantPrepareErr: exhausts,
+	}, {
+		name:        "a holder of a share alone beside a take reserved past Prepare's check",
+		claim:       shareAlone(),
+		env:         []string{env("held", "vmm-cpu")},
+		pastPrepare: true,
+		wantCPUs:    "0,2-4",
+	}, {
+		name: "a holder of a share beside exclusive CPUs",
+		claim: claimWithResults("held",
+			claimResult{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
+			claimResult{request: "vmm-cpu", consumed: "0", device: "cpudevnuma000"}),
+		env:         []string{env("held", "vcpu"), env("held", "vmm-cpu")},
+		wantCPUs:    "0-5",
+		wantMovedTo: "1,5",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			d := allowingDriver(t, true, false, nil)
+			prepare := func(claim *resourceapi.ResourceClaim) error {
+				t.Helper()
+				results, err := d.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim})
+				require.NoError(t, err)
+				return results[claim.UID].Err
+			}
+			if tc.claim != nil {
+				require.NoError(t, prepare(tc.claim))
+			}
+			holder := &api.Container{Id: "holder", Name: "holder", PodSandboxId: pod.Id, Env: tc.env}
+			adjust, _, err := d.CreateContainer(ctx, pod, holder)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantCPUs, adjust.GetLinux().GetResources().GetCpu().GetCpus())
+
+			if tc.wantPrepareErr != "" {
+				require.EqualError(t, prepare(takeOfEveryCPU()), tc.wantPrepareErr)
+				return
+			}
+			if tc.pastPrepare {
+				take := store.ClaimRecord{Namespace: "vms", Name: "excl", Requests: []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 2, 3, 4)}}}
+				require.NoError(t, d.allocationState.Reserve(testr.New(t), "excl", take, false))
+			} else {
+				require.NoError(t, prepare(takeOfEveryCPU()))
+			}
+			app := &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: []string{env("excl", "cpus")}}
+			adjust, updates, err := d.CreateContainer(ctx, pod, app)
+			if tc.wantMovedTo != "" {
+				require.NoError(t, err)
+				require.Equal(t, "0,2-4", adjust.GetLinux().GetResources().GetCpu().GetCpus())
+				require.Len(t, updates, 1)
+				require.Equal(t, "holder", updates[0].GetContainerId())
+				require.Equal(t, tc.wantMovedTo, updates[0].GetLinux().GetResources().GetCpu().GetCpus(), "the holder keeps its exclusive CPUs alone")
+				return
+			}
+			require.EqualError(t, err, `cannot update shared CPU pool after creating container "app" in pod "pod": cannot update shared containers: no shared CPUs available`)
+			owner, _ := d.allocationState.Owner("excl")
+			require.True(t, owner.Vacant(), "the refused container does not keep the take")
+
+			_, err = d.StopContainer(ctx, pod, holder)
+			require.NoError(t, err)
+			adjust, updates, err = d.CreateContainer(ctx, pod, app)
+			require.NoError(t, err, "the take's container comes up once the holder is gone")
+			require.Equal(t, "0,2-4", adjust.GetLinux().GetResources().GetCpu().GetCpus())
+			require.Empty(t, updates)
+		})
+	}
+}
+
+// No container without claims runs on a named partition of role default, so
+// there the running holders of its shares alone hold a take back: a take that
+// would leave one of them no CPU is refused at Prepare, and one where nobody
+// runs, or beside a holder of exclusive CPUs of its own, is accepted.
+func TestPrepareCountsRunningShareHoldersOnANamedDefaultPartition(t *testing.T) {
+	const infra = "cpudevnuma000-infra"
+	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "pod", Namespace: "vms"}
+	env := func(claim, request string) string {
+		return fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claim, request, cdiEnvDynamicValue)
+	}
+	share := func() *resourceapi.ResourceClaim {
+		return claimWithResults("held", claimResult{request: "vmm-cpu", consumed: "0", device: infra})
+	}
+	for _, tc := range []struct {
+		name    string
+		held    *resourceapi.ResourceClaim
+		running [][]string // each running container's env, none for one without claims
+		take    string
+		wantErr string
+	}{{
+		name:    "a running holder of a zero-amount share",
+		held:    share(),
+		running: [][]string{{env("held", "vmm-cpu")}},
+		take:    "2",
+		wantErr: `claim "excl" would exhaust the shared CPU pool while shared containers are running`,
+	}, {
+		name: "nobody running",
+		take: "2",
+	}, {
+		name: "a holder's claim prepared, its container not created",
+		held: share(),
+		take: "2",
+	}, {
+		name:    "a running holder left a CPU",
+		held:    share(),
+		running: [][]string{{env("held", "vmm-cpu")}},
+		take:    "1",
+	}, {
+		name: "a running holder of exclusive CPUs beside its share",
+		held: claimWithResults("held",
+			claimResult{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
+			claimResult{request: "vmm-cpu", consumed: "0", device: infra}),
+		running: [][]string{{env("held", "vcpu"), env("held", "vmm-cpu")}},
+		take:    "2",
+	}, {
+		name:    "a running container without claims, on the default partition",
+		running: [][]string{nil},
+		take:    "2",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ctxlog.NewContext(context.Background(), testr.New(t))
+			d := partitionDriver(t, mixedCoreCPUInfos, []device.Partition{
+				{Name: device.DefaultPartitionName},
+				{Name: "infra", Role: device.PARTITION_ROLE_DEFAULT, CPUs: cpuset.New(2, 3), AllowExclusive: true},
+				{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)},
+			}, false, nil)
+			prepare := func(claim *resourceapi.ResourceClaim) error {
+				t.Helper()
+				results, err := d.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim})
+				require.NoError(t, err)
+				return results[claim.UID].Err
+			}
+			if tc.held != nil {
+				require.NoError(t, prepare(tc.held))
+			}
+			for i, env := range tc.running {
+				id := fmt.Sprintf("ctr%d", i)
+				_, _, err := d.CreateContainer(ctx, pod, &api.Container{Id: id, Name: id, PodSandboxId: pod.Id, Env: env})
+				require.NoError(t, err)
+			}
+
+			err := prepare(withConfig(claimWithResults("excl", claimResult{request: "cpus", written: tc.take, consumed: tc.take, device: infra}),
+				resourceapi.AllocationConfigSourceClaim, nil, exclusiveParams))
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+				_, recorded := d.allocationState.GetClaimRecord("excl")
+				require.False(t, recorded, "a refused take reserves nothing")
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// `cpuConfig.exclusive: false` asks for a share, which an owned device does
+// not give.
+func TestPrepareRefusesExclusiveFalseOnAnOwnedDevice(t *testing.T) {
+	d := partitionDriver(t, mixedCoreCPUInfos, nil, false, nil)
+	claim := withConfig(claimWithResults("claim", claimResult{request: "cpus", written: "500m", consumed: "500m", device: "cpudevnuma000"}),
+		resourceapi.AllocationConfigSourceClaim, nil, `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": false}}`)
+	results, err := d.PrepareResourceClaims(context.Background(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.EqualError(t, results["claim"].Err, "request \"cpus\": `cpuConfig.exclusive: false`, but node \""+testNodeName+
+		"\" runs without partitions, where "+testDriverName+" gives exclusive CPUs only; add `- name: default` to cpuPartitions, or drop cpuConfig.exclusive")
 }
 
 // partitionDriver is a driver on infos whose configuration declares

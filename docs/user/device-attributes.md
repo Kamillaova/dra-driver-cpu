@@ -24,20 +24,21 @@ CPU group. `individual` exposes one device per CPU, but is **deprecated**; see
 
 #### Supported attributes
 
-| Attribute                                 | Type    | Description                                                                                                    |
-| ----------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `resource.kubernetes.io/numaNode`         | int     | Standard NUMA node of the group; published when grouping by NUMA node or uncore cache                          |
-| `resource.kubernetes.io/pcieRoot`         | strings | PCIe roots local to the group's CPUs; needs `--expose-pcie-roots` and the `DRAListTypeAttributes` feature gate |
-| `dra.cpu/socketID`                        | int     | CPU socket of the group; published when grouping by socket, NUMA node or uncore cache                          |
-| `dra.cpu/cacheL3ID`                       | int     | Uncore (L3) cache of the group, by the id the kernel gives it; published when grouping by uncore cache         |
-| `dra.cpu/numCPUs`                         | int     | Number of allocatable CPUs in the group                                                                        |
-| `dra.cpu/smtEnabled`                      | bool    | Whether SMT/hyper-threading is enabled on the node                                                             |
-| `dra.cpu/threadsPerCore`                  | int     | Logical CPUs on each physical core of the group; `0` when its cores differ, as on a hybrid CPU                 |
-| `dra.cpu/fullPhysicalCPUsOnly`            | bool    | The driver's `fullPhysicalCPUsOnly` setting                                                                    |
-| `dra.cpu/allocator`                       | string  | The driver's `allocator` setting, `cpumanager` or `external`                                                   |
-| `dra.cpu/allowFractionalCapacityRequests` | bool    | The driver's `allowFractionalCapacityRequests` setting                                                         |
-| `dra.cpu/partition`                       | string  | The CPU partition the group's CPUs belong to; `default` on a node without `cpuPartitions`                      |
-| `dra.cpu/role`                            | string  | That partition's role, `default` or `exclusive`                                                                |
+| Attribute                                 | Type    | Description                                                                                                             |
+| ----------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `resource.kubernetes.io/numaNode`         | int     | Standard NUMA node of the group; published when grouping by NUMA node or uncore cache                                   |
+| `resource.kubernetes.io/pcieRoot`         | strings | PCIe roots local to the group's CPUs; needs `--expose-pcie-roots` and the `DRAListTypeAttributes` feature gate          |
+| `dra.cpu/socketID`                        | int     | CPU socket of the group; published when grouping by socket, NUMA node or uncore cache                                   |
+| `dra.cpu/cacheL3ID`                       | int     | Uncore (L3) cache of the group, by the id the kernel gives it; published when grouping by uncore cache                  |
+| `dra.cpu/numCPUs`                         | int     | Number of allocatable CPUs in the group                                                                                 |
+| `dra.cpu/smtEnabled`                      | bool    | Whether SMT/hyper-threading is enabled on the node                                                                      |
+| `dra.cpu/threadsPerCore`                  | int     | Logical CPUs on each physical core of the group; `0` when its cores differ, as on a hybrid CPU                          |
+| `dra.cpu/fullPhysicalCPUsOnly`            | bool    | The driver's `fullPhysicalCPUsOnly` setting                                                                             |
+| `dra.cpu/allocator`                       | string  | The driver's `allocator` setting, `cpumanager` or `external`                                                            |
+| `dra.cpu/allowFractionalCapacityRequests` | bool    | The driver's `allowFractionalCapacityRequests` setting                                                                  |
+| `dra.cpu/allowExclusive`                  | bool    | Whether a request may take CPUs of its own: `true` on an owned device, its partition's `allowExclusive` on a shared one |
+| `dra.cpu/partition`                       | string  | The CPU partition the group's CPUs belong to; `default` on a node without `cpuPartitions`                               |
+| `dra.cpu/role`                            | string  | That partition's role, `default` or `exclusive`                                                                         |
 
 On a node with `cpuPartitions`, a group is published once for each partition that holds CPUs
 in it, with that partition's CPUs alone, and the device of every partition but `default` is
@@ -48,10 +49,13 @@ counts the threads of each core inside the partition alone, and its `dra.cpu/smt
 A partition of role `default` publishes shared devices: any number of claims hold one, each booking
 an amount of its `dra.cpu/cpu` capacity, from `0`, which a request naming no amount books, up to the
 device's CPU count, in whole CPUs or, with `allowFractionalCapacityRequests`, in millicores. The
-claims run on the device's CPUs together, and no claim takes any of them for itself.
+claims run on the device's CPUs together, and no claim takes any of them for itself, but a request
+with `cpuConfig.exclusive: true` where the partition sets `allowExclusive`; see
+[Exclusive requests on a default partition](cpu-partitions.md#exclusive-requests-on-a-default-partition).
 
-`dra.cpu/fullPhysicalCPUsOnly`, `dra.cpu/allocator` and `dra.cpu/allowFractionalCapacityRequests` let
-a claim's selector keep it off the nodes that would refuse to prepare it; see
+`dra.cpu/fullPhysicalCPUsOnly`, `dra.cpu/allocator`, `dra.cpu/allowFractionalCapacityRequests` and
+`dra.cpu/allowExclusive` let a claim's selector keep it off the nodes that would refuse to prepare
+it; see
 [Settings published as device attributes](configuration.md#settings-published-as-device-attributes).
 
 #### External allocator attributes
@@ -106,6 +110,7 @@ This is retained as a reference for existing deployments. For the supported repl
 | `dra.cpu/fullPhysicalCPUsOnly`            | bool    | The driver's `fullPhysicalCPUsOnly` setting, `false` in this mode                                     |
 | `dra.cpu/allocator`                       | string  | The driver's `allocator` setting, `cpumanager` or `external`                                          |
 | `dra.cpu/allowFractionalCapacityRequests` | bool    | The driver's `allowFractionalCapacityRequests` setting                                                |
+| `dra.cpu/allowExclusive`                  | bool    | `true`: every device of this mode is owned                                                            |
 | `dra.cpu/partition`                       | string  | `default`: this mode takes no `cpuPartitions`                                                         |
 | `dra.cpu/role`                            | string  | `default`                                                                                             |
 
@@ -197,6 +202,8 @@ spec:
         bool: false
       dra.cpu/allocator:
         string: cpumanager
+      dra.cpu/allowExclusive:
+        bool: true
       dra.cpu/allowFractionalCapacityRequests:
         bool: false
       dra.cpu/partition:
@@ -232,6 +239,8 @@ spec:
         bool: false
       dra.cpu/allocator:
         string: cpumanager
+      dra.cpu/allowExclusive:
+        bool: true
       dra.cpu/allowFractionalCapacityRequests:
         bool: false
       dra.cpu/partition:
@@ -293,6 +302,8 @@ spec:
         bool: false
       dra.cpu/allocator:
         string: cpumanager
+      dra.cpu/allowExclusive:
+        bool: true
       dra.cpu/allowFractionalCapacityRequests:
         bool: false
       dra.cpu/partition:
@@ -327,6 +338,8 @@ spec:
         bool: false
       dra.cpu/allocator:
         string: cpumanager
+      dra.cpu/allowExclusive:
+        bool: true
       dra.cpu/allowFractionalCapacityRequests:
         bool: false
       dra.cpu/partition:

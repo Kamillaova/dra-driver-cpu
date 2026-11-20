@@ -231,6 +231,18 @@ profile for each kind of node, each holding `- name: default`, and label every n
 a node whose cores are all alike names a profile holding only that entry. Its removal will be
 announced in this document one release before it happens.
 
+#### Running without partitions
+
+A node without `cpuPartitions`, the list left out, `null` or `[]`, keeps working as upstream's
+driver does and is deprecated: `cpuPartitions` holding `- name: default` replaces it; see
+[CPU Partitions](cpu-partitions.md). That entry makes `dra.cpu` give shares where it gave exclusive
+CPUs. To keep the CPUs of the claims that need them carved out of the shared ones, as upstream's
+driver does, set `allowExclusive: true` on the `default` entry and `cpuConfig.exclusive: true` on
+those claims; see
+[Exclusive requests on a default partition](cpu-partitions.md#exclusive-requests-on-a-default-partition).
+The driver logs nothing for it. Its removal will be announced in this document one release before
+it happens.
+
 ### Early warning
 
 Before the driver enters beta stage, a batch of **breaking** changes are planned.
