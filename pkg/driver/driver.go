@@ -291,6 +291,15 @@ type Providers struct {
 	// Process is the driver's own process, read by the start checks of
 	// cgroupThreadedMode.
 	Process ProcessProbe
+	// Processes are other containers' processes, read by the threaded build.
+	Processes ContainerProcesses
+}
+
+func (pr Providers) EnsureProcesses() ContainerProcesses {
+	if pr.Processes == nil {
+		return hostProcesses{}
+	}
+	return pr.Processes
 }
 
 func (pr Providers) EnsureCgroupFS() (cgroupfs.FS, error) {
@@ -546,6 +555,7 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 		Withheld:                              withheld,
 		Tainted:                               tainted,
 		AllowFractionalCapacityRequests:       config.AllowFractionalCapacityRequests,
+		CgroupThreadedMode:                    threadedModeAttribute(cp.cgroupThreadedMode),
 	})
 	if err != nil {
 		return err

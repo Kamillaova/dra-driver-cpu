@@ -19,6 +19,7 @@ limitations under the License.
 package admission
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -30,6 +31,7 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/dynamic-resource-allocation/resourceclaim"
 )
 
@@ -46,6 +48,9 @@ type Kind struct {
 	// Node names, in the same refusal, the node that runs without
 	// partitions.
 	Node string
+	// FromAllocation is set where the request is known by the devices the
+	// node allocated it alone, its class being none the chart renders.
+	FromAllocation bool
 }
 
 // FlaggedExclusive is the kind of a request on shared devices that sets
@@ -140,21 +145,9 @@ func CheckClaim(spec *resourceapi.ResourceClaimSpec, driverName string, kindOf f
 		return nil
 	}
 
-	var entries []entry
-	for i, config := range spec.Devices.Config {
-		if config.Opaque == nil || config.Opaque.Driver != driverName {
-			continue
-		}
-		e := entry{index: i, requests: config.Requests}
-		if !slices.ContainsFunc(requests, func(j judged) bool { return e.reaches(j.ref) }) {
-			continue
-		}
-		parsed, err := allocationapi.ParseOpaqueConfig(config.Opaque.Parameters.Raw)
-		if err != nil {
-			return fmt.Errorf("config entry #%d: %w", i, err)
-		}
-		e.config = parsed
-		entries = append(entries, e)
+	entries, err := driverEntries(spec, driverName, requests)
+	if err != nil {
+		return err
 	}
 
 	for _, e := range entries {
@@ -201,6 +194,22 @@ func CheckClaim(spec *resourceapi.ResourceClaimSpec, driverName string, kindOf f
 		}
 	}
 
+	threaded, err := threadedEntry(entries, requests)
+	if err != nil {
+		return err
+	}
+	if !threaded.IsZero() {
+		if err := checkThreadedShape(spec, threaded, requests); err != nil {
+			return err
+		}
+	}
+	var groups []threadedGroup
+	if threaded.Enabled {
+		if groups, err = threadedGroups(spec, threaded, requests); err != nil {
+			return err
+		}
+	}
+
 	for i := range requests {
 		if err := checkExclusiveFlag(requests[i], driverName); err != nil {
 			return err
@@ -215,12 +224,277 @@ func CheckClaim(spec *resourceapi.ResourceClaimSpec, driverName string, kindOf f
 			return err
 		}
 	}
+	if threaded.Enabled {
+		for _, g := range groups {
+			if err := checkCappedInGroup(g, requests); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	for _, j := range requests {
 		if err := checkCapped(j, requests); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// threadedEntry returns the one threaded block of the claim's entries, its
+// zero value where none carries one. A block applies to the whole claim, so
+// an entry carrying one is unscoped or reaches every judged request; Kubernetes
+// defines an entry listing every request to mean the same as one listing
+// none. An entry whose block is all zero values is no entry.
+func threadedEntry(entries []entry, requests []judged) (v1alpha1.ThreadedConfig, error) {
+	var found *entry
+	for i := range entries {
+		e := &entries[i]
+		if e.config.Threaded.IsZero() {
+			continue
+		}
+		if len(e.requests) > 0 && slices.ContainsFunc(requests, func(j judged) bool { return !e.reaches(j.ref) }) {
+			return v1alpha1.ThreadedConfig{}, fmt.Errorf("cgroupConfig: applies to the whole claim; drop \"requests\" from its config entry, or list every request (%s)",
+				strings.Join(requestBases(requests), ", "))
+		}
+		if found != nil {
+			return v1alpha1.ThreadedConfig{}, fmt.Errorf("cgroupConfig set by two config entries (#%d and #%d); set it in one entry", found.index, e.index)
+		}
+		found = e
+	}
+	if found == nil {
+		return v1alpha1.ThreadedConfig{}, nil
+	}
+	return found.config.Threaded, nil
+}
+
+// requestBases returns the requests the judged requests and alternatives
+// belong to, in the claim's order.
+func requestBases(requests []judged) []string {
+	var bases []string
+	for _, j := range requests {
+		if !slices.Contains(bases, j.base) {
+			bases = append(bases, j.base)
+		}
+	}
+	return bases
+}
+
+// checkThreadedShape refuses a threaded block that is wrong whatever enabled
+// says: an empty groups list, a group whose name is no DNS label, is given
+// twice or holds no requests, a group naming what is no request or alternative
+// of the claim, a name in two groups, a request named beside one of its own
+// alternatives, and a place naming no group.
+func checkThreadedShape(spec *resourceapi.ResourceClaimSpec, t v1alpha1.ThreadedConfig, requests []judged) error {
+	if t.Groups != nil && len(t.Groups) == 0 {
+		return errors.New("cgroupConfig.threaded.groups: empty; list the groups, or drop it for one group per request")
+	}
+	claimRefs := claimRequestRefs(spec)
+	listedIn := map[string][]string{}
+	for i, g := range t.Groups {
+		if errs := validation.IsDNS1123Label(g.Name); len(errs) > 0 {
+			return fmt.Errorf("group %q: not a DNS label; use lower-case letters, digits and \"-\"", g.Name)
+		}
+		if slices.ContainsFunc(t.Groups[:i], func(other v1alpha1.ThreadedGroup) bool { return other.Name == g.Name }) {
+			return fmt.Errorf("group %q appears twice in cgroupConfig.threaded.groups; group names must be unique", g.Name)
+		}
+		if len(g.Requests) == 0 {
+			return fmt.Errorf("group %q names no request; name its requests, or drop the group", g.Name)
+		}
+		for _, name := range g.Requests {
+			if !slices.Contains(claimRefs, name) {
+				return fmt.Errorf("group %q: the claim has no request %q", g.Name, name)
+			}
+			if !slices.Contains(listedIn[name], g.Name) {
+				listedIn[name] = append(listedIn[name], g.Name)
+			}
+		}
+	}
+	for _, g := range t.Groups {
+		for _, name := range g.Requests {
+			if in := listedIn[name]; len(in) > 1 {
+				return fmt.Errorf("%s: in groups %q and %q; a request belongs to one group", refNoun(name), in[0], in[1])
+			}
+			base := resourceclaim.BaseRequestRef(name)
+			if base == name {
+				continue
+			}
+			viaRequest := listedIn[base]
+			if len(viaRequest) == 0 {
+				continue
+			}
+			if viaRequest[0] == listedIn[name][0] {
+				return fmt.Errorf("group %q names request %q and its alternative %q; name the request or its alternatives, not both", viaRequest[0], base, name)
+			}
+			return fmt.Errorf("group %q names request %q and group %q its alternative %q; name the request or its alternatives, not both", viaRequest[0], base, listedIn[name][0], name)
+		}
+	}
+	if t.Place == "" {
+		return nil
+	}
+	names := groupNames(t, requests)
+	if !slices.Contains(names, t.Place) {
+		return fmt.Errorf("cgroupConfig.threaded.place %q: no such group (groups: %s)", t.Place, strings.Join(names, ", "))
+	}
+	return nil
+}
+
+func refNoun(ref string) string {
+	if resourceclaim.BaseRequestRef(ref) != ref {
+		return fmt.Sprintf("subrequest %q", ref)
+	}
+	return fmt.Sprintf("request %q", ref)
+}
+
+// claimRequestRefs returns the name of every request of the claim and of every
+// alternative of its firstAvailable requests, whatever driver serves them.
+func claimRequestRefs(spec *resourceapi.ResourceClaimSpec) []string {
+	var refs []string
+	for _, request := range spec.Devices.Requests {
+		refs = append(refs, request.Name)
+		for _, sub := range request.FirstAvailable {
+			refs = append(refs, resourceclaim.CreateSubRequestRef(request.Name, sub.Name))
+		}
+	}
+	return refs
+}
+
+// groupNames returns the names of the block's groups: those it lists, or else
+// one per judged request, named after it.
+func groupNames(t v1alpha1.ThreadedConfig, requests []judged) []string {
+	if t.Groups == nil {
+		return requestBases(requests)
+	}
+	names := make([]string, 0, len(t.Groups))
+	for _, g := range t.Groups {
+		names = append(names, g.Name)
+	}
+	return names
+}
+
+// GroupOf returns the group of a threaded block that holds a result of the
+// request or alternative ref: the group listing ref or its request, or,
+// without a groups list, the group named after its request. It returns false
+// where no group holds it.
+func GroupOf(t v1alpha1.ThreadedConfig, ref string) (string, bool) {
+	base := resourceclaim.BaseRequestRef(ref)
+	if t.Groups == nil {
+		return base, true
+	}
+	for _, g := range t.Groups {
+		if slices.Contains(g.Requests, ref) || slices.Contains(g.Requests, base) {
+			return g.Name, true
+		}
+	}
+	return "", false
+}
+
+type threadedGroup struct {
+	name    string
+	members []int
+}
+
+// threadedGroups returns the judged requests each group of an enabled block
+// holds, refusing a judged request no group holds, whose CPUs would sit in the
+// thread root, and a place whose group may receive no result: a group naming
+// a request whole, or every alternative of one, receives one wherever the
+// request's alternatives are this driver's.
+func threadedGroups(spec *resourceapi.ResourceClaimSpec, t v1alpha1.ThreadedConfig, requests []judged) ([]threadedGroup, error) {
+	groups := make([]threadedGroup, 0, len(requests))
+	for _, name := range groupNames(t, requests) {
+		groups = append(groups, threadedGroup{name: name})
+	}
+	for i, j := range requests {
+		name, ok := GroupOf(t, j.ref)
+		if !ok {
+			return nil, notInAGroup(j)
+		}
+		g := slices.IndexFunc(groups, func(g threadedGroup) bool { return g.name == name })
+		groups[g].members = append(groups[g].members, i)
+	}
+	if t.Place == "" || t.Groups == nil {
+		return groups, nil
+	}
+	place := t.Groups[slices.IndexFunc(t.Groups, func(g v1alpha1.ThreadedGroup) bool { return g.Name == t.Place })]
+	if !namesARequest(spec, place, requests) {
+		return nil, fmt.Errorf("cgroupConfig.threaded.place %q: group %q names no request whole nor every alternative of one, and is not built where none of its alternatives is allocated; place a group that names a request",
+			t.Place, t.Place)
+	}
+	return groups, nil
+}
+
+func notInAGroup(j judged) error {
+	switch {
+	case j.kind.FromAllocation:
+		return fmt.Errorf("%s is in no group; add it to cgroupConfig.threaded.groups", j.noun())
+	case j.ref != j.base:
+		return fmt.Errorf("%s: in no group of cgroupConfig.threaded.groups; add it or its request %q to a group, or drop groups for one group per request", j.noun(), j.base)
+	}
+	return fmt.Errorf("%s: in no group of cgroupConfig.threaded.groups; add it to a group, or drop groups for one group per request", j.noun())
+}
+
+// namesARequest reports whether a group names a judged request whole, or every
+// alternative of a firstAvailable request.
+func namesARequest(spec *resourceapi.ResourceClaimSpec, g v1alpha1.ThreadedGroup, requests []judged) bool {
+	for _, request := range spec.Devices.Requests {
+		if slices.Contains(g.Requests, request.Name) && slices.ContainsFunc(requests, func(j judged) bool { return j.base == request.Name }) {
+			return true
+		}
+		if len(request.FirstAvailable) > 0 && !slices.ContainsFunc(request.FirstAvailable, func(sub resourceapi.DeviceSubRequest) bool {
+			return !slices.Contains(g.Requests, resourceclaim.CreateSubRequestRef(request.Name, sub.Name))
+		}) {
+			return true
+		}
+	}
+	return false
+}
+
+// Threaded judges the claim's threaded block by its shape, its scope and the
+// group it gives each judged request, as CheckClaim does, and returns it, its
+// zero value where no entry of the driver's carries one.
+func Threaded(spec *resourceapi.ResourceClaimSpec, driverName string, kindOf func(ref, class string) (Kind, bool)) (v1alpha1.ThreadedConfig, error) {
+	requests := judgedRequests(spec, driverName, kindOf)
+	if len(requests) == 0 {
+		return v1alpha1.ThreadedConfig{}, nil
+	}
+	entries, err := driverEntries(spec, driverName, requests)
+	if err != nil {
+		return v1alpha1.ThreadedConfig{}, err
+	}
+	threaded, err := threadedEntry(entries, requests)
+	if err != nil || threaded.IsZero() {
+		return v1alpha1.ThreadedConfig{}, err
+	}
+	if err := checkThreadedShape(spec, threaded, requests); err != nil {
+		return v1alpha1.ThreadedConfig{}, err
+	}
+	if threaded.Enabled {
+		if _, err := threadedGroups(spec, threaded, requests); err != nil {
+			return v1alpha1.ThreadedConfig{}, err
+		}
+	}
+	return threaded, nil
+}
+
+// driverEntries parses the driver's configuration entries that reach a judged
+// request.
+func driverEntries(spec *resourceapi.ResourceClaimSpec, driverName string, requests []judged) ([]entry, error) {
+	var entries []entry
+	for i, config := range spec.Devices.Config {
+		if config.Opaque == nil || config.Opaque.Driver != driverName {
+			continue
+		}
+		e := entry{index: i, requests: config.Requests}
+		if !slices.ContainsFunc(requests, func(j judged) bool { return e.reaches(j.ref) }) {
+			continue
+		}
+		parsed, err := allocationapi.ParseOpaqueConfig(config.Opaque.Parameters.Raw)
+		if err != nil {
+			return nil, fmt.Errorf("config entry #%d: %w", i, err)
+		}
+		e.config = parsed
+		entries = append(entries, e)
+	}
+	return entries, nil
 }
 
 // target names, in a refusal of the entry's limit, the first judged request it
@@ -331,23 +605,65 @@ func checkCapped(j judged, requests []judged) error {
 		return nil
 	}
 	if j.spread != "" {
-		return fmt.Errorf("%s has limit of %s with %s; a limit can be applied to only one device: ask for one device, or remove the limit", j.noun(), limit, j.spread)
+		return spreadRefusal(j, limit)
 	}
+	others := othersBeside(j, requests, nil)
+	if len(others) == 1 {
+		return fmt.Errorf("%s has limit of %s, so it cannot be used together with request %q: use cgroupConfig.threaded, or remove the limit", j.noun(), limit, others[0])
+	}
+	if len(others) > 1 {
+		return fmt.Errorf("%s has limit of %s, so it cannot be used together with requests %s: use cgroupConfig.threaded, or remove the limit", j.noun(), limit, quoteAll(others))
+	}
+	return nil
+}
+
+// checkCappedInGroup refuses, in a threaded group, a capped share that may
+// take more than one device, or that shares the group's cgroup with another
+// request.
+func checkCappedInGroup(g threadedGroup, requests []judged) error {
+	for _, i := range g.members {
+		j := requests[i]
+		limit, capped := capOf(j)
+		if !capped {
+			continue
+		}
+		if j.spread != "" {
+			return spreadRefusal(j, limit)
+		}
+		others := othersBeside(j, requests, g.members)
+		if len(others) == 1 {
+			return fmt.Errorf("group %q: %s has limit of %s, so it cannot be used together with request %q: give it its own group", g.name, j.noun(), limit, others[0])
+		}
+		if len(others) > 1 {
+			return fmt.Errorf("group %q: %s has limit of %s, so it cannot be used together with requests %s: give it its own group", g.name, j.noun(), limit, quoteAll(others))
+		}
+	}
+	return nil
+}
+
+func spreadRefusal(j judged, limit string) error {
+	return fmt.Errorf("%s has limit of %s with %s; a limit can be applied to only one device: ask for one device, or remove the limit", j.noun(), limit, j.spread)
+}
+
+// othersBeside returns the requests other than j's own that share its cgroup:
+// those of members, or of every judged request where members is nil.
+func othersBeside(j judged, requests []judged, members []int) []string {
 	var others []string
-	for _, other := range requests {
+	for i, other := range requests {
+		if members != nil && !slices.Contains(members, i) {
+			continue
+		}
 		if other.base != j.base && !slices.Contains(others, other.base) {
 			others = append(others, other.base)
 		}
 	}
-	if len(others) == 1 {
-		return fmt.Errorf("%s has limit of %s, so it cannot be used together with request %q: remove the limit", j.noun(), limit, others[0])
+	return others
+}
+
+func quoteAll(names []string) string {
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		quoted = append(quoted, strconv.Quote(name))
 	}
-	if len(others) > 1 {
-		quoted := make([]string, 0, len(others))
-		for _, request := range others {
-			quoted = append(quoted, strconv.Quote(request))
-		}
-		return fmt.Errorf("%s has limit of %s, so it cannot be used together with requests %s: remove the limit", j.noun(), limit, strings.Join(quoted, ", "))
-	}
-	return nil
+	return strings.Join(quoted, ", ")
 }

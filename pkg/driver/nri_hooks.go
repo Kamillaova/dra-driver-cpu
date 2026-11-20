@@ -273,11 +273,17 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 			boundRefs = append(boundRefs, refs...)
 		}
 		members := boundMembers(sc, allocationState, claimUIDs)
+		threaded := hasLayout(allocationState, claimUIDs)
 		var capped cappedBesideError
-		if err := checkCappedAlone(sc.container.GetName(), members); errors.As(err, &capped) {
+		if err := checkCappedAlone(sc.container.GetName(), members); !threaded && errors.As(err, &capped) {
 			sc.logger.Info("keeping the container bound to its claims under an older rule, without a limit: NRI gives no way to stop it from here", "rule", cpumetrics.RuleLimitWithOthers)
 			keptUnder.Insert(cpumetrics.RuleLimitWithOthers)
 			broken = append(broken, olderRule{rule: cpumetrics.RuleLimitWithOthers, detail: capped.detail()})
+		}
+		for _, older := range threadedRulesBroken(sc.container.GetName(), allocationState, claimUIDs) {
+			sc.logger.Info("keeping the container bound to its claims under an older rule rather than stopping it", "rule", older.rule)
+			keptUnder.Insert(older.rule)
+			broken = append(broken, older)
 		}
 		kept = append(kept, sets.List(keptUnder)...)
 		if len(broken) > 0 {
@@ -286,6 +292,10 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 
 		state := store.NewContainerState(sc.container.GetName(), types.UID(sc.container.GetId()), claimUIDs...)
 		state.SetClaimRequests(boundRefs)
+		if known := cp.podState.GetContainerState(sc.owner.PodUID, sc.container.GetName()); threaded && known != nil &&
+			known.MatchesContainer(sc.container.GetName(), types.UID(sc.container.GetId())) {
+			state.SetThreadRoot(known.ThreadRoot())
+		}
 		if len(claimUIDs) > 0 && allGuaranteedCPUs.IsEmpty() {
 			noSharedCPUs = append(noSharedCPUs, sc.container.GetId())
 		} else if len(claimUIDs) > 0 {
@@ -296,7 +306,7 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 				ContainerId: sc.container.GetId(),
 			}
 			guaranteedUpdate.SetLinuxCPUSetCPUs(allGuaranteedCPUs.String())
-			if len(broken) == 0 {
+			if len(broken) == 0 && !threaded {
 				convergeCap(sc, members, guaranteedUpdate)
 			}
 			containerUpdates = append(containerUpdates, guaranteedUpdate)
@@ -335,6 +345,7 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 	}
 	cp.hasSynchronized = true
 	cp.refreshAllocationMetrics()
+	cp.rewriteThreadedShares(logger)
 	for range refused {
 		cp.metrics.RecordNRISynchronizeRefusedClaim()
 	}
@@ -355,6 +366,14 @@ func boundMembers(sc *syncContainer, allocations *store.AllocationState, claimUI
 		bound[uid] = sc.claims[uid]
 	}
 	return cgroupMembers(allocations, bound)
+}
+
+// hasLayout reports whether one of the claims is threaded.
+func hasLayout(allocations *store.AllocationState, claimUIDs []types.UID) bool {
+	return slices.ContainsFunc(claimUIDs, func(uid types.UID) bool {
+		record, ok := allocations.GetClaimRecord(uid)
+		return ok && record.Layout != nil
+	})
 }
 
 // convergeCap gives a listed container the cap CreateContainer would have
@@ -741,10 +760,10 @@ type cappedBesideError struct {
 
 func (err cappedBesideError) Error() string {
 	if err.other.capMilli > 0 {
-		return fmt.Sprintf("container %q: %s and %s both have limits, so they cannot be used together: use the claims in separate containers, or remove one of the limits",
+		return fmt.Sprintf("container %q: %s and %s both have limits, so they cannot be used together: use the claims in separate containers, use cgroupConfig.threaded in both claims, or remove one of the limits",
 			err.container, err.capped, err.other)
 	}
-	return fmt.Sprintf("container %q: %s has limit of %s, so it cannot be used together with %s: use the claims in separate containers, or remove the limit",
+	return fmt.Sprintf("container %q: %s has limit of %s, so it cannot be used together with %s: use the claims in separate containers, use cgroupConfig.threaded in both claims, or remove the limit",
 		err.container, err.capped, resource.NewMilliQuantity(err.capped.capMilli, resource.DecimalSI), err.other)
 }
 
@@ -1014,8 +1033,16 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 			}
 		}
 		members := cgroupMembers(cp.allocationState, claimAllocations)
-		if err := checkCappedAlone(ctr.GetName(), members); err != nil {
+		threaded, err := checkThreadedContainer(ctr.GetName(), cp.allocationState, claimAllocations)
+		if err != nil {
 			return nil, nil, err
+		}
+		// A threaded container's caps go to its groups' cgroups, each holding
+		// one capped request alone.
+		if !threaded {
+			if err := checkCappedAlone(ctr.GetName(), members); err != nil {
+				return nil, nil, err
+			}
 		}
 		updatedClaims, err := cp.allocationState.Bind(logger, podUID, ctr.Name, refs, expected)
 		if err != nil {
@@ -1028,7 +1055,11 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		if !exclusiveCPUs.IsEmpty() {
 			adjust.AddEnv(dracpuapi.EnvVarExclusiveAssignedCPUSet, exclusiveCPUs.String())
 		}
-		if capMilli := soleCap(members); capMilli > 0 {
+		if capped := slices.IndexFunc(members, func(m cgroupMember) bool { return m.capMilli > 0 }); threaded && capped >= 0 && hasKubeletQuota(ctr) {
+			// The kubelet's quota on the container's cgroup also bounds every
+			// group below it.
+			cp.eventRecorder.Event(podObject(pod), corev1.EventTypeWarning, reasonCPULimitReplacesCap, capReplacedMessage(ctr, members[capped]))
+		} else if capMilli := soleCap(members); capMilli > 0 && !threaded {
 			if hasKubeletQuota(ctr) {
 				cp.eventRecorder.Event(podObject(pod), corev1.EventTypeWarning, reasonCPULimitReplacesCap, capReplacedMessage(ctr, members[0]))
 			} else {
@@ -1051,6 +1082,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 				cp.allocationState.Unbind(logger, updatedClaims...)
 				return nil, nil, fmt.Errorf("cannot update shared CPU pool after creating container %q in pod %q: %w", ctr.Name, pod.Uid, err)
 			}
+			cp.rewriteThreadedShares(logger)
 		}
 		cp.podState.SetContainerState(podUID, state)
 	}
@@ -1062,6 +1094,9 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 // holds. Such a container was created before the driver started, and an
 // update killing it while it has no task only rewrites its stored spec
 // (containerd v2.4.0 internal/cri/server/container_update_resources.go:120-124).
+// It then builds a threaded container's groups, after runc create and before
+// the task starts (containerd v2.4.0 internal/cri/server/container_start.go:172-176),
+// and never waits or calls the runtime.
 func (cp *CPUDriver) StartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
 	defer cp.watchdog.track("StartContainer")()
 	cp.stateMu.Lock()
@@ -1069,18 +1104,18 @@ func (cp *CPUDriver) StartContainer(ctx context.Context, pod *api.PodSandbox, ct
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if cp.window != nil || len(cp.reservedHolds) == 0 {
+	if cp.window != nil {
 		return nil
 	}
 	_, logger := ctxlog.WithValues(ctx, "pod", ctxlog.KObj(pod), "podUID", pod.Uid, "container", ctr.Name, "containerID", ctr.Id)
 	claims, err := parseDRAEnvToClaimAllocations(logger, ctr.Env)
-	if err != nil {
+	if err != nil || len(claims) == 0 {
 		return nil
 	}
 	if uid, hold, held := cp.heldClaimOf(claims); held {
 		return fmt.Errorf("cannot start container %q in pod %q: %s", ctr.Name, pod.Uid, hold.refusal(uid))
 	}
-	return nil
+	return cp.buildThreadedTree(logger, pod, ctr, claims)
 }
 
 // StopContainer removes runtime container state without changing DRA-owned allocations.

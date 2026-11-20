@@ -37,6 +37,7 @@ CPU group. `individual` exposes one device per CPU, but is **deprecated**; see
 | `dra.cpu/allocator`                       | string  | The driver's `allocator` setting, `cpumanager` or `external`                                                            |
 | `dra.cpu/allowFractionalCapacityRequests` | bool    | The driver's `allowFractionalCapacityRequests` setting                                                                  |
 | `dra.cpu/allowExclusive`                  | bool    | Whether a request may take CPUs of its own: `true` on an owned device, its partition's `allowExclusive` on a shared one |
+| `dra.cpu/cgroupThreadedMode`              | string  | The driver's `cgroupThreadedMode` setting, `off`, `create` or `place`                                                   |
 | `dra.cpu/partition`                       | string  | The CPU partition the group's CPUs belong to; `default` on a node without `cpuPartitions`                               |
 | `dra.cpu/role`                            | string  | That partition's role, `default` or `exclusive`                                                                         |
 
@@ -53,8 +54,8 @@ claims run on the device's CPUs together, and no claim takes any of them for its
 with `cpuConfig.exclusive: true` where the partition sets `allowExclusive`; see
 [Exclusive requests on a default partition](cpu-partitions.md#exclusive-requests-on-a-default-partition).
 
-`dra.cpu/fullPhysicalCPUsOnly`, `dra.cpu/allocator`, `dra.cpu/allowFractionalCapacityRequests` and
-`dra.cpu/allowExclusive` let a claim's selector keep it off the nodes that would refuse to prepare
+`dra.cpu/fullPhysicalCPUsOnly`, `dra.cpu/allocator`, `dra.cpu/allowFractionalCapacityRequests`,
+`dra.cpu/allowExclusive` and `dra.cpu/cgroupThreadedMode` let a claim's selector keep it off the nodes that would refuse to prepare
 it; see
 [Settings published as device attributes](configuration.md#settings-published-as-device-attributes).
 
@@ -111,6 +112,7 @@ This is retained as a reference for existing deployments. For the supported repl
 | `dra.cpu/allocator`                       | string  | The driver's `allocator` setting, `cpumanager` or `external`                                          |
 | `dra.cpu/allowFractionalCapacityRequests` | bool    | The driver's `allowFractionalCapacityRequests` setting                                                |
 | `dra.cpu/allowExclusive`                  | bool    | `true`: every device of this mode is owned                                                            |
+| `dra.cpu/cgroupThreadedMode`              | string  | The driver's `cgroupThreadedMode` setting, `off`, `create` or `place`                                 |
 | `dra.cpu/partition`                       | string  | `default`: this mode takes no `cpuPartitions`                                                         |
 | `dra.cpu/role`                            | string  | `default`                                                                                             |
 
@@ -206,6 +208,8 @@ spec:
         bool: true
       dra.cpu/allowFractionalCapacityRequests:
         bool: false
+      dra.cpu/cgroupThreadedMode:
+        string: "off"
       dra.cpu/partition:
         string: default
       dra.cpu/role:
@@ -243,6 +247,8 @@ spec:
         bool: true
       dra.cpu/allowFractionalCapacityRequests:
         bool: false
+      dra.cpu/cgroupThreadedMode:
+        string: "off"
       dra.cpu/partition:
         string: default
       dra.cpu/role:
@@ -306,6 +312,8 @@ spec:
         bool: true
       dra.cpu/allowFractionalCapacityRequests:
         bool: false
+      dra.cpu/cgroupThreadedMode:
+        string: "off"
       dra.cpu/partition:
         string: default
       dra.cpu/role:
@@ -342,6 +350,8 @@ spec:
         bool: true
       dra.cpu/allowFractionalCapacityRequests:
         bool: false
+      dra.cpu/cgroupThreadedMode:
+        string: "off"
       dra.cpu/partition:
         string: default
       dra.cpu/role:
