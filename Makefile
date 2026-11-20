@@ -140,6 +140,9 @@ DRACPU_E2E_ALLOCATOR ?= cpumanager
 DRACPU_E2E_FULL_PCPUS_ONLY ?= false
 # The driver's cgroupThreadedMode, which ci-kind-setup installs on every node.
 DRACPU_E2E_THREADED_MODE ?= create
+# The containerd runtime handler the threaded specs run their pods under, and
+# the name of its RuntimeClass: a crun lane's runs crun.
+DRACPU_E2E_RUNTIME_HANDLER ?= $(if $(filter crun-%,$(DRACPU_E2E_LANE)),crun-writable,cgroup-writable)
 # Extra arguments passed to golangci-lint in the lint target.
 # For example, set GOLANGCI_LINT_EXTRA_ARGS=--fix to auto-fix issues.
 GOLANGCI_LINT_EXTRA_ARGS ?=
@@ -263,7 +266,7 @@ ifneq ($(DRACPU_E2E_VERBOSE),)
 endif
 ifneq ($(DRACPU_E2E_LANE),)
 	lane_vars="$$(hack/ci/lane-setup.sh $(DRACPU_E2E_LANE) pre)" && $(MAKE) ci-kind-cluster TAG=$(TAG) $$lane_vars
-	hack/ci/lane-setup.sh $(DRACPU_E2E_LANE) post
+	CLUSTER_NAME=$(CLUSTER_NAME) hack/ci/lane-setup.sh $(DRACPU_E2E_LANE) post
 else
 	$(MAKE) ci-kind-cluster TAG=$(TAG)
 endif
@@ -312,7 +315,7 @@ build-test-dracpuinfo: ## build helper to expose hardware info in the internal d
 	go build -v -o "$(OUT_DIR)/dracpuinfo" ./test/image/dracpuinfo
 
 test-e2e: ## run e2e test against an existing configured cluster
-	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(DRACPU_E2E_RESERVED_CPUS) go test -v ./test/e2e/ --ginkgo.v $(GINKGO_LABEL_FILTER_ARG) $(GINKGO_REPORT_ARG)
+	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(DRACPU_E2E_RESERVED_CPUS) DRACPU_E2E_RUNTIME_HANDLER=$(DRACPU_E2E_RUNTIME_HANDLER) go test -v ./test/e2e/ --ginkgo.v $(GINKGO_LABEL_FILTER_ARG) $(GINKGO_REPORT_ARG)
 
 test-e2e-kind: ci-kind-setup test-e2e ## run e2e test against a purpose-built kind cluster
 
