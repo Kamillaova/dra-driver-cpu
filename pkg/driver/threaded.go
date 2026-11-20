@@ -31,6 +31,8 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/cpuset"
 )
@@ -52,6 +54,22 @@ func (hostProcesses) Status(pid int) ([]byte, error) {
 
 func (hostProcesses) Cgroup(pid int) ([]byte, error) {
 	return os.ReadFile(path.Join("/proc", strconv.Itoa(pid), "cgroup"))
+}
+
+const reasonPlacementBestEffort = "ThreadedPlacementBestEffort"
+
+const placeWindowMessage = "`cgroupThreadedMode: place`: a container created while the driver is slow or down starts outside its groups, on all its claim's CPUs and without their limits, until it is restarted"
+
+// announcePlaceWindow says, under place, on the driver's log and its Node,
+// that a container may start unplaced: NRI lets a container start when its
+// call to the driver times out or no driver is connected, unless the runtime
+// requires the driver's plugin, and a process is never moved once it runs.
+func (cp *CPUDriver) announcePlaceWindow(logger logr.Logger) {
+	if cp.cgroupThreadedMode != cgroupfs.ThreadedModePlace {
+		return
+	}
+	logger.Info(placeWindowMessage)
+	cp.eventRecorder.Event(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: cp.nodeName}}, corev1.EventTypeWarning, reasonPlacementBestEffort, placeWindowMessage)
 }
 
 // threadedModeAttribute is the mode as every device publishes it.
