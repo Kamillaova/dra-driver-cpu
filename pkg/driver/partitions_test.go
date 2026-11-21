@@ -644,6 +644,7 @@ func sharingDriver(t *testing.T, fractional bool, onDisk map[types.UID]cdiClaimR
 		CPUDeviceGroupBy:                device.GROUP_BY_NUMA_NODE,
 		AllowFractionalCapacityRequests: fractional,
 		Metrics:                         recorder,
+		KubeletRootDir:                  t.TempDir(),
 		CPUPartitions: []device.Partition{
 			{Name: device.DefaultPartitionName},
 			{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 5)},
@@ -1690,6 +1691,7 @@ func partitionDriver(t *testing.T, infos []cpuinfo.CPUInfo, partitions []device.
 		CPUDeviceGroupBy:     device.GROUP_BY_NUMA_NODE,
 		FullPhysicalCPUsOnly: fullPhysicalCPUsOnly,
 		CPUPartitions:        partitions,
+		KubeletRootDir:       t.TempDir(),
 	})
 	require.NoError(t, err)
 	cdi := newMockCdiMgr()

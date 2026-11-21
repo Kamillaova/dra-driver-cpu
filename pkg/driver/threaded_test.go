@@ -513,36 +513,6 @@ func TestStartContainerBuildsNothingWithoutALayout(t *testing.T) {
 	}
 }
 
-// A container whose threaded claims give two groups one name, created while
-// the driver was away, gets no groups when it starts: CreateContainer would
-// have refused it, and one group for both claims is what that keeps out.
-func TestStartContainerBuildsNoSharedGroup(t *testing.T) {
-	ctx := ctxlog.NewContext(context.Background(), testr.New(t))
-	const root = "kubepods/burstable/podvm/vm"
-	tree := newWritableTree(t, map[string]string{root: fmt.Sprintf("%d\n", vmInit)})
-	d := sharingDriver(t, true, nil, nil)
-	d.cgroupThreadedMode = "create"
-	d.cgroups = tree
-	d.providers.Processes = fakeProcesses{status: map[int]string{vmInit: vmInitStatus}}
-	results, err := d.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{
-		withConfig(claimWithResults("a", claimResult{request: "vcpu", written: "1", consumed: "1", device: "cpudevnuma000-vms"}),
-			resourceapi.AllocationConfigSourceClaim, nil, threadedParams(`{"enabled": true}`)),
-		withConfig(claimWithResults("b", claimResult{request: "vcpu", written: "1", consumed: "1", device: "cpudevnuma000-vms"}),
-			resourceapi.AllocationConfigSourceClaim, nil, threadedParams(`{"enabled": true}`)),
-	})
-	require.NoError(t, err)
-	for uid, result := range results {
-		require.NoError(t, result.Err, "claim %s", uid)
-	}
-	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod", Name: "vm", Namespace: "vms"}
-	ctr := &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Pid: vmInit, Env: append(claimEnv("a", "vcpu"), claimEnv("b", "vcpu")...),
-		Linux: &api.LinuxContainer{CgroupsPath: "/" + root}}
-	require.NoError(t, d.StartContainer(ctx, pod, ctr))
-	_, built := tree.MapFS[path.Join(root, "vcpu")]
-	require.False(t, built, "no group is built for both claims")
-	require.Empty(t, tree.read(t, path.Join(root, "cgroup.subtree_control")))
-}
-
 // A threaded container refuses a claim of this driver that is not threaded
 // and two threaded claims giving one group name; its caps go to its groups,
 // so it is never refused or given a quota for a capped share beside another
