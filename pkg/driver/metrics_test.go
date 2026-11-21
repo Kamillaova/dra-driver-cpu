@@ -52,6 +52,7 @@ func newMetricsTestDriverWithCPUInfos(t *testing.T, cpuInfos []cpuinfo.CPUInfo) 
 	reg := prometheus.NewRegistry()
 	recorder := cpumetrics.New(reg)
 	driver := &CPUDriver{
+		kubeClient: statusClient(),
 		driverName: testDriverName,
 		topology: deviceTopology{
 			Inventory: device.Inventory{
@@ -123,7 +124,7 @@ func individualMetricsClaim(uid types.UID, devices ...string) *resourceapi.Resou
 		})
 	}
 	return &resourceapi.ResourceClaim{
-		ObjectMeta: metav1.ObjectMeta{UID: uid, Name: string(uid)},
+		ObjectMeta: metav1.ObjectMeta{UID: uid, Name: string(uid), ResourceVersion: "1"},
 		Status: resourceapi.ResourceClaimStatus{
 			Allocation: &resourceapi.AllocationResult{
 				Devices: resourceapi.DeviceAllocationResult{Results: results},
