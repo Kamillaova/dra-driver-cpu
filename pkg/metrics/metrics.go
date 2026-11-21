@@ -77,9 +77,12 @@ const (
 	// RulePartialHolder refuses a container that names some but not all of a
 	// claim's requests.
 	RulePartialHolder Rule = "partial_holder"
+	// RuleLimitWithOthers refuses a container that holds a request with a
+	// limit together with another request.
+	RuleLimitWithOthers Rule = "limit_with_others"
 )
 
-var rules = []Rule{RulePartialHolder}
+var rules = []Rule{RulePartialHolder, RuleLimitWithOthers}
 
 // Descriptor describes a custom driver metric for programmatic introspection.
 type Descriptor struct {
