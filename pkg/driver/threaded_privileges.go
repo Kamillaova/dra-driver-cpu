@@ -42,8 +42,16 @@ type ProcessProbe interface {
 	// namespace of PID 1.
 	SharesInitCgroupNamespace() (bool, error)
 	// EnterInitCgroupNamespace opens the cgroup namespace of PID 1 and enters
-	// it, on a thread that is then discarded.
-	EnterInitCgroupNamespace() error
+	// it on a thread kept for the driver's life, and returns what moves
+	// processes from that thread.
+	EnterInitCgroupNamespace() (processMover, error)
+}
+
+// processMover moves another container's process into a cgroup from the
+// cgroup namespace of PID 1.
+type processMover interface {
+	MoveProcess(fsys cgroupfs.FS, dir string, pid int) error
+	Stop()
 }
 
 // Capability numbers, linux v7.2 include/uapi/linux/capability.h:237,281,296.
@@ -61,40 +69,44 @@ func threadedModeOn(mode string) bool {
 // serves anything, and opens the host's cgroup2 tree.
 func (cp *CPUDriver) setUpThreadedMode(logger logr.Logger, providers Providers, mode string) error {
 	mount := cgroupfs.HostRoot()
-	hostNamespace, err := checkThreadedPrivileges(providers.EnsureProcess(), mode, mount)
+	mover, err := checkThreadedPrivileges(providers.EnsureProcess(), mode, mount)
 	if err != nil {
 		return err
 	}
 	cgroups, err := providers.EnsureCgroupFS()
 	if err != nil {
+		if mover != nil {
+			mover.Stop()
+		}
 		return err
 	}
 	cp.cgroupThreadedMode = mode
 	cp.cgroups = cgroups
-	cp.cgroupHostNamespace = hostNamespace
-	logger.Info("checked the privileges cgroupThreadedMode needs", "mode", mode, "mount", mount, "enterHostCgroupNamespace", hostNamespace)
+	cp.hostCgroups = mover
+	logger.Info("checked the privileges cgroupThreadedMode needs", "mode", mode, "mount", mount, "enterHostCgroupNamespace", mover != nil)
 	return nil
 }
 
 // checkThreadedPrivileges checks that the mount at mountPoint is the read-write
 // cgroup2 tree the mode writes, and under place that the driver can move
 // another container's process, naming the mount's state and the missing
-// capabilities in one refusal. It reports whether such a move has to enter the
-// cgroup namespace of PID 1: under nsdelegate a migration is allowed only
-// between cgroups below the writer's cgroup namespace root (linux v7.2
-// kernel/cgroup/cgroup.c:5374-5377).
-func checkThreadedPrivileges(probe ProcessProbe, mode, mountPoint string) (bool, error) {
+// capabilities in one refusal. Where such a move has to enter the cgroup
+// namespace of PID 1, under nsdelegate a migration being allowed only between
+// cgroups below the writer's cgroup namespace root (linux v7.2
+// kernel/cgroup/cgroup.c:5374-5377), it returns what moves processes from
+// there, and nil where the driver moves them from its own.
+func checkThreadedPrivileges(probe ProcessProbe, mode, mountPoint string) (processMover, error) {
 	mountinfo, err := probe.MountInfo()
 	if err != nil {
-		return false, fmt.Errorf("`cgroupThreadedMode: %s`: read the driver's mounts: %w", mode, err)
+		return nil, fmt.Errorf("`cgroupThreadedMode: %s`: read the driver's mounts: %w", mode, err)
 	}
 	mount, found := findMount(mountinfo, mountPoint)
 	if !found {
-		return false, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: nothing is mounted at %s; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
+		return nil, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: nothing is mounted at %s; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
 			mode, mountPoint, mountPoint)
 	}
 	if mount.fsType != "cgroup2" {
-		return false, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: %s is %s, not cgroup2; run the node on cgroup v2, or set `cgroupThreadedMode: false`",
+		return nil, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: %s is %s, not cgroup2; run the node on cgroup v2, or set `cgroupThreadedMode: false`",
 			mode, mountPoint, mountPoint, mount.fsType)
 	}
 	readOnly := !slices.Contains(mount.options, "rw")
@@ -108,27 +120,27 @@ func checkThreadedPrivileges(probe ProcessProbe, mode, mountPoint string) (bool,
 		// Reading PID 1's namespace is a ptrace access, as entering it is, so a
 		// refusal leaves the answer to the attempt below.
 		case !errors.Is(err, syscall.EACCES):
-			return false, fmt.Errorf("`cgroupThreadedMode: place`: compare the driver's cgroup namespace with PID 1's: %w", err)
+			return nil, fmt.Errorf("`cgroupThreadedMode: place`: compare the driver's cgroup namespace with PID 1's: %w", err)
 		}
 	}
 	if !place {
 		if readOnly {
-			return false, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: %s is mounted read-only; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
+			return nil, fmt.Errorf("`cgroupThreadedMode: %s` needs the host's cgroup v2 hierarchy mounted read-write at %s: %s is mounted read-only; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
 				mode, mountPoint, mountPoint)
 		}
-		return false, nil
+		return nil, nil //nolint:nilnil // no mover: create moves no process
 	}
 	caps, err := probe.EffectiveCapabilities()
 	if err != nil {
-		return false, fmt.Errorf("`cgroupThreadedMode: place`: read the driver's capabilities: %w", err)
+		return nil, fmt.Errorf("`cgroupThreadedMode: place`: read the driver's capabilities: %w", err)
 	}
 	if !enter {
-		return false, checkPlaceInOwnNamespace(mountPoint, readOnly, caps)
+		if err := checkPlaceInOwnNamespace(mountPoint, readOnly, caps); err != nil {
+			return nil, err
+		}
+		return nil, nil //nolint:nilnil // no mover: moves are written from the driver's own cgroup namespace
 	}
-	if err := enterHostCgroupNamespace(probe, mountPoint, readOnly, caps); err != nil {
-		return false, err
-	}
-	return true, nil
+	return enterHostCgroupNamespace(probe, mountPoint, readOnly, caps)
 }
 
 // checkPlaceInOwnNamespace checks place where the driver moves processes from
@@ -149,31 +161,34 @@ func checkPlaceInOwnNamespace(mountPoint string, readOnly bool, caps uint64) err
 	return nil
 }
 
-// enterHostCgroupNamespace enters PID 1's cgroup namespace once, as a move
-// does, the bits of the two capabilities entering needs naming only what is
-// missing when the attempt is refused.
-func enterHostCgroupNamespace(probe ProcessProbe, mountPoint string, readOnly bool, caps uint64) error {
-	enterErr := probe.EnterInitCgroupNamespace()
+// enterHostCgroupNamespace enters PID 1's cgroup namespace on the thread every
+// move is made from, the bits of the two capabilities entering needs naming
+// only what is missing when the attempt is refused.
+func enterHostCgroupNamespace(probe ProcessProbe, mountPoint string, readOnly bool, caps uint64) (processMover, error) {
+	mover, enterErr := probe.EnterInitCgroupNamespace()
 	refused := errors.Is(enterErr, syscall.EACCES) || errors.Is(enterErr, syscall.EPERM)
 	if enterErr != nil && !refused {
-		return fmt.Errorf("`cgroupThreadedMode: place`: enter the host's cgroup namespace: %w", enterErr)
+		return nil, fmt.Errorf("`cgroupThreadedMode: place`: enter the host's cgroup namespace: %w", enterErr)
 	}
 	missing := missingCapabilities(caps, refused)
+	if enterErr == nil && (readOnly || missing != "") {
+		mover.Stop()
+	}
 	switch {
 	case missing != "" && readOnly:
-		return fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_NICE, CAP_SYS_PTRACE and CAP_SYS_ADMIN: %s is mounted read-only; the driver lacks %s; fix its pod, or set `cgroupThreadedMode: false`",
+		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_NICE, CAP_SYS_PTRACE and CAP_SYS_ADMIN: %s is mounted read-only; the driver lacks %s; fix its pod, or set `cgroupThreadedMode: false`",
 			mountPoint, mountPoint, missing)
 	case missing != "":
-		return fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_NICE, CAP_SYS_PTRACE and CAP_SYS_ADMIN: the driver lacks %s; fix its pod, or set `cgroupThreadedMode: false`",
+		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_NICE, CAP_SYS_PTRACE and CAP_SYS_ADMIN: the driver lacks %s; fix its pod, or set `cgroupThreadedMode: false`",
 			mountPoint, missing)
 	case readOnly:
-		return fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_NICE, CAP_SYS_PTRACE and CAP_SYS_ADMIN: %s is mounted read-only; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
+		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at %s, CAP_SYS_NICE, CAP_SYS_PTRACE and CAP_SYS_ADMIN: %s is mounted read-only; mount the host's /sys/fs/cgroup read-write in its pod, or set `cgroupThreadedMode: false`",
 			mountPoint, mountPoint)
 	case refused:
-		return fmt.Errorf("`cgroupThreadedMode: place` needs to enter the host's cgroup namespace: it was refused though the driver holds CAP_SYS_PTRACE and CAP_SYS_ADMIN (%w); run the driver in the host's user namespace, under an AppArmor profile that allows it",
+		return nil, fmt.Errorf("`cgroupThreadedMode: place` needs to enter the host's cgroup namespace: it was refused though the driver holds CAP_SYS_PTRACE and CAP_SYS_ADMIN (%w); run the driver in the host's user namespace, under an AppArmor profile that allows it",
 			enterErr)
 	}
-	return nil
+	return mover, nil
 }
 
 // missingCapabilities names the capabilities place needs that caps lacks:
