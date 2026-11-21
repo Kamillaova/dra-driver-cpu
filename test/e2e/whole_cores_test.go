@@ -153,7 +153,7 @@ var _ = ginkgo.Describe("Whole physical cores", ginkgo.Serial, ginkgo.Ordered, g
 		gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
 		ginkgo.By("waiting for the kubelet to report the driver's refusal")
-		refusal := fmt.Sprintf("request \"request-cpus\": amount %d on exclusive request (class %s); ask for whole cores of %d threads (`fullPhysicalCPUsOnly: true`)", written, driverName, step)
+		refusal := fmt.Sprintf("request \"request-cpus\": amount %d on exclusive request (class %s, no cpuPartitions); ask for whole cores of %d threads (`fullPhysicalCPUsOnly: true`)", written, driverName, step)
 		gomega.Eventually(func(g gomega.Gomega) {
 			events, err := fxt.K8SClientset.CoreV1().Events(pod.Namespace).List(ctx, metav1.ListOptions{
 				FieldSelector: "involvedObject.name=" + pod.Name,

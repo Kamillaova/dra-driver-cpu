@@ -33,10 +33,11 @@ Optional features need additional cluster feature gates.
 All the driver options which depends on the availability of a Kubernetes feature controlled by a Feature Gate require a double opt-in mechanism.
 First, the driver must be made aware of Kubernetes feature gate status (see above). Then, driver features can be enabled or disabled.
 
-| Feature                           | Kubernetes feature gate       |
-| --------------------------------- | ----------------------------- |
-| PCIe root attributes              | `DRAListTypeAttributes`       |
-| NodeAllocatable resources mapping | `DRANodeAllocatableResources` |
+| Feature                                                                   | Kubernetes feature gate                                                |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| PCIe root attributes                                                      | `DRAListTypeAttributes`                                                |
+| NodeAllocatable resources mapping                                         | `DRANodeAllocatableResources`                                          |
+| Fractional amounts on shared requests (`allowFractionalCapacityRequests`) | `DRAFractionalCapacityRange` on every scheduler that places claim pods |
 
 The driver is Linux-only and needs node-level privileges (host networking, and NRI socket,
 CDI directory, and kubelet plugin directory access) — see
