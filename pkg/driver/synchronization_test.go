@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 
@@ -47,13 +48,25 @@ func TestSynchronizeFailurePreservesState(t *testing.T) {
 	d.refreshAllocationMetrics()
 	oldMetrics := recorder.state
 	oldCPU, oldPods := d.allocationState, d.podState
-	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"full": cpuset.New(0, 1, 2, 3)})
+	cdi := &pausedRefreshCDI{
+		mockCdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"full": cpuset.New(0, 1, 2, 3)}),
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	d.cdiMgr = cdi
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		<-cdi.entered
+		cancel()
+		close(cdi.release)
+	}()
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
-	updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{
+	updates, err := d.Synchronize(ctx, []*api.PodSandbox{pod}, []*api.Container{
 		{Id: "exclusive", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_full=0-3"}},
 		{Id: "shared", Name: "sidecar", PodSandboxId: pod.Id},
 	})
-	require.ErrorContains(t, err, "no shared CPUs available")
+	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, updates)
 	require.Same(t, oldCPU, d.allocationState)
 	require.Same(t, oldPods, d.podState)
@@ -101,28 +114,35 @@ func TestSynchronizeRetainsPreparedClaimAndOwner(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestWarmSynchronizeRejectsConflictingClaims(t *testing.T) {
+// A reconnect judges each container against the records this process keeps. A
+// record never changes, and only the container that fails it loses its CPUs.
+func TestWarmSynchronizeContainsConflictingClaims(t *testing.T) {
 	testCases := []struct {
-		name   string
-		mutate func(*mockCdiMgr, *api.Container)
+		name     string
+		mutate   func(*mockCdiMgr, *api.Container)
+		wantCPUs string
 	}{
 		{
+			// The CDI spec is written from the record, not the other way round.
 			name: "missing CDI",
 			mutate: func(cdi *mockCdiMgr, _ *api.Container) {
 				delete(cdi.devices, getCDIDeviceName("a"))
 			},
+			wantCPUs: "0",
 		},
 		{
 			name: "changed CPU",
 			mutate: func(_ *mockCdiMgr, app *api.Container) {
 				app.Env = []string{"DRA_CPUSET_a=1"}
 			},
+			wantCPUs: "1-3",
 		},
 		{
 			name: "different owner",
 			mutate: func(_ *mockCdiMgr, app *api.Container) {
 				app.Name = "other"
 			},
+			wantCPUs: "1-3",
 		},
 	}
 
@@ -141,12 +161,14 @@ func TestWarmSynchronizeRejectsConflictingClaims(t *testing.T) {
 			app := &api.Container{Id: "app", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0"}}
 			testCase.mutate(cdi, app)
 
-			oldCPU, oldPods := d.allocationState, d.podState
-			_, err = d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{app})
-			require.Error(t, err)
-			require.Same(t, oldCPU, d.allocationState)
-			require.Same(t, oldPods, d.podState)
+			updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{app})
+			require.NoError(t, err)
+			require.Equal(t, map[string]string{"app": testCase.wantCPUs}, cpusByContainer(updates))
 			require.Equal(t, "0", d.allocationState.GetPreparedCPUs().String())
+			require.True(t, d.allocationState.IsOwner("a", "pod", "app"))
+			state := d.podState.GetContainerState("pod", app.Name)
+			require.NotNil(t, state)
+			require.Equal(t, testCase.wantCPUs == "0", state.HasExclusiveCPUAllocation())
 		})
 	}
 }
@@ -226,11 +248,23 @@ func (m *pausedRefreshCDI) Refresh() error {
 	return m.mockCdiMgr.Refresh()
 }
 
+type pausedRecorder struct {
+	Recorder
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *pausedRecorder) SetAllocationState(state cpumetrics.AllocationState) {
+	r.once.Do(func() { close(r.entered); <-r.release })
+	r.Recorder.SetAllocationState(state)
+}
+
 func requireStateLockHeld(t *testing.T, d *CPUDriver) {
 	t.Helper()
 	if d.stateMu.TryLock() {
 		d.stateMu.Unlock()
-		t.Fatal("state lock is not held during CDI refresh")
+		t.Fatal("state lock is not held while Synchronize is paused")
 	}
 }
 
@@ -280,15 +314,14 @@ func TestSynchronizeSerializesUnprepare(t *testing.T) {
 	_, err := d.Synchronize(t.Context(), nil, nil)
 	require.NoError(t, err)
 	claim := individualMetricsClaim("pending", "cpudev0")
-	cdi := &pausedRefreshCDI{
-		mockCdiMgr: newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"running": cpuset.New(1)}),
-		entered:    make(chan struct{}),
-		release:    make(chan struct{}),
-	}
+	cdi := newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"running": cpuset.New(1)})
 	d.cdiMgr = cdi
 	prepared, err := d.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
 	require.NoError(t, err)
 	require.NoError(t, prepared[claim.UID].Err)
+	// A reconnect reads no CDI spec, so pause it where it publishes its metrics.
+	paused := &pausedRecorder{Recorder: d.metrics, entered: make(chan struct{}), release: make(chan struct{})}
+	d.metrics = paused
 
 	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
 	syncDone := make(chan error, 1)
@@ -298,7 +331,7 @@ func TestSynchronizeSerializesUnprepare(t *testing.T) {
 		})
 		syncDone <- err
 	}()
-	<-cdi.entered
+	<-paused.entered
 	requireStateLockHeld(t, d)
 
 	unprepareDone := make(chan error, 1)
@@ -312,7 +345,7 @@ func TestSynchronizeSerializesUnprepare(t *testing.T) {
 		unprepareDone <- err
 	}()
 	<-started
-	close(cdi.release)
+	close(paused.release)
 	require.NoError(t, <-syncDone)
 	require.NoError(t, <-unprepareDone)
 
@@ -523,4 +556,193 @@ func TestWarmSynchronizeMalformedExclusiveContainerKeepsOwnership(t *testing.T) 
 	adjustment, _, err := d.CreateContainer(t.Context(), pod, app)
 	require.NoError(t, err)
 	require.Equal(t, "0", adjustment.Linux.Resources.Cpu.Cpus)
+}
+
+func pinnedTo(cpus string) *api.LinuxContainer {
+	return &api.LinuxContainer{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: cpus}}}
+}
+
+func cpusByContainer(updates []*api.ContainerUpdate) map[string]string {
+	byID := make(map[string]string, len(updates))
+	for _, update := range updates {
+		byID[update.ContainerId] = update.GetLinux().GetResources().GetCpu().GetCpus()
+	}
+	return byID
+}
+
+// Two containers name one claim, the second created while the driver was not
+// connected. Every process must synchronize, and reach the same answer at each
+// attempt and in either list order.
+func TestSynchronizeClaimNamedByTwoContainers(t *testing.T) {
+	const claimUID = types.UID("shared-claim")
+	held := cpuset.New(0, 2)
+	env := []string{fmt.Sprintf("%s_%s=%s", cdiEnvVarPrefix, claimUID, held.String())}
+	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
+	otherPod := &api.PodSandbox{Id: "other-pod", Uid: "other-pod-uid"}
+
+	testCases := []struct {
+		name       string
+		containers []*api.Container
+		wantOwner  *store.OwnerIdent
+		wantCPUs   map[string]string
+	}{
+		{
+			name: "neither was admitted by the driver",
+			containers: []*api.Container{
+				{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: env},
+				{Id: "c-sidecar", Name: "sidecar", PodSandboxId: pod.Id, Env: env},
+				{Id: "c-plain", Name: "plain", PodSandboxId: pod.Id},
+			},
+			wantCPUs: map[string]string{"c-app": "1,3", "c-sidecar": "1,3", "c-plain": "1,3"},
+		},
+		{
+			name: "the one the driver admitted keeps the claim",
+			containers: []*api.Container{
+				{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: env, Linux: pinnedTo("0,2")},
+				{Id: "c-sidecar", Name: "sidecar", PodSandboxId: pod.Id, Env: env},
+				{Id: "c-plain", Name: "plain", PodSandboxId: pod.Id},
+			},
+			wantOwner: &store.OwnerIdent{PodUID: "pod-uid", ContainerName: "app"},
+			wantCPUs:  map[string]string{"c-app": "0,2", "c-sidecar": "1,3", "c-plain": "1,3"},
+		},
+		{
+			name: "a second pod names a standalone claim",
+			containers: []*api.Container{
+				{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: env, Linux: pinnedTo("0,2")},
+				{Id: "c-intruder", Name: "app", PodSandboxId: otherPod.Id, Env: env, Linux: pinnedTo("0-3")},
+			},
+			wantOwner: &store.OwnerIdent{PodUID: "pod-uid", ContainerName: "app"},
+			wantCPUs:  map[string]string{"c-app": "0,2", "c-intruder": "1,3"},
+		},
+		{
+			name: "two containers pinned to the claim prove nothing",
+			containers: []*api.Container{
+				{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: env, Linux: pinnedTo("0,2")},
+				{Id: "c-sidecar", Name: "sidecar", PodSandboxId: pod.Id, Env: env, Linux: pinnedTo("0,2")},
+			},
+			wantCPUs: map[string]string{"c-app": "1,3", "c-sidecar": "1,3"},
+		},
+		{
+			name: "a container naming other CPUs does not contend for the claim",
+			containers: []*api.Container{
+				{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: env},
+				{Id: "c-forged", Name: "app", PodSandboxId: otherPod.Id, Env: []string{fmt.Sprintf("%s_%s=1", cdiEnvVarPrefix, claimUID)}},
+			},
+			wantOwner: &store.OwnerIdent{PodUID: "pod-uid", ContainerName: "app"},
+			wantCPUs:  map[string]string{"c-app": "0,2", "c-forged": "1,3"},
+		},
+	}
+
+	for _, tc := range testCases {
+		for _, reversed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/reversed=%v", tc.name, reversed), func(t *testing.T) {
+				containers := slices.Clone(tc.containers)
+				if reversed {
+					slices.Reverse(containers)
+				}
+				pods := []*api.PodSandbox{pod, otherPod}
+				d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
+				d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{claimUID: held})
+
+				// The first attempt is a fresh process, the others are reconnects.
+				for attempt := range 3 {
+					updates, err := d.Synchronize(t.Context(), pods, containers)
+					require.NoError(t, err, "attempt %d", attempt)
+					require.Equal(t, tc.wantCPUs, cpusByContainer(updates), "attempt %d", attempt)
+					require.Equal(t, held.String(), d.allocationState.GetPreparedCPUs().String())
+					owner, bound := d.allocationState.Owner(claimUID)
+					if tc.wantOwner == nil {
+						require.False(t, bound, "attempt %d: bound to %v", attempt, owner)
+					} else {
+						require.True(t, bound, "attempt %d", attempt)
+						require.Equal(t, *tc.wantOwner, owner)
+					}
+				}
+				require.True(t, d.hasSynchronized)
+
+				claim := individualMetricsClaim("new-claim", "cpudev1")
+				results, err := d.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
+				require.NoError(t, err)
+				require.NoError(t, results[claim.UID].Err, "an unrelated claim must still prepare")
+			})
+		}
+	}
+}
+
+func TestSynchronizeBindsClaimOnceUncontested(t *testing.T) {
+	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
+	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)})
+	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
+	app := &api.Container{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0"}}
+	sidecar := &api.Container{Id: "c-sidecar", Name: "sidecar", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0"}}
+
+	_, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{app, sidecar})
+	require.NoError(t, err)
+	_, bound := d.allocationState.Owner("a")
+	require.False(t, bound)
+
+	updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{app})
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"c-app": "0"}, cpusByContainer(updates))
+	require.True(t, d.allocationState.IsOwner("a", "pod-uid", "app"))
+}
+
+func TestWarmSynchronizeKeepsOwnerAgainstSecondContainer(t *testing.T) {
+	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
+	_, err := d.Synchronize(t.Context(), nil, nil)
+	require.NoError(t, err)
+	claim := individualMetricsClaim("a", "cpudev0")
+	results, err := d.PrepareResourceClaims(t.Context(), []*resourceapi.ResourceClaim{claim})
+	require.NoError(t, err)
+	require.NoError(t, results[claim.UID].Err)
+	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
+	app := &api.Container{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0"}}
+	_, _, err = d.CreateContainer(t.Context(), pod, app)
+	require.NoError(t, err)
+	sidecar := &api.Container{Id: "c-sidecar", Name: "sidecar", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0"}}
+	_, _, err = d.CreateContainer(t.Context(), pod, sidecar)
+	require.ErrorIs(t, err, store.ErrClaimAlreadyBound)
+
+	for _, containers := range [][]*api.Container{{app, sidecar}, {sidecar, app}} {
+		updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, containers)
+		require.NoError(t, err)
+		require.Equal(t, map[string]string{"c-app": "0", "c-sidecar": "1-3"}, cpusByContainer(updates))
+		require.True(t, d.allocationState.IsOwner("a", "pod-uid", "app"))
+	}
+}
+
+func TestSynchronizeJudgesEachClaimOfAContainer(t *testing.T) {
+	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
+	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0), "b": cpuset.New(1)})
+	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
+	app := &api.Container{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_a=0", "DRA_CPUSET_b=1"}}
+	sidecar := &api.Container{Id: "c-sidecar", Name: "sidecar", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_b=1"}}
+
+	updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{app, sidecar})
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"c-app": "0", "c-sidecar": "2-3"}, cpusByContainer(updates))
+	require.True(t, d.allocationState.IsOwner("a", "pod-uid", "app"))
+	_, bound := d.allocationState.Owner("b")
+	require.False(t, bound)
+	require.Equal(t, "0-1", d.allocationState.GetPreparedCPUs().String())
+}
+
+// NRI cannot give the container without claims an empty cpuset, so it stays
+// where the runtime put it rather than taking the driver off the node.
+func TestSynchronizeLeavesSharedContainersWhenPoolIsExhausted(t *testing.T) {
+	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
+	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"full": cpuset.New(0, 1, 2, 3)})
+	pod := &api.PodSandbox{Id: "sandbox", Uid: "pod"}
+	updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, []*api.Container{
+		{Id: "exclusive", Name: "app", PodSandboxId: pod.Id, Env: []string{"DRA_CPUSET_full=0-3"}},
+		{Id: "shared", Name: "sidecar", PodSandboxId: pod.Id},
+	})
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"exclusive": "0-3"}, cpusByContainer(updates))
+	require.True(t, d.hasSynchronized)
+	require.True(t, d.allocationState.IsOwner("full", types.UID(pod.Uid), "app"))
+	require.NotNil(t, d.podState.GetContainerState(types.UID(pod.Uid), "sidecar"))
+
+	_, _, err = d.CreateContainer(t.Context(), pod, &api.Container{Id: "late", Name: "late", PodSandboxId: pod.Id})
+	require.ErrorContains(t, err, "no shared CPUs available")
 }

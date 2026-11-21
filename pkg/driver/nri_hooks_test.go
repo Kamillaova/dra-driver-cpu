@@ -596,7 +596,7 @@ func TestNRISynchronize(t *testing.T) {
 			},
 		},
 		{
-			name: "synchronize rejects an empty shared pool with existing shared containers",
+			name: "synchronize leaves shared containers in place when no shared CPUs remain",
 			driver: &CPUDriver{
 				podState:        store.NewPodState(),
 				allocationState: store.NewAllocationState(topo, cpuset.New()),
@@ -611,7 +611,12 @@ func TestNRISynchronize(t *testing.T) {
 				{Id: "p1-guaranteed", PodSandboxId: pod1.Id, Name: "guaranteed-ctr", Env: []string{fmt.Sprintf("%s_claim-full=%s", cdiEnvVarPrefix, allCPUs.String())}},
 				{Id: "p1-shared", PodSandboxId: pod1.Id, Name: "shared-ctr"},
 			},
-			expectedError:        "no shared CPUs available",
+			expectedUpdates: []*api.ContainerUpdate{
+				{
+					ContainerId: "p1-guaranteed",
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: allCPUs.String()}}},
+				},
+			},
 			expectedRefreshCalls: 1,
 		},
 		{
@@ -748,7 +753,7 @@ func TestNRISynchronize(t *testing.T) {
 			expectedRefreshCalls: 1,
 		},
 		{
-			name: "runtime DRA env that mismatches driver-owned CDI spec is ignored",
+			name: "runtime DRA env that mismatches driver-owned CDI spec gets none of the claim's CPUs",
 			driver: &CPUDriver{
 				podState:        store.NewPodState(),
 				allocationState: store.NewAllocationState(topo, cpuset.New()),
@@ -765,7 +770,7 @@ func TestNRISynchronize(t *testing.T) {
 			expectedUpdates: []*api.ContainerUpdate{
 				{
 					ContainerId: "p1-invalid",
-					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-7"}}},
+					Linux:       &api.LinuxContainerUpdate{Resources: &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "0-1,4-7"}}},
 				},
 			},
 			expectedRefreshCalls: 1,
