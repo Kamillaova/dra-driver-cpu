@@ -82,6 +82,16 @@ The report records:
 
 When the driver process is running in the same container, `driverConfig` is derived from the driver's actual command line and falls back to defaults only when that information is unavailable.
 
+## A Driver That Exits
+
+When the driver exits on an error, at start, for example on a configuration it cannot load or a
+node that does not give a setting what it needs, or later, it logs the error in a
+`failed to load configuration` or `failed to run` line and writes it to its container's
+termination message file, `/dev/termination-log`. `kubectl describe pod` then shows it under the
+container's `Last State`, and the pod's status holds it in the container's
+`lastState.terminated.message`. The chart sets `terminationMessagePolicy: FallbackToLogsOnError`,
+so where an exit on an error writes no message, the end of the container's log takes its place.
+
 ## A Stuck Driver
 
 The driver times how long its state lock has been held and how long each NRI hook and each
