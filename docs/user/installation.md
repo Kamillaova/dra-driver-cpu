@@ -26,7 +26,7 @@ Other requirements:
 | Requirement           | Minimum                                                                                                                   |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | Kernel cgroup version | **Cgroup v2**. The driver does not support cgroup v1.                                                                     |
-| Kernel build options  | `CONFIG_CPUSETS`, the cpuset controller; `CONFIG_CFS_BANDWIDTH` for a shared request capped at its amount                 |
+| Kernel build options  | `CONFIG_CPUSETS`, the cpuset controller; `CONFIG_CFS_BANDWIDTH` for a capped shared request                               |
 | Container runtime     | containerd **2.0** or CRI-O **1.30** (NRI and CDI enabled by default)                                                     |
 | Kubelet configuration | CPUManager disabled: `cpuManagerPolicy: none` — see [Configuration](configuration.md#kubelet-configuration-prerequisites) |
 

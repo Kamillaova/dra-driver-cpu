@@ -131,6 +131,31 @@ func TestCPUManagerGetPreferredCPUs(t *testing.T) {
 			want:    cpuset.New(),
 			wantErr: ErrUnsupportedPreferredCPUs,
 		},
+		{
+			name: "matching opaque config naming no CPUs is accepted",
+			allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Config: []resourceapi.DeviceAllocationConfiguration{
+						{
+							Source:   resourceapi.AllocationConfigSourceClaim,
+							Requests: []string{"claim-1"},
+							DeviceConfiguration: resourceapi.DeviceConfiguration{
+								Opaque: &resourceapi.OpaqueDeviceConfiguration{
+									Driver: testDriverName,
+									Parameters: runtime.RawExtension{
+										Raw: []byte(`{"apiVersion":"v1alpha1","cpuConfig":{"limit":"max"}}`),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			alloc: resourceapi.DeviceRequestAllocationResult{
+				Request: "claim-1",
+			},
+			want: cpuset.New(),
+		},
 	}
 
 	for _, tc := range testCases {
