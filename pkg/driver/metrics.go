@@ -34,6 +34,7 @@ type Recorder interface {
 	RecordNRISynchronizeRefusedClaim()
 	RecordContainerKeptUnderOlderRule(rule cpumetrics.Rule)
 	SetWatchdogStuck(stalled time.Duration)
+	RecordNodeAllocatableMappingDropped()
 }
 
 // refreshAllocationMetrics requires stateMu once the driver is serving callbacks.

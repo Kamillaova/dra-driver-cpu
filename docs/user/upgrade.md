@@ -130,6 +130,15 @@ chart creates no policy.
 
 ### Behavior changes
 
+#### Node condition for the node-allocatable mapping
+
+With `publishNodeAllocatableResourceMapping: true`, the driver now keeps the condition
+`CPUAllocatableMappingDropped` in its Node's status, through the `nodes/status` permission above:
+`True` once the API server has dropped the mapping from the node's ResourceSlices, `False`
+otherwise, and `Unknown` after the driver stops. With the option off, the default, the driver
+writes nothing to its Node. See
+[troubleshooting](troubleshooting.md#a-node-allocatable-mapping-the-api-server-dropped).
+
 #### Kubernetes API client limits
 
 The driver's Kubernetes API client now sends up to 20 requests per second, with bursts of 50,
