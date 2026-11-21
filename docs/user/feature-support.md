@@ -103,7 +103,7 @@ claims, nor to a claim and the containers without one. It requires `cpuDeviceMod
 A device whose cores all have two logical CPUs carries a request policy in whole cores (see
 [Device Attributes](device-attributes.md#with-whole-physical-cores)), so the scheduler rounds an
 amount up to whole cores: a claim for 3 CPUs is allocated 4. The driver refuses that claim when it
-prepares it, with `` request "cpus": amount 3 on exclusive request (class dra.cpu); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`) ``. The scheduler cannot see the refusal coming: it may allocate a claim whose amount is not
+prepares it, with `` request "cpus": amount 3 on exclusive request (class dra.cpu, no cpuPartitions); ask for whole cores of 2 threads (`fullPhysicalCPUsOnly: true`) ``. The scheduler cannot see the refusal coming: it may allocate a claim whose amount is not
 a multiple of 2 on such a device although a node whose cores have one logical CPU could serve it.
 The pod then stays in `ContainerCreating` on that node, the kubelet retrying the preparation about
 once a minute, and the claim keeps its device allocated until the pod is deleted. Give such a claim

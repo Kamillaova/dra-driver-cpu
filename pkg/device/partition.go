@@ -73,6 +73,13 @@ func (p Partition) PublishesOwnedDevices(partitionsUsed bool) bool {
 	return false
 }
 
+// PublishesSharedDevices reports whether claims share the CPUs of p, which
+// every partition of role default does where the configuration declares the
+// partitions.
+func (p Partition) PublishesSharedDevices(partitionsUsed bool) bool {
+	return p.Role == PARTITION_ROLE_DEFAULT && partitionsUsed
+}
+
 // IsReserved reports whether p keeps its CPUs from every workload.
 func (p Partition) IsReserved() bool {
 	return p.Role == PARTITION_ROLE_RESERVED

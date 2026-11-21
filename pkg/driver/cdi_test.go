@@ -24,6 +24,7 @@ import (
 
 	"github.com/go-logr/logr/testr"
 	"github.com/google/go-cmp/cmp"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
@@ -225,12 +226,30 @@ func TestGetDeviceAllocations(t *testing.T) {
 		{
 			name:    "a request recorded twice",
 			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vcpus","cpus":"0"},{"request":"vcpus","cpus":"1"}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
-			wantErr: `dra.cpu/record records request "vcpus" twice or without a name`,
+			wantErr: `dra.cpu/record records request "vcpus" twice in one role or without a name`,
 		},
 		{
 			name:    "a request without CPUs",
 			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vcpus","cpus":""}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
 			wantErr: `dra.cpu/record records no CPU for request "vcpus"`,
+		},
+		{
+			name: "a shared request keeps its role and devices",
+			spec: specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vmm-cpu","cpus":"0-3","role":"shared","results":[{"device":"cpudevcache000","consumed":"250m"}]}]}`), "DRA_CPUSET_vm_vmm-cpu=dynamic"),
+			want: cdiClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []cdiRequestRecord{{
+				Request: "vmm-cpu", CPUs: cpuset.New(0, 1, 2, 3), Role: store.RoleShared,
+				Results: []cdiResultRecord{{Device: "cpudevcache000", Consumed: new(resource.MustParse("250m"))}},
+			}}},
+		},
+		{
+			name:    "a role this driver does not know",
+			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vcpus","cpus":"0","role":"pinned"}]}`), "DRA_CPUSET_vm_vcpus=dynamic"),
+			wantErr: `dra.cpu/record records request "vcpus" with role "pinned", which this driver does not know`,
+		},
+		{
+			name:    "a shared request without a device",
+			spec:    specWith(record(`{"namespace":"ns","name":"vm-claim","placements":[{"request":"vmm-cpu","cpus":"0","role":"shared"}]}`), "DRA_CPUSET_vm_vmm-cpu=dynamic"),
+			wantErr: `dra.cpu/record records shared request "vmm-cpu" with no device`,
 		},
 		{
 			name:    "CPUs that do not parse",
