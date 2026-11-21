@@ -118,9 +118,10 @@ honor these settings, where applicable.
   prepares; see [lanes](#lanes). Empty creates the cluster from `hack/ci/kind-ci.yaml` and installs
   the driver without CPU partitions.
 
-- `DRACPU_E2E_NOSMT_PARTITION_CPUS` and `DRACPU_E2E_RESERVED_PARTITION_CPUS`: (optional, used on a
-  lane): the cpusets of the `nosmt` and `reserved` partitions. `hack/ci/lane-setup.sh` computes
-  each from the host where it is empty, and leaves it empty where the host lacks the shape.
+- `DRACPU_E2E_NOSMT_PARTITION_CPUS`, `DRACPU_E2E_DEGRADED_PARTITION_CPUS` and
+  `DRACPU_E2E_RESERVED_PARTITION_CPUS`: (optional, used on a lane): the cpusets of the `nosmt`,
+  `degraded` and `reserved` partitions. `hack/ci/lane-setup.sh` computes each from the host where it
+  is empty, and leaves it empty where the host lacks the shape.
 
 - `DRACPU_E2E_REPORT`: (optional): a path, best absolute, where *the Makefile* `test-e2e` target
   writes the Ginkgo JSON report.
@@ -185,9 +186,12 @@ where their lane did not prepare the cluster.
 - `partitions` (label `partitions`): the driver with the profiles `e2e`, on the control plane and
   `worker`, and `e2e-wide`, on `worker2`, which `ci-kind-setup` labels with `dra.cpu/profile`.
   Both hold the `default` partition and, where the host has a core without an online sibling,
-  a partition `nosmt` of one such core; `e2e` also holds a partition `reserved` of one whole core.
-  `lane-setup.sh pre` leaves at least two CPUs to `default`. Each kubelet reserves the CPUs outside
-  its profile's `default` partition, as the driver requires before it publishes devices. The
+  a partition `nosmt` of one such core. `e2e` also holds, where the host has a core with an online
+  sibling, a partition `degraded` under `smt: false` of one thread of such a core, whose devices the
+  driver publishes tainted, the lane setting `taintDegradedPartitions`, and a partition `reserved`
+  of one whole core. `lane-setup.sh pre` places `degraded` before `reserved`, leaves at least two
+  CPUs to `default`. Each kubelet reserves the CPUs outside its profile's `default` partition, as
+  the driver requires before it publishes devices. The
   driver publishes the node allocatable mapping, which only the `default` partition's shared
   devices carry. Where `nosmt` is declared, a third profile, `e2e-grown`, gives its CPUs to a
   `reserved` partition `grown`; no node runs it until a spec moves `worker2` to it. The specs of
