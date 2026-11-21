@@ -54,10 +54,12 @@ const (
 	AttributeAllocatedNumCPUs resourceapi.QualifiedName = "dra.cpu/allocatedNumCPUs"
 	AttributeCPUIDs           resourceapi.QualifiedName = "dra.cpu/cpuIDs"
 	AttributeSMTLayout        resourceapi.QualifiedName = "dra.cpu/smtLayout"
-	// AttributeFullPhysicalCPUsOnly and AttributeAllocator are the driver
-	// settings of the same names, published on every device.
-	AttributeFullPhysicalCPUsOnly resourceapi.QualifiedName = "dra.cpu/fullPhysicalCPUsOnly"
-	AttributeAllocator            resourceapi.QualifiedName = "dra.cpu/allocator"
+	// AttributeFullPhysicalCPUsOnly, AttributeAllocator and
+	// AttributeAllowFractionalCapacityRequests are the driver settings of the
+	// same names, published on every device.
+	AttributeFullPhysicalCPUsOnly            resourceapi.QualifiedName = "dra.cpu/fullPhysicalCPUsOnly"
+	AttributeAllocator                       resourceapi.QualifiedName = "dra.cpu/allocator"
+	AttributeAllowFractionalCapacityRequests resourceapi.QualifiedName = "dra.cpu/allowFractionalCapacityRequests"
 	// AttributeCPUSet is a metadata-only attribute that names the CPUs a request
 	// holding exclusive CPUs was given on a device.
 	AttributeCPUSet resourceapi.QualifiedName = "dra.cpu/cpuset"
@@ -84,10 +86,11 @@ func addCompatibilityAttributes(attrs map[resourceapi.QualifiedName]resourceapi.
 // addSettingAttributes publishes the settings Prepare checks a claim against,
 // so that a claim's selector can keep it off a node whose Prepare would refuse
 // it after the scheduler placed it there.
-func addSettingAttributes(devices []resourceapi.Device, fullPhysicalCPUsOnly bool, allocator string) {
+func addSettingAttributes(devices []resourceapi.Device, input BuildInput) {
 	for _, dev := range devices {
-		dev.Attributes[AttributeFullPhysicalCPUsOnly] = resourceapi.DeviceAttribute{BoolValue: new(fullPhysicalCPUsOnly)}
-		dev.Attributes[AttributeAllocator] = resourceapi.DeviceAttribute{StringValue: new(allocator)}
+		dev.Attributes[AttributeFullPhysicalCPUsOnly] = resourceapi.DeviceAttribute{BoolValue: new(input.FullPhysicalCPUsOnly)}
+		dev.Attributes[AttributeAllocator] = resourceapi.DeviceAttribute{StringValue: new(input.Allocator)}
+		dev.Attributes[AttributeAllowFractionalCapacityRequests] = resourceapi.DeviceAttribute{BoolValue: new(input.AllowFractionalCapacityRequests)}
 	}
 }
 

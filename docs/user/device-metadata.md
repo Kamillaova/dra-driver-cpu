@@ -87,10 +87,19 @@ Each device carries the attributes it publishes in its `ResourceSlice`, describe
 
 `dra.cpu/cpuRequest` and `dra.cpu/cpuLimit` mirror a container's CPU request and limit.
 
+A shared request, one on a device of a partition of role `default` such as the `dra.cpu` class on a
+node with `cpuPartitions`, holds no CPU alone, and its CPUs can move while its container keeps the file
+it started with. So its file carries neither `dra.cpu/cpuset` nor `dra.cpu/allocatedNumCPUs`: a workload
+reads its current CPUs from its own CPU affinity, for example `Cpus_allowed_list` in
+`/proc/self/status`. Its `dra.cpu/cpuRequest` is the amount it booked, `0` where it books nothing. Like
+every file it carries its device's attributes, so its `dra.cpu/numCPUs` is the device's CPU count, not
+the share's. A request that holds exclusive CPUs keeps `dra.cpu/allocatedNumCPUs` with upstream's
+meaning.
+
 A request that spans several devices has one entry per device in `devices`, and each entry's
 `dra.cpu/cpuset` names the CPUs the request holds on that device alone. The CPUs of the whole request
 are the union of the entries. A container that uses several requests, or several claims, runs on the
-CPUs of all of them; `DRA_EXCLUSIVE_ASSIGNED_CPUSET` holds that union, see
+CPUs of all of them; `DRA_EXCLUSIVE_ASSIGNED_CPUSET` holds the union of their exclusive CPUs, see
 [Workload Configuration Requirements](workload-requirements.md).
 
 ## Reading it

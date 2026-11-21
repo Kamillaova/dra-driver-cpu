@@ -422,21 +422,18 @@ func (m *Metrics) RecordNRISynchronize(err error, elapsed time.Duration) {
 	m.nriSynchronizeDuration.WithLabelValues(res.String()).Observe(elapsed.Seconds())
 }
 
-func (m *Metrics) RecordNRICreateContainer(err error, claimCount int, elapsed time.Duration) {
+func (m *Metrics) RecordNRICreateContainer(err error, alloc CPUAllocation, elapsed time.Duration) {
 	res := determineResult(err)
-	alloc := determineAllocation(claimCount)
 	m.nriCreateContainerDuration.WithLabelValues(res.String(), alloc.String()).Observe(elapsed.Seconds())
 }
 
-func (m *Metrics) RecordNRIStopContainer(err error, claimCount int, elapsed time.Duration) {
+func (m *Metrics) RecordNRIStopContainer(err error, alloc CPUAllocation, elapsed time.Duration) {
 	res := determineResult(err)
-	alloc := determineAllocation(claimCount)
 	m.nriStopContainerDuration.WithLabelValues(res.String(), alloc.String()).Observe(elapsed.Seconds())
 }
 
-func (m *Metrics) RecordNRIRemoveContainer(err error, claimCount int, elapsed time.Duration) {
+func (m *Metrics) RecordNRIRemoveContainer(err error, alloc CPUAllocation, elapsed time.Duration) {
 	res := determineResult(err)
-	alloc := determineAllocation(claimCount)
 	m.nriRemoveContainerDuration.WithLabelValues(res.String(), alloc.String()).Observe(elapsed.Seconds())
 }
 
@@ -467,16 +464,6 @@ func determineResult(err error) Result {
 	return ResultSuccess
 }
 
-func determineAllocation(claimCount int) CPUAllocation {
-	if claimCount < 0 {
-		return CPUAllocationUnknown
-	}
-	if claimCount == 0 {
-		return CPUAllocationShared
-	}
-	return CPUAllocationExclusive
-}
-
 type noopRecorder struct{}
 
 // Noop returns a recorder that discards all metric observations.
@@ -484,16 +471,16 @@ func Noop() noopRecorder {
 	return noopRecorder{}
 }
 
-func (noopRecorder) SetAllocationState(AllocationState)                 {}
-func (noopRecorder) RecordPrepare(Result, time.Duration)                {}
-func (noopRecorder) RecordUnprepare(Result, time.Duration)              {}
-func (noopRecorder) RecordClaimAllocatedCPUs(int)                       {}
-func (noopRecorder) RecordNRISynchronize(error, time.Duration)          {}
-func (noopRecorder) RecordNRICreateContainer(error, int, time.Duration) {}
-func (noopRecorder) RecordNRIStopContainer(error, int, time.Duration)   {}
-func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
-func (noopRecorder) RecordNRISynchronizeRefusedClaim()                  {}
-func (noopRecorder) RecordMisplacedClaim()                              {}
-func (noopRecorder) RecordContainerKeptUnderOlderRule(Rule)             {}
-func (noopRecorder) SetWatchdogStuck(time.Duration)                     {}
-func (noopRecorder) RecordNodeAllocatableMappingDropped()               {}
+func (noopRecorder) SetAllocationState(AllocationState)                           {}
+func (noopRecorder) RecordPrepare(Result, time.Duration)                          {}
+func (noopRecorder) RecordUnprepare(Result, time.Duration)                        {}
+func (noopRecorder) RecordClaimAllocatedCPUs(int)                                 {}
+func (noopRecorder) RecordNRISynchronize(error, time.Duration)                    {}
+func (noopRecorder) RecordNRICreateContainer(error, CPUAllocation, time.Duration) {}
+func (noopRecorder) RecordNRIStopContainer(error, CPUAllocation, time.Duration)   {}
+func (noopRecorder) RecordNRIRemoveContainer(error, CPUAllocation, time.Duration) {}
+func (noopRecorder) RecordNRISynchronizeRefusedClaim()                            {}
+func (noopRecorder) RecordMisplacedClaim()                                        {}
+func (noopRecorder) RecordContainerKeptUnderOlderRule(Rule)                       {}
+func (noopRecorder) SetWatchdogStuck(time.Duration)                               {}
+func (noopRecorder) RecordNodeAllocatableMappingDropped()                         {}
