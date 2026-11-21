@@ -63,6 +63,10 @@ const (
 	// after a restart. It covers the NRI connection plus the 2s NRI request
 	// timeout, and stays well under kubelet's 45s DRA call timeout.
 	initialSyncWait = 5 * time.Second
+	// profileReadTimeout bounds each read of the node's profile label, and
+	// profileReadInterval spaces the reads while the API server does not answer.
+	profileReadTimeout  = 10 * time.Second
+	profileReadInterval = 2 * time.Second
 )
 
 const opIDLen = 8
@@ -171,6 +175,15 @@ type CPUDriver struct {
 	// allocatableMappingDropped is never cleared: once the API server drops a
 	// field, the plugin library stops sending it until the driver restarts.
 	allocatableMappingDropped atomic.Bool
+
+	// window is set, under stateMu, while the node's profile is not read yet;
+	// see Config.SelectProfile.
+	window              *unconfiguredWindow
+	providers           Providers
+	profileLabel        string
+	selectProfile       func(name string) (*Config, error)
+	profileReadTimeout  time.Duration
+	profileReadInterval time.Duration
 }
 
 // deviceHealthEntry is the last known health of a single device.
@@ -235,6 +248,13 @@ type Config struct {
 	// without it. HandleError calls it with a cause wrapping ErrFatal, so that
 	// the caller stops the driver.
 	CancelRun context.CancelCauseFunc
+	// ProfileLabel and SelectProfile are set where the configuration declares
+	// profiles. New then builds only what no profile decides, and Start, once
+	// connected to NRI, reads the node's ProfileLabel label, builds the driver
+	// from the Config SelectProfile returns for its value, and only then
+	// registers with the kubelet. An error from SelectProfile stops Start.
+	ProfileLabel  string
+	SelectProfile func(name string) (*Config, error)
 }
 
 func (cfg Config) DevicesPerResourceSlice() int {
@@ -248,6 +268,8 @@ func (cfg Config) DevicesPerResourceSlice() int {
 
 // New creates and initializes a CPUDriver, preparing all internal state.
 // No external listeners or goroutines are started; call Start to begin serving.
+// With config.SelectProfile set, the state a profile decides is prepared by
+// Start instead, once it has read the node's profile.
 func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, error) {
 	logger = logger.WithValues("driver", config.DriverName)
 
@@ -256,61 +278,79 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		metricsRecorder = cpumetrics.Noop()
 	}
 	plugin := &CPUDriver{
-		initialSync:     make(chan struct{}),
-		initialSyncWait: initialSyncWait,
-		driverName:      config.DriverName,
-		nodeName:        config.NodeName,
-		kubeClient:      providers.K8SClient,
-		topology: deviceTopology{
-			Inventory: device.Inventory{
-				ReservedCPUs: config.ReservedCPUs,
-			},
-		},
-		cpuDeviceMode:           config.CPUDeviceMode,
-		cpuDeviceGroupBy:        config.CPUDeviceGroupBy,
-		pcieRootMapper:          store.NewPCIeRootMapper(),
-		devicesPerResourceSlice: config.DevicesPerResourceSlice(),
-		metrics:                 metricsRecorder,
-		health:                  newHealthTracker(),
-		kubeletRootDir:          config.KubeletRootDir,
-		cancelRun:               config.CancelRun,
+		initialSync:         make(chan struct{}),
+		initialSyncWait:     initialSyncWait,
+		driverName:          config.DriverName,
+		nodeName:            config.NodeName,
+		kubeClient:          providers.K8SClient,
+		metrics:             metricsRecorder,
+		health:              newHealthTracker(),
+		kubeletRootDir:      config.KubeletRootDir,
+		cancelRun:           config.CancelRun,
+		providers:           providers,
+		profileLabel:        config.ProfileLabel,
+		selectProfile:       config.SelectProfile,
+		profileReadTimeout:  profileReadTimeout,
+		profileReadInterval: profileReadInterval,
 	}
 	if config.AssumeUnsolicitedUpdatesSafe {
 		plugin.reconcileTrigger = make(chan struct{}, 1)
 	}
+	if config.SelectProfile != nil {
+		plugin.window = newUnconfiguredWindow()
+		return plugin, nil
+	}
+	if err := plugin.configure(logger, providers, config); err != nil {
+		return nil, err
+	}
+	return plugin, nil
+}
+
+// configure prepares the state that depends on the node's configuration: the
+// topology, the allocator, the stores and the devices.
+func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *Config) error {
+	cp.topology = deviceTopology{
+		Inventory: device.Inventory{
+			ReservedCPUs: config.ReservedCPUs,
+		},
+	}
+	cp.cpuDeviceMode = config.CPUDeviceMode
+	cp.cpuDeviceGroupBy = config.CPUDeviceGroupBy
+	cp.pcieRootMapper = store.NewPCIeRootMapper()
+	cp.devicesPerResourceSlice = config.DevicesPerResourceSlice()
 	var conditions []nodeConditionSource
 	if config.PublishNodeAllocatableResourceMapping {
-		conditions = append(conditions, plugin.allocatableMappingCondition())
+		conditions = append(conditions, cp.allocatableMappingCondition())
 	}
-	plugin.nodeConditions = newNodeConditionWriter(providers.K8SClient, config.NodeName, &plugin.stateMu, conditions,
+	cp.nodeConditions = newNodeConditionWriter(providers.K8SClient, config.NodeName, &cp.stateMu, conditions,
 		workqueue.DefaultTypedControllerRateLimiter[string]())
 	topo, err := providers.EnsureCPUInfo().GetCPUTopology(logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get CPU topology: %w", err)
+		return fmt.Errorf("failed to get CPU topology: %w", err)
 	}
 	if topo == nil {
-		return nil, fmt.Errorf("failed to get CPU topology: topology is nil")
+		return fmt.Errorf("failed to get CPU topology: topology is nil")
 	}
-	plugin.topology.CPUTopology = topo
-	managedCPUs := plugin.topology.ManagedCPUs()
+	cp.topology.CPUTopology = topo
+	managedCPUs := cp.topology.ManagedCPUs()
 	logger.V(2).Info("detected topology-validated CPUs", "cpus", managedCPUs.String())
 
-	plugin.fullPhysicalCPUsOnly = config.FullPhysicalCPUsOnly
+	cp.fullPhysicalCPUsOnly = config.FullPhysicalCPUsOnly
 	if config.FullPhysicalCPUsOnly {
 		if err := validateReservedCPUsAlignment(topo, config.ReservedCPUs); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	if config.ExposePCIeRoots {
-		if err := plugin.pcieRootMapper.Probe(logger, providers.EnsureSysFS(), managedCPUs); err != nil {
-			return nil, fmt.Errorf("failed to list PCIe domains: %w", err)
+		if err := cp.pcieRootMapper.Probe(logger, providers.EnsureSysFS(), managedCPUs); err != nil {
+			return fmt.Errorf("failed to list PCIe domains: %w", err)
 		}
 	}
 
-	plugin.allocationState = store.NewAllocationState(plugin.topology.CPUTopology, config.ReservedCPUs)
-	plugin.refreshAllocationMetrics()
-	plugin.podState = store.NewPodState()
+	cp.allocationState = store.NewAllocationState(cp.topology.CPUTopology, config.ReservedCPUs)
+	cp.refreshAllocationMetrics()
+	cp.podState = store.NewPodState()
 
 	exposeExtAttrs := false
 	allocator := cpuallocator.ModeCPUManager
@@ -321,25 +361,25 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		if config.FullPhysicalCPUsOnly {
 			external.RequireWholeCores(topo)
 		}
-		plugin.cpuAllocator = external
+		cp.cpuAllocator = external
 		exposeExtAttrs = true
 		allocator = cpuallocator.ModeExternal
 	default:
-		plugin.cpuAllocator = cpuallocator.NewCPUManager(config.DriverName, topo)
-		plugin.wholeCorePicker = config.FullPhysicalCPUsOnly
+		cp.cpuAllocator = cpuallocator.NewCPUManager(config.DriverName, topo)
+		cp.wholeCorePicker = config.FullPhysicalCPUsOnly
 	}
 
 	result, err := device.Build(device.BuildInput{
-		Inventory:                             plugin.topology.Inventory,
-		Layout:                                device.FindLayout(plugin.cpuDeviceMode, plugin.cpuDeviceGroupBy),
-		PCIeRootMapper:                        plugin.pcieRootMapper,
+		Inventory:                             cp.topology.Inventory,
+		Layout:                                device.FindLayout(cp.cpuDeviceMode, cp.cpuDeviceGroupBy),
+		PCIeRootMapper:                        cp.pcieRootMapper,
 		PublishNodeAllocatableResourceMapping: config.PublishNodeAllocatableResourceMapping,
 		ExposeExtAttrs:                        exposeExtAttrs,
 		FullPhysicalCPUsOnly:                  config.FullPhysicalCPUsOnly,
 		Allocator:                             allocator,
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if config.FullPhysicalCPUsOnly {
 		for _, name := range slices.Sorted(maps.Keys(result.MixedCores)) {
@@ -349,24 +389,24 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		}
 	}
 
-	plugin.topology.Mapping = result.Mapping
-	plugin.topology.threadsPerCore = result.ThreadsPerCore
+	cp.topology.Mapping = result.Mapping
+	cp.topology.threadsPerCore = result.ThreadsPerCore
 	if len(result.Devices) > 0 {
 		// Chunk devices into slices of at most devicesPerResourceSlice
-		plugin.topology.deviceSlices = slices.Collect(slices.Chunk(result.Devices, plugin.devicesPerResourceSlice))
+		cp.topology.deviceSlices = slices.Collect(slices.Chunk(result.Devices, cp.devicesPerResourceSlice))
 	}
 	logger.Info("chunked devices into ResourceSlices", "numDevices", len(result.Devices),
-		"devicesPerResourceSlice", plugin.devicesPerResourceSlice, "numResourceSlices", len(plugin.topology.deviceSlices),
+		"devicesPerResourceSlice", cp.devicesPerResourceSlice, "numResourceSlices", len(cp.topology.deviceSlices),
 		"exposePCIeRoots", config.ExposePCIeRoots)
 
 	for _, d := range result.Devices {
-		plugin.health.devices[d.Name] = &deviceHealthEntry{
+		cp.health.devices[d.Name] = &deviceHealthEntry{
 			status:  kubeletplugin.HealthStatusHealthy,
 			message: "device initialized",
 		}
 	}
 
-	return plugin, nil
+	return nil
 }
 
 // validateReservedCPUsAlignment refuses a reservation that holds part of a
@@ -421,7 +461,9 @@ func checkSocketPathFits(kubeletRootDir, driverName string) error {
 }
 
 // Start registers the plugin with kubelet, starts the NRI plugin, and begins
-// async resource publication. Setup must have been called first.
+// async resource publication. Setup must have been called first. Where the
+// node's profile is still to be read, it connects to NRI first and registers
+// only once the profile is read and the driver built from it.
 func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	ctx, logger := ctxlog.WithValues(ctx, "driver", cp.driverName)
 
@@ -444,33 +486,70 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 		return asyncErr, fmt.Errorf("failed to create CDI manager: %w", err)
 	}
 	cp.cdiMgr = cdiMgr
-	cp.seedAllocationStoreFromDisk(logger)
 
+	if cp.window != nil {
+		return asyncErr, cp.startWithProfile(ctx, asyncErr)
+	}
+
+	cp.seedAllocationStoreFromDisk(logger)
+	go cp.runWatchdog(ctx)
+	if err := cp.register(ctx); err != nil {
+		return asyncErr, err
+	}
+
+	cp.eventBroadcaster, cp.eventRecorder = newEventRecorder(ctx, cp.kubeClient, cp.driverName, cp.nodeName)
+
+	if err := cp.startNRI(ctx, asyncErr); err != nil {
+		return asyncErr, err
+	}
+	// Registered already, the driver is in service once NRI first synchronizes.
+	cp.serve(ctx)
+
+	return asyncErr, nil
+}
+
+// startWithProfile serves NRI unconfigured until the node's profile is read,
+// then builds the driver from it and registers with the kubelet.
+func (cp *CPUDriver) startWithProfile(ctx context.Context, asyncErr chan error) error {
+	go cp.runWatchdog(ctx)
+	if err := cp.startNRI(ctx, asyncErr); err != nil {
+		return err
+	}
+	if err := cp.configureFromProfile(ctx, asyncErr); err != nil {
+		return err
+	}
+	if err := cp.register(ctx); err != nil {
+		return err
+	}
+	cp.serve(ctx)
+	return nil
+}
+
+// register starts the kubelet plugin and waits for the kubelet to register it.
+func (cp *CPUDriver) register(ctx context.Context) error {
 	kubeletOpts := []kubeletplugin.Option{
 		kubeletplugin.DriverName(cp.driverName),
 		kubeletplugin.NodeName(cp.nodeName),
 		kubeletplugin.KubeClient(cp.kubeClient),
 		kubeletplugin.RegistrarDirectoryPath(registrarDir(cp.kubeletRootDir)),
-		kubeletplugin.PluginDataDirectoryPath(driverPluginPath),
+		kubeletplugin.PluginDataDirectoryPath(pluginDataDir(cp.kubeletRootDir, cp.driverName)),
 		kubeletplugin.EnableDeviceMetadata(true, []schema.GroupVersion{
 			drametadatav1beta1.SchemeGroupVersion,
 			drametadatav1alpha1.SchemeGroupVersion,
 		}),
 		kubeletplugin.HealthService(true),
 	}
-	go cp.runWatchdog(ctx)
 	d, err := kubeletplugin.Start(ctx, cp, kubeletOpts...)
 	if err != nil {
-		return asyncErr, fmt.Errorf("start kubelet plugin: %w", err)
+		return fmt.Errorf("start kubelet plugin: %w", err)
 	}
 	cp.draPlugin = d
-	if err := waitForRegistration(ctx, d, registrarDir(cp.kubeletRootDir), registrationPollInterval, registrationTimeout); err != nil {
-		return asyncErr, err
-	}
+	return waitForRegistration(ctx, d, registrarDir(cp.kubeletRootDir), registrationPollInterval, registrationTimeout)
+}
 
-	cp.eventBroadcaster, cp.eventRecorder = newEventRecorder(ctx, cp.kubeClient, cp.driverName, cp.nodeName)
-
-	// register the NRI plugin
+// startNRI creates the NRI plugin and keeps it connected.
+func (cp *CPUDriver) startNRI(ctx context.Context, asyncErr chan<- error) error {
+	logger := ctxlog.FromContext(ctx)
 	nriOpts := []stub.Option{
 		stub.WithPluginName(cp.driverName),
 		stub.WithPluginIdx("00"),
@@ -482,11 +561,16 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	}
 	stub, err := stub.New(cp, nriOpts...)
 	if err != nil {
-		return asyncErr, fmt.Errorf("failed to create plugin stub: %w", err)
+		return fmt.Errorf("failed to create plugin stub: %w", err)
 	}
 	cp.nriPlugin = stub
 	cp.startNRIPlugin(ctx, asyncErr)
-	// Registered already, the driver is in service once NRI first synchronizes.
+	return nil
+}
+
+// serve starts the work of a registered driver: the Node conditions, the
+// published resources and the device health.
+func (cp *CPUDriver) serve(ctx context.Context) {
 	cp.nodeConditions.run(ctx, cp.initialSync)
 
 	// publish available resources
@@ -496,8 +580,6 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	// the kubelet's lease on it does not expire (see WatchHealthStatus in
 	// health.go)
 	go cp.healthResendLoop(ctx)
-
-	return asyncErr, nil
 }
 
 // seedAllocationStoreFromDisk restores the record of every claim whose CDI spec
