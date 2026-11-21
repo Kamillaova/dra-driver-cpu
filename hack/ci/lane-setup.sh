@@ -79,8 +79,27 @@ cores_of() {
 	done | sort -nu | paste -sd, -
 }
 
+# The threaded specs move pinned threads into threaded children of a claim's
+# group, which needs cpuset in a threaded subtree: fail here rather than let
+# them skip on a kernel without it.
+probe_threaded_cpuset() {
+	local root=/sys/fs/cgroup
+	[ "$(stat -fc %T "${root}")" = cgroup2fs ] || fail "${root} is not a cgroup2 mount"
+	grep -qw cpuset "${root}/cgroup.subtree_control" || fail "cpuset is not enabled in ${root}/cgroup.subtree_control"
+	local probe=${root}/dracpu-e2e-probe-$$
+	as_root mkdir "${probe}" "${probe}/child"
+	local ok=true
+	echo threaded | as_root tee "${probe}/child/cgroup.type" >/dev/null || ok=false
+	if ${ok}; then
+		echo +cpuset | as_root tee "${probe}/cgroup.subtree_control" >/dev/null || ok=false
+	fi
+	as_root rmdir "${probe}/child" "${probe}"
+	${ok} || fail "cannot enable cpuset in a threaded cgroup subtree on kernel $(uname -r)"
+}
+
 partitions_pre() {
 	echo "lane-setup: kernel $(uname -r)" >&2
+	probe_threaded_cpuset
 
 	local -a online cores
 	local -A seen
