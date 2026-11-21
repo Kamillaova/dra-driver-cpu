@@ -562,6 +562,8 @@ func TestBuildUncoreCacheDevices(t *testing.T) {
 					"dra.cpu/numaNodeID",
 					device.AttributeFullPhysicalCPUsOnly,
 					device.AttributeAllocator,
+					device.AttributePartition,
+					device.AttributeRole,
 				}, slices.Collect(maps.Keys(dev.Attributes)), "device %q attributes", dev.Name)
 				require.Equalf(t, want.cacheID, *dev.Attributes[device.AttributeCacheL3ID].IntValue, "device %q cacheL3ID", dev.Name)
 				require.Equalf(t, want.numaNode, *dev.Attributes[deviceattribute.StandardDeviceAttributeNUMANode].IntValue, "device %q numaNode", dev.Name)
@@ -593,10 +595,10 @@ func TestBuildGroupedDeviceAttributeCount(t *testing.T) {
 		layout device.Layout
 		want   int
 	}{
-		{layout: device.LayoutNUMANode, want: 12},
-		{layout: device.LayoutSocket, want: 9},
-		{layout: device.LayoutMachine, want: 8},
-		{layout: device.LayoutUncoreCache, want: 13},
+		{layout: device.LayoutNUMANode, want: 14},
+		{layout: device.LayoutSocket, want: 11},
+		{layout: device.LayoutMachine, want: 10},
+		{layout: device.LayoutUncoreCache, want: 15},
 	} {
 		res, err := device.Build(device.BuildInput{
 			Inventory: device.Inventory{
@@ -944,5 +946,180 @@ func TestConsumedCPUCount(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tc.wantCount, got)
 		})
+	}
+}
+
+func TestBuildPartitionDevices(t *testing.T) {
+	type wantDevice struct {
+		name           string
+		cpus           cpuset.CPUSet
+		partition      string
+		role           string
+		threadsPerCore int64
+		smtEnabled     bool
+	}
+	twoNUMANodes := func(core int) int { return core / 2 }
+	exclusive := func(name string, threads int, cpus ...int) device.Partition {
+		return device.Partition{Name: name, Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(cpus...), ThreadsPerCore: threads}
+	}
+	defaultEntry := device.Partition{Name: device.DefaultPartitionName}
+
+	tests := []struct {
+		name       string
+		topo       *cpuinfo.CPUTopology
+		layout     device.Layout
+		declared   []device.Partition
+		want       []wantDevice
+		wantSlices [][]string
+	}{
+		{
+			name:   "without partitions the node is the partition default with upstream's devices",
+			topo:   coreTopology(true, onNUMANode0, twoThreadCores(4)...),
+			layout: device.LayoutUncoreCache,
+			want: []wantDevice{
+				{name: "cpudevcache000", cpus: cpuset.New(0, 1, 2, 3, 4, 5, 6, 7), partition: "default", role: "default", threadsPerCore: 2, smtEnabled: true},
+			},
+			wantSlices: [][]string{{"cpudevcache000"}},
+		},
+		{
+			name:   "without partitions a device of one-thread cores keeps the node's SMT",
+			topo:   coreTopology(true, onNUMANode0, offlineSiblingCores[4:]...),
+			layout: device.LayoutUncoreCache,
+			want: []wantDevice{
+				{name: "cpudevcache000", cpus: cpuset.New(4, 5), partition: "default", role: "default", threadsPerCore: 1, smtEnabled: true},
+			},
+			wantSlices: [][]string{{"cpudevcache000"}},
+		},
+		{
+			name:   "only an exclusive partition publishes devices, named after it",
+			topo:   coreTopology(true, onNUMANode0, twoThreadCores(4)...),
+			layout: device.LayoutUncoreCache,
+			declared: []device.Partition{
+				defaultEntry,
+				exclusive("vms", 0, 1, 5, 2, 6),
+				{Name: "system", Role: device.PARTITION_ROLE_RESERVED, CPUs: cpuset.New(3, 7)},
+			},
+			want: []wantDevice{
+				{name: "cpudevcache000-vms", cpus: cpuset.New(1, 2, 5, 6), partition: "vms", role: "exclusive", threadsPerCore: 2, smtEnabled: true},
+			},
+			wantSlices: [][]string{{"cpudevcache000-vms"}},
+		},
+		{
+			name:   "each partition's devices are cut by the layout and sliced on their own",
+			topo:   coreTopology(true, twoNUMANodes, twoThreadCores(4)...),
+			layout: device.LayoutNUMANode,
+			declared: []device.Partition{
+				exclusive("dpdk", 0, 0, 4, 2, 6),
+				defaultEntry,
+				exclusive("vms", 0, 1, 5),
+			},
+			want: []wantDevice{
+				{name: "cpudevnuma000-dpdk", cpus: cpuset.New(0, 4), partition: "dpdk", role: "exclusive", threadsPerCore: 2, smtEnabled: true},
+				{name: "cpudevnuma001-dpdk", cpus: cpuset.New(2, 6), partition: "dpdk", role: "exclusive", threadsPerCore: 2, smtEnabled: true},
+				{name: "cpudevnuma000-vms", cpus: cpuset.New(1, 5), partition: "vms", role: "exclusive", threadsPerCore: 2, smtEnabled: true},
+			},
+			wantSlices: [][]string{{"cpudevnuma000-dpdk", "cpudevnuma001-dpdk"}, {"cpudevnuma000-vms"}},
+		},
+		{
+			name:   "a degraded smt false partition counts its own threads",
+			topo:   coreTopology(true, onNUMANode0, twoThreadCores(4)...),
+			layout: device.LayoutUncoreCache,
+			declared: []device.Partition{
+				defaultEntry,
+				exclusive("spdk", 1, 1, 2),
+			},
+			want: []wantDevice{
+				{name: "cpudevcache000-spdk", cpus: cpuset.New(1, 2), partition: "spdk", role: "exclusive", threadsPerCore: 1, smtEnabled: false},
+			},
+			wantSlices: [][]string{{"cpudevcache000-spdk"}},
+		},
+		{
+			name:   "a partition of one-thread cores publishes no SMT on a node with SMT",
+			topo:   coreTopology(true, onNUMANode0, offlineSiblingCores...),
+			layout: device.LayoutUncoreCache,
+			declared: []device.Partition{
+				defaultEntry,
+				exclusive("vms", 0, 4, 5),
+			},
+			want: []wantDevice{
+				{name: "cpudevcache000-vms", cpus: cpuset.New(4, 5), partition: "vms", role: "exclusive", threadsPerCore: 1, smtEnabled: false},
+			},
+			wantSlices: [][]string{{"cpudevcache000-vms"}},
+		},
+		{
+			name:   "a partition whose cores differ in threads publishes 0 and SMT on a node without it",
+			topo:   coreTopology(false, onNUMANode0, offlineSiblingCores...),
+			layout: device.LayoutUncoreCache,
+			declared: []device.Partition{
+				defaultEntry,
+				exclusive("infra", 0, 0, 1, 2, 3, 4, 5, 128, 129, 130, 131),
+			},
+			want: []wantDevice{
+				{name: "cpudevcache000-infra", cpus: cpuset.New(0, 1, 2, 3, 4, 5, 128, 129, 130, 131), partition: "infra", role: "exclusive", threadsPerCore: 0, smtEnabled: true},
+			},
+			wantSlices: [][]string{{"cpudevcache000-infra"}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := device.BuildInput{
+				Inventory:      device.Inventory{CPUTopology: tc.topo, ReservedCPUs: cpuset.New()},
+				Layout:         tc.layout,
+				PCIeRootMapper: store.NewPCIeRootMapper(),
+			}
+			if len(tc.declared) > 0 {
+				input.Partitions = device.ResolvePartitions(tc.declared, tc.topo.CPUDetails, cpuset.New())
+				input.PartitionsUsed = true
+			}
+			res, err := device.Build(input)
+			require.NoError(t, err)
+
+			var names []string
+			for _, dev := range res.Devices {
+				names = append(names, dev.Name)
+			}
+			var wantNames []string
+			for _, want := range tc.want {
+				wantNames = append(wantNames, want.name)
+			}
+			require.Equal(t, wantNames, names, "devices in published order")
+			var gotSlices [][]string
+			for _, partitionDevices := range res.DevicesByPartition {
+				var slice []string
+				for _, dev := range partitionDevices {
+					slice = append(slice, dev.Name)
+				}
+				gotSlices = append(gotSlices, slice)
+			}
+			require.Equal(t, tc.wantSlices, gotSlices, "devices by partition")
+
+			for i, dev := range res.Devices {
+				want := tc.want[i]
+				capacity := dev.Capacity[resourceapi.QualifiedName(device.CPUResourceQualifiedName)]
+				require.EqualValuesf(t, want.cpus.Size(), capacity.Value.Value(), "device %q capacity", dev.Name)
+				if cpus, ok := res.Mapping.NameToCPUs[dev.Name]; ok {
+					require.Truef(t, want.cpus.Equals(cpus), "device %q CPUs: got %s, want %s", dev.Name, cpus, want.cpus)
+				}
+				require.Equalf(t, want.partition, *dev.Attributes[device.AttributePartition].StringValue, "device %q partition", dev.Name)
+				require.Equalf(t, want.role, *dev.Attributes[device.AttributeRole].StringValue, "device %q role", dev.Name)
+				require.Equalf(t, want.threadsPerCore, *dev.Attributes[device.AttributeThreadsPerCore].IntValue, "device %q threadsPerCore", dev.Name)
+				require.Equalf(t, want.smtEnabled, *dev.Attributes[device.AttributeSMTEnabled].BoolValue, "device %q smtEnabled", dev.Name)
+			}
+		})
+	}
+}
+
+func TestBuildIndividualDevicesNameTheDefaultPartition(t *testing.T) {
+	res, err := device.Build(device.BuildInput{
+		Inventory:      device.Inventory{CPUTopology: fakeTopology(), ReservedCPUs: cpuset.New(0)},
+		Layout:         device.LayoutIndividual,
+		PCIeRootMapper: store.NewPCIeRootMapper(),
+	})
+	require.NoError(t, err)
+	require.Len(t, res.Devices, 3)
+	require.Len(t, res.DevicesByPartition, 1)
+	for _, dev := range res.Devices {
+		require.Equalf(t, device.DefaultPartitionName, *dev.Attributes[device.AttributePartition].StringValue, "device %q partition", dev.Name)
+		require.Equalf(t, device.PARTITION_ROLE_DEFAULT, *dev.Attributes[device.AttributeRole].StringValue, "device %q role", dev.Name)
 	}
 }

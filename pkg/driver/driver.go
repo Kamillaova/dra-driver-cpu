@@ -242,6 +242,9 @@ type Config struct {
 	PublishNodeAllocatableResourceMapping bool
 	// FullPhysicalCPUsOnly is driverconfig.Config.FullPhysicalCPUsOnly.
 	FullPhysicalCPUsOnly bool
+	// CPUPartitions is driverconfig.Config.Partitions: the declared partitions,
+	// empty where the configuration uses none.
+	CPUPartitions []device.Partition
 	// AssumeUnsolicitedUpdatesSafe is driverconfig.Config.AssumeUnsolicitedUpdatesSafe.
 	AssumeUnsolicitedUpdatesSafe bool
 	// CancelRun cancels the context given to Start, which refuses to run
@@ -337,6 +340,12 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 	managedCPUs := cp.topology.ManagedCPUs()
 	logger.V(2).Info("detected topology-validated CPUs", "cpus", managedCPUs.String())
 
+	partitions, err := resolvePartitions(logger, providers.EnsureSysFS(), topo, config.CPUPartitions, config.ReservedCPUs)
+	if err != nil {
+		return err
+	}
+	cp.topology.ReservedCPUs = config.ReservedCPUs.Union(unclaimablePartitionCPUs(partitions))
+
 	cp.fullPhysicalCPUsOnly = config.FullPhysicalCPUsOnly
 	if config.FullPhysicalCPUsOnly {
 		if err := validateReservedCPUsAlignment(topo, config.ReservedCPUs); err != nil {
@@ -350,7 +359,7 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 		}
 	}
 
-	cp.allocationState = store.NewAllocationState(cp.topology.CPUTopology, config.ReservedCPUs)
+	cp.allocationState = store.NewAllocationState(cp.topology.CPUTopology, cp.topology.ReservedCPUs)
 	cp.refreshAllocationMetrics()
 	cp.podState = store.NewPodState()
 
@@ -379,6 +388,8 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 		ExposeExtAttrs:                        exposeExtAttrs,
 		FullPhysicalCPUsOnly:                  config.FullPhysicalCPUsOnly,
 		Allocator:                             allocator,
+		Partitions:                            partitions,
+		PartitionsUsed:                        len(config.CPUPartitions) > 0,
 	})
 	if err != nil {
 		return err
@@ -393,9 +404,9 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 
 	cp.topology.Mapping = result.Mapping
 	cp.topology.threadsPerCore = result.ThreadsPerCore
-	if len(result.Devices) > 0 {
-		// Chunk devices into slices of at most devicesPerResourceSlice
-		cp.topology.deviceSlices = slices.Collect(slices.Chunk(result.Devices, cp.devicesPerResourceSlice))
+	// Chunk devices into slices of at most devicesPerResourceSlice
+	for _, devices := range result.DevicesByPartition {
+		cp.topology.deviceSlices = append(cp.topology.deviceSlices, slices.Collect(slices.Chunk(devices, cp.devicesPerResourceSlice))...)
 	}
 	logger.Info("chunked devices into ResourceSlices", "numDevices", len(result.Devices),
 		"devicesPerResourceSlice", cp.devicesPerResourceSlice, "numResourceSlices", len(cp.topology.deviceSlices),

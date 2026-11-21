@@ -133,6 +133,14 @@ type BuildInput struct {
 	// Allocator is the allocator Prepare takes CPUs with, which every device
 	// publishes.
 	Allocator string
+	// Partitions are the node's partitions as ResolvePartitions returns them.
+	// Left empty, the whole node less the reserved CPUs is the one partition
+	// DefaultPartitionName.
+	Partitions []Partition
+	// PartitionsUsed is whether the configuration declares the partitions. A
+	// grouped device then counts threads per core and SMT among its
+	// partition's CPUs alone.
+	PartitionsUsed bool
 }
 
 type BuildResult struct {
@@ -145,6 +153,9 @@ type BuildResult struct {
 	// MixedCores counts, under FullPhysicalCPUsOnly, the cores of each size of
 	// every grouped device whose cores differ in threads, by device name.
 	MixedCores map[string]CoreCounts
+	// DevicesByPartition holds Devices split by partition, in the order of
+	// the partitions, leaving out a partition without devices.
+	DevicesByPartition [][]resourceapi.Device
 }
 
 // CoreCounts is the number of cores of two threads and of one in a device.
@@ -154,6 +165,10 @@ type CoreCounts struct {
 }
 
 func Build(input BuildInput) (BuildResult, error) {
+	partitions := input.Partitions
+	if len(partitions) == 0 {
+		partitions = ResolvePartitions(nil, input.Inventory.CPUTopology.CPUDetails, input.Inventory.ReservedCPUs)
+	}
 	if input.Layout == LayoutIndividual {
 		nameToID := make(map[string]int)
 		deviceInfos := cpuDeviceInfos(input.Inventory)
@@ -164,19 +179,26 @@ func Build(input BuildInput) (BuildResult, error) {
 		if err != nil {
 			return BuildResult{}, err
 		}
+		// Partitions require grouped mode, so the node is the one partition.
+		for _, dev := range devices {
+			addPartitionAttributes(dev.Attributes, partitions[0])
+		}
 		addSettingAttributes(devices, input.FullPhysicalCPUsOnly, input.Allocator)
 		if err := validateDeviceAttributeValueCount(devices); err != nil {
 			return BuildResult{}, err
 		}
-		return BuildResult{
+		res := BuildResult{
 			Devices: devices,
 			Mapping: Mapping{
 				NameToCPUID: nameToID,
 			},
-		}, nil
+		}
+		if len(devices) > 0 {
+			res.DevicesByPartition = [][]resourceapi.Device{devices}
+		}
+		return res, nil
 	}
 
-	var err error
 	var res BuildResult
 	switch input.Layout {
 	case LayoutSocket:
@@ -188,38 +210,58 @@ func Build(input BuildInput) (BuildResult, error) {
 	}
 	res.ThreadsPerCore = make(map[string]int)
 	res.MixedCores = make(map[string]CoreCounts)
-	deviceInfos, err := groupedCPUDeviceInfos(input.Layout, input.Inventory, input.FullPhysicalCPUsOnly)
-	if err != nil {
-		return BuildResult{}, err
-	}
-	for _, dev := range deviceInfos {
-		switch input.Layout {
-		case LayoutSocket:
-			res.Mapping.NameToSocketID[dev.name] = dev.socketID
-		case LayoutNUMANode:
-			res.Mapping.NameToNUMANodeID[dev.name] = dev.numaNodeID
-		case LayoutUncoreCache:
-			res.Mapping.NameToCPUs[dev.name] = dev.cpus
-		}
-		res.ThreadsPerCore[dev.name] = dev.threadsPerCore
-		if !input.FullPhysicalCPUsOnly {
+	topo := input.Inventory.CPUTopology
+	var ends []int
+	for _, partition := range partitions {
+		if !partition.PublishesOwnedDevices(input.PartitionsUsed) {
 			continue
 		}
-		counts, err := countCores(input.Inventory.CPUTopology.CPUDetails, dev)
+		counted := topo.CPUDetails
+		if input.PartitionsUsed {
+			counted = counted.KeepOnly(partition.CPUs)
+		}
+		deviceInfos, err := groupedCPUDeviceInfos(input.Layout, topo, counted, partition, input.PartitionsUsed, input.FullPhysicalCPUsOnly)
 		if err != nil {
 			return BuildResult{}, err
 		}
-		if dev.threadsPerCore == 0 && dev.cpus.Size() > 0 {
-			res.MixedCores[dev.name] = counts
+		for _, dev := range deviceInfos {
+			switch input.Layout {
+			case LayoutSocket:
+				res.Mapping.NameToSocketID[dev.name] = dev.socketID
+			case LayoutNUMANode:
+				res.Mapping.NameToNUMANodeID[dev.name] = dev.numaNodeID
+			case LayoutUncoreCache:
+				res.Mapping.NameToCPUs[dev.name] = dev.cpus
+			}
+			res.ThreadsPerCore[dev.name] = dev.threadsPerCore
+			if !input.FullPhysicalCPUsOnly {
+				continue
+			}
+			counts, err := countCores(counted, dev)
+			if err != nil {
+				return BuildResult{}, err
+			}
+			if dev.threadsPerCore == 0 && dev.cpus.Size() > 0 {
+				res.MixedCores[dev.name] = counts
+			}
 		}
-	}
-	res.Devices, err = createGroupedCPUDeviceSlices(input.Layout, deviceInfos, input.PCIeRootMapper, input.Inventory.CPUTopology, input.PublishNodeAllocatableResourceMapping, input.ExposeExtAttrs, input.FullPhysicalCPUsOnly)
-	if err != nil {
-		return BuildResult{}, err
+		devices, err := createGroupedCPUDeviceSlices(input.Layout, deviceInfos, input.PCIeRootMapper, topo, input.PublishNodeAllocatableResourceMapping, input.ExposeExtAttrs, input.FullPhysicalCPUsOnly)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		if len(devices) > 0 {
+			res.Devices = append(res.Devices, devices...)
+			ends = append(ends, len(res.Devices))
+		}
 	}
 	addSettingAttributes(res.Devices, input.FullPhysicalCPUsOnly, input.Allocator)
 	if err := validateDeviceAttributeValueCount(res.Devices); err != nil {
 		return BuildResult{}, err
+	}
+	start := 0
+	for _, end := range ends {
+		res.DevicesByPartition = append(res.DevicesByPartition, res.Devices[start:end:end])
+		start = end
 	}
 	return res, nil
 }
@@ -258,6 +300,8 @@ type groupedCPUDeviceInfo struct {
 	numaNodeID     int
 	cacheID        int
 	threadsPerCore int
+	smtEnabled     bool
+	partition      Partition
 }
 
 type cpuDeviceInfo struct {
@@ -265,67 +309,68 @@ type cpuDeviceInfo struct {
 	cpu  cpuinfo.CPUInfo
 }
 
-func groupedCPUDeviceInfos(layout Layout, machine Inventory, fullPhysicalCPUsOnly bool) ([]groupedCPUDeviceInfo, error) {
+// groupedCPUDeviceInfos cuts partition's CPUs into the layout's groups.
+// counted holds the CPUs threads per core and whole cores are counted among.
+func groupedCPUDeviceInfos(layout Layout, topo *cpuinfo.CPUTopology, counted cpuinfo.CPUDetails, partition Partition, partitionsUsed, fullPhysicalCPUsOnly bool) ([]groupedCPUDeviceInfo, error) {
 	var devices []groupedCPUDeviceInfo
 
-	topo := machine.CPUTopology // shortcut
 	usable := func(cpus cpuset.CPUSet) cpuset.CPUSet {
 		if !fullPhysicalCPUsOnly {
 			return cpus
 		}
-		return topo.CPUDetails.CompleteCores(cpus)
+		return counted.CompleteCores(cpus)
+	}
+	newInfo := func(name string, cpus cpuset.CPUSet) groupedCPUDeviceInfo {
+		if partition.Name != DefaultPartitionName {
+			name += "-" + partition.Name
+		}
+		threads := counted.UniformThreadsPerCore(cpus)
+		smtEnabled := topo.SMTEnabled
+		if partitionsUsed {
+			smtEnabled = threads != 1
+		}
+		return groupedCPUDeviceInfo{name: name, cpus: cpus, threadsPerCore: threads, smtEnabled: smtEnabled, partition: partition}
 	}
 
 	switch layout {
 	case LayoutSocket:
 		socketIDs := topo.CPUDetails.Sockets().List()
 		for _, socketID := range socketIDs {
-			allocatableCPUs := usable(topo.CPUDetails.CPUsInSockets(socketID).Difference(machine.ReservedCPUs))
+			allocatableCPUs := usable(topo.CPUDetails.CPUsInSockets(socketID).Intersection(partition.CPUs))
 			if allocatableCPUs.Size() == 0 {
 				continue
 			}
-			devices = append(devices, groupedCPUDeviceInfo{
-				name:           fmt.Sprintf("%s%03d", CPUDeviceSocketGroupedPrefix, socketID),
-				cpus:           allocatableCPUs,
-				socketID:       socketID,
-				threadsPerCore: topo.CPUDetails.UniformThreadsPerCore(allocatableCPUs),
-			})
+			info := newInfo(fmt.Sprintf("%s%03d", CPUDeviceSocketGroupedPrefix, socketID), allocatableCPUs)
+			info.socketID = socketID
+			devices = append(devices, info)
 		}
 	case LayoutNUMANode:
 		numaNodeIDs := topo.CPUDetails.NUMANodes().List()
 		for _, numaID := range numaNodeIDs {
-			allocatableCPUs := usable(topo.CPUDetails.CPUsInNUMANodes(numaID).Difference(machine.ReservedCPUs))
+			allocatableCPUs := usable(topo.CPUDetails.CPUsInNUMANodes(numaID).Intersection(partition.CPUs))
 			if allocatableCPUs.Size() == 0 {
 				continue
 			}
 
 			// All CPUs in a NUMA node belong to the same socket.
 			anyCPU := allocatableCPUs.UnsortedList()[0]
-			devices = append(devices, groupedCPUDeviceInfo{
-				name:           fmt.Sprintf("%s%03d", CPUDeviceNUMAGroupedPrefix, numaID),
-				cpus:           allocatableCPUs,
-				socketID:       topo.CPUDetails[anyCPU].SocketID,
-				numaNodeID:     numaID,
-				threadsPerCore: topo.CPUDetails.UniformThreadsPerCore(allocatableCPUs),
-			})
+			info := newInfo(fmt.Sprintf("%s%03d", CPUDeviceNUMAGroupedPrefix, numaID), allocatableCPUs)
+			info.socketID = topo.CPUDetails[anyCPU].SocketID
+			info.numaNodeID = numaID
+			devices = append(devices, info)
 		}
 	case LayoutMachine:
 		// Use the topology-validated CPU set. GetCPUInfos filters online CPUs
 		// whose topology is incomplete, and the allocation store is built from
 		// the same CPUDetails map.
-		allocatableCPUs := usable(machine.AllocatableCPUs())
-		devices = append(devices, groupedCPUDeviceInfo{
-			name:           CPUDeviceMachineGrouped,
-			cpus:           allocatableCPUs,
-			threadsPerCore: topo.CPUDetails.UniformThreadsPerCore(allocatableCPUs),
-		})
+		devices = append(devices, newInfo(CPUDeviceMachineGrouped, usable(partition.CPUs)))
 	case LayoutUncoreCache:
 		caches, unreported, spanning := uncoreCaches(topo.CPUDetails)
 		var reasons []string
-		if cpus := unreported.Difference(machine.ReservedCPUs); !cpus.IsEmpty() {
+		if cpus := unreported.Intersection(partition.CPUs); !cpus.IsEmpty() {
 			reasons = append(reasons, "the kernel reports no uncore cache for CPUs "+cpus.String())
 		}
-		if cpus := spanning.Difference(machine.ReservedCPUs); !cpus.IsEmpty() {
+		if cpus := spanning.Intersection(partition.CPUs); !cpus.IsEmpty() {
 			reasons = append(reasons, "CPUs "+cpus.String()+" share an uncore cache with CPUs of another NUMA node")
 		}
 		if len(reasons) > 0 {
@@ -333,20 +378,17 @@ func groupedCPUDeviceInfos(layout Layout, machine Inventory, fullPhysicalCPUsOnl
 				GROUP_BY_UNCORE_CACHE, strings.Join(reasons, ", and "), GROUP_BY_NUMA_NODE, GROUP_BY_SOCKET)
 		}
 		for _, cache := range caches {
-			allocatableCPUs := usable(cache.cpus.Difference(machine.ReservedCPUs))
+			allocatableCPUs := usable(cache.cpus.Intersection(partition.CPUs))
 			if allocatableCPUs.Size() == 0 {
 				continue
 			}
 			// A cache listed lies in one NUMA node, so in one socket.
 			anyCPU := allocatableCPUs.UnsortedList()[0]
-			devices = append(devices, groupedCPUDeviceInfo{
-				name:           fmt.Sprintf("%s%03d", CPUDeviceCacheGroupedPrefix, cache.id),
-				cpus:           allocatableCPUs,
-				socketID:       topo.CPUDetails[anyCPU].SocketID,
-				numaNodeID:     cache.numaNodeID,
-				cacheID:        cache.id,
-				threadsPerCore: topo.CPUDetails.UniformThreadsPerCore(allocatableCPUs),
-			})
+			info := newInfo(fmt.Sprintf("%s%03d", CPUDeviceCacheGroupedPrefix, cache.id), allocatableCPUs)
+			info.socketID = topo.CPUDetails[anyCPU].SocketID
+			info.numaNodeID = cache.numaNodeID
+			info.cacheID = cache.id
+			devices = append(devices, info)
 		}
 	}
 	return devices, nil
@@ -499,9 +541,10 @@ func createGroupedCPUDeviceSlices(layout Layout, deviceInfos []groupedCPUDeviceI
 			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 				AttributeSocketID:       {IntValue: new(int64(deviceInfo.socketID))},
 				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
-				AttributeSMTEnabled:     {BoolValue: new(topo.SMTEnabled)},
+				AttributeSMTEnabled:     {BoolValue: new(deviceInfo.smtEnabled)},
 				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
+			addPartitionAttributes(deviceAttrs, deviceInfo.partition)
 			if err := addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...); err != nil {
 				return nil, err
 			}
@@ -525,10 +568,11 @@ func createGroupedCPUDeviceSlices(layout Layout, deviceInfos []groupedCPUDeviceI
 			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 				// Driver-specific/non-standard attributes
 				AttributeSocketID:       {IntValue: new(int64(deviceInfo.socketID))},
-				AttributeSMTEnabled:     {BoolValue: new(topo.SMTEnabled)},
+				AttributeSMTEnabled:     {BoolValue: new(deviceInfo.smtEnabled)},
 				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
 				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
+			addPartitionAttributes(deviceAttrs, deviceInfo.partition)
 			addCompatibilityAttributes(deviceAttrs, int64(deviceInfo.numaNodeID))
 			if err := addNUMANodeAttribute(deviceAttrs, deviceInfo.numaNodeID); err != nil {
 				return nil, err
@@ -554,10 +598,11 @@ func createGroupedCPUDeviceSlices(layout Layout, deviceInfos []groupedCPUDeviceI
 			})
 		case LayoutMachine:
 			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				AttributeSMTEnabled:     {BoolValue: new(topo.SMTEnabled)},
+				AttributeSMTEnabled:     {BoolValue: new(deviceInfo.smtEnabled)},
 				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
 				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
+			addPartitionAttributes(deviceAttrs, deviceInfo.partition)
 			if err := addPCIeRootsAttribute(pcieRootMapper, deviceAttrs, deviceInfo.cpus.UnsortedList()...); err != nil {
 				return nil, err
 			}
@@ -580,10 +625,11 @@ func createGroupedCPUDeviceSlices(layout Layout, deviceInfos []groupedCPUDeviceI
 			deviceAttrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 				AttributeSocketID:       {IntValue: new(int64(deviceInfo.socketID))},
 				AttributeCacheL3ID:      {IntValue: new(int64(deviceInfo.cacheID))},
-				AttributeSMTEnabled:     {BoolValue: new(topo.SMTEnabled)},
+				AttributeSMTEnabled:     {BoolValue: new(deviceInfo.smtEnabled)},
 				AttributeNumCPUs:        {IntValue: new(availableCPUs)},
 				AttributeThreadsPerCore: {IntValue: new(int64(deviceInfo.threadsPerCore))},
 			}
+			addPartitionAttributes(deviceAttrs, deviceInfo.partition)
 			addCompatibilityAttributes(deviceAttrs, int64(deviceInfo.numaNodeID))
 			if err := addNUMANodeAttribute(deviceAttrs, deviceInfo.numaNodeID); err != nil {
 				return nil, err

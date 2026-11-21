@@ -35,6 +35,14 @@ CPU group. `individual` exposes one device per CPU, but is **deprecated**; see
 | `dra.cpu/threadsPerCore`          | int     | Logical CPUs on each physical core of the group; `0` when its cores differ, as on a hybrid CPU                 |
 | `dra.cpu/fullPhysicalCPUsOnly`    | bool    | The driver's `fullPhysicalCPUsOnly` setting                                                                    |
 | `dra.cpu/allocator`               | string  | The driver's `allocator` setting, `cpumanager` or `external`                                                   |
+| `dra.cpu/partition`               | string  | The CPU partition the group's CPUs belong to; `default` on a node without `cpuPartitions`                      |
+| `dra.cpu/role`                    | string  | That partition's role, `default` or `exclusive`                                                                |
+
+On a node with `cpuPartitions`, a group is published once for each partition that holds CPUs
+in it, with that partition's CPUs alone, and the device of every partition but `default` is
+named `<group device>-<partition>`, such as `cpudevnuma000-vms`. Its `dra.cpu/threadsPerCore`
+counts the threads of each core inside the partition alone, and its `dra.cpu/smtEnabled` is
+`false` only where that count is 1.
 
 `dra.cpu/fullPhysicalCPUsOnly` and `dra.cpu/allocator` let a claim's selector keep it off the nodes
 that would refuse to prepare it; see
@@ -91,6 +99,8 @@ This is retained as a reference for existing deployments. For the supported repl
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                    |
 | `dra.cpu/fullPhysicalCPUsOnly`    | bool    | The driver's `fullPhysicalCPUsOnly` setting, `false` in this mode                                     |
 | `dra.cpu/allocator`               | string  | The driver's `allocator` setting, `cpumanager` or `external`                                          |
+| `dra.cpu/partition`               | string  | `default`: this mode takes no `cpuPartitions`                                                         |
+| `dra.cpu/role`                    | string  | `default`                                                                                             |
 
 #### Compatibility / legacy attributes
 
@@ -180,6 +190,10 @@ spec:
         bool: false
       dra.cpu/allocator:
         string: cpumanager
+      dra.cpu/partition:
+        string: default
+      dra.cpu/role:
+        string: default
       resource.kubernetes.io/numaNode:
         int: 0
       dra.cpu/socketID:
@@ -209,6 +223,10 @@ spec:
         bool: false
       dra.cpu/allocator:
         string: cpumanager
+      dra.cpu/partition:
+        string: default
+      dra.cpu/role:
+        string: default
       resource.kubernetes.io/numaNode:
         int: 1
       dra.cpu/socketID:
@@ -264,6 +282,10 @@ spec:
         bool: false
       dra.cpu/allocator:
         string: cpumanager
+      dra.cpu/partition:
+        string: default
+      dra.cpu/role:
+        string: default
       dra.cpu/socketID:
         int: 0
       dra.net/numaNode:
@@ -292,6 +314,10 @@ spec:
         bool: false
       dra.cpu/allocator:
         string: cpumanager
+      dra.cpu/partition:
+        string: default
+      dra.cpu/role:
+        string: default
       dra.cpu/socketID:
         int: 0
       dra.net/numaNode:
