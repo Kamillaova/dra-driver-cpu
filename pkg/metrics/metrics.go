@@ -36,6 +36,9 @@ const (
 	// ResultRewriteError is a threaded group whose CPUs the driver failed to
 	// rewrite after an exclusive request took or gave back CPUs.
 	ResultRewriteError Result = "rewrite_error"
+	// ResultRepairError is a running threaded container whose groups the
+	// driver failed to find or repair when it synchronized with the runtime.
+	ResultRepairError Result = "repair_error"
 )
 
 func (r Result) String() string {
@@ -48,6 +51,8 @@ func (r Result) String() string {
 		return string(ResultUnknown)
 	case ResultRewriteError:
 		return string(ResultRewriteError)
+	case ResultRepairError:
+		return string(ResultRepairError)
 	default:
 		return string(ResultUnknown)
 	}
@@ -289,7 +294,7 @@ var (
 	threadedContainersSpec = metricSpec{
 		name:   "dra_cpu_threaded_containers_total",
 		kind:   metricCounter,
-		help:   "Total number of threaded containers whose groups the NRI StartContainer callback built (success) or failed to build, refusing the start (error), and of threaded groups whose CPUs the driver failed to rewrite (rewrite_error).",
+		help:   "Total number of threaded containers whose groups the NRI StartContainer callback built (success) or failed to build, refusing the start (error), of threaded groups whose CPUs the driver failed to rewrite (rewrite_error), and of running threaded containers whose groups the NRI Synchronize callback failed to find or repair (repair_error).",
 		labels: []string{"mode", "result"},
 	}
 )
