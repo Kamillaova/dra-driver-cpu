@@ -32,6 +32,8 @@ import (
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/cpuset"
@@ -88,6 +90,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				continue
 			}
 			listed = append(listed, &syncContainer{
+				pod:       pod,
 				container: container,
 				owner:     store.OwnerIdent{PodUID: types.UID(pod.GetUid()), ContainerName: container.GetName()},
 				claims:    claimAllocations,
@@ -113,10 +116,12 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	contenders := contendersForUnboundClaims(allocationState, listed)
 	refused := 0
 	var kept []cpumetrics.Rule
+	var warnings []olderRuleWarning
 	for _, sc := range listed {
 		allGuaranteedCPUs := cpuset.New()
 		var claimUIDs []types.UID
 		keptUnder := sets.New[cpumetrics.Rule]()
+		var broken []olderRule
 		for _, uid := range slices.Sorted(maps.Keys(sc.claims)) {
 			caLogger := sc.logger.WithValues("claimUID", uid)
 			if c, ok := contenders[uid]; ok && c.excludes(sc.owner) {
@@ -124,7 +129,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				refused++
 				continue
 			}
-			refs, expected, rule, err := syncBinding(allocationState, uid, sc)
+			refs, expected, older, err := syncBinding(allocationState, uid, sc)
 			var cpus cpuset.CPUSet
 			if err == nil {
 				cpus, err = allocationState.GetRequestAllocationUnion(refs...)
@@ -137,14 +142,18 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				refused++
 				continue
 			}
-			if rule != "" {
-				caLogger.Info("keeping the container bound to the whole claim under an older rule: the runtime shows it pinned to its claims' CPUs", "rule", rule)
-				keptUnder.Insert(rule)
+			if older.rule != "" {
+				caLogger.Info("keeping the container bound to the whole claim under an older rule: the runtime shows it pinned to its claims' CPUs", "rule", older.rule)
+				keptUnder.Insert(older.rule)
+				broken = append(broken, older)
 			}
 			allGuaranteedCPUs = allGuaranteedCPUs.Union(cpus)
 			claimUIDs = append(claimUIDs, uid)
 		}
 		kept = append(kept, sets.List(keptUnder)...)
+		if len(broken) > 0 {
+			warnings = append(warnings, olderRuleWarning{pod: sc.pod, container: sc.container.GetName(), broken: broken})
+		}
 
 		state := store.NewContainerState(sc.container.GetName(), types.UID(sc.container.GetId()), claimUIDs...)
 		if len(claimUIDs) > 0 {
@@ -187,6 +196,9 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 	}
 	for _, rule := range kept {
 		cp.metrics.RecordContainerKeptUnderOlderRule(rule)
+	}
+	for _, warning := range warnings {
+		cp.eventRecorder.Event(warning.object(), corev1.EventTypeWarning, reasonKeptUnderOlderRule, warning.message())
 	}
 	logger.V(6).Info("synchronization complete", "updatesCount", len(containerUpdates))
 	return containerUpdates, nil
@@ -307,6 +319,7 @@ func cdiSpecCPUs(logger logr.Logger, uid types.UID, envs []string) (cpuset.CPUSe
 }
 
 type syncContainer struct {
+	pod       *api.PodSandbox
 	container *api.Container
 	owner     store.OwnerIdent
 	claims    map[types.UID]draEnvClaim
@@ -347,22 +360,54 @@ func (sc *syncContainer) recordClaims(allocations *store.AllocationState) {
 // refuses since this rule came, keeps the whole claim where the runtime shows
 // it pinned to exactly the CPUs of its claims: the rule then applies at its next
 // CreateContainer.
-func syncBinding(allocations *store.AllocationState, uid types.UID, sc *syncContainer) ([]store.ClaimRequestRef, map[store.ClaimRequestRef]cpuset.CPUSet, cpumetrics.Rule, error) {
+func syncBinding(allocations *store.AllocationState, uid types.UID, sc *syncContainer) ([]store.ClaimRequestRef, map[store.ClaimRequestRef]cpuset.CPUSet, olderRule, error) {
 	claim := sc.claims[uid]
 	refs := claim.refs(uid)
 	if claim.upstreamForm() {
-		return refs, map[store.ClaimRequestRef]cpuset.CPUSet{refs[0]: claim.cpus}, "", nil
+		return refs, map[store.ClaimRequestRef]cpuset.CPUSet{refs[0]: claim.cpus}, olderRule{}, nil
 	}
 	if _, err := allocations.GetRequestAllocationUnion(refs...); err != nil {
-		return nil, nil, "", err
+		return nil, nil, olderRule{}, err
 	}
 	if err := wholeClaimUse(allocations, uid, claim, sc.container.GetName()); err != nil {
-		if !sc.pinnedToRecord {
-			return nil, nil, "", err
+		var partial partialHolderError
+		if !sc.pinnedToRecord || !errors.As(err, &partial) {
+			return nil, nil, olderRule{}, err
 		}
-		return []store.ClaimRequestRef{{ClaimUID: uid}}, nil, cpumetrics.RulePartialHolder, nil
+		return []store.ClaimRequestRef{{ClaimUID: uid}}, nil, olderRule{rule: cpumetrics.RulePartialHolder, detail: partial.detail()}, nil
 	}
-	return refs, nil, "", nil
+	return refs, nil, olderRule{}, nil
+}
+
+// olderRule is a rule on a claim's shape that was not applied when a listed
+// container was created, and that the container breaks.
+type olderRule struct {
+	rule   cpumetrics.Rule
+	detail string
+}
+
+const reasonKeptUnderOlderRule = "KeptUnderOlderRule"
+
+// olderRuleWarning is the Warning on the pod of a container that Synchronize
+// keeps bound to its claims although it breaks rules not applied when it was
+// created.
+type olderRuleWarning struct {
+	pod       *api.PodSandbox
+	container string
+	broken    []olderRule
+}
+
+func (w olderRuleWarning) object() *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: w.pod.GetNamespace(), Name: w.pod.GetName(), UID: types.UID(w.pod.GetUid())}}
+}
+
+func (w olderRuleWarning) message() string {
+	broken := make([]string, 0, len(w.broken))
+	for _, older := range w.broken {
+		broken = append(broken, fmt.Sprintf("rule %s: it %s", older.rule, older.detail))
+	}
+	return fmt.Sprintf("container %q breaks a rule that was not applied when it was created and keeps its claims until it is created again, when it is refused by %s",
+		w.container, strings.Join(broken, ", and by "))
 }
 
 // wholeClaimUse refuses a container that names some but not all of a claim's
@@ -386,6 +431,10 @@ type partialHolderError struct {
 }
 
 func (err partialHolderError) Error() string {
+	return fmt.Sprintf("container %q: %s", err.container, err.detail())
+}
+
+func (err partialHolderError) detail() string {
 	noun := "request"
 	if len(err.requests) > 1 {
 		noun = "requests"
@@ -394,8 +443,8 @@ func (err partialHolderError) Error() string {
 	for _, request := range err.requests {
 		quoted = append(quoted, strconv.Quote(request))
 	}
-	return fmt.Sprintf("container %q: uses only %s %s of claim %q, which must be used whole; use the whole claim, or give the container its own claim",
-		err.container, noun, strings.Join(quoted, ", "), err.claim)
+	return fmt.Sprintf("uses only %s %s of claim %q, which must be used whole; use the whole claim, or give the container its own claim",
+		noun, strings.Join(quoted, ", "), err.claim)
 }
 
 type syncRefusal string
