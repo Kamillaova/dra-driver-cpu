@@ -181,6 +181,17 @@ ClusterRole already grants `get` on `nodes`. Until its first synchronization the
 registered, so the kubelet prepares no claim on the node meanwhile; an API server that does not
 answer at start holds the registration back as long, the driver logging each failed read.
 
+#### Claim status
+
+The driver now writes, at every preparation of a claim, one entry per allocated device in the
+claim's `status.devices`, naming the device's CPU partition and, for an exclusive request, the CPUs
+it holds there. It writes them with an update of the claim's status, and leaves a claim that
+already carries them as it is. A write that fails fails the preparation, and the kubelet retries
+it. The ClusterRole already grants `update` on `resourceclaims/status`, and
+`associated-node:update` on `resourceclaims/driver` for `dra.cpu`. See
+[How It Works](how-it-works.md) and
+[A Stalled Claim Status Write](troubleshooting.md#a-stalled-claim-status-write).
+
 #### Node condition for the node-allocatable mapping
 
 With `publishNodeAllocatableResourceMapping: true`, the driver now keeps the condition

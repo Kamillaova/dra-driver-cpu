@@ -260,7 +260,7 @@ func TestPrepareRefusedWhileNRIReconnects(t *testing.T) {
 
 func TestReadyNeedsRegistrationAndNRI(t *testing.T) {
 	infos := mockCPUInfos_SingleSocket_4CPUS_HT
-	d, err := New(testr.New(t), Providers{CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}, SysFS: testSysFS(infos)}, &Config{
+	d, err := New(testr.New(t), Providers{K8SClient: statusClient(), CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}, SysFS: testSysFS(infos)}, &Config{
 		DriverName: testDriverName, NodeName: testNodeName,
 		CPUDeviceMode: device.CPU_DEVICE_MODE_GROUPED, CPUDeviceGroupBy: device.GROUP_BY_NUMA_NODE,
 	})
