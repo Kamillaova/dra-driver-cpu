@@ -228,7 +228,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			if !ok {
 				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no valid socket ID found for device %s", alloc.Device)}
 			}
-			socketCPUs := topo.CPUDetails.CPUsInSockets(socketID)
+			socketCPUs := cp.topology.NameToCPUs[alloc.Device]
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(socketCPUs)
 			logger.V(4).Info("socket CPU availability", "socketID", socketID, "socketCPUs", socketCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
 			cur, err = cp.takeCPUsForDevice(logger, alloc, socketCPUs, availableCPUsForDevice, preferredCPUs, claimCPUCount)
@@ -238,7 +238,7 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 			if !ok {
 				return kubeletplugin.PrepareResult{Err: fmt.Errorf("no valid NUMA node ID found for device %s", alloc.Device)}
 			}
-			numaCPUs := topo.CPUDetails.CPUsInNUMANodes(numaNodeID)
+			numaCPUs := cp.topology.NameToCPUs[alloc.Device]
 			availableCPUsForDevice := allocatableCPUs.Difference(assignedCPUs).Intersection(numaCPUs)
 			logger.V(4).Info("NUMA node CPU availability", "numaNodeID", numaNodeID, "numaCPUs", numaCPUs.String(), "availableCPUs", availableCPUsForDevice.String())
 			cur, err = cp.takeCPUsForDevice(logger, alloc, numaCPUs, availableCPUsForDevice, preferredCPUs, claimCPUCount)
