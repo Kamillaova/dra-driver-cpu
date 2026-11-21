@@ -315,13 +315,19 @@ func (cp *CPUDriver) buildThreadedTree(ctx context.Context, logger logr.Logger, 
 		logger.Info("building no threaded groups: the node runs cgroupThreadedMode false")
 		return nil
 	}
-	// A container created while the driver was away was never refused, and one
-	// group built for two claims is what the refusal keeps out.
-	if shared, found := containerClaimsOf(cp.allocationState, uids).sharedGroup(ctr.GetName()); found {
-		logger.Info("building no threaded groups: the container was created without the driver, which refuses it", "reason", shared.Error())
+	unseen, err := cp.createdUnseen(ctr)
+	if err != nil {
+		cp.metrics.RecordThreadedContainer(cp.cgroupThreadedMode, cpumetrics.ResultError)
+		return err
+	}
+	if unseen {
+		logger.Info("building no threaded groups: the driver did not see the container created, so it runs on its claims' CPUs without its groups and their limits")
 		return nil
 	}
 	root, err := cp.buildTree(ctr, uids)
+	if err == nil {
+		err = cp.linkThreadRoot(logger, ctr, root)
+	}
 	if err == nil {
 		err = cp.place(ctx, logger, ctr, uids, root)
 	}
@@ -399,8 +405,16 @@ func (cp *CPUDriver) repairThreadedTrees(repairs []threadedRepair) {
 			cp.metrics.RecordThreadedContainer(cp.cgroupThreadedMode, cpumetrics.ResultRepairError)
 			continue
 		}
+		if root == "" {
+			r.sc.logger.Info("building no threaded groups: the driver did not see the container created, so it runs on its claims' CPUs without its groups and their limits")
+			continue
+		}
 		cp.podState.SetThreadRoot(r.sc.owner.PodUID, r.sc.container.GetName(), types.UID(r.sc.container.GetId()), root)
 		r.sc.logger.V(2).Info("repaired the container's threaded groups", "threadRoot", root)
+		if err := cp.linkThreadRoot(r.sc.logger, r.sc.container, root); err != nil {
+			r.sc.logger.Error(err, "the container's /var/run/dracpu/cgroup stays as it is until the driver synchronizes again")
+			cp.metrics.RecordThreadedContainer(cp.cgroupThreadedMode, cpumetrics.ResultLinkError)
+		}
 	}
 }
 
@@ -410,7 +424,9 @@ func (cp *CPUDriver) repairThreadedTrees(repairs []threadedRepair) {
 // that are missing, sets every group again and hands the files of the groups
 // it made to the user the process runs as now. Where it finds none, the
 // container started while the driver missed it, and the groups are built
-// where its init is, as StartContainer builds them; no process is moved.
+// where its init is, as StartContainer builds them; no process is moved. A
+// container whose creation the driver missed as well gets none, as
+// StartContainer gives it none, and no thread root is returned.
 func (cp *CPUDriver) repairTree(ctr *api.Container, uids []types.UID) (string, error) {
 	dir, err := cgroupfs.Dir(ctr.GetLinux().GetCgroupsPath())
 	if err != nil {
@@ -427,6 +443,10 @@ func (cp *CPUDriver) repairTree(ctr *api.Container, uids []types.UID) (string, e
 		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
 	}
 	if root == "" {
+		unseen, err := cp.createdUnseen(ctr)
+		if err != nil || unseen {
+			return "", err
+		}
 		return cp.buildTree(ctr, uids)
 	}
 	groups, err := cp.buildableGroups(ctr.GetName(), uids)

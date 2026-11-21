@@ -215,6 +215,16 @@ groups under the cgroup that holds the container's first process, and moves no p
 that fails is logged and counted in `dra_cpu_threaded_containers_total{result="repair_error"}`, and
 the container keeps its groups as they are until the driver synchronizes again.
 
+A threaded container finds its thread root at `/var/run/dracpu/cgroup`, a link in a read-only
+directory the driver mounts when it creates the container, written when the container starts and
+repaired when the driver synchronizes. A container created while the driver was not connected has
+no `/var/run/dracpu`, and the driver, which did not judge it, builds it no groups, neither when it
+starts nor when the driver synchronizes, in either mode: it runs in its thread root, on all its
+claims' CPUs and without their limits. One
+that joined another container's cgroup namespace gets no link. The driver logs each. Each synchronization removes the link directories of the containers the runtime
+does not list, so a running container the runtime reports as unknown, or did not load again after
+it restarted, loses its link for good: its `/var/run/dracpu` stays empty.
+
 When an exclusive request takes CPUs of a default partition, or gives them back, the driver writes
 the CPUs of every threaded group holding a share there. A write that fails, for a container that is
 gone among others, is logged and counted in `dra_cpu_threaded_containers_total{result="rewrite_error"}`,
