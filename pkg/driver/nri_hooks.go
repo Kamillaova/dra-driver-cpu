@@ -117,7 +117,7 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 				refused++
 				continue
 			}
-			if _, err := allocationState.Bind(caLogger, sc.owner.PodUID, sc.owner.ContainerName, map[types.UID]cpuset.CPUSet{uid: sc.claims[uid]}); err != nil {
+			if _, err := allocationState.Bind(caLogger, sc.owner.PodUID, sc.owner.ContainerName, map[store.ClaimRequestRef]cpuset.CPUSet{{ClaimUID: uid}: sc.claims[uid]}); err != nil {
 				caLogger.Error(err, "not binding claim to container during synchronize", "reason", refusalReason(err))
 				refused++
 				continue
@@ -227,7 +227,7 @@ func (cp *CPUDriver) restoreNamedClaims(logger logr.Logger, allocations *store.A
 			caLogger.Error(err, "not restoring claim with an unusable CDI spec")
 			continue
 		}
-		allocations.Restore(caLogger, uid, cpus)
+		allocations.Restore(caLogger, uid, []store.RequestAllocation{{CPUs: cpus}})
 	}
 }
 
@@ -414,11 +414,13 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		// entries that match a claim prepared by this driver.
 		guaranteedCPUs := cpuset.New()
 		claimUIDs := []types.UID{}
+		expected := make(map[store.ClaimRequestRef]cpuset.CPUSet, len(claimAllocations))
 		for uid, cpus := range claimAllocations {
 			guaranteedCPUs = guaranteedCPUs.Union(cpus)
 			claimUIDs = append(claimUIDs, uid)
+			expected[store.ClaimRequestRef{ClaimUID: uid}] = cpus
 		}
-		updatedClaims, err := cp.allocationState.Bind(logger, podUID, ctr.Name, claimAllocations)
+		updatedClaims, err := cp.allocationState.Bind(logger, podUID, ctr.Name, expected)
 		if err != nil {
 			return nil, nil, fmt.Errorf("cannot bind claim to container %q in pod %q: %w", ctr.Name, pod.Uid, err)
 		}
