@@ -366,6 +366,7 @@ func TestNodeConditionWriterWithoutConditionsCallsNothing(t *testing.T) {
 	w.run(t.Context(), entered)
 	close(entered)
 	w.nodeChanged(testConditionNode())
+	w.requeue()
 	w.stop()
 	w.writeStopped()
 	require.Empty(t, client.Actions())
