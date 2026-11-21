@@ -142,6 +142,11 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		return fmt.Errorf("failed to parse reserved CPUs: %w", err)
 	}
 
+	cpuPartitions, err := cfg.Partitions()
+	if err != nil {
+		return err
+	}
+
 	sfs, err := newSysFS(logger, cfg.SysFSOverlay)
 	if err != nil {
 		return err
@@ -221,16 +226,21 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 		Allocator:                             cfg.Allocator,
+		CPUPartitions:                         cpuPartitions,
 		CancelRun:                             cancel,
 		ProfileLabel:                          driverconfig.ProfileLabel,
 	}
 	if len(cfg.Profiles) > 0 {
 		driverConfig.SelectProfile = func(name string) (*driver.Config, error) {
-			if _, err := cfg.WithProfile(name); err != nil {
+			profile, err := cfg.WithProfile(name)
+			if err != nil {
 				return nil, err
 			}
 			selected := driverConfig
 			selected.ProfileLabel, selected.SelectProfile = "", nil
+			if selected.CPUPartitions, err = profile.Partitions(); err != nil {
+				return nil, err
+			}
 			return &selected, nil
 		}
 	}
