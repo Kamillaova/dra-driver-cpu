@@ -62,6 +62,8 @@ type cdiRequestRecord struct {
 	CPUs    cpuset.CPUSet
 	Role    store.Role
 	Results []cdiResultRecord
+	// Cap is the request's cap in millicores, 0 for none.
+	Cap int64
 }
 
 type cdiResultRecord struct {
@@ -78,16 +80,17 @@ type cdiRecord struct {
 
 // cdiPlacement is one request of dra.cpu/record as the spec holds it.
 type cdiPlacement struct {
-	Request string            `json:"request"`
-	CPUs    string            `json:"cpus"`
-	Role    store.Role        `json:"role,omitempty"`
-	Results []cdiResultRecord `json:"results,omitempty"`
+	Request string             `json:"request"`
+	CPUs    string             `json:"cpus"`
+	Role    store.Role         `json:"role,omitempty"`
+	Results []cdiResultRecord  `json:"results,omitempty"`
+	Cap     *resource.Quantity `json:"cap,omitempty"`
 }
 
 func (r cdiClaimRecord) storeRecord() store.ClaimRecord {
 	record := store.ClaimRecord{Namespace: r.Namespace, Name: r.Name}
 	for _, request := range r.Requests {
-		allocation := store.RequestAllocation{Request: request.Request, CPUs: request.CPUs, Role: request.Role}
+		allocation := store.RequestAllocation{Request: request.Request, CPUs: request.CPUs, Role: request.Role, Cap: request.Cap}
 		if request.Role == store.RoleShared {
 			for _, result := range request.Results {
 				allocation.Devices = append(allocation.Devices, result.Device)
@@ -101,7 +104,11 @@ func (r cdiClaimRecord) storeRecord() store.ClaimRecord {
 func encodeClaimRecord(record cdiClaimRecord) (string, error) {
 	encoded := cdiRecord{Namespace: record.Namespace, Name: record.Name, Placements: make([]cdiPlacement, 0, len(record.Requests))}
 	for _, request := range record.Requests {
-		encoded.Placements = append(encoded.Placements, cdiPlacement{Request: request.Request, CPUs: request.CPUs.String(), Role: request.Role, Results: request.Results})
+		placement := cdiPlacement{Request: request.Request, CPUs: request.CPUs.String(), Role: request.Role, Results: request.Results}
+		if request.Cap > 0 {
+			placement.Cap = resource.NewMilliQuantity(request.Cap, resource.DecimalSI)
+		}
+		encoded.Placements = append(encoded.Placements, placement)
 	}
 	value, err := json.Marshal(encoded)
 	if err != nil {
@@ -147,7 +154,14 @@ func decodeClaimRecord(value string) (cdiClaimRecord, error) {
 		if placement.Role == store.RoleShared && len(placement.Results) == 0 {
 			return cdiClaimRecord{}, fmt.Errorf("%s records shared request %q with no device", cdiRecordAnnotation, placement.Request)
 		}
-		record.Requests = append(record.Requests, cdiRequestRecord{Request: placement.Request, CPUs: cpus, Role: placement.Role, Results: placement.Results})
+		var capMilli int64
+		if placement.Cap != nil {
+			if placement.Role != store.RoleShared || placement.Cap.Sign() <= 0 {
+				return cdiClaimRecord{}, fmt.Errorf("%s records cap %s on request %q, which only a shared request above 0 has", cdiRecordAnnotation, placement.Cap.String(), placement.Request)
+			}
+			capMilli = placement.Cap.MilliValue()
+		}
+		record.Requests = append(record.Requests, cdiRequestRecord{Request: placement.Request, CPUs: cpus, Role: placement.Role, Results: placement.Results, Cap: capMilli})
 	}
 	return record, nil
 }

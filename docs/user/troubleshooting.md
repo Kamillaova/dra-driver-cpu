@@ -127,6 +127,35 @@ each kind of node, then label each node and restart its driver: the driver reads
 and the label only when it starts, and once profiles are declared it refuses a node without the
 label.
 
+## A Capped Shared Request
+
+A shared request with an amount above `0` is capped at that amount, and must take one device and be
+alone in its container's cgroup, see
+[Capped Shared Requests](workload-requirements.md#capped-shared-requests). Prepare refuses a claim
+that breaks this, and the pod's `FailedPrepareDynamicResources` event carries one of:
+
+```text
+request "vmm-cpu" has limit of 250m with `count: 2`; a limit can be applied to only one device: ask for one device
+request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu"
+```
+
+A container whose claims together put a capped request beside another request shows
+`CreateContainerError` with:
+
+```text
+container "app": request "cpus" of claim "app-a-x7k2p" has limit of 250m, so it cannot be used together with request "cpus" of claim "app-b-q9m4t": use the claims in separate containers
+```
+
+A container the driver finds running when it starts or reconnects to the container runtime, holding
+a capped request beside another request, keeps running without the cap, and gets a
+`KeptUnderOlderRule` Warning with the rule `limit_with_others`, see
+[A Container Kept Under an Older Rule](#a-container-kept-under-an-older-rule). A running container
+whose cap is missing, where the container has no CPU limit, gets it then.
+
+To see the cap a container runs under, read `cpu.max` in its cgroup: `25000 100000` for `250m`, and
+`max 100000` for none. A container that shows another quota has a CPU limit, set in its pod or by a
+`LimitRange` or another admission controller, which replaces the cap.
+
 ## CPUs Held by Another Claim
 
 When the driver cannot prepare a claim because claims it has already prepared hold the CPUs, the
