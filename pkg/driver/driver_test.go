@@ -37,8 +37,12 @@ import (
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/utils/cpuset"
 	cdiSpec "tags.cncf.io/container-device-interface/specs-go"
@@ -775,6 +779,23 @@ func TestStopStopsTheNRIPluginLast(t *testing.T) {
 			stops = append(stops, "nri")
 		},
 	}
+	client := fake.NewClientset(testConditionNode())
+	client.PrependReactor("patch", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if strings.Contains(string(action.(k8stesting.PatchAction).GetPatch()), `"Unknown"`) {
+			stops = append(stops, "conditions")
+		}
+		return false, nil, nil
+	})
+	cp.nodeConditions = newNodeConditionWriter(client, testNodeName, &cp.stateMu, []nodeConditionSource{{
+		conditionType:  testConditionType,
+		evaluate:       func() nodeConditionValue { return testConditionV },
+		stoppedMessage: "driver stopped; nothing checked",
+	}}, workqueue.DefaultTypedControllerRateLimiter[string]())
+	inService := make(chan struct{})
+	close(inService)
+	cp.nodeConditions.run(runCtx, inService)
+	require.Eventually(t, func() bool { return len(client.Actions()) >= 2 }, 5*time.Second, 5*time.Millisecond,
+		"the writer reads its Node and writes its condition")
 	go cp.healthResendLoop(runCtx)
 	asyncErr := make(chan error, 1)
 	cp.startNRIPlugin(runCtx, asyncErr)
@@ -784,7 +805,7 @@ func TestStopStopsTheNRIPluginLast(t *testing.T) {
 	require.NoError(t, nriCtx.Err(), "a cancelled run context must not stop the NRI plugin")
 
 	cp.Stop()
-	require.Equal(t, []string{"dra", "nri"}, stops)
+	require.Equal(t, []string{"dra", "conditions", "nri"}, stops)
 	<-runReturned
 	require.Empty(t, asyncErr, "stopping the NRI plugin is not a failure")
 }
