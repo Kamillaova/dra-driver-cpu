@@ -43,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 	drametadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
 	drametadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -166,6 +167,7 @@ type CPUDriver struct {
 	// coalesced requests to the worker that sends containerUpdater's updates.
 	reconcileTrigger chan struct{}
 	containerUpdater containerUpdater
+	nodeConditions   *nodeConditionWriter
 }
 
 // deviceHealthEntry is the last known health of a single device.
@@ -273,6 +275,8 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	if config.AssumeUnsolicitedUpdatesSafe {
 		plugin.reconcileTrigger = make(chan struct{}, 1)
 	}
+	plugin.nodeConditions = newNodeConditionWriter(providers.K8SClient, config.NodeName, &plugin.stateMu, nil,
+		workqueue.DefaultTypedControllerRateLimiter[string]())
 	topo, err := providers.EnsureCPUInfo().GetCPUTopology(logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get CPU topology: %w", err)
@@ -475,6 +479,8 @@ func (cp *CPUDriver) Start(ctx context.Context) (<-chan error, error) {
 	}
 	cp.nriPlugin = stub
 	cp.startNRIPlugin(ctx, asyncErr)
+	// Registered already, the driver is in service once NRI first synchronizes.
+	cp.nodeConditions.run(ctx, cp.initialSync)
 
 	// publish available resources
 	go cp.PublishResources(ctx)
@@ -531,6 +537,8 @@ func (cp *CPUDriver) Stop() {
 	cp.health.Stop()
 	cp.eventBroadcaster.Shutdown()
 	cp.draPlugin.Stop()
+	cp.nodeConditions.stop()
+	cp.nodeConditions.writeStopped()
 	cp.cancelNRI()
 	cp.nriPlugin.Stop()
 }

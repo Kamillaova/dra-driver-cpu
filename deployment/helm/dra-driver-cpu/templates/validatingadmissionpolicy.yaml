@@ -68,4 +68,221 @@ metadata:
 spec:
   policyName: {{ include "dra-driver-cpu.fullname" . }}-events
   validationActions: [Deny]
+---
+# A nodes/status write keeps changes to the Node's metadata as well as its
+# status, so everything but the driver's own conditions is held to the old
+# object, key by key, fields added in later Kubernetes versions included.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-cpu.fullname" . }}-node-status
+  labels:
+    {{- include "dra-driver-cpu.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes/status"]
+  matchConditions:
+    - name: driver-service-account
+      expression: >-
+        request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:{{ include "dra-driver-cpu.fullname" . }}"
+  variables:
+    - name: nodeName
+      expression: >-
+        request.userInfo.?extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
+    - name: driverConditions
+      expression: >-
+        []
+    - name: newMetadata
+      expression: >-
+        object.metadata
+    - name: oldMetadata
+      expression: >-
+        oldObject.metadata
+    - name: newStatus
+      expression: >-
+        object.?status.orValue({})
+    - name: oldStatus
+      expression: >-
+        oldObject.?status.orValue({})
+    - name: newOtherConditions
+      expression: >-
+        variables.newStatus.?conditions.orValue([]).filter(c, !(c.type in variables.driverConditions))
+    - name: oldOtherConditions
+      expression: >-
+        variables.oldStatus.?conditions.orValue([]).filter(c, !(c.type in variables.driverConditions))
+  validations:
+    - expression: variables.nodeName != ''
+      message: >-
+        the driver's service account token names no node: run the driver in a pod, with the
+        token the kubelet mounts into it
+    - expression: variables.newMetadata.name == variables.nodeName
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may write only its own node's status,
+        not node '" + variables.newMetadata.name + "'"
+    - expression: >-
+        variables.newMetadata.all(k, k in ['resourceVersion', 'managedFields'] ||
+        (k in variables.oldMetadata && variables.newMetadata[k] == variables.oldMetadata[k])) &&
+        variables.oldMetadata.all(k, k in ['resourceVersion', 'managedFields'] || k in variables.newMetadata)
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may not change its node's metadata"
+    - expression: >-
+        variables.newStatus.all(k, k == 'conditions' ||
+        (k in variables.oldStatus && variables.newStatus[k] == variables.oldStatus[k])) &&
+        variables.oldStatus.all(k, k == 'conditions' || k in variables.newStatus)
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may change only its own conditions
+        in its node's status"
+    - expression: >-
+        variables.newOtherConditions.size() == variables.oldOtherConditions.size() &&
+        variables.newOtherConditions.all(c, variables.oldOtherConditions.exists(o, o.type == c.type && o == c))
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may change only the node conditions "
+        + variables.driverConditions.join(", ")
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-cpu.fullname" . }}-node-status
+  labels:
+    {{- include "dra-driver-cpu.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-cpu.fullname" . }}-node-status
+  validationActions: [Deny]
+---
+# On a DELETE the object is null and the slice's node is read from the old
+# object; an UPDATE is judged by both.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-cpu.fullname" . }}-resourceslices
+  labels:
+    {{- include "dra-driver-cpu.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["resource.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["resourceslices"]
+  matchConditions:
+    - name: driver-service-account
+      expression: >-
+        request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:{{ include "dra-driver-cpu.fullname" . }}"
+  variables:
+    - name: nodeName
+      expression: >-
+        request.userInfo.?extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
+    - name: sliceNode
+      expression: >-
+        request.operation == 'DELETE' ? '' : object.?spec.?nodeName.orValue('')
+    - name: oldSliceNode
+      expression: >-
+        request.operation == 'CREATE' ? '' : oldObject.?spec.?nodeName.orValue('')
+  validations:
+    - expression: variables.nodeName != ''
+      message: >-
+        the driver's service account token names no node: run the driver in a pod, with the
+        token the kubelet mounts into it
+    - expression: request.operation == 'DELETE' || variables.sliceNode == variables.nodeName
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may write only ResourceSlices of its
+        own node, not of node '" + variables.sliceNode + "'"
+    - expression: request.operation == 'CREATE' || variables.oldSliceNode == variables.nodeName
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may change only ResourceSlices of its
+        own node, not of node '" + variables.oldSliceNode + "'"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-cpu.fullname" . }}-resourceslices
+  labels:
+    {{- include "dra-driver-cpu.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-cpu.fullname" . }}-resourceslices
+  validationActions: [Deny]
+---
+# The API server confines a node's claim status writes to claims allocated on
+# that node itself only from Kubernetes 1.36, with
+# DRAResourceClaimGranularStatusAuthorization. Other drivers' device entries
+# are matched by their keys, since an apply does not keep their order.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-cpu.fullname" . }}-resourceclaim-status
+  labels:
+    {{- include "dra-driver-cpu.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["resource.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["resourceclaims/status"]
+  matchConditions:
+    - name: driver-service-account
+      expression: >-
+        request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:{{ include "dra-driver-cpu.fullname" . }}"
+  variables:
+    - name: nodeName
+      expression: >-
+        request.userInfo.?extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
+    - name: newStatus
+      expression: >-
+        object.?status.orValue({})
+    - name: oldStatus
+      expression: >-
+        oldObject.?status.orValue({})
+    - name: allocatedOnNode
+      expression: >-
+        variables.oldStatus.?allocation.?nodeSelector.?nodeSelectorTerms.orValue([]).exists(t,
+        t.?matchFields.orValue([]).exists(f, f.key == 'metadata.name' && f.operator == 'In' &&
+        f.?values.orValue([]).exists(v, v == variables.nodeName)))
+    - name: newOtherDevices
+      expression: >-
+        variables.newStatus.?devices.orValue([]).filter(d, d.driver != 'dra.cpu')
+    - name: oldOtherDevices
+      expression: >-
+        variables.oldStatus.?devices.orValue([]).filter(d, d.driver != 'dra.cpu')
+  validations:
+    - expression: variables.nodeName != ''
+      message: >-
+        the driver's service account token names no node: run the driver in a pod, with the
+        token the kubelet mounts into it
+    - expression: variables.allocatedOnNode
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may write only the status of a claim
+        allocated on its node"
+    - expression: >-
+        variables.newStatus.all(k, k == 'devices' ||
+        (k in variables.oldStatus && variables.newStatus[k] == variables.oldStatus[k])) &&
+        variables.oldStatus.all(k, k == 'devices' || k in variables.newStatus)
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may change only the devices of a
+        claim's status"
+    - expression: >-
+        variables.newOtherDevices.size() == variables.oldOtherDevices.size() &&
+        variables.newOtherDevices.all(d, variables.oldOtherDevices.exists(o, o.driver == d.driver &&
+        o.pool == d.pool && o.device == d.device &&
+        o.?shareID.orValue('') == d.?shareID.orValue('') && o == d))
+      messageExpression: >-
+        "the driver on node '" + variables.nodeName + "' may change only the dra.cpu entries of
+        a claim's status.devices"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-cpu.fullname" . }}-resourceclaim-status
+  labels:
+    {{- include "dra-driver-cpu.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-cpu.fullname" . }}-resourceclaim-status
+  validationActions: [Deny]
 {{- end }}
