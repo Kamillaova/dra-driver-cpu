@@ -82,7 +82,7 @@ honor these settings, where applicable.
   setting. The value must be a linux cpuset string. The tests will ensure no containers
   consume these CPUs.
   NOTE: the Makefile defaults to "0" if not set, because a nonempty value is needed internally,
-  and to empty on a lane, whose partitions replace it.
+  and to empty on every lane but `upgrade`, whose partitions replace it.
   NOTE: at the moment is not easy to autodetect this setting from the driver configuration.
   Future version may autodetect it.
 
@@ -133,6 +133,12 @@ honor these settings, where applicable.
 
 - `DRACPU_E2E_REPORT`: (optional): a path, best absolute, where *the Makefile* `test-e2e` target
   writes the Ginkgo JSON report.
+
+- `DRACPU_E2E_DRIVER_IMAGE`: (set by *the Makefile* `test-e2e` target): this tree's driver image,
+  which the specs labeled `upgrade` upgrade upstream's release to.
+
+- `DRACPU_E2E_HELM`: (optional, default `helm`; *the Makefile* `test-e2e` target passes its own):
+  the Helm binary the specs labeled `upgrade` run.
 
 - `DRACPU_E2E_DUMP_RAW_LOGS`: (optional): if set to any value which is true-ish (e.g. `1`, `true`...)
   makes the tests which verify the contextual logging integrity dump the full raw captured logs
@@ -227,6 +233,15 @@ where their lane did not prepare the cluster.
   driver's own pod under crun too. The specs labeled `threaded` run their pods under crun, and
   the specs labeled `crun` add the cases of crun's annotations and run the reserved-partition
   spec's pod under crun.
+- `upgrade` (label `upgrade`): upstream's last release in place of this tree's chart, on a cluster
+  from `hack/ci/kind-ci.yaml` without partitions or profiles. `lane-setup.sh post` installs chart
+  `0.3.1` from `oci://registry.k8s.io/dra-driver-cpu/charts/dra-driver-cpu`, pinned by its digest,
+  with its own image and the values upstream's own e2e install passes. The specs prepare a claim
+  on a worker, drain the worker, upgrade the release to this tree's chart with
+  `helm upgrade --reset-then-reuse-values --wait`, which changes only the image, and uncordon the
+  worker; they check that the driver keeps its configuration and its devices, and that the upgraded
+  driver prepares the worker's new claims. Run them alone, with `DRACPU_E2E_LABEL_FILTER=upgrade`:
+  the other specs expect this tree's driver.
 
 The specs labeled `threaded` run on every lane and without one, where the driver runs
 `cgroupThreadedMode` `create` or `place`. Every kind configuration but the crun lanes' declares a
@@ -241,7 +256,7 @@ driver is away runs `docker exec` on the kind node's container, and skips where 
 reach it.
 
 `.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner, the
-`gates-off` lane on the x64 runner and the two crun lanes on the arm64 runner, and fails when a spec the runner's host can run was skipped.
+`gates-off` and `upgrade` lanes on the x64 runner and the two crun lanes on the arm64 runner, and fails when a spec the runner's host can run was skipped.
 
 ### troubleshooting
 
