@@ -42,7 +42,7 @@ import (
 func startupWindowFixture(t *testing.T, alsoOnDisk map[types.UID]cpuset.CPUSet) (*CPUDriver, *api.PodSandbox, []*api.Container, *resourceapi.ResourceClaim) {
 	t.Helper()
 	infos := mockCPUInfos_SingleSocket_4CPUS_HT
-	driver, err := New(testr.New(t), Providers{CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}, SysFS: testSysFS(infos)}, &Config{
+	driver, err := New(testr.New(t), Providers{K8SClient: statusClient(), CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}, SysFS: testSysFS(infos)}, &Config{
 		DriverName: testDriverName, NodeName: testNodeName,
 		CPUDeviceMode: device.CPU_DEVICE_MODE_GROUPED, CPUDeviceGroupBy: device.GROUP_BY_NUMA_NODE,
 	})

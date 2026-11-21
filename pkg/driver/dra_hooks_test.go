@@ -432,6 +432,7 @@ func TestPublishResources(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mockPlugin := &mockKubeletPlugin{publishError: tc.publishError}
 			prov := Providers{
+				K8SClient: statusClient(),
 				CPUInfo: &cpuinfo.MockCPUInfoProvider{
 					CPUInfos: tc.cpuInfos,
 					Err:      tc.cpuInfoErr,
@@ -573,6 +574,7 @@ func TestPublishResourcesGroupedModeInitializesLookupMaps(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mockPlugin := &mockKubeletPlugin{}
 			prov := Providers{
+				K8SClient: statusClient(),
 				CPUInfo: &cpuinfo.MockCPUInfoProvider{
 					CPUInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
 				},
@@ -635,6 +637,7 @@ func TestPrepareResourceClaimsSucceedsBeforePublishResources(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			prov := Providers{
+				K8SClient: statusClient(),
 				CPUInfo: &cpuinfo.MockCPUInfoProvider{
 					CPUInfos: mockCPUInfos_DualSocket_4CPUsPerSocket_HT,
 				},
@@ -670,6 +673,7 @@ func TestPrepareResourceClaims(t *testing.T) {
 	baseCPUDriver := func(t *testing.T) *CPUDriver {
 		t.Helper()
 		prov := Providers{
+			K8SClient: statusClient(),
 			CPUInfo: &cpuinfo.MockCPUInfoProvider{
 				CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT,
 			},
@@ -705,7 +709,7 @@ func TestPrepareResourceClaims(t *testing.T) {
 			setupDriver: baseCPUDriver,
 			claims: []*resourceapi.ResourceClaim{
 				{
-					ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: "my-claim"},
+					ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: "my-claim", ResourceVersion: "1"},
 					Status: resourceapi.ResourceClaimStatus{
 						Allocation: &resourceapi.AllocationResult{
 							Devices: resourceapi.DeviceAllocationResult{
@@ -811,7 +815,7 @@ func TestPrepareResourceClaims(t *testing.T) {
 			setupDriver: baseCPUDriver,
 			claims: []*resourceapi.ResourceClaim{
 				{
-					ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: "my-claim"},
+					ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: "my-claim", ResourceVersion: "1"},
 					Status: resourceapi.ResourceClaimStatus{
 						Allocation: &resourceapi.AllocationResult{
 							Devices: resourceapi.DeviceAllocationResult{
@@ -903,8 +907,9 @@ func TestPrepareResourceClaimsRejectsExhaustingSharedPool(t *testing.T) {
 	newDriver := func(grouped bool) *CPUDriver {
 		t.Helper()
 		prov := Providers{
-			CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
-			SysFS:   testSysFS(mockCPUInfos_SingleSocket_4CPUS_HT),
+			K8SClient: statusClient(),
+			CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
+			SysFS:     testSysFS(mockCPUInfos_SingleSocket_4CPUS_HT),
 		}
 		conf := Config{
 			DriverName: testDriverName,
@@ -973,6 +978,7 @@ func TestPrepareResourceClaimsRejectAdminAccess(t *testing.T) {
 	baseCPUDriver := func(t *testing.T) *CPUDriver {
 		t.Helper()
 		prov := Providers{
+			K8SClient: statusClient(),
 			CPUInfo: &cpuinfo.MockCPUInfoProvider{
 				CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT,
 			},
@@ -1003,7 +1009,7 @@ func TestPrepareResourceClaimsRejectAdminAccess(t *testing.T) {
 			setupDriver: baseCPUDriver,
 			claims: []*resourceapi.ResourceClaim{
 				{
-					ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: "my-claim"},
+					ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: "my-claim", ResourceVersion: "1"},
 					Status: resourceapi.ResourceClaimStatus{
 						Allocation: &resourceapi.AllocationResult{
 							Devices: resourceapi.DeviceAllocationResult{
@@ -1026,7 +1032,7 @@ func TestPrepareResourceClaimsRejectAdminAccess(t *testing.T) {
 			setupDriver: baseCPUDriver,
 			claims: []*resourceapi.ResourceClaim{
 				{
-					ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: "my-claim"},
+					ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: "my-claim", ResourceVersion: "1"},
 					Status: resourceapi.ResourceClaimStatus{
 						Allocation: &resourceapi.AllocationResult{
 							Devices: resourceapi.DeviceAllocationResult{
@@ -1105,6 +1111,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 		topo, err := mockProvider.GetCPUTopology(logger)
 		require.NoError(t, err)
 		driver := &CPUDriver{
+			kubeClient: statusClient(),
 			driverName: testDriverName,
 			topology: deviceTopology{
 				Mapping: devattr.Mapping{
@@ -1131,6 +1138,7 @@ func TestPrepareResourceClaimsDoesNotCommitAllocationWhenCDIFails(t *testing.T) 
 		topo, err := mockProvider.GetCPUTopology(logger)
 		require.NoError(t, err)
 		driver := &CPUDriver{
+			kubeClient:       statusClient(),
 			driverName:       testDriverName,
 			cpuDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
 			cpuDeviceGroupBy: devattr.GROUP_BY_SOCKET,
@@ -1241,6 +1249,7 @@ func TestPrepareResourceClaimsGroupedMode(t *testing.T) {
 	baseCPUDriver := func(t *testing.T, groupBy string, cpuInfos []cpuinfo.CPUInfo, initialAllocations map[types.UID]cpuset.CPUSet, reservedCPUs cpuset.CPUSet) *CPUDriver {
 		t.Helper()
 		prov := Providers{
+			K8SClient: statusClient(),
 			CPUInfo: &cpuinfo.MockCPUInfoProvider{
 				CPUInfos: cpuInfos,
 			},
@@ -1631,8 +1640,9 @@ func TestPrepareResourceClaimsGroupedModeRejectsInvalidCPUCapacity(t *testing.T)
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			prov := Providers{
-				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
-				SysFS:   testSysFS(mockCPUInfos_SingleSocket_4CPUS_HT),
+				K8SClient: statusClient(),
+				CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
+				SysFS:     testSysFS(mockCPUInfos_SingleSocket_4CPUS_HT),
 			}
 			conf := Config{
 				DriverName:       testDriverName,
@@ -1824,7 +1834,7 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 			resultRequest = "vcpu/" + shape.subrequest
 		}
 		claim := &resourceapi.ResourceClaim{
-			ObjectMeta: metav1.ObjectMeta{Name: uid, Namespace: "ns", UID: types.UID(uid)},
+			ObjectMeta: metav1.ObjectMeta{Name: uid, Namespace: "ns", UID: types.UID(uid), ResourceVersion: "1"},
 			Spec: resourceapi.ResourceClaimSpec{
 				Devices: resourceapi.DeviceClaim{Requests: []resourceapi.DeviceRequest{request}},
 			},
@@ -1862,8 +1872,9 @@ func TestPrepareGroupedClaimTakesWholeCores(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			prov := Providers{
-				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: tc.cpuInfos},
-				SysFS:   testSysFS(tc.cpuInfos),
+				K8SClient: statusClient(),
+				CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: tc.cpuInfos},
+				SysFS:     testSysFS(tc.cpuInfos),
 			}
 			groupBy, deviceName := devattr.GROUP_BY_NUMA_NODE, devattr.CPUDeviceNUMAGroupedPrefix+"000"
 			if tc.groupBy == devattr.GROUP_BY_MACHINE {
@@ -1932,8 +1943,9 @@ func TestPrepareGroupedClaimOnACacheDevice(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			prov := Providers{
-				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: wholeCoreCPUInfos},
-				SysFS:   testSysFS(wholeCoreCPUInfos),
+				K8SClient: statusClient(),
+				CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: wholeCoreCPUInfos},
+				SysFS:     testSysFS(wholeCoreCPUInfos),
 			}
 			driver, err := New(testr.New(t), prov, &Config{
 				DriverName:           testDriverName,
@@ -2020,8 +2032,9 @@ func TestPrepareRecordsCPUsPerRequest(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			prov := Providers{
-				CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: tc.cpuInfos},
-				SysFS:   testSysFS(tc.cpuInfos),
+				K8SClient: statusClient(),
+				CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: tc.cpuInfos},
+				SysFS:     testSysFS(tc.cpuInfos),
 			}
 			driver, err := New(testr.New(t), prov, &Config{
 				DriverName:       testDriverName,
@@ -2052,8 +2065,9 @@ func TestPrepareRecordsCPUsPerRequest(t *testing.T) {
 func newGroupedTestDriver(t *testing.T) *CPUDriver {
 	t.Helper()
 	prov := Providers{
-		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
-		SysFS:   testSysFS(mockCPUInfos_SingleSocket_4CPUS_HT),
+		K8SClient: statusClient(),
+		CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
+		SysFS:     testSysFS(mockCPUInfos_SingleSocket_4CPUS_HT),
 	}
 	driver, err := New(testr.New(t), prov, &Config{
 		DriverName:       testDriverName,
@@ -2155,7 +2169,7 @@ func TestPrepareRefusalNamesTheHolders(t *testing.T) {
 	newDriver := func(infos []cpuinfo.CPUInfo, conf Config) func(t *testing.T) *CPUDriver {
 		return func(t *testing.T) *CPUDriver {
 			conf.DriverName, conf.NodeName = testDriverName, testNodeName
-			d, err := New(testr.New(t), Providers{CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}, SysFS: testSysFS(infos)}, &conf)
+			d, err := New(testr.New(t), Providers{K8SClient: statusClient(), CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: infos}, SysFS: testSysFS(infos)}, &conf)
 			require.NoError(t, err)
 			return d
 		}
@@ -2321,7 +2335,7 @@ func TestPrepareMetadataNamesEachRequestsCPUs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			conf := tc.conf
 			conf.DriverName, conf.NodeName = testDriverName, testNodeName
-			d, err := New(testr.New(t), Providers{CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: tc.cpuInfos}, SysFS: testSysFS(tc.cpuInfos)}, &conf)
+			d, err := New(testr.New(t), Providers{K8SClient: statusClient(), CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: tc.cpuInfos}, SysFS: testSysFS(tc.cpuInfos)}, &conf)
 			require.NoError(t, err)
 			d.cdiMgr = newMockCdiMgr()
 			d.hasSynchronized = true
@@ -2358,8 +2372,9 @@ func TestPrepareMetadataNamesEachRequestsCPUs(t *testing.T) {
 
 func TestPrepareResourceClaimsGroupedModeIgnoresAllocationsFromOtherDrivers(t *testing.T) {
 	prov := Providers{
-		CPUInfo: &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
-		SysFS:   testSysFS(mockCPUInfos_SingleSocket_4CPUS_HT),
+		K8SClient: statusClient(),
+		CPUInfo:   &cpuinfo.MockCPUInfoProvider{CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT},
+		SysFS:     testSysFS(mockCPUInfos_SingleSocket_4CPUS_HT),
 	}
 	conf := Config{
 		DriverName:       testDriverName,
@@ -2430,6 +2445,7 @@ func TestPrepareResourceClaimsRepeatedCalls(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mockCdiMgr := newMockCdiMgr()
 			prov := Providers{
+				K8SClient: statusClient(),
 				CPUInfo: &cpuinfo.MockCPUInfoProvider{
 					CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT,
 				},
@@ -2450,7 +2466,7 @@ func TestPrepareResourceClaimsRepeatedCalls(t *testing.T) {
 				}
 				return []*resourceapi.ResourceClaim{
 					{
-						ObjectMeta: metav1.ObjectMeta{UID: claimUID},
+						ObjectMeta: metav1.ObjectMeta{UID: claimUID, ResourceVersion: "1"},
 						Status: resourceapi.ResourceClaimStatus{
 							Allocation: &resourceapi.AllocationResult{
 								Devices: resourceapi.DeviceAllocationResult{Results: results},
@@ -2506,6 +2522,7 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 		topo, _ := mockProvider.GetCPUTopology(logger)
 		cpuStore := store.NewAllocationState(topo, cpuset.New())
 		return &CPUDriver{
+			kubeClient:       statusClient(),
 			driverName:       testDriverName,
 			cpuDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
 			cpuDeviceGroupBy: devattr.GROUP_BY_SOCKET,
@@ -2535,6 +2552,7 @@ func TestPrepareGroupedResourceClaimsRepeatedCalls(t *testing.T) {
 		topo, _ := mockProvider.GetCPUTopology(logger)
 		cpuStore := store.NewAllocationState(topo, cpuset.New())
 		return &CPUDriver{
+			kubeClient:       statusClient(),
 			driverName:       testDriverName,
 			cpuDeviceMode:    devattr.CPU_DEVICE_MODE_GROUPED,
 			cpuDeviceGroupBy: devattr.GROUP_BY_NUMA_NODE,
@@ -2666,6 +2684,7 @@ func TestUnprepareResourceClaims(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			prov := Providers{
+				K8SClient: statusClient(),
 				CPUInfo: &cpuinfo.MockCPUInfoProvider{
 					CPUInfos: mockCPUInfos_SingleSocket_4CPUS_HT,
 				},
@@ -2752,6 +2771,7 @@ func newDriverWithAllocatedClaim(t *testing.T, logger logr.Logger, claimUID type
 	require.NoError(t, err)
 
 	return &CPUDriver{
+		kubeClient:      statusClient(),
 		cdiMgr:          mockCdiMgr,
 		allocationState: allocationState,
 		podState:        store.NewPodState(),
@@ -2792,7 +2812,7 @@ func TestHandleError(t *testing.T) {
 
 func testClaimWithResults(claimUID types.UID, results []resourceapi.DeviceRequestAllocationResult) *resourceapi.ResourceClaim {
 	return &resourceapi.ResourceClaim{
-		ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: string(claimUID)},
+		ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: string(claimUID), ResourceVersion: "1"},
 		Status: resourceapi.ResourceClaimStatus{
 			Allocation: &resourceapi.AllocationResult{
 				Devices: resourceapi.DeviceAllocationResult{
@@ -2895,7 +2915,7 @@ func testClaim(claimUID types.UID, driverName, poolName string, consumedCapacity
 		})
 	}
 	return &resourceapi.ResourceClaim{
-		ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: string(claimUID)},
+		ObjectMeta: metav1.ObjectMeta{UID: claimUID, Name: string(claimUID), ResourceVersion: "1"},
 		Status: resourceapi.ResourceClaimStatus{
 			Allocation: &resourceapi.AllocationResult{
 				Devices: resourceapi.DeviceAllocationResult{
@@ -3257,7 +3277,7 @@ func TestOpaqueConfigAllocation(t *testing.T) {
 func createCPUDriverExternalAllocForTest(t *testing.T, groupBy string, cpuInfos []cpuinfo.CPUInfo, initialAllocations map[types.UID]cpuset.CPUSet, reservedCPUs cpuset.CPUSet, cdiMgr cdiManager) *CPUDriver {
 	t.Helper()
 	logger := testr.New(t)
-	driver := &CPUDriver{}
+	driver := &CPUDriver{kubeClient: statusClient()}
 	driver.metrics = cpumetrics.Noop()
 	driver.cdiMgr = cdiMgr
 	driver.driverName = testDriverName

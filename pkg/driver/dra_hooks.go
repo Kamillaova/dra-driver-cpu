@@ -790,9 +790,38 @@ func (cp *CPUDriver) shortageHeldBy(err error, deviceName string, deviceCPUs, av
 
 var errNRIDisconnected = errors.New("NRI connection to the container runtime is down; retry preparation")
 
+// prepareResourceClaim prepares a claim and writes its status. The write runs
+// once stateMu is released: an API server that stalls it would otherwise hold
+// every NRI hook past NRI's timeout. The plugin library serializes Prepare and
+// Unprepare, so nothing changes the claim's record meanwhile.
 func (cp *CPUDriver) prepareResourceClaim(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+	result, entries := cp.prepareResourceClaimLocked(ctx, logger, claim)
+	if result.Err != nil || len(result.Devices) == 0 {
+		return result
+	}
+	if err := cp.writeClaimStatus(ctx, claim, entries); err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
+	return result
+}
+
+// prepareResourceClaimLocked prepares a claim under stateMu, and returns the
+// status entries to write for it where it prepared devices of this driver.
+func (cp *CPUDriver) prepareResourceClaimLocked(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim) (kubeletplugin.PrepareResult, []resourceapi.AllocatedDeviceStatus) {
 	cp.stateMu.Lock()
 	defer cp.stateMu.Unlock()
+	result := cp.prepareClaimLocked(ctx, logger, claim)
+	if result.Err != nil || len(result.Devices) == 0 {
+		return result, nil
+	}
+	entries, err := cp.claimStatus(logger, claim)
+	if err != nil {
+		return kubeletplugin.PrepareResult{Err: err}, nil
+	}
+	return result, entries
+}
+
+func (cp *CPUDriver) prepareClaimLocked(ctx context.Context, logger logr.Logger, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	if err := ctx.Err(); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
@@ -909,11 +938,10 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 				metadataAttrs[string(k)] = v
 			}
 			ref := metadataRef(claim.UID, record, allocResult.Request)
-			shares, err := cp.sharesResult(claim, allocResult)
+			exclusive, exclusiveCPUs, err := cp.resultExclusiveCPUs(claim, record, allocResult, cpusKnown)
 			if err != nil {
 				return kubeletplugin.PrepareResult{Err: err}
 			}
-			exclusive := !shares && cp.allocationState.HoldsExclusiveCPUsOf(ref)
 			if quantity, ok := device.LookupConsumedCapacity(allocResult.ConsumedCapacity, cp.driverName); ok && exclusive {
 				allocatedCount := quantity.Value()
 				metadataAttrs[string(device.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{
@@ -928,9 +956,9 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 					StringValue: new(cpuLimit(record, ref.Request)),
 				}
 			}
-			if cpus := requestCPUsOn(record, ref.Request, cp.deviceCPUs(allocResult.Device)); exclusive && cpusKnown && !cpus.IsEmpty() {
+			if !exclusiveCPUs.IsEmpty() {
 				metadataAttrs[string(device.AttributeCPUSet)] = resourceapi.DeviceAttribute{
-					StringValue: new(cpus.String()),
+					StringValue: new(exclusiveCPUs.String()),
 				}
 			}
 			preparedDevice.Metadata = &kubeletplugin.DeviceMetadata{
@@ -945,6 +973,24 @@ func (cp *CPUDriver) prepareDevices(logger logr.Logger, claim *resourceapi.Resou
 	return kubeletplugin.PrepareResult{
 		Devices: preparedDevices,
 	}
+}
+
+// resultExclusiveCPUs reports whether a result's request holds CPUs alone,
+// and the CPUs it holds on the result's device where the record names them
+// per request: a request spanning several devices holds CPUs of each.
+func (cp *CPUDriver) resultExclusiveCPUs(claim *resourceapi.ResourceClaim, record store.ClaimRecord, alloc resourceapi.DeviceRequestAllocationResult, cpusKnown bool) (bool, cpuset.CPUSet, error) {
+	shares, err := cp.sharesResult(claim, alloc)
+	if err != nil {
+		return false, cpuset.New(), err
+	}
+	ref := metadataRef(claim.UID, record, alloc.Request)
+	if shares || !cp.allocationState.HoldsExclusiveCPUsOf(ref) {
+		return false, cpuset.New(), nil
+	}
+	if !cpusKnown {
+		return true, cpuset.New(), nil
+	}
+	return true, requestCPUsOn(record, ref.Request, cp.deviceCPUs(alloc.Device)), nil
 }
 
 // cpuLimit returns a request's cap as a quantity, or cpu.max's word for no

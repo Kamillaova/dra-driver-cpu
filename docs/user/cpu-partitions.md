@@ -144,9 +144,11 @@ the flag, or with `false`, shares the device as before.
   CPUs of its own beside the share is moved onto those alone. Should the take's first container
   still meet a running container it would leave no CPU, it is refused with
   `cannot update shared CPU pool after creating container "app" in pod "<pod UID>": cannot update shared containers: no shared CPUs available`.
-- The request's metadata file names its CPUs in `dra.cpu/cpuset`, and `DRA_EXCLUSIVE_ASSIGNED_CPUSET`
-  lists them in its container. A share's metadata file names no CPUs, since they move; see
-  [Device Metadata](device-metadata.md).
+- The request's metadata file names its CPUs in `dra.cpu/cpuset`, its entry in the claim's status
+  says `partition: default` and names them in `cpuset`, and `DRA_EXCLUSIVE_ASSIGNED_CPUSET` lists them
+  in its container. A share's metadata file and claim status entry name no CPUs, since they move; see
+  [Device Metadata](device-metadata.md) and [How It Works](how-it-works.md). A reader of the claim
+  status that looks for `partition: vms`, as a VM operator may, does not see a flagged request.
 - A workload that reads its cpuset once at start, such as DPDK's control threads, must not hold a
   share on a partition that sets `allowExclusive`, since its CPUs change under it. Run it on a
   partition that leaves the flag `false`.
