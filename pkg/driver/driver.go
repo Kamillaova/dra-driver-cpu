@@ -168,6 +168,9 @@ type CPUDriver struct {
 	reconcileTrigger chan struct{}
 	containerUpdater containerUpdater
 	nodeConditions   *nodeConditionWriter
+	// allocatableMappingDropped is never cleared: once the API server drops a
+	// field, the plugin library stops sending it until the driver restarts.
+	allocatableMappingDropped atomic.Bool
 }
 
 // deviceHealthEntry is the last known health of a single device.
@@ -275,7 +278,11 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	if config.AssumeUnsolicitedUpdatesSafe {
 		plugin.reconcileTrigger = make(chan struct{}, 1)
 	}
-	plugin.nodeConditions = newNodeConditionWriter(providers.K8SClient, config.NodeName, &plugin.stateMu, nil,
+	var conditions []nodeConditionSource
+	if config.PublishNodeAllocatableResourceMapping {
+		conditions = append(conditions, plugin.allocatableMappingCondition())
+	}
+	plugin.nodeConditions = newNodeConditionWriter(providers.K8SClient, config.NodeName, &plugin.stateMu, conditions,
 		workqueue.DefaultTypedControllerRateLimiter[string]())
 	topo, err := providers.EnsureCPUInfo().GetCPUTopology(logger)
 	if err != nil {

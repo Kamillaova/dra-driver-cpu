@@ -137,6 +137,15 @@ func (w *nodeConditionWriter) nodeChanged(node *corev1.Node) {
 	w.queue.Add(w.nodeName)
 }
 
+// requeue has the worker compare its conditions with the Node again. It makes
+// no API call, so a caller that must not wait on the API server may use it.
+func (w *nodeConditionWriter) requeue() {
+	if w == nil || w.queue == nil {
+		return
+	}
+	w.queue.Add(w.nodeName)
+}
+
 // stop stops the worker and waits for it, ending a call in flight.
 func (w *nodeConditionWriter) stop() {
 	if w == nil || w.done == nil {

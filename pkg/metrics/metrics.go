@@ -116,6 +116,7 @@ type Metrics struct {
 	nriSynchronizeRefused      prometheus.Counter
 	containersKeptUnderOlder   *prometheus.CounterVec
 	watchdogStuck              prometheus.Gauge
+	mappingDropped             prometheus.Counter
 }
 
 type metricKind string
@@ -237,6 +238,11 @@ var (
 		kind: metricGauge,
 		help: "Seconds the driver's state lock has been held or an NRI hook or Prepare or Unprepare call has run, while one passes 60 seconds; 0 otherwise.",
 	}
+	mappingDroppedSpec = metricSpec{
+		name: "dra_cpu_node_allocatable_mapping_dropped_total",
+		kind: metricCounter,
+		help: "Total number of ResourceSlices the API server stored without the nodeAllocatableResources mapping the driver published.",
+	}
 )
 
 var metricSpecs = []metricSpec{
@@ -256,6 +262,7 @@ var metricSpecs = []metricSpec{
 	nriSynchronizeRefusedSpec,
 	containersKeptUnderOlderRuleSpec,
 	watchdogStuckSpec,
+	mappingDroppedSpec,
 }
 
 // Descriptors returns metadata for custom CPU driver metrics.
@@ -303,6 +310,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		nriSynchronizeRefused:      newCounter(nriSynchronizeRefusedSpec),
 		containersKeptUnderOlder:   newCounterVec(containersKeptUnderOlderRuleSpec),
 		watchdogStuck:              newGauge(watchdogStuckSpec),
+		mappingDropped:             newCounter(mappingDroppedSpec),
 	}
 
 	reg.MustRegister(
@@ -322,6 +330,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.nriSynchronizeRefused,
 		m.containersKeptUnderOlder,
 		m.watchdogStuck,
+		m.mappingDropped,
 	)
 	for _, rule := range rules {
 		m.containersKeptUnderOlder.WithLabelValues(string(rule))
@@ -434,6 +443,10 @@ func (m *Metrics) SetWatchdogStuck(stalled time.Duration) {
 	m.watchdogStuck.Set(stalled.Seconds())
 }
 
+func (m *Metrics) RecordNodeAllocatableMappingDropped() {
+	m.mappingDropped.Inc()
+}
+
 func determineResult(err error) Result {
 	if err != nil {
 		return ResultError
@@ -469,3 +482,4 @@ func (noopRecorder) RecordNRIRemoveContainer(error, int, time.Duration) {}
 func (noopRecorder) RecordNRISynchronizeRefusedClaim()                  {}
 func (noopRecorder) RecordContainerKeptUnderOlderRule(Rule)             {}
 func (noopRecorder) SetWatchdogStuck(time.Duration)                     {}
+func (noopRecorder) RecordNodeAllocatableMappingDropped()               {}

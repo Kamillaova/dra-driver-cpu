@@ -157,6 +157,35 @@ Where the node cannot be rebooted, remove the claim's CDI spec,
 `/var/run/cdi/dra.k8s.io-cpu_claim-<claim UID>.json`, from a privileged pod on the node, then
 delete the driver pod: the new driver pod restores its records without that claim.
 
+## A Node-Allocatable Mapping the API Server Dropped
+
+With `publishNodeAllocatableResourceMapping: true` the driver publishes each device with a
+`nodeAllocatableResources` mapping, so the scheduler and the kubelet count the CPUs of `dra.cpu`
+claims against the node's `cpu`. An API server with the `DRANodeAllocatableResources` feature
+gate off stores the ResourceSlices without the mapping and refuses nothing: those CPUs stop
+counting, and ordinary pods can be placed on CPUs that claims already hold. The driver keeps its
+devices published and reports the drop in the condition `CPUAllocatableMappingDropped` on its
+Node:
+
+```bash
+kubectl get node <node> -o jsonpath='{.status.conditions[?(@.type=="CPUAllocatableMappingDropped")]}'
+```
+
+- `True`, reason `DroppedByAPIServer`: the API server dropped the mapping since the driver
+  started, so `dra.cpu` claims are not counted against the node's `cpu`.
+  `dra_cpu_node_allocatable_mapping_dropped_total` counts each ResourceSlice stored without it,
+  and the driver logs `API server dropped nodeAllocatableResources from a ResourceSlice`.
+- `False`, reason `MappingPublished`: every ResourceSlice kept the mapping since the driver
+  started.
+- `Unknown`, reason `DriverStopped`: the driver has stopped and checks nothing.
+
+Once the API server has dropped the mapping, the driver stops sending it until it restarts, so
+the condition stays `True` after the API server is fixed. Enable `DRANodeAllocatableResources` on
+the API server, then restart the driver pod on each node whose condition is `True`.
+
+A kubelet with the gate off is a different case: the API server refuses the node's ResourceSlices
+that carry the mapping, so the driver publishes no devices and logs the refusal.
+
 ## Integration With Bug Reports
 
 1. Run `dracpu gatherinfo` on the affected node.
