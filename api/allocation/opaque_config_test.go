@@ -87,6 +87,33 @@ func TestParseOpaqueConfig(t *testing.T) {
 			expected: Config{},
 		},
 		{
+			name: "a threaded layout",
+			rawJSON: `{"apiVersion": "v1alpha1", "cgroupConfig": {"threaded": {"enabled": true, "place": "vmm-cpu",
+				"groups": [{"name": "vcpu", "requests": ["vcpu"]}, {"name": "vmm-cpu", "requests": ["vmm-cpu"]}]}}}`,
+			expected: Config{Threaded: v1alpha1.ThreadedConfig{Enabled: true, Place: "vmm-cpu", Groups: []v1alpha1.ThreadedGroup{
+				{Name: "vcpu", Requests: []string{"vcpu"}}, {Name: "vmm-cpu", Requests: []string{"vmm-cpu"}}}}},
+		},
+		{
+			name:     "an empty groups list is kept apart from the list left out",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cgroupConfig": {"threaded": {"enabled": true, "groups": []}}}`,
+			expected: Config{Threaded: v1alpha1.ThreadedConfig{Enabled: true, Groups: []v1alpha1.ThreadedGroup{}}},
+		},
+		{
+			name:     "a null groups list is the list left out",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cgroupConfig": {"threaded": {"enabled": true, "groups": null}}}`,
+			expected: Config{Threaded: v1alpha1.ThreadedConfig{Enabled: true}},
+		},
+		{
+			name:     "an empty or null block is the block left out",
+			rawJSON:  `{"apiVersion": "v1alpha1", "cgroupConfig": {"threaded": null}}`,
+			expected: Config{},
+		},
+		{
+			name:          "invalid - an unknown key in the threaded block",
+			rawJSON:       `{"apiVersion": "v1alpha1", "cgroupConfig": {"threaded": {"enable": true}}}`,
+			expectedError: `opaque config: strict decoding error: unknown field "cgroupConfig.threaded.enable"`,
+		},
+		{
 			name:          "invalid - exclusive of another type",
 			rawJSON:       `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": "yes"}}`,
 			expectedError: "failed to unmarshal opaque config",

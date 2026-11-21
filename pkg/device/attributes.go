@@ -64,6 +64,13 @@ const (
 	// from the device: true on an owned device, and on a shared device its
 	// partition's allowExclusive.
 	AttributeAllowExclusive resourceapi.QualifiedName = "dra.cpu/allowExclusive"
+	// AttributeCgroupThreadedMode is the driver's cgroupThreadedMode, off,
+	// create or place, published on every device.
+	AttributeCgroupThreadedMode resourceapi.QualifiedName = "dra.cpu/cgroupThreadedMode"
+	// AttributeGroup is a metadata-only attribute that names the threaded
+	// group a request's CPUs land in, in a claim that sets
+	// cgroupConfig.threaded.enabled.
+	AttributeGroup resourceapi.QualifiedName = "dra.cpu/group"
 	// AttributeCPUSet is a metadata-only attribute that names the CPUs a request
 	// holding exclusive CPUs was given on a device.
 	AttributeCPUSet resourceapi.QualifiedName = "dra.cpu/cpuset"
@@ -95,6 +102,7 @@ func addSettingAttributes(devices []resourceapi.Device, input BuildInput) {
 		dev.Attributes[AttributeFullPhysicalCPUsOnly] = resourceapi.DeviceAttribute{BoolValue: new(input.FullPhysicalCPUsOnly)}
 		dev.Attributes[AttributeAllocator] = resourceapi.DeviceAttribute{StringValue: new(input.Allocator)}
 		dev.Attributes[AttributeAllowFractionalCapacityRequests] = resourceapi.DeviceAttribute{BoolValue: new(input.AllowFractionalCapacityRequests)}
+		dev.Attributes[AttributeCgroupThreadedMode] = resourceapi.DeviceAttribute{StringValue: new(input.CgroupThreadedMode)}
 	}
 }
 

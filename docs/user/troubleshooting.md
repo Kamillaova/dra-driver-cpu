@@ -147,14 +147,14 @@ that breaks this, and the pod's `FailedPrepareDynamicResources` event carries on
 
 ```text
 request "vmm-cpu" has limit of 250m with `count: 2`; a limit can be applied to only one device: ask for one device, or remove the limit
-request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu": remove the limit
+request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu": use cgroupConfig.threaded, or remove the limit
 ```
 
 A container whose claims together put a capped request beside another request shows
 `CreateContainerError` with:
 
 ```text
-container "app": request "cpus" of claim "app-a-x7k2p" has limit of 250m, so it cannot be used together with request "cpus" of claim "app-b-q9m4t": use the claims in separate containers, or remove the limit
+container "app": request "cpus" of claim "app-a-x7k2p" has limit of 250m, so it cannot be used together with request "cpus" of claim "app-b-q9m4t": use the claims in separate containers, use cgroupConfig.threaded in both claims, or remove the limit
 ```
 
 A container the driver finds running when it starts or reconnects to the container runtime, holding
@@ -173,8 +173,30 @@ limit and the claim's cap:
 container "app": its CPU limit of 500m replaces the limit of 250m of request "cpus" of claim "app-a-x7k2p"
 ```
 
-The container runs under the kubelet's quota. Remove the CPU limit, or the `LimitRange` default or
+In a threaded container the event names a group's cap: the kubelet's quota bounds the container's
+whole cgroup, every group below it included. The container runs under the kubelet's quota. Remove the CPU limit, or the `LimitRange` default or
 the admission controller that sets it, and create the pod again.
+
+## A Threaded Container That Does Not Start
+
+With `cgroupThreadedMode` set to `create`, the driver builds a threaded container's groups when the
+container starts, under the cgroup that holds its first process. The container's cgroup, which the
+runtime names, or a cgroup below it, as crun makes under the systemd cgroup driver and for
+`run.oci.delegate-cgroup`, must hold that process; elsewhere the start is refused, and the
+container shows `RunContainerError` with:
+
+```text
+container "vm": init runs in "/kubepods/other", outside the container's cgroup "/kubepods/burstable/pod1f0c/vm", so threaded groups cannot be built
+```
+
+The start is also refused, with the cause, when the driver cannot build the groups, for example
+when the host's cgroup tree refuses a write. Each refusal counts in
+`dra_cpu_threaded_containers_total{result="error"}`, and the kubelet starts the container again.
+
+When an exclusive request takes CPUs of a default partition, or gives them back, the driver writes
+the CPUs of every threaded group holding a share there. A write that fails, for a container that is
+gone among others, is logged and counted in `dra_cpu_threaded_containers_total{result="rewrite_error"}`,
+and the group keeps its CPUs until the next write.
 
 ## CPUs Held by Another Claim
 

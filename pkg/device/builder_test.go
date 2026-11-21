@@ -563,6 +563,7 @@ func TestBuildUncoreCacheDevices(t *testing.T) {
 					device.AttributeFullPhysicalCPUsOnly,
 					device.AttributeAllocator,
 					device.AttributeAllowFractionalCapacityRequests,
+					device.AttributeCgroupThreadedMode,
 					device.AttributePartition,
 					device.AttributeRole,
 					device.AttributeAllowExclusive,
@@ -597,10 +598,10 @@ func TestBuildGroupedDeviceAttributeCount(t *testing.T) {
 		layout device.Layout
 		want   int
 	}{
-		{layout: device.LayoutNUMANode, want: 16},
-		{layout: device.LayoutSocket, want: 13},
-		{layout: device.LayoutMachine, want: 12},
-		{layout: device.LayoutUncoreCache, want: 17},
+		{layout: device.LayoutNUMANode, want: 17},
+		{layout: device.LayoutSocket, want: 14},
+		{layout: device.LayoutMachine, want: 13},
+		{layout: device.LayoutUncoreCache, want: 18},
 	} {
 		res, err := device.Build(device.BuildInput{
 			Inventory: device.Inventory{
@@ -628,8 +629,11 @@ func TestBuildPublishesSettingAttributes(t *testing.T) {
 		fullPhysicalCPUsOnly bool
 		allocator            string
 		fractional           bool
+		mode                 string
 	}{
-		{name: "individual", layout: device.LayoutIndividual, allocator: "cpumanager"},
+		{name: "individual", layout: device.LayoutIndividual, allocator: "cpumanager", mode: "off"},
+		{name: "individual, threaded cgroups placed", layout: device.LayoutIndividual, allocator: "cpumanager", mode: "place"},
+		{name: "NUMA node, threaded cgroups created", layout: device.LayoutNUMANode, allocator: "cpumanager", mode: "create"},
 		{name: "individual, fractional amounts", layout: device.LayoutIndividual, allocator: "cpumanager", fractional: true},
 		{name: "NUMA node, fractional amounts", layout: device.LayoutNUMANode, allocator: "cpumanager", fractional: true},
 		{name: "individual, external allocator", layout: device.LayoutIndividual, allocator: "external"},
@@ -650,6 +654,7 @@ func TestBuildPublishesSettingAttributes(t *testing.T) {
 				FullPhysicalCPUsOnly:            tc.fullPhysicalCPUsOnly,
 				Allocator:                       tc.allocator,
 				AllowFractionalCapacityRequests: tc.fractional,
+				CgroupThreadedMode:              tc.mode,
 			})
 			require.NoError(t, err)
 			require.NotEmpty(t, res.Devices)
@@ -663,6 +668,9 @@ func TestBuildPublishesSettingAttributes(t *testing.T) {
 				fractional := dev.Attributes[device.AttributeAllowFractionalCapacityRequests]
 				require.NotNilf(t, fractional.BoolValue, "device %q must publish allowFractionalCapacityRequests as a bool", dev.Name)
 				require.Equalf(t, tc.fractional, *fractional.BoolValue, "device %q allowFractionalCapacityRequests", dev.Name)
+				mode := dev.Attributes[device.AttributeCgroupThreadedMode]
+				require.NotNilf(t, mode.StringValue, "device %q must publish cgroupThreadedMode as a string", dev.Name)
+				require.Equalf(t, tc.mode, *mode.StringValue, "device %q cgroupThreadedMode", dev.Name)
 				require.LessOrEqualf(t, len(dev.Attributes)+len(dev.Capacity), resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice,
 					"device %q attributes and capacities", dev.Name)
 			}
