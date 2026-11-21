@@ -113,8 +113,11 @@ DRACPU_E2E_CPU_GROUP_BY ?= numanode
 # A lane configures the cluster for the specs that need more than the default
 # install; see test/e2e/README.md. Empty keeps the default install.
 DRACPU_E2E_LANE ?=
+# Every lane but upgrade installs this tree's chart on partitions; upgrade
+# installs upstream's last release without them, through hack/ci/lane-setup.sh.
+E2E_PARTITIONS_LANE := $(filter-out upgrade,$(DRACPU_E2E_LANE))
 # Partitions replace reservedCPUs, so a lane reserves nothing through it.
-DRACPU_E2E_RESERVED_CPUS ?= $(if $(DRACPU_E2E_LANE),,0)
+DRACPU_E2E_RESERVED_CPUS ?= $(if $(E2E_PARTITIONS_LANE),,0)
 # Set by hack/ci/lane-setup.sh from the host's topology on a lane; a value
 # given here is kept.
 DRACPU_E2E_NOSMT_PARTITION_CPUS ?=
@@ -266,7 +269,7 @@ ifneq ($(DRACPU_E2E_VERBOSE),)
 endif
 ifneq ($(DRACPU_E2E_LANE),)
 	lane_vars="$$(hack/ci/lane-setup.sh $(DRACPU_E2E_LANE) pre)" && $(MAKE) ci-kind-cluster TAG=$(TAG) $$lane_vars
-	CLUSTER_NAME=$(CLUSTER_NAME) hack/ci/lane-setup.sh $(DRACPU_E2E_LANE) post
+	CLUSTER_NAME=$(CLUSTER_NAME) HELM=$(HELM) hack/ci/lane-setup.sh $(DRACPU_E2E_LANE) post
 else
 	$(MAKE) ci-kind-cluster TAG=$(TAG)
 endif
@@ -278,12 +281,13 @@ endif
 	kind create cluster --name ${CLUSTER_NAME} --image=kindest/node:$(KIND_K8S_VERSION) --config $(KIND_CI_CONFIG)
 	kubectl wait --for=create node/${CLUSTER_NAME}-worker --timeout=120s
 	kubectl label node ${CLUSTER_NAME}-worker node-role.kubernetes.io/worker=''
-ifneq ($(DRACPU_E2E_LANE),)
+ifneq ($(E2E_PARTITIONS_LANE),)
 	kubectl wait --for=create node/${CLUSTER_NAME}-worker2 --timeout=120s
 	kubectl label node ${CLUSTER_NAME}-control-plane ${CLUSTER_NAME}-worker dra.cpu/profile=e2e
 	kubectl label node ${CLUSTER_NAME}-worker2 dra.cpu/profile=e2e-wide
 endif
 	kind load docker-image --name ${CLUSTER_NAME} ${IMAGE_CI} ${IMAGE_TEST}
+ifneq ($(DRACPU_E2E_LANE),upgrade)
 	$(HELM) install dra-driver-cpu ${HELM_CHART} ${HELM_COMMON_ARGS} \
 		--set image.repository=${IMAGE_REPO_CI} \
 		--set image.tag=${TAG} \
@@ -300,6 +304,7 @@ endif
 		--set driverConfig.cgroupThreadedMode=$(DRACPU_E2E_THREADED_MODE) \
 		$(if $(DRACPU_E2E_LANE),$(E2E_LANE_HELM_ARGS))
 	hack/ci/wait-resourcelices.sh
+endif
 
 build-test-image: ## build tests image
 	docker buildx build . \
@@ -315,7 +320,7 @@ build-test-dracpuinfo: ## build helper to expose hardware info in the internal d
 	go build -v -o "$(OUT_DIR)/dracpuinfo" ./test/image/dracpuinfo
 
 test-e2e: ## run e2e test against an existing configured cluster
-	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_RESERVED_CPUS=$(DRACPU_E2E_RESERVED_CPUS) DRACPU_E2E_RUNTIME_HANDLER=$(DRACPU_E2E_RUNTIME_HANDLER) go test -v ./test/e2e/ --ginkgo.v $(GINKGO_LABEL_FILTER_ARG) $(GINKGO_REPORT_ARG)
+	env DRACPU_E2E_TEST_IMAGE=$(IMAGE_TEST) DRACPU_E2E_DRIVER_IMAGE=$(IMAGE_CI) DRACPU_E2E_HELM=$(HELM) DRACPU_E2E_RESERVED_CPUS=$(DRACPU_E2E_RESERVED_CPUS) DRACPU_E2E_RUNTIME_HANDLER=$(DRACPU_E2E_RUNTIME_HANDLER) go test -v ./test/e2e/ --ginkgo.v $(GINKGO_LABEL_FILTER_ARG) $(GINKGO_REPORT_ARG)
 
 test-e2e-kind: ci-kind-setup test-e2e ## run e2e test against a purpose-built kind cluster
 

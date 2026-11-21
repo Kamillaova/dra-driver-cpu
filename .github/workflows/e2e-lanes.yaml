@@ -127,6 +127,15 @@ jobs:
               should build, place and repair the groups under the init's cgroup with no annotation
               should build, place and repair the groups under the init's cgroup with run.oci.delegate-cgroup naming a nested path
               should stop the claim's containers and refuse them until the claim's pod is deleted
+          # Upstream's last release, upgraded to this tree's chart on a
+          # drained node.
+          - lane: upgrade
+            runner: ubuntu-26.04
+            labels: upgrade
+            mustRun: |
+              should prepare an exclusive claim under upstream's last release
+              should upgrade the driver of the drained node and keep upstream's configuration and devices
+              should prepare a new claim on the drained node with the upgraded driver
     name: e2e (${{ matrix.lane }}, ${{ matrix.runner }})
     steps:
       - name: Checkout

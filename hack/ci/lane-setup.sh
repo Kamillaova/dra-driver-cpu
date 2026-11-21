@@ -228,12 +228,34 @@ EOF2
 	fi
 }
 
+# Upstream's last release, chart 0.3.1 by its digest, with the values its own
+# e2e install passes (Makefile at v0.3.1) and the chart's own image.
+readonly UPSTREAM_CHART=oci://registry.k8s.io/dra-driver-cpu/charts/dra-driver-cpu@sha256:4bd9830401fb50df1e7be11574a64532469ce4788712bf1583127aae1f94027d
+readonly -a UPSTREAM_VALUES=(
+	--namespace kube-system
+	--set fullnameOverride=dracpu
+	--set podLabels.app=dracpu
+	--set args.logLevel=6
+	--set args.cpuDeviceMode=grouped
+	--set args.groupBy=numanode
+	--set-string args.reservedCPUs=0
+	--set args.exposePCIeRoots=true
+	--set driverConfig.publishNodeAllocatableResourceMapping=false
+	--set driverConfig.allocator=cpumanager
+)
+
+upgrade_post() {
+	"${HELM:-helm}" install dra-driver-cpu "${UPSTREAM_CHART}" "${UPSTREAM_VALUES[@]}" --wait --timeout 5m
+	"$(dirname "$0")/wait-resourcelices.sh"
+}
+
 [ $# -eq 2 ] || fail "usage: $0 <lane> pre|post"
 lane=$1
 step=$2
 case "${lane}/${step}" in
 partitions/pre | gates-off/pre) partitions_pre ;;
-partitions/post | gates-off/post) ;;
+partitions/post | gates-off/post | upgrade/pre) ;;
+upgrade/post) upgrade_post ;;
 crun-systemd/pre | crun-cgroupfs/pre) crun_pre ;;
 crun-systemd/post) crun_post systemd ;;
 crun-cgroupfs/post) crun_post cgroupfs ;;
