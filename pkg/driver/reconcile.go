@@ -107,5 +107,6 @@ func (cp *CPUDriver) sharedContainerUpdates(logger logr.Logger) ([]*api.Containe
 		logger.Error(err, "leaving the containers without claims and those holding shares on their current CPUs")
 		return nil, false
 	}
+	cp.rewriteThreadedShares(logger)
 	return append(updates, holderUpdates...), true
 }

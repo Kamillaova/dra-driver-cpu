@@ -223,10 +223,13 @@ cgroup:
   that holds a capped request beside any other request of this driver: the container that uses the
   claim holds every request of it in its one cgroup, where an uncapped share would run under the cap
   and exclusive CPUs would be throttled. The pod stays `ContainerCreating` with a
-  `FailedPrepareDynamicResources` event.
+  `FailedPrepareDynamicResources` event. With `cgroupConfig.threaded.enabled: true` each threaded
+  group is a cgroup of its own, and a capped request must be alone in its group instead.
 - The driver refuses a container whose claims together put a capped request beside any other
   request, and the container shows `CreateContainerError`. Give each capped request a container of
-  its own.
+  its own, or split each claim into threaded groups with `cgroupConfig.threaded`. A threaded
+  container also refuses a claim of this driver that is not threaded, whose requests would sit
+  outside every group.
 
 The driver writes the cap only where the container arrives without a CPU quota from the kubelet. A
 CPU limit on the container, or a pod-level CPU limit it inherits, makes the kubelet set a quota of its
@@ -235,15 +238,19 @@ claim's mapped amount to that limit. A CPU limit can be set without anyone writi
 namespace `LimitRange` with a `default` limit, a VerticalPodAutoscaler, or a mutating admission
 webhook can put one on every container. When a container starts with such a quota while its claim
 asks for a cap, the driver posts a `CPULimitReplacesCap` Warning event on its pod and refuses
-nothing. A CPU limit an in-place resize adds later replaces the cap the same way, with no event. A kubelet with `cpuCFSQuota: false` sends no quota even for a CPU limit, so there the
+nothing; in a threaded container the event comes for a group's cap too, since the kubelet's quota
+bounds the container's whole cgroup, every group below it included. A CPU limit an in-place resize
+adds later replaces the cap the same way, with no event. A kubelet with `cpuCFSQuota: false` sends no quota even for a CPU limit, so there the
 driver's cap stays.
 
 Limitation: one limit per cgroup. A request with a limit on the shared default CPUs must be alone in
-its container: any other request beside it in the same container is refused. When you hit this: a
-workload needs more of the shared default CPUs than one device offers, for example with
-`groupBy: uncorecache` and 8 shared CPUs per cache a request for 8500m fits no single cache. The
-amount has to be split into two requests, one per cache, and those two parts cannot be limited
-together. Why the limits are not simply added together: a limit is one CPU-time budget for the whole
+its container, or with threaded cgroups alone in its group: any other request beside it in the same
+container or group is refused. When you hit this: a workload needs more of the shared default CPUs
+than one device offers, for example with `groupBy: uncorecache` and 8 shared CPUs per cache a request
+for 8500m fits no single cache. The amount has to be split into two requests, one per cache, and
+those two parts cannot be limited together. What you can do: with threaded cgroups, put each part in
+its own group, each with its own limit; your workload decides which threads go into which group.
+Why the limits are not simply added together: a limit is one CPU-time budget for the whole
 cgroup; with two parts in one budget, either part could spend all of it, on any of the caches, so a
 request that was meant to stay small could use the large part's share, on CPUs it was never meant to
 load. Status: open for discussion upstream; DRA has no way to request one amount across several

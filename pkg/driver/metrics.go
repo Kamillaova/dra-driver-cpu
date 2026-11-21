@@ -39,6 +39,7 @@ type Recorder interface {
 	SetPartitionVerified(partition string, verified bool)
 	SetNodeReservationOK(ok bool)
 	RecordDeviceTaintsDropped()
+	RecordThreadedContainer(mode string, result cpumetrics.Result)
 }
 
 // refreshAllocationMetrics requires stateMu once the driver is serving callbacks.

@@ -55,6 +55,7 @@ type cdiClaimRecord struct {
 	Namespace string
 	Name      string
 	Requests  []cdiRequestRecord
+	Layout    *store.Layout
 }
 
 type cdiRequestRecord struct {
@@ -63,7 +64,8 @@ type cdiRequestRecord struct {
 	Role    store.Role
 	Results []cdiResultRecord
 	// Cap is the request's cap in millicores, 0 for none.
-	Cap int64
+	Cap   int64
+	Group string
 }
 
 type cdiResultRecord struct {
@@ -76,6 +78,19 @@ type cdiRecord struct {
 	Namespace  string         `json:"namespace"`
 	Name       string         `json:"name"`
 	Placements []cdiPlacement `json:"placements"`
+	Layout     *cdiLayout     `json:"layout,omitempty"`
+}
+
+// cdiLayout is a threaded claim's layout; each placement names its group.
+type cdiLayout struct {
+	Place string `json:"place,omitempty"`
+}
+
+func (l *cdiLayout) GetPlace() string {
+	if l == nil {
+		return ""
+	}
+	return l.Place
 }
 
 // cdiPlacement is one request of dra.cpu/record as the spec holds it.
@@ -85,15 +100,22 @@ type cdiPlacement struct {
 	Role    store.Role         `json:"role,omitempty"`
 	Results []cdiResultRecord  `json:"results,omitempty"`
 	Cap     *resource.Quantity `json:"cap,omitempty"`
+	Group   string             `json:"group,omitempty"`
 }
 
 func (r cdiClaimRecord) storeRecord() store.ClaimRecord {
 	record := store.ClaimRecord{Namespace: r.Namespace, Name: r.Name}
+	if r.Layout != nil {
+		record.Layout = &store.Layout{Place: r.Layout.Place}
+	}
 	for _, request := range r.Requests {
-		allocation := store.RequestAllocation{Request: request.Request, CPUs: request.CPUs, Role: request.Role, Cap: request.Cap}
+		allocation := store.RequestAllocation{Request: request.Request, CPUs: request.CPUs, Role: request.Role, Cap: request.Cap, Group: request.Group}
 		if request.Role == store.RoleShared {
 			for _, result := range request.Results {
 				allocation.Devices = append(allocation.Devices, result.Device)
+				if result.Consumed != nil {
+					allocation.Amount += result.Consumed.MilliValue()
+				}
 			}
 		}
 		record.Requests = append(record.Requests, allocation)
@@ -103,8 +125,11 @@ func (r cdiClaimRecord) storeRecord() store.ClaimRecord {
 
 func encodeClaimRecord(record cdiClaimRecord) (string, error) {
 	encoded := cdiRecord{Namespace: record.Namespace, Name: record.Name, Placements: make([]cdiPlacement, 0, len(record.Requests))}
+	if record.Layout != nil {
+		encoded.Layout = &cdiLayout{Place: record.Layout.Place}
+	}
 	for _, request := range record.Requests {
-		placement := cdiPlacement{Request: request.Request, CPUs: request.CPUs.String(), Role: request.Role, Results: request.Results}
+		placement := cdiPlacement{Request: request.Request, CPUs: request.CPUs.String(), Role: request.Role, Results: request.Results, Group: request.Group}
 		if request.Cap > 0 {
 			placement.Cap = resource.NewMilliQuantity(request.Cap, resource.DecimalSI)
 		}
@@ -135,7 +160,13 @@ func decodeClaimRecord(value string) (cdiClaimRecord, error) {
 		return cdiClaimRecord{}, fmt.Errorf("%s records no request", cdiRecordAnnotation)
 	}
 	record := cdiClaimRecord{Namespace: decoded.Namespace, Name: decoded.Name}
+	if decoded.Layout != nil {
+		record.Layout = &store.Layout{Place: decoded.Layout.Place}
+	}
 	for _, placement := range decoded.Placements {
+		if (placement.Group != "") != (decoded.Layout != nil) {
+			return cdiClaimRecord{}, fmt.Errorf("%s records request %q with group %q, which a request has exactly where the claim has a layout", cdiRecordAnnotation, placement.Request, placement.Group)
+		}
 		if placement.Request == "" || slices.ContainsFunc(record.Requests, func(r cdiRequestRecord) bool {
 			return r.Request == placement.Request && r.Role == placement.Role
 		}) {
@@ -161,7 +192,10 @@ func decodeClaimRecord(value string) (cdiClaimRecord, error) {
 			}
 			capMilli = placement.Cap.MilliValue()
 		}
-		record.Requests = append(record.Requests, cdiRequestRecord{Request: placement.Request, CPUs: cpus, Role: placement.Role, Results: placement.Results, Cap: capMilli})
+		record.Requests = append(record.Requests, cdiRequestRecord{Request: placement.Request, CPUs: cpus, Role: placement.Role, Results: placement.Results, Cap: capMilli, Group: placement.Group})
+	}
+	if place := decoded.Layout.GetPlace(); place != "" && !slices.ContainsFunc(record.Requests, func(r cdiRequestRecord) bool { return r.Group == place }) {
+		return cdiClaimRecord{}, fmt.Errorf("%s records place %q, which no request's group is", cdiRecordAnnotation, place)
 	}
 	return record, nil
 }

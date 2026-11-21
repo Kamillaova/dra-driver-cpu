@@ -81,6 +81,26 @@ func TestSetClaimRequestsKeepsItsOwnCopy(t *testing.T) {
 	require.Equal(t, map[types.UID][]ClaimRequestRef{"app-uid": {{ClaimUID: "claim-a", Request: "cpus"}}}, s.ClaimRequestsByContainer())
 }
 
+func TestThreadedContainers(t *testing.T) {
+	refs := []ClaimRequestRef{{ClaimUID: "vm", Request: "vcpu"}, {ClaimUID: "vm", Request: "vmm-cpu"}}
+	s := NewPodState()
+	s.SetContainerState("pod", withRequests(NewContainerState("compute", "vm-uid", "vm"), refs))
+	s.SetContainerState("pod", NewContainerState("plain", "plain-uid"))
+	require.Empty(t, s.ThreadedContainers(), "no thread root is known before it is set")
+
+	require.False(t, s.SetThreadRoot("pod", "compute", "replaced-uid", "kubepods/vm"), "a replaced container's root is not set")
+	require.True(t, s.SetThreadRoot("pod", "compute", "vm-uid", "kubepods/vm"))
+	require.False(t, s.SetThreadRoot("other-pod", "compute", "vm-uid", "kubepods/vm"))
+	require.Equal(t, map[types.UID]ThreadedContainer{"vm-uid": {ThreadRoot: "kubepods/vm", ClaimRequests: refs}}, s.ThreadedContainers())
+	require.Equal(t, "kubepods/vm", s.GetContainerState("pod", "compute").ThreadRoot())
+
+	s.ThreadedContainers()["vm-uid"].ClaimRequests[0].Request = "changed"
+	require.Equal(t, refs, s.ThreadedContainers()["vm-uid"].ClaimRequests, "the requests read back are a copy")
+
+	s.SetContainerState("pod", withRequests(NewContainerState("compute", "restarted-uid", "vm"), refs))
+	require.Empty(t, s.ThreadedContainers(), "a restarted container has no root until its own is found")
+}
+
 func withRequests(state *ContainerState, refs []ClaimRequestRef) *ContainerState {
 	state.SetClaimRequests(refs)
 	return state
