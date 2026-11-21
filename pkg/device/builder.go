@@ -203,6 +203,7 @@ func Build(input BuildInput) (BuildResult, error) {
 		for _, dev := range devices {
 			addPartitionAttributes(dev.Attributes, partitions[0])
 		}
+		addAllowExclusiveAttribute(devices, partitions[0], false)
 		addSettingAttributes(devices, input)
 		if err := validateDeviceAttributeValueCount(devices); err != nil {
 			return BuildResult{}, err
@@ -292,6 +293,7 @@ func Build(input BuildInput) (BuildResult, error) {
 		if err != nil {
 			return BuildResult{}, err
 		}
+		addAllowExclusiveAttribute(devices, partition, input.PartitionsUsed)
 		if shared {
 			for _, dev := range devices {
 				capacity := dev.Capacity[CPUResourceQualifiedName]
