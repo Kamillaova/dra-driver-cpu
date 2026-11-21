@@ -139,7 +139,7 @@ func TestMetricsRecordsCollectors(t *testing.T) {
 	m.RecordNRISynchronizeRefusedClaim()
 	m.RecordNRISynchronizeRefusedClaim()
 	require.InDelta(t, 0, testutil.ToFloat64(m.containersKeptUnderOlder.WithLabelValues(string(RulePartialHolder))), 0.01)
-	require.Equal(t, 4, testutil.CollectAndCount(m.containersKeptUnderOlder), "every rule is exported before any container is kept")
+	require.Equal(t, 5, testutil.CollectAndCount(m.containersKeptUnderOlder), "every rule is exported before any container is kept")
 	m.RecordContainerKeptUnderOlderRule(RulePartialHolder)
 	m.SetWatchdogStuck(61500 * time.Millisecond)
 	m.RecordNodeAllocatableMappingDropped()

@@ -205,15 +205,15 @@ type CPUDriver struct {
 	reservedHoldsClaims atomic.Bool
 
 	// cgroupThreadedMode is Config.CgroupThreadedMode. Under create and place,
-	// cgroups is the host's cgroup2 tree, and cgroupHostNamespace is whether
-	// moving a process into a cgroup has to enter the cgroup namespace of PID
-	// 1; all set in New, read-only after that. ownCgroupFound, kept under
-	// stateMu, is set once a Synchronize has found the driver's process in
-	// that tree.
-	cgroupThreadedMode  string
-	cgroups             cgroupfs.FS
-	cgroupHostNamespace bool
-	ownCgroupFound      bool
+	// cgroups is the host's cgroup2 tree, and hostCgroups moves processes from
+	// the cgroup namespace of PID 1 where a move has to enter it, nil
+	// elsewhere; all set in New, read-only after that. ownCgroupFound, kept
+	// under stateMu, is set once a Synchronize has found the driver's process
+	// in that tree.
+	cgroupThreadedMode string
+	cgroups            cgroupfs.FS
+	hostCgroups        processMover
+	ownCgroupFound     bool
 
 	// window is set, under stateMu, while the node's profile is not read yet;
 	// see Config.SelectProfile.
@@ -895,6 +895,9 @@ func (cp *CPUDriver) Stop() {
 	cp.nodeConditions.writeStopped()
 	cp.cancelNRI()
 	cp.nriPlugin.Stop()
+	if cp.hostCgroups != nil {
+		cp.hostCgroups.Stop()
+	}
 }
 
 // Ready reports whether the kubelet has the plugin registered, the NRI plugin
