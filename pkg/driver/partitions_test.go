@@ -785,7 +785,8 @@ func TestPrepareRecordsASharedRequest(t *testing.T) {
 			record, ok := d.allocationState.GetClaimRecord("share")
 			require.True(t, ok)
 			base, _, _ := strings.Cut(tc.result.request, "/")
-			require.Equal(t, []store.RequestAllocation{{Request: base, CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Devices: []string{"cpudevnuma000"}, Cap: tc.wantCap}}, record.Requests)
+			require.Equal(t, []store.RequestAllocation{{Request: base, CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Devices: []string{"cpudevnuma000"}, Cap: tc.wantCap,
+				Amount: new(resource.MustParse(tc.result.consumed)).MilliValue()}}, record.Requests)
 			require.True(t, d.allocationState.GetPreparedCPUs().IsEmpty(), "a share reserves no CPU")
 			require.Truef(t, cpuset.New(0, 2, 3, 4).Equals(d.allocationState.GetClaimlessCPUs()), "containers without claims keep the default partition, got %s", d.allocationState.GetClaimlessCPUs())
 
@@ -843,14 +844,14 @@ func TestPrepareRefusesACappedShareThatIsNotAlone(t *testing.T) {
 			{request: "helper", consumed: "0", device: "cpudevnuma000"},
 			{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"},
 		},
-		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "helper": remove the limit`,
+		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "helper": use cgroupConfig.threaded, or remove the limit`,
 	}, {
 		name: "a capped share beside exclusive CPUs",
 		results: []claimResult{
 			{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
 			{request: "vmm-cpu", written: "250m", consumed: "250m", device: "cpudevnuma000"},
 		},
-		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu": remove the limit`,
+		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu": use cgroupConfig.threaded, or remove the limit`,
 	}, {
 		name: "a capped share beside several requests, named in the claim's order",
 		results: []claimResult{
@@ -859,14 +860,14 @@ func TestPrepareRefusesACappedShareThatIsNotAlone(t *testing.T) {
 			{request: "helper", consumed: "0", device: "cpudevnuma000"},
 			{request: "io", consumed: "0", device: "cpudevnuma000"},
 		},
-		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with requests "vcpu", "helper", "io": remove the limit`,
+		wantErr: `request "vmm-cpu" has limit of 250m, so it cannot be used together with requests "vcpu", "helper", "io": use cgroupConfig.threaded, or remove the limit`,
 	}, {
 		name: "a picked capped alternative beside another request",
 		results: []claimResult{
 			{request: "helper/shared", written: "500m", consumed: "500m", device: "cpudevnuma000"},
 			{request: "vcpu", written: "2", consumed: "2", device: "cpudevnuma000-vms"},
 		},
-		wantErr: `subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu": remove the limit`,
+		wantErr: `subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu": use cgroupConfig.threaded, or remove the limit`,
 	}, {
 		name:    "an uncapped share spanning devices",
 		results: []claimResult{{request: "cpus", consumed: "0", device: "cpudevnuma000"}},
@@ -1003,7 +1004,7 @@ func TestPrepareAWrittenLimit(t *testing.T) {
 		},
 		edit:       func(claim *resourceapi.ResourceClaim) { vmsClass(claim); pickOwnedBesideCappable(claim) },
 		classKinds: chartKinds,
-		wantErr:    `subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu": remove the limit`,
+		wantErr:    `subrequest "helper/shared" has limit of 500m, so it cannot be used together with request "vcpu": use cgroupConfig.threaded, or remove the limit`,
 	}, {
 		name: "the picked alternative alone judged where they are not",
 		results: []claimResult{
@@ -1288,7 +1289,7 @@ func TestPrepareTakesExclusiveCPUsFromADefaultPartition(t *testing.T) {
 		name:    "exclusive false is a share",
 		results: []claimResult{{request: "cpus", written: "2", consumed: "2", device: "cpudevnuma000"}},
 		params:  `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": false}}`,
-		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Devices: []string{"cpudevnuma000"}, Cap: 2000}},
+		want:    []store.RequestAllocation{{Request: "cpus", CPUs: cpuset.New(0, 2, 3, 4), Role: store.RoleShared, Devices: []string{"cpudevnuma000"}, Cap: 2000, Amount: 2000}},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := allowingDriver(t, !tc.disallowed, tc.whole, tc.onDisk)
@@ -2090,22 +2091,22 @@ func TestCreateContainerCapsACappedShareAlone(t *testing.T) {
 	}, {
 		name:        "two capped shares",
 		env:         env("a_cpus", "b_cpus"),
-		wantErr:     `container "app": request "cpus" of claim "a" and request "cpus" of claim "b" both have limits, so they cannot be used together: use the claims in separate containers, or remove one of the limits`,
+		wantErr:     `container "app": request "cpus" of claim "a" and request "cpus" of claim "b" both have limits, so they cannot be used together: use the claims in separate containers, use cgroupConfig.threaded in both claims, or remove one of the limits`,
 		wantUnbound: []types.UID{"a", "b"},
 	}, {
 		name:        "a capped share beside an uncapped one",
 		env:         env("a_cpus", "uncapped_cpus"),
-		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so it cannot be used together with request "cpus" of claim "uncapped": use the claims in separate containers, or remove the limit`,
+		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so it cannot be used together with request "cpus" of claim "uncapped": use the claims in separate containers, use cgroupConfig.threaded in both claims, or remove the limit`,
 		wantUnbound: []types.UID{"a", "uncapped"},
 	}, {
 		name:        "a capped share beside exclusive CPUs",
 		env:         env("a_cpus", "vcpu_vcpu"),
-		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so it cannot be used together with request "vcpu" of claim "exclusive": use the claims in separate containers, or remove the limit`,
+		wantErr:     `container "app": request "cpus" of claim "a" has limit of 250m, so it cannot be used together with request "vcpu" of claim "exclusive": use the claims in separate containers, use cgroupConfig.threaded in both claims, or remove the limit`,
 		wantUnbound: []types.UID{"a", "vcpu"},
 	}, {
 		name:        "a capped share beside another request of its claim",
 		env:         env("older_vcpu", "older_vmm-cpu"),
-		wantErr:     `container "app": request "vmm-cpu" of claim "older" has limit of 250m, so it cannot be used together with request "vcpu" of claim "older": use the claims in separate containers, or remove the limit`,
+		wantErr:     `container "app": request "vmm-cpu" of claim "older" has limit of 250m, so it cannot be used together with request "vcpu" of claim "older": use the claims in separate containers, use cgroupConfig.threaded in both claims, or remove the limit`,
 		wantUnbound: []types.UID{"older"},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {

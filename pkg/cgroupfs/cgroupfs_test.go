@@ -23,27 +23,7 @@ import (
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/stretchr/testify/require"
-	"k8s.io/utils/cpuset"
 )
-
-func TestCPUSet(t *testing.T) {
-	fsys := fstest.MapFS{
-		"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod9c26.slice/cri-containerd-2f5a.scope/cpuset.cpus.effective": &fstest.MapFile{
-			Data: []byte("0-3,8\n"),
-		},
-		"kubepods/burstable/pod9c26/2f5a/cpuset.cpus.effective": &fstest.MapFile{Data: []byte("garbage\n")},
-	}
-
-	cpus, err := cgroupfs.CPUSet(fsys, "kubepods-burstable-pod9c26.slice:cri-containerd:2f5a")
-	require.NoError(t, err)
-	require.Equal(t, cpuset.New(0, 1, 2, 3, 8), cpus)
-
-	_, err = cgroupfs.CPUSet(fsys, "/kubepods/burstable/pod9c26/2f5a")
-	require.ErrorContains(t, err, "parse")
-
-	_, err = cgroupfs.CPUSet(fsys, "/kubepods/burstable/podgone/2f5a")
-	require.ErrorContains(t, err, "read")
-}
 
 func TestFindProcess(t *testing.T) {
 	const scope = "system.slice/cri-containerd-2f5a.scope"

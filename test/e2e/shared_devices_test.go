@@ -183,7 +183,7 @@ var _ = ginkgo.Describe("Shared default devices", ginkgo.Label("partitions"), gi
 
 		// The driver names a container's requests in the order of their claims' UIDs.
 		slices.SortFunc(claims, func(a, b *resourcev1.ResourceClaim) int { return strings.Compare(string(a.UID), string(b.UID)) })
-		want := fmt.Sprintf("container %q: request %q of claim %q and request %q of claim %q both have limits, so they cannot be used together: use the claims in separate containers, or remove one of the limits",
+		want := fmt.Sprintf("container %q: request %q of claim %q and request %q of claim %q both have limits, so they cannot be used together: use the claims in separate containers, use cgroupConfig.threaded in both claims, or remove one of the limits",
 			pod.Spec.Containers[0].Name, "request-cpus", claims[0].Name, "request-cpus", claims[1].Name)
 		EventuallyFailedToCreate(ctx, fxt, pod)
 		gomega.Expect(createContainerError(ctx, fxt, pod)).To(gomega.ContainSubstring(want))

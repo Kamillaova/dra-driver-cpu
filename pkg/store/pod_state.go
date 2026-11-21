@@ -33,12 +33,33 @@ type ContainerState struct {
 	resourceClaimUIDs []types.UID
 	// claimRequests are the requests of those claims the container uses.
 	claimRequests []ClaimRequestRef
+	// threadRoot is the cgroup holding a threaded container's groups, as the
+	// host's cgroup2 tree names it, once the driver has found it.
+	threadRoot string
 }
 
 // SetClaimRequests records the requests of its claims the container uses,
 // before the state is stored.
 func (cs *ContainerState) SetClaimRequests(refs []ClaimRequestRef) {
 	cs.claimRequests = slices.Clone(refs)
+}
+
+// SetThreadRoot records the cgroup holding the container's threaded groups,
+// before the state is stored.
+func (cs *ContainerState) SetThreadRoot(dir string) {
+	cs.threadRoot = dir
+}
+
+// ThreadRoot returns the cgroup holding the container's threaded groups, or
+// "" where the driver has not found it.
+func (cs *ContainerState) ThreadRoot() string {
+	return cs.threadRoot
+}
+
+// ThreadedContainer is a container whose threaded groups the driver built.
+type ThreadedContainer struct {
+	ThreadRoot    string
+	ClaimRequests []ClaimRequestRef
 }
 
 // NewContainerState creates a new ContainerState.
@@ -156,6 +177,35 @@ func (s *PodState) ClaimRequestsByContainer() map[types.UID][]ClaimRequestRef {
 		}
 	}
 	return byContainer
+}
+
+// SetThreadRoot records the thread root of a stored container whose runtime
+// ID still matches, and reports whether it found one.
+func (s *PodState) SetThreadRoot(podUID types.UID, containerName string, containerUID types.UID, dir string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cs, ok := s.configs[podUID][containerName]
+	if !ok || cs.containerUID != containerUID {
+		return false
+	}
+	cs.threadRoot = dir
+	return true
+}
+
+// ThreadedContainers returns every container whose thread root is known, with
+// the requests it uses, by container UID.
+func (s *PodState) ThreadedContainers() map[types.UID]ThreadedContainer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	threaded := make(map[types.UID]ThreadedContainer)
+	for _, assignments := range s.configs {
+		for _, state := range assignments {
+			if state.threadRoot != "" {
+				threaded[state.containerUID] = ThreadedContainer{ThreadRoot: state.threadRoot, ClaimRequests: slices.Clone(state.claimRequests)}
+			}
+		}
+	}
+	return threaded
 }
 
 func (s *PodState) Len() int {
