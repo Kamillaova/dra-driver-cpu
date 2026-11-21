@@ -177,6 +177,46 @@ In a threaded container the event names a group's cap: the kubelet's quota bound
 whole cgroup, every group below it included. The container runs under the kubelet's quota. Remove the CPU limit, or the `LimitRange` default or
 the admission controller that sets it, and create the pod again.
 
+## A Threaded Claim That Is Refused
+
+The driver refuses to prepare a claim whose threaded block the node cannot build, and the pod's
+`FailedPrepareDynamicResources` event carries the refusal. On a node that runs
+`cgroupThreadedMode: false`, or `create` for a claim that names `place`:
+
+```text
+node "worker-1" runs `cgroupThreadedMode: false`; threaded cgroups need create or place
+cgroupConfig.threaded.place "vmm-cpu": node "worker-1" runs `cgroupThreadedMode: create`, which moves no process; drop place
+```
+
+A block that breaks the rules of [Threaded Cgroups](threaded-cgroups.md#rules) is refused with one
+of these, each naming what to change:
+
+```text
+cgroupConfig: applies to the whole claim; drop "requests" from its config entry, or list every request (vcpu, vmm-cpu)
+cgroupConfig set by two config entries (#0 and #1); set it in one entry
+cgroupConfig.threaded.groups: empty; list the groups, or drop it for one group per request
+group "VCPU": not a DNS label; use lower-case letters, digits and "-"
+group "vcpu" appears twice in cgroupConfig.threaded.groups; group names must be unique
+group "vcpu" names no request; name its requests, or drop the group
+group "vcpu": the claim has no request "vcpus"
+request "vcpu": in groups "a" and "b"; a request belongs to one group
+group "a" names request "cpus" and its alternative "cpus/two"; name the request or its alternatives, not both
+group "a" names request "cpus" and group "b" its alternative "cpus/two"; name the request or its alternatives, not both
+cgroupConfig.threaded.place "vmm": no such group (groups: vcpu, vmm-cpu)
+cgroupConfig.threaded.place "helper": group "helper" names no request whole nor every alternative of one, and is not built where none of its alternatives is allocated; place a group that names a request
+request "io": in no group of cgroupConfig.threaded.groups; add it to a group, or drop groups for one group per request
+group "all": request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu": give it its own group
+```
+
+When the container is created, the driver refuses a container whose threaded claims cannot share
+it, and the container shows `CreateContainerError` with one of:
+
+```text
+container "vm": claim "cache" is not threaded but shares the container with threaded claim "vm"; move its requests into the threaded claim or another container
+container "vm": claims "a" and "b" both set place; keep place in one claim
+container "vm": claims "a" and "b" both have group "vcpu"; give the groups different names
+```
+
 ## A Threaded Container That Does Not Start
 
 With `cgroupThreadedMode` set to `create`, the driver builds a threaded container's groups when the
