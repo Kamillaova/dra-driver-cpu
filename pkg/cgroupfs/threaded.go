@@ -64,42 +64,67 @@ type Owner struct {
 // threads into them to owner. Every step tolerates having been done, so Build
 // also completes a tree that lacks a child.
 func Build(fsys FS, dir string, groups []Group, owner Owner) error {
-	for _, g := range groups {
-		child := path.Join(dir, g.Name)
-		if err := fsys.Mkdir(child, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
-			return fmt.Errorf("create cgroup %s: %w", child, err)
-		}
-		// A threaded cgroup takes "threaded" again as a no-op (linux v7.2
-		// kernel/cgroup/cgroup.c:3653-3655).
-		if err := write(fsys, child, typeFile, "threaded"); err != nil {
-			return err
-		}
-	}
-	// Threaded controllers may be enabled while the thread root still holds
-	// the process (cgroup.c:3514-3526), and enabling them again is a no-op
-	// (:3583-3585).
-	if err := write(fsys, dir, subtreeControlFile, "+cpu +cpuset"); err != nil {
+	if _, err := Repair(fsys, dir, groups); err != nil {
 		return err
-	}
-	for _, g := range groups {
-		child := path.Join(dir, g.Name)
-		if err := SetCPUs(fsys, child, g.CPUs); err != nil {
-			return err
-		}
-		if err := write(fsys, child, maxFile, cpuMax(g.Quota, g.Period)); err != nil {
-			return err
-		}
-		if err := write(fsys, child, weightFile, strconv.FormatUint(g.Weight, 10)); err != nil {
-			return err
-		}
 	}
 	// The thread root's cgroup.threads stays root's: no thread belongs there,
 	// and one moved there would leave its group's limit.
 	if err := handOver(fsys, path.Join(dir, procsFile), owner); err != nil {
 		return err
 	}
+	names := make([]string, 0, len(groups))
+	for _, g := range groups {
+		names = append(names, g.Name)
+	}
+	return HandOver(fsys, dir, names, owner)
+}
+
+// Repair makes the groups of the thread root dir that are missing and sets
+// every group's CPUs, limit and weight again. It returns the names of the
+// groups it made, whose files nobody has been handed yet.
+func Repair(fsys FS, dir string, groups []Group) ([]string, error) {
+	var made []string
 	for _, g := range groups {
 		child := path.Join(dir, g.Name)
+		err := fsys.Mkdir(child, 0o755)
+		if err != nil && !errors.Is(err, fs.ErrExist) {
+			return nil, fmt.Errorf("create cgroup %s: %w", child, err)
+		}
+		if err == nil {
+			made = append(made, g.Name)
+		}
+		// A threaded cgroup takes "threaded" again as a no-op (linux v7.2
+		// kernel/cgroup/cgroup.c:3653-3655).
+		if err := write(fsys, child, typeFile, "threaded"); err != nil {
+			return nil, err
+		}
+	}
+	// Threaded controllers may be enabled while the thread root still holds
+	// the process (cgroup.c:3514-3526), and enabling them again is a no-op
+	// (:3583-3585).
+	if err := write(fsys, dir, subtreeControlFile, "+cpu +cpuset"); err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
+		child := path.Join(dir, g.Name)
+		if err := SetCPUs(fsys, child, g.CPUs); err != nil {
+			return nil, err
+		}
+		if err := write(fsys, child, maxFile, cpuMax(g.Quota, g.Period)); err != nil {
+			return nil, err
+		}
+		if err := write(fsys, child, weightFile, strconv.FormatUint(g.Weight, 10)); err != nil {
+			return nil, err
+		}
+	}
+	return made, nil
+}
+
+// HandOver hands the files that move processes and threads into the groups
+// names of the thread root dir to owner.
+func HandOver(fsys FS, dir string, names []string, owner Owner) error {
+	for _, name := range names {
+		child := path.Join(dir, name)
 		if err := handOver(fsys, path.Join(child, threadsFile), owner); err != nil {
 			return err
 		}

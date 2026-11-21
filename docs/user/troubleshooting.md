@@ -206,6 +206,15 @@ says so at start, in its log and in a `ThreadedPlacementBestEffort` Warning even
 Requiring the driver's NRI plugin closes most of the disconnected half; see
 [Requiring the driver's NRI plugin](installation.md#requiring-the-drivers-nri-plugin).
 
+When the driver starts or reconnects to the container runtime, it finds each running threaded
+container's groups again: under the cgroup the kernel marks `domain threaded` that holds one of
+them, wherever the container's process sits now. It makes the groups that are missing, sets every
+group's CPUs, limit and weight again, and hands the files of a group it made to the user the
+container's process runs as at that moment. For a container whose start it missed, it builds the
+groups under the cgroup that holds the container's first process, and moves no process. A repair
+that fails is logged and counted in `dra_cpu_threaded_containers_total{result="repair_error"}`, and
+the container keeps its groups as they are until the driver synchronizes again.
+
 When an exclusive request takes CPUs of a default partition, or gives them back, the driver writes
 the CPUs of every threaded group holding a share there. A write that fails, for a container that is
 gone among others, is logged and counted in `dra_cpu_threaded_containers_total{result="rewrite_error"}`,

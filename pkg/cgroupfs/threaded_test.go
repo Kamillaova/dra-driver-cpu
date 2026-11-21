@@ -265,6 +265,48 @@ func TestBuild(t *testing.T) {
 	}
 }
 
+// Repair makes a tree's missing groups and sets every group again, and hands
+// over nothing: the groups it made are the caller's to hand over.
+func TestRepair(t *testing.T) {
+	const root = "kubepods/burstable/pod9c26/2f5a"
+	vcpu := cgroupfs.Group{Name: "vcpu", CPUs: cpuset.New(16, 144), Period: 100000, Weight: 1}
+	vmm := cgroupfs.Group{Name: "vmm-cpu", CPUs: cpuset.New(0, 1), Quota: 25000, Period: 100000, Weight: 10000}
+	started := cgroupfs.Owner{UID: 2038693884, GID: 2038693884}
+	now := cgroupfs.Owner{UID: 65532, GID: 65532}
+	testCases := []struct {
+		name       string
+		built      []cgroupfs.Group
+		expectMade []string
+	}{
+		{name: "a whole tree", built: []cgroupfs.Group{vcpu, vmm}},
+		{name: "a tree missing one group", built: []cgroupfs.Group{vcpu}, expectMade: []string{"vmm-cpu"}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := newFakeTree(t, root)
+			require.NoError(t, cgroupfs.Build(tree, root, tc.built, started))
+			tree.MapFS[root+"/vcpu/cpuset.cpus"].Data = []byte("0-63")
+			ownedBefore := maps.Clone(tree.owners)
+
+			made, err := cgroupfs.Repair(tree, root, []cgroupfs.Group{vcpu, vmm})
+			require.NoError(t, err)
+			require.Equal(t, tc.expectMade, made)
+			require.Equal(t, ownedBefore, tree.owners, "Repair hands over nothing")
+			require.Equal(t, "16,144", string(tree.MapFS[root+"/vcpu/cpuset.cpus"].Data), "a changed setting is set again")
+			require.Equal(t, "25000 100000", string(tree.MapFS[root+"/vmm-cpu/cpu.max"].Data))
+			require.Equal(t, "threaded", string(tree.MapFS[root+"/vmm-cpu/cgroup.type"].Data))
+
+			require.NoError(t, cgroupfs.HandOver(tree, root, made, now))
+			for _, name := range made {
+				require.Equal(t, now, tree.owners[path.Join(root, name, "cgroup.procs")], name)
+				require.Equal(t, now, tree.owners[path.Join(root, name, "cgroup.threads")], name)
+			}
+			require.Equal(t, started, tree.owners[root+"/vcpu/cgroup.threads"], "a group that was there keeps its owner")
+		})
+	}
+}
+
 func TestSetCPUs(t *testing.T) {
 	const root = "kubepods/burstable/pod9c26/2f5a"
 	testCases := []struct {

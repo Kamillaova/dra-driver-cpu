@@ -230,6 +230,7 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 	var noSharedCPUs []string
 	var kept []cpumetrics.Rule
 	var warnings []olderRuleWarning
+	var repairs []threadedRepair
 	running := sets.New[store.OwnerIdent]()
 	for _, sc := range listed {
 		if uid, hold, held := cp.heldClaimOf(sc.claims); held {
@@ -289,6 +290,14 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 		kept = append(kept, sets.List(keptUnder)...)
 		if len(broken) > 0 {
 			warnings = append(warnings, olderRuleWarning{pod: sc.pod, container: sc.container.GetName(), broken: broken})
+		}
+		// A created container has no cgroup until it starts.
+		switch {
+		case !threaded || !hasTask(sc.container):
+		case keptUnder.Has(cpumetrics.RuleDuplicateGroupName):
+			sc.logger.Info("not repairing the threaded groups of a container whose claims give two groups one name", "rule", cpumetrics.RuleDuplicateGroupName)
+		default:
+			repairs = append(repairs, threadedRepair{sc: sc, uids: claimUIDs})
 		}
 
 		state := store.NewContainerState(sc.container.GetName(), types.UID(sc.container.GetId()), claimUIDs...)
@@ -358,6 +367,7 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 	}
 	cp.hasSynchronized = true
 	cp.refreshAllocationMetrics()
+	cp.repairThreadedTrees(repairs)
 	cp.rewriteThreadedShares(logger)
 	for range refused {
 		cp.metrics.RecordNRISynchronizeRefusedClaim()
