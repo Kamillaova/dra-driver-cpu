@@ -111,6 +111,23 @@ where its detail gives advice, and counts the container in
 rules. Change the pod so it no longer breaks the rule: when the container is created again, the
 driver refuses it.
 
+## A Profile Label Without Profiles
+
+A `dra.cpu/profile` label selects a node's profile only where the configuration declares
+[profiles](configuration.md#per-node-profiles). Without them, a driver on a node carrying the label
+stops before it registers with the kubelet or publishes anything. Its log ends with a
+`failed to run` line whose error reads:
+
+```text
+driver failed to start: node label dra.cpu/profile=r7625 names a profile, and the config declares no profiles: declare the profiles the nodes' labels name, or remove the label with kubectl label node worker-a dra.cpu/profile-
+```
+
+Remove the label, `kubectl label node worker-a dra.cpu/profile-`, or declare the profiles the
+labels name. To move a fleet to profiles, change the configuration first, declaring a profile for
+each kind of node, then label each node and restart its driver: the driver reads the configuration
+and the label only when it starts, and once profiles are declared it refuses a node without the
+label.
+
 ## CPUs Held by Another Claim
 
 When the driver cannot prepare a claim because claims it has already prepared hold the CPUs, the
