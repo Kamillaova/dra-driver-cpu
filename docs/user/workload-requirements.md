@@ -15,7 +15,7 @@ How to configure your workloads depends on whether KEP-5517 accounting is active
 
 To check which mode is active, inspect the driver's ResourceSlices (`kubectl get resourceslice -o yaml`): the devices include a `nodeAllocatableResources` entry only when the mapping is enabled.
 
-**1-to-1 Claim to Container:** in both modes, this driver enforces that a specific CPU `ResourceClaim` can only be used by *one* container within or across pods. See [Sharing resource claims](feature-support.md#sharing-resource-claims).
+**1-to-1 Claim to Container:** in both modes, this driver enforces that a specific CPU `ResourceClaim` can only be used by *one* container within or across pods. That container uses the claim whole: it names the claim without a request, or every request the claim makes of this driver, and a container that names only some of them fails to start. See [Sharing resource claims](feature-support.md#sharing-resource-claims).
 
 ## Before KEP-5517 (before 1.37 or alpha FG `DRANodeAllocatableResources` disabled)
 
@@ -158,7 +158,7 @@ When exclusive CPUs are assigned via DRA claims, declaring `limits.cpu` in `pod.
 
 > For an in-depth technical explanation of Linux cgroup v2, Kubelet cgroup managers, and CFS quota mechanics, see the [Kubelet Cgroups and QoS Deep Dive](../dev/kubelet-cgroups-and-qos.md).
 
-**Reserved environment variables:** the `DRA_CPUSET_*` environment variable prefix is reserved for the driver's CDI injection — do not set variables with this prefix; containers with malformed `DRA_CPUSET_*` values are rejected during creation. See [How it Works](how-it-works.md).
+**Reserved environment variables:** the `DRA_CPUSET_*` environment variable prefix is reserved for the driver's CDI injection — do not set variables with this prefix; containers with malformed `DRA_CPUSET_*` values are rejected during creation. The driver injects `DRA_CPUSET_<claimUID>_<request>` for each request a container holds; its value is always `dynamic`, and no workload should read it. See [How it Works](how-it-works.md).
 
 **Assigned CPU set:** Containers using CPU ResourceClaims receive `DRA_EXCLUSIVE_ASSIGNED_CPUSET` in Linux cpuset format (for example, `2-3,8`). It contains the union of CPUs assigned to that container across all its CPU claims.
 Containers without CPU claims do not receive it. The driver sets this variable; workloads should not set or override it.
