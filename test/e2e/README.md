@@ -114,6 +114,10 @@ honor these settings, where applicable.
   several other specs ask for, so run the whole-core specs alone there with
   `DRACPU_E2E_LABEL_FILTER=whole-cores`.
 
+- `DRACPU_E2E_THREADED_MODE`: (optional, default `create`): the `driverConfig.cgroupThreadedMode`
+  *the Makefile* `ci-kind-setup` target installs the driver with. `false` installs it without threaded
+  cgroups, and the specs labeled `threaded` skip.
+
 - `DRACPU_E2E_LANE`: (optional, default empty): the lane *the Makefile* `ci-kind-setup` target
   prepares; see [lanes](#lanes). Empty creates the cluster from `hack/ci/kind-ci.yaml` and installs
   the driver without CPU partitions.
@@ -192,8 +196,9 @@ where their lane did not prepare the cluster.
   sibling, a partition `degraded` under `smt: false` of one thread of such a core, whose devices the
   driver publishes tainted, the lane setting `taintDegradedPartitions`, and a partition `reserved`
   of one whole core. `lane-setup.sh pre` places `degraded` before `reserved`, leaves at least two
-  CPUs to `default`. Each kubelet reserves the CPUs outside its profile's `default` partition, as
-  the driver requires before it publishes devices. The
+  CPUs to `default`, and fails unless the host's kernel can enable `cpuset` in a threaded cgroup
+  subtree. Each kubelet reserves the CPUs outside its profile's `default` partition, as the driver
+  requires before it publishes devices. The
   driver publishes the node allocatable mapping, which only the `default` partition's shared
   devices carry. Where `nosmt` is declared, a third profile, `e2e-grown`, gives its CPUs to a
   `reserved` partition `grown`; no node runs it until a spec moves `worker2` to it. The specs of
@@ -207,6 +212,17 @@ where their lane did not prepare the cluster.
   off in every component. Its API server drops the node allocatable mapping and the degraded
   partition's taint from the driver's ResourceSlices, and the specs check what the driver does
   then. Each spec skips where the API server reports its gate on.
+
+The specs labeled `threaded` run on every lane and without one, where the driver runs
+`cgroupThreadedMode` `create` or `place`. Every kind configuration declares a containerd runtime
+handler `cgroup-writable`, whose containers get a writable `/sys/fs/cgroup`, as an administrator
+gives a threaded workload; the specs run their pods under a RuntimeClass of that name, which they
+create and delete, as a user other than root and without privileges. Their claims hold exclusive
+CPUs and shares on a node whose `default` partition allows exclusive requests, `worker2` on a lane,
+and exclusive CPUs only on a node without partitions; the specs that need a share skip elsewhere,
+and so do the `place` cases where the driver runs `create`. The spec that breaks a tree while the
+driver is away runs `docker exec` on the kind node's container, and skips where `docker` cannot
+reach it.
 
 `.github/workflows/e2e-lanes.yaml` runs the `partitions` lane on an x64 and an arm64 runner and the
 `gates-off` lane on the x64 runner, and fails when a spec the runner's host can run was skipped.
