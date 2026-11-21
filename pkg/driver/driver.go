@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -203,6 +204,8 @@ type Config struct {
 	// PublishNodeAllocatableResourceMapping publishes KEP-5517 nodeAllocatableResources mappings in
 	// ResourceSlice devices. Requires the DRANodeAllocatableResources feature gate to be enabled in the cluster.
 	PublishNodeAllocatableResourceMapping bool
+	// FullPhysicalCPUsOnly is driverconfig.Config.FullPhysicalCPUsOnly.
+	FullPhysicalCPUsOnly bool
 	// CancelRun cancels the context given to Start, which refuses to run
 	// without it. HandleError calls it with a cause wrapping ErrFatal, so that
 	// the caller stops the driver.
@@ -284,9 +287,17 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 		PCIeRootMapper:                        plugin.pcieRootMapper,
 		PublishNodeAllocatableResourceMapping: config.PublishNodeAllocatableResourceMapping,
 		ExposeExtAttrs:                        exposeExtAttrs,
+		FullPhysicalCPUsOnly:                  config.FullPhysicalCPUsOnly,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if config.FullPhysicalCPUsOnly {
+		for _, name := range slices.Sorted(maps.Keys(result.MixedCores)) {
+			counts := result.MixedCores[name]
+			logger.Info("fullPhysicalCPUsOnly publishes no request policy on a device whose cores differ in threads",
+				"device", name, "coresWithTwoThreads", counts.TwoThreads, "coresWithOneThread", counts.OneThread)
+		}
 	}
 
 	plugin.topology.Mapping = result.Mapping

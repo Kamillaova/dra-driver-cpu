@@ -31,6 +31,7 @@ CPU group. `individual` exposes one device per CPU, but is **deprecated**; see
 | `dra.cpu/socketID`                | int     | CPU socket of the group; published when grouping by socket or NUMA node                                        |
 | `dra.cpu/numCPUs`                 | int     | Number of allocatable CPUs in the group                                                                        |
 | `dra.cpu/smtEnabled`              | bool    | Whether SMT/hyper-threading is enabled on the node                                                             |
+| `dra.cpu/threadsPerCore`          | int     | Logical CPUs on each physical core of the group; `0` when its cores differ, as on a hybrid CPU                 |
 
 #### External allocator attributes
 
@@ -161,6 +162,8 @@ spec:
         bool: true
       dra.cpu/numCPUs:
         int: 64
+      dra.cpu/threadsPerCore:
+        int: 2
       resource.kubernetes.io/numaNode:
         int: 0
       dra.cpu/socketID:
@@ -184,6 +187,8 @@ spec:
         bool: true
       dra.cpu/numCPUs:
         int: 64
+      dra.cpu/threadsPerCore:
+        int: 2
       resource.kubernetes.io/numaNode:
         int: 1
       dra.cpu/socketID:
@@ -307,6 +312,34 @@ mode maps each device to one CPU.
         mapping:
           deviceMultiplier: "1"
 ```
+
+### With whole physical cores
+
+When the driver runs with `fullPhysicalCPUsOnly: true`, a group leaves out every core whose
+logical CPUs `reservedCPUs` splits. A group whose cores all have two logical CPUs also carries a
+request policy in whole cores, so the scheduler rounds a request up to whole cores, for example 3
+CPUs to 4:
+
+```yaml
+  devices:
+  - allowMultipleAllocations: true
+    attributes:
+      dra.cpu/threadsPerCore:
+        int: 2
+    capacity:
+      dra.cpu/cpu:
+        value: "64"
+        requestPolicy:
+          default: "64"
+          validRange:
+            min: "2"
+            step: "2"
+    name: cpudevnuma000
+```
+
+A group of a single core gets `min` without `step`, since the API server refuses a step that does
+not fit in the capacity. A group whose cores have one logical CPU, or differ, carries no request
+policy.
 
 ## Selecting CPUs based on properties with CEL
 
