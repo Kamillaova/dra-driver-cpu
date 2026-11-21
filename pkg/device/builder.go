@@ -18,6 +18,7 @@ package device
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -144,8 +145,11 @@ type BuildInput struct {
 	// shared devices.
 	PartitionsUsed bool
 	// Withheld names the partitions that publish no device, those whose smt
-	// the kernel contradicts.
+	// the kernel contradicts where their devices are not Tainted.
 	Withheld map[string]bool
+	// Tainted names the partitions whose devices carry DegradedTaint, those
+	// whose smt the kernel contradicts where the driver taints their devices.
+	Tainted map[string]bool
 	// AllowFractionalCapacityRequests lets a request on a shared device book
 	// an amount in millicores rather than in whole CPUs. Every device
 	// publishes it.
@@ -169,6 +173,9 @@ type BuildResult struct {
 	DevicePartitions map[string]Partition
 	// Shared holds the name of every device whose CPUs its claims share.
 	Shared map[string]bool
+	// WithheldDevices is the partition of each device a Withheld partition
+	// leaves out, by device name.
+	WithheldDevices map[string]string
 }
 
 // CoreCounts is the number of cores of two threads and of one in a device.
@@ -227,11 +234,12 @@ func Build(input BuildInput) (BuildResult, error) {
 	res.MixedCores = make(map[string]CoreCounts)
 	res.DevicePartitions = make(map[string]Partition)
 	res.Shared = make(map[string]bool)
+	res.WithheldDevices = make(map[string]string)
 	topo := input.Inventory.CPUTopology
 	var ends []int
 	for _, partition := range partitions {
 		shared := partition.PublishesSharedDevices(input.PartitionsUsed)
-		if input.Withheld[partition.Name] || (!shared && !partition.PublishesOwnedDevices(input.PartitionsUsed)) {
+		if !shared && !partition.PublishesOwnedDevices(input.PartitionsUsed) {
 			continue
 		}
 		counted := topo.CPUDetails
@@ -242,6 +250,12 @@ func Build(input BuildInput) (BuildResult, error) {
 		deviceInfos, err := groupedCPUDeviceInfos(input.Layout, topo, counted, partition, input.PartitionsUsed, wholeCores)
 		if err != nil {
 			return BuildResult{}, err
+		}
+		if input.Withheld[partition.Name] {
+			for _, dev := range deviceInfos {
+				res.WithheldDevices[dev.name] = partition.Name
+			}
+			continue
 		}
 		for _, dev := range deviceInfos {
 			switch input.Layout {
@@ -285,6 +299,11 @@ func Build(input BuildInput) (BuildResult, error) {
 				dev.Capacity[CPUResourceQualifiedName] = capacity
 			}
 		}
+		if input.Tainted[partition.Name] {
+			for i := range devices {
+				devices[i].Taints = []resourceapi.DeviceTaint{DegradedTaint()}
+			}
+		}
 		if len(devices) > 0 {
 			res.Devices = append(res.Devices, devices...)
 			ends = append(ends, len(res.Devices))
@@ -300,6 +319,22 @@ func Build(input BuildInput) (BuildResult, error) {
 		start = end
 	}
 	return res, nil
+}
+
+// ChunkDevices cuts each partition's devices into ResourceSlices of at most
+// devicesPerSlice devices, and of at most
+// ResourceSliceMaxDevicesWithAdvancedFeatures where they carry a taint, the
+// API server's limit for a slice holding a tainted device.
+func ChunkDevices(devicesByPartition [][]resourceapi.Device, devicesPerSlice int) [][]resourceapi.Device {
+	var chunks [][]resourceapi.Device
+	for _, devices := range devicesByPartition {
+		size := devicesPerSlice
+		if slices.ContainsFunc(devices, func(dev resourceapi.Device) bool { return len(dev.Taints) > 0 }) {
+			size = min(size, resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures)
+		}
+		chunks = append(chunks, slices.Collect(slices.Chunk(devices, size))...)
+	}
+	return chunks
 }
 
 func groupedCPUNodeAllocatable(enabled bool) map[v1.ResourceName]resourceapi.NodeAllocatableResource {

@@ -224,6 +224,7 @@ func run(logger logr.Logger, cfg driverconfig.Config) error {
 		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
 		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
 		AllowFractionalCapacityRequests:       cfg.AllowFractionalCapacityRequests,
+		TaintDegradedPartitions:               cfg.TaintDegradedPartitions,
 		Metrics:                               cpumetrics.New(prometheus.DefaultRegisterer),
 		KubeletRootDir:                        cfg.KubeletRootDir,
 		Allocator:                             cfg.Allocator,

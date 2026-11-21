@@ -175,6 +175,14 @@ otherwise, and `Unknown` after the driver stops. With the option off, the defaul
 writes nothing to its Node. See
 [troubleshooting](troubleshooting.md#a-node-allocatable-mapping-the-api-server-dropped).
 
+#### Tainted devices of a degraded partition
+
+The new option `taintDegradedPartitions` is off by default, so an upgrade changes nothing until it is
+set. With it on, a partition whose `smt` the kernel contradicts publishes its devices with the taint
+`dra.cpu/degraded=SiblingThreadsOnline:NoSchedule` instead of none; it needs the `DRADeviceTaints`
+feature gate on the API server and on every scheduler that places claim pods. See
+[A degraded partition](cpu-partitions.md#a-degraded-partition).
+
 #### Kubernetes API client limits
 
 The driver's Kubernetes API client now sends up to 20 requests per second, with bursts of 50,
