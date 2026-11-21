@@ -89,6 +89,7 @@ type DriverConfig struct {
 	FullPhysicalCPUsOnly                  bool               `json:"fullPhysicalCPUsOnly,omitempty"`
 	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
 	AllowFractionalCapacityRequests       bool               `json:"allowFractionalCapacityRequests,omitempty"`
+	TaintDegradedPartitions               bool               `json:"taintDegradedPartitions,omitempty"`
 	CPUPartitions                         []CPUPartition     `json:"cpuPartitions,omitempty"`
 	Profiles                              map[string]Profile `json:"profiles,omitempty"`
 }

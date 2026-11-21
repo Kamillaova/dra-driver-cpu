@@ -59,6 +59,9 @@ func (cp *CPUDriver) PublishResources(ctx context.Context) {
 	// The library deletes a pool's slices only when the pool is left out or
 	// has none, so a node left with no device still publishes its pool.
 	deviceSlices := cp.topology.deviceSlices
+	if cp.deviceTaintsDropped.Load() {
+		deviceSlices = untaintedSlices(deviceSlices)
+	}
 	switch {
 	case cp.reservationMissing.Load():
 		logger.Info("node misses its kubelet CPU reservation: publishing the node's pool empty")
@@ -396,6 +399,9 @@ func (cp *CPUDriver) prepareGroupedResourceClaimLocked(logger logr.Logger, claim
 		return cp.prepareDevices(logger, claim, existing)
 	}
 
+	if err := cp.checkDegradedPartitions(claim); err != nil {
+		return kubeletplugin.PrepareResult{Err: err}
+	}
 	if err := cp.checkResultsPublished(claim); err != nil {
 		return kubeletplugin.PrepareResult{Err: err}
 	}
@@ -1031,7 +1037,9 @@ func (cp *CPUDriver) HandleError(ctx context.Context, err error, msg string) {
 	logger := ctxlog.FromContext(ctx)
 
 	// Log the error using the standard Kubernetes error handler
-	if !cp.handleDroppedMapping(ctx, err, msg) {
+	mappingDropped := cp.handleDroppedMapping(ctx, err, msg)
+	taintsDropped := cp.handleDroppedTaints(ctx, err, msg)
+	if !mappingDropped && !taintsDropped {
 		runtime.HandleErrorWithContext(ctx, err, msg)
 	}
 

@@ -114,8 +114,7 @@ partition "vms" lists offline CPUs 5: bring them online, or remove them from its
 A thread that a partition's `smt` expects offline, but that is still online, stays in that partition
 without being listed. It runs nothing, containers without claims included, it belongs to no device,
 and it serves no other partition either, while the kubelet reservation counts it. Meanwhile the
-partition is degraded and publishes no devices; see
-[A CPU Partition Whose SMT the Kernel Contradicts](troubleshooting.md#a-cpu-partition-whose-smt-the-kernel-contradicts).
+partition is degraded; see [A degraded partition](#a-degraded-partition).
 This is a known gap: until such threads are offline, the node reserves them and runs nothing on
 them.
 
@@ -123,6 +122,66 @@ The `default` entry takes `smt` too. Under `false` or a number its CPUs are the 
 online threads of each of its cores, and the other online threads of those cores are kept as above,
 running nothing until they are offline. While it is degraded, containers without claims keep running
 on its CPUs.
+
+## A degraded partition
+
+A partition is degraded when the kernel has a thread of its cores online that its `smt` expects
+offline. The driver decides this at start, and keeps the condition `CPUPartitionDegraded` on its Node
+naming each degraded partition and the CPUs to take offline; see
+[A CPU Partition Whose SMT the Kernel Contradicts](troubleshooting.md#a-cpu-partition-whose-smt-the-kernel-contradicts).
+
+- With `taintDegradedPartitions` off, the default, a degraded partition publishes no devices. The
+  driver refuses to prepare a claim allocated one of its devices before the restart and not prepared
+  then.
+- With `taintDegradedPartitions` on, it publishes its devices with the taint
+  `dra.cpu/degraded=SiblingThreadsOnline:NoSchedule`. The scheduler keeps every claim that does not
+  tolerate the taint off them, and the driver refuses to prepare such a claim where one gets through.
+  A degraded `default` entry taints its shared devices, so no new pod with a `dra.cpu` claim lands on
+  the node without the toleration; the pods already running stay.
+
+A claim tolerates the taint in its request, or in a `firstAvailable` subrequest:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: spdk-poll
+spec:
+  devices:
+    requests:
+      - name: poll
+        exactly:
+          deviceClassName: dra.cpu.spdk
+          tolerations:
+            - key: dra.cpu/degraded
+              operator: Equal
+              value: SiblingThreadsOnline
+              effect: NoSchedule
+```
+
+What tolerating gives up: the claim's CPUs are the ones its partition lists, and the other thread of
+each of their cores stays online. The driver pins nothing to those threads, but the kernel,
+interrupts and host processes can run there, so the workload does not get the one thread per core
+that its partition's `smt` promises.
+
+The taint needs the `DRADeviceTaints` feature gate on the API server and on every scheduler that
+places claim pods: off by default in Kubernetes 1.34 and 1.35, on from 1.36. A scheduler without the
+gate ignores the taint, and the driver refuses to prepare the claims that do not tolerate it. An API
+server without the gate drops the taint from the driver's ResourceSlices: the driver then withholds
+the partition's devices and refuses every claim on them, tolerating or not, until it restarts, and
+counts it in `dra_cpu_device_taints_dropped_total`; see [Metrics](metrics.md).
+
+`kubectl get resourceslices` and `kubectl describe node` do not show taints. List each device of a
+node with its taints:
+
+```bash
+kubectl get resourceslices --field-selector spec.nodeName=<node>,spec.driver=dra.cpu \
+  -o jsonpath='{range .items[*].spec.devices[*]}{.name}{"\t"}{.taints}{"\n"}{end}'
+```
+
+A node missing its [kubelet reservation](#the-kubelet-reservation) publishes no device, tainted or
+not: the driver refuses every claim there, so a tainted device would let a tolerating claim be placed
+on a node that can only refuse it.
 
 ## Device classes
 

@@ -225,6 +225,7 @@ func makeDriverConfigSnapshot(cfg driverconfig.Config) (gatherinfoapi.DriverConf
 		FullPhysicalCPUsOnly:                  cfg.FullPhysicalCPUsOnly,
 		AssumeUnsolicitedUpdatesSafe:          cfg.AssumeUnsolicitedUpdatesSafe,
 		AllowFractionalCapacityRequests:       cfg.AllowFractionalCapacityRequests,
+		TaintDegradedPartitions:               cfg.TaintDegradedPartitions,
 		CPUPartitions:                         partitions,
 		Profiles:                              profiles,
 	}, nil
