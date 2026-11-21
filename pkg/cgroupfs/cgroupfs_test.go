@@ -17,11 +17,79 @@ limitations under the License.
 package cgroupfs_test
 
 import (
+	"io/fs"
 	"testing"
+	"testing/fstest"
 
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFindProcess(t *testing.T) {
+	const scope = "system.slice/cri-containerd-2f5a.scope"
+	testCases := []struct {
+		name        string
+		tree        fstest.MapFS
+		dir         string
+		expected    string
+		expectError error
+	}{
+		{
+			name: "the process in the cgroup the runtime reports",
+			tree: fstest.MapFS{
+				scope + "/cgroup.procs": &fstest.MapFile{Data: []byte("4242\n")},
+			},
+			dir:      scope,
+			expected: scope,
+		},
+		{
+			name: "the process in crun's sub-cgroup below it",
+			tree: fstest.MapFS{
+				scope + "/cgroup.procs":           &fstest.MapFile{},
+				scope + "/container/cgroup.procs": &fstest.MapFile{Data: []byte("17\n4242\n")},
+			},
+			dir:      scope,
+			expected: scope + "/container",
+		},
+		{
+			name: "a pid that only begins like the process's",
+			tree: fstest.MapFS{
+				scope + "/cgroup.procs": &fstest.MapFile{Data: []byte("42420\n")},
+			},
+			dir: scope,
+		},
+		{
+			name: "the process elsewhere in the tree",
+			tree: fstest.MapFS{
+				scope + "/cgroup.procs":                      &fstest.MapFile{},
+				"system.slice/other.scope/cgroup.procs":      &fstest.MapFile{Data: []byte("4242\n")},
+				"system.slice/cri-containerd-2f5b.scope/x/y": &fstest.MapFile{},
+			},
+			dir: scope,
+		},
+		{
+			name: "a cgroup the tree does not show",
+			tree: fstest.MapFS{
+				"kubepods/cgroup.procs": &fstest.MapFile{Data: []byte("4242\n")},
+			},
+			dir:         scope,
+			expectError: fs.ErrNotExist,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			found, err := cgroupfs.FindProcess(tc.tree, tc.dir, 4242)
+			if tc.expectError != nil {
+				require.ErrorIs(t, err, tc.expectError)
+				require.ErrorContains(t, err, "find pid 4242 below "+scope)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, found)
+		})
+	}
+}
 
 func TestDir(t *testing.T) {
 	testCases := []struct {

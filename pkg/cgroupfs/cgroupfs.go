@@ -24,6 +24,8 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -38,9 +40,15 @@ type FS interface {
 	Chown(name string, uid, gid int) error
 }
 
-// Host opens the host cgroup2 tree, honoring HOST_ROOT when set.
+// HostRoot is where Host finds the host cgroup2 tree, honoring HOST_ROOT when
+// set.
+func HostRoot() string {
+	return path.Join(os.Getenv("HOST_ROOT"), Root)
+}
+
+// Host opens the host cgroup2 tree at HostRoot.
 func Host() (FS, error) {
-	root, err := os.OpenRoot(path.Join(os.Getenv("HOST_ROOT"), Root))
+	root, err := os.OpenRoot(HostRoot())
 	if err != nil {
 		return nil, fmt.Errorf("open the host cgroup2 tree: %w", err)
 	}
@@ -69,6 +77,36 @@ func (h *hostFS) WriteFile(name string, data []byte) error {
 
 func (h *hostFS) Chown(name string, uid, gid int) error {
 	return h.root.Chown(name, uid, gid)
+}
+
+// FindProcess returns the cgroup of dir's subtree, dir included, whose
+// cgroup.procs lists pid, or "" where none does. No name below dir is assumed:
+// a runtime may hold the process in a cgroup of its own below the one it
+// reports, as crun does under the systemd driver.
+func FindProcess(fsys fs.FS, dir string, pid int) (string, error) {
+	want := strconv.Itoa(pid)
+	var found string
+	err := fs.WalkDir(fsys, dir, func(name string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		procs, err := fs.ReadFile(fsys, path.Join(name, procsFile))
+		if err != nil {
+			return err
+		}
+		if slices.Contains(strings.Fields(string(procs)), want) {
+			found = name
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("find pid %d below %s: %w", pid, dir, err)
+	}
+	return found, nil
 }
 
 // Dir turns the cgroups path a runtime reports into a directory under the
