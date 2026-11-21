@@ -204,6 +204,32 @@ the API server, then restart the driver pod on each node whose condition is `Tru
 A kubelet with the gate off is a different case: the API server refuses the node's ResourceSlices
 that carry the mapping, so the driver publishes no devices and logs the refusal.
 
+## A CPU Partition Whose SMT the Kernel Contradicts
+
+A partition's `smt` says how many threads per core the platform leaves online on the partition's
+cores; the driver only checks it. Where the kernel has more threads online on a partition's cores
+than its `smt` declares, the partition is degraded: it publishes no devices, so no claim can take
+its CPUs, and the rest of the node serves as usual. A partition that itself lists more threads of
+one core than its `smt` allows is refused at start instead, since taking the extra threads offline
+would leave it naming an offline CPU. Where the degraded partition is the `default`
+entry, its shared devices are the ones not published, and containers without claims keep running
+on its CPUs. The driver reports it in the condition `CPUPartitionDegraded` on its Node, on every
+node that uses `cpuPartitions`:
+
+```bash
+kubectl get node <node> -o jsonpath='{.status.conditions[?(@.type=="CPUPartitionDegraded")]}'
+```
+
+- `True`, reason `SiblingThreadsOnline`: the message names each degraded partition and the CPUs of
+  its cores that are online too. `dra_cpu_partition_verified` is `0` for each such partition.
+- `False`, reason `PartitionsVerified`: the kernel has online the threads per core every
+  partition's `smt` declares.
+- `Unknown`, reason `DriverStopped`: the driver has stopped and checks nothing.
+
+The driver decides this at start, and the condition holds until the driver restarts. Take the CPUs
+the message names offline at boot, through the platform's configuration, then restart the driver
+pod. What the driver does with CPUs taken offline while it runs is undefined.
+
 ## Integration With Bug Reports
 
 1. Run `dracpu gatherinfo` on the affected node.
