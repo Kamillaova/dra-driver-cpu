@@ -1118,7 +1118,7 @@ func (cp *CPUDriver) StartContainer(ctx context.Context, pod *api.PodSandbox, ct
 	if uid, hold, held := cp.heldClaimOf(claims); held {
 		return fmt.Errorf("cannot start container %q in pod %q: %s", ctr.Name, pod.Uid, hold.refusal(uid))
 	}
-	return cp.buildThreadedTree(logger, pod, ctr, claims)
+	return cp.buildThreadedTree(ctx, logger, pod, ctr, claims)
 }
 
 // StopContainer removes runtime container state without changing DRA-owned allocations.
