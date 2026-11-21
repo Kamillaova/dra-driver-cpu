@@ -44,6 +44,8 @@ const (
 	AttributeCoreID     resourceapi.QualifiedName = "dra.cpu/coreID"
 	AttributeCPUID      resourceapi.QualifiedName = "dra.cpu/cpuID"
 	AttributeNumCPUs    resourceapi.QualifiedName = "dra.cpu/numCPUs"
+	// AttributeThreadsPerCore is a grouped device's threads per core, 0 when its cores differ.
+	AttributeThreadsPerCore resourceapi.QualifiedName = "dra.cpu/threadsPerCore"
 	// AttributeAllocatedNumCPUs is a metadata-only attribute (not published in
 	// ResourceSlice) that indicates how many CPUs were allocated to a specific
 	// claim from a grouped device's capacity.

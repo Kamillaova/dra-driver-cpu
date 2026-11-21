@@ -2631,6 +2631,7 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 		attrs[string(devattr.AttributeNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(numCPUs)}
 		attrs[string(devattr.AttributeSMTEnabled)] = resourceapi.DeviceAttribute{BoolValue: new(smtEnabled)}
 	}
+	attrs[string(devattr.AttributeThreadsPerCore)] = resourceapi.DeviceAttribute{IntValue: new(expectedThreadsPerCore(cpuInfos, cpuIDs))}
 
 	if allocatedCPUs > 0 {
 		attrs[string(devattr.AttributeAllocatedNumCPUs)] = resourceapi.DeviceAttribute{IntValue: new(allocatedCPUs)}
@@ -2645,4 +2646,27 @@ func expectedGroupMetadata(groupBy string, cpuInfos []cpuinfo.CPUInfo, reservedC
 	}
 
 	return &kubeletplugin.DeviceMetadata{Attributes: attrs}
+}
+
+// expectedThreadsPerCore counts the CPUs of each core groupCPUs touches by
+// socket, cluster and core id, as the fixtures carry no sibling lists, and
+// returns the count every such core shares, or 0.
+func expectedThreadsPerCore(cpuInfos []cpuinfo.CPUInfo, groupCPUs []int) int64 {
+	type coreKey struct{ socket, cluster, core int }
+	keyOf := make(map[int]coreKey, len(cpuInfos))
+	threads := make(map[coreKey]int64)
+	for _, ci := range cpuInfos {
+		key := coreKey{ci.SocketID, ci.ClusterID, ci.CoreID}
+		keyOf[ci.CpuID] = key
+		threads[key]++
+	}
+	var want int64
+	for _, cpu := range groupCPUs {
+		n := threads[keyOf[cpu]]
+		if want != 0 && n != want {
+			return 0
+		}
+		want = n
+	}
+	return want
 }
