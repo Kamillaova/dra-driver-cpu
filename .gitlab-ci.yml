@@ -1,0 +1,241 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"
+    - when: never
+
+variables:
+  SOURCE_REPO:
+    value: https://github.com/Kamillaova/dra-driver-cpu.git
+    description: Git repository to build from.
+  SOURCE_REF:
+    value: fork/gitlab-ci
+    description: Branch, tag or full commit SHA of SOURCE_REPO to build.
+  DOCKER_CONTEXT: src
+  DOCKERFILE_DIR: src
+  CHART_DIR: src/deployment/helm/dra-driver-cpu
+  REGISTRY: cr.yandex
+  REGISTRY_PATH: crp9l3e97rrm0c36mo1v
+
+source:
+  stage: .pre
+  image:
+    name: alpine/git:latest
+    entrypoint: [""]
+  script:
+    - |
+      set -eu
+      git init -q src
+      git -C src fetch -q --depth 1 "$SOURCE_REPO" "$SOURCE_REF"
+      git -C src checkout -q --detach FETCH_HEAD
+      sha=$(git -C src rev-parse HEAD)
+      base=$(sed -n 's/^version: *//p' "$CHART_DIR/Chart.yaml")
+      {
+        echo "SOURCE_SHA=$sha"
+        echo "IMAGE_TAG=$sha"
+        echo "CHART_VERSION=$base-g$(git -C src rev-parse --short=8 HEAD)"
+        echo "SOURCE_DATE_EPOCH=$(git -C src log -1 --format=%ct)"
+      } > source.env
+      cat source.env
+      rm -rf src/.git
+  artifacts:
+    paths:
+      - src
+    reports:
+      dotenv: source.env
+    expire_in: 1 day
+
+.docker-build:
+  image:
+    name: moby/buildkit:latest
+    entrypoint: [""]
+  stage: build
+  interruptible: true
+  variables:
+    BUILDKIT_PROGRESS: plain
+  artifacts:
+    paths:
+      - metadata.json
+    reports:
+      dotenv: build.env
+    expire_in: 7 days
+  script:
+    - |
+      set -euo pipefail
+      : "${REGISTRY:?REGISTRY is not set}"
+      : "${REGISTRY_PATH:?REGISTRY_PATH is not set}"
+      : "${DOCKER_AUTH_CONFIG:?DOCKER_AUTH_CONFIG is not set}"
+
+      IMAGE_NAME="${IMAGE_NAME:-${CI_PROJECT_PATH}}"
+      IMAGE_REPO="${IMAGE_REPO:-${REGISTRY}/${REGISTRY_PATH}/${IMAGE_NAME}}"
+      CACHE_IMAGE="${CACHE_IMAGE:-${IMAGE_REPO}:cache}"
+      DOCKERFILE_DIR="${DOCKERFILE_DIR:-.}"
+      DOCKER_CONTEXT="${DOCKER_CONTEXT:-.}"
+      test -f "${DOCKERFILE_DIR}/Dockerfile" || { echo "no Dockerfile in ${DOCKERFILE_DIR} -- set DOCKERFILE_DIR" >&2; exit 1; }
+
+      umask 077
+
+      # netrc for Go / Git
+      cat > "$HOME/.netrc" <<EOF
+        machine git.volta.ru
+        login gitlab-ci-token
+        password ${CI_JOB_TOKEN}
+      EOF
+
+      # Docker registry auth
+      mkdir -p "$HOME/.docker"
+      if [ -f "${DOCKER_AUTH_CONFIG}" ]; then
+        cp "${DOCKER_AUTH_CONFIG}" "$HOME/.docker/config.json"
+      else
+        printf '%s' "${DOCKER_AUTH_CONFIG}" > "$HOME/.docker/config.json"
+      fi
+
+      NAMES="${IMAGE_REPO}:${CI_COMMIT_SHA}"
+
+      if [ -n "${IMAGE_TAG:-}" ] && [ "${IMAGE_TAG}" != "${CI_COMMIT_SHA}" ]; then
+        NAMES="${NAMES},${IMAGE_REPO}:${IMAGE_TAG}"
+      fi
+
+      if [ "${CI_COMMIT_BRANCH:-}" = "${CI_DEFAULT_BRANCH:-}" ] && [ "${IMAGE_TAG:-}" != "latest" ]; then
+        NAMES="${NAMES},${IMAGE_REPO}:latest"
+      fi
+
+      if [ -n "${CI_COMMIT_TAG:-}" ] && [ "${CI_COMMIT_TAG}" != "${IMAGE_TAG:-}" ]; then
+        NAMES="${NAMES},${IMAGE_REPO}:${CI_COMMIT_TAG}"
+      fi
+
+      set -- \
+        --frontend dockerfile.v0 \
+        --opt image-resolve-mode=pull \
+        --secret id=netrc,src=$HOME/.netrc \
+        --local context="${DOCKER_CONTEXT}" \
+        --local dockerfile="${DOCKERFILE_DIR}"
+
+      if [ -n "${BUILD_PLATFORMS:-}" ]; then
+        set -- "$@" --opt platform="${BUILD_PLATFORMS}"
+      fi
+
+      while IFS= read -r arg; do
+        [ -n "$arg" ] || continue
+        set -- "$@" --opt "build-arg:${arg}"
+      done <<EOF
+      ${BUILD_ARGS:-}
+      EOF
+
+      buildctl-daemonless.sh build "$@" \
+        --import-cache type=registry,ref="${CACHE_IMAGE}" \
+        --export-cache type=registry,ref="${CACHE_IMAGE}",mode=max,compression=zstd \
+        --metadata-file metadata.json \
+        --output "type=image,oci-mediatypes=true,\"name=${NAMES}\",push=true,compression=zstd"
+
+      IMAGE_DIGEST=$(tr -d '[:space:]' < metadata.json | sed -n 's/.*"containerimage.digest":"\(sha256:[a-f0-9]*\)".*/\1/p')
+      [ -n "$IMAGE_DIGEST" ] || { echo "no containerimage.digest in metadata.json" >&2; exit 1; }
+
+      {
+        echo "IMAGE_DIGEST=${IMAGE_DIGEST}"
+        echo "IMAGE_REF=${IMAGE_REPO}@${IMAGE_DIGEST}"
+      } > build.env
+
+      echo "pushed: ${NAMES}"
+      echo "digest: ${IMAGE_DIGEST}"
+      echo "pin:    ${IMAGE_REPO}@${IMAGE_DIGEST}"
+
+.helm-publish:
+  image:
+    name: alpine/helm:latest
+    entrypoint: [""]
+  stage: build
+  interruptible: true
+  artifacts:
+    paths:
+      - "*.tgz"
+    reports:
+      dotenv: chart.env
+    expire_in: 7 days
+  script:
+    - |
+      set -euo pipefail
+      : "${REGISTRY:?REGISTRY is not set}"
+      : "${REGISTRY_PATH:?REGISTRY_PATH is not set}"
+      : "${DOCKER_AUTH_CONFIG:?DOCKER_AUTH_CONFIG is not set}"
+
+      CHART_DIR="${CHART_DIR:-.}"
+      CHART_REPO="${CHART_REPO:-oci://${REGISTRY}/${REGISTRY_PATH}/${CI_PROJECT_PATH}/charts}"
+      CHART_REPO="${CHART_REPO%/}"
+      test -f "${CHART_DIR}/Chart.yaml" || { echo "no Chart.yaml in ${CHART_DIR} -- set CHART_DIR" >&2; exit 1; }
+
+      umask 077
+
+      mkdir -p "$HOME/.docker"
+      if [ -f "${DOCKER_AUTH_CONFIG}" ]; then
+        cp "${DOCKER_AUTH_CONFIG}" "$HOME/.docker/config.json"
+      else
+        printf '%s' "${DOCKER_AUTH_CONFIG}" > "$HOME/.docker/config.json"
+      fi
+      export HELM_REGISTRY_CONFIG="$HOME/.docker/config.json"
+
+      for dir in ${CHART_PRUNE:-}; do
+        rm -rf "${CHART_DIR:?}/${dir}"
+      done
+
+      meta=$(helm show chart "${CHART_DIR}")
+      name=$(printf '%s\n' "$meta" | grep '^name:' | awk '{ print $2 }')
+      [ -n "$name" ] || { echo "Chart.yaml has no name" >&2; exit 1; }
+
+      version="${CHART_VERSION:-}"
+      if [ -z "$version" ]; then
+        if [ -n "${CI_COMMIT_TAG:-}" ]; then
+          version="${CI_COMMIT_TAG#v}"
+        else
+          base=$(printf '%s\n' "$meta" | grep '^version:' | awk '{ print $2 }')
+          [ -n "$base" ] || { echo "Chart.yaml has no version" >&2; exit 1; }
+          version="${base}-g${CI_COMMIT_SHORT_SHA}"
+        fi
+      fi
+
+      helm dependency build "${CHART_DIR}"
+
+      # No released helm honors SOURCE_DATE_EPOCH: the code is on main only, and the
+      # string in the binary comes from vendored spf13/cobra. Stamp mtimes ourselves,
+      # from the committer date. BusyBox touch -d rejects ISO 8601, so go via date -d.
+      if [ "${CHART_REPRODUCIBLE:-true}" = "true" ]; then
+        epoch="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || true)}"
+        : "${epoch:=1577836800}"
+        export SOURCE_DATE_EPOCH="$epoch"
+
+        # helm push stamps org.opencontainers.image.created from time.Now() unless
+        # Chart.yaml carries it. That key is absent from helm's immutableOciAnnotations,
+        # so a chart-level value wins -- which is what makes the manifest digest, and
+        # not just the archive, reproducible. A value the chart already declares stays.
+        if ! command -v yq >/dev/null; then
+          echo "WARNING: no yq; archive will be reproducible but the pushed digest will not" >&2
+        elif [ -z "$(yq '.annotations."org.opencontainers.image.created" // ""' "${CHART_DIR}/Chart.yaml")" ]; then
+          CHART_CREATED=$(TZ=UTC date -d "@${epoch}" +%Y-%m-%dT%H:%M:%SZ) \
+            yq -i '.annotations."org.opencontainers.image.created" = strenv(CHART_CREATED)' "${CHART_DIR}/Chart.yaml"
+        fi
+
+        TZ=UTC find "${CHART_DIR}" -exec touch -t "$(TZ=UTC date -d "@${epoch}" +%Y%m%d%H%M.%S)" {} +
+      fi
+
+      helm package "${CHART_DIR}" --version "$version" --destination .
+      helm push "./${name}-${version}.tgz" "${CHART_REPO}" 2>&1 | tee push.log
+
+      CHART_DIGEST=$(sed -n 's/^Digest: *//p' push.log)
+      if [ -n "$CHART_DIGEST" ]; then
+        {
+          echo "CHART_DIGEST=${CHART_DIGEST}"
+          echo "CHART_REF=${CHART_REPO}/${name}:${version}@${CHART_DIGEST}"
+        } > chart.env
+        echo "pushed: ${CHART_REPO}/${name}:${version}"
+        echo "digest: ${CHART_DIGEST}"
+        echo "pin:    ${CHART_REPO}/${name}:${version}@${CHART_DIGEST}"
+      else
+        echo "WARNING: no digest in helm push output; chart.env not written" >&2
+      fi
+
+build:
+  extends: .docker-build
+  needs: [source]
+
+chart:
+  extends: .helm-publish
+  needs: [source]
