@@ -59,6 +59,11 @@ type Config struct {
 	// DRAFractionalCapacityRange feature gate, so that a request may consume a
 	// fraction of a CPU. Defaults to false.
 	AllowFractionalCapacityRequests bool `json:"allowFractionalCapacityRequests,omitempty"`
+	// TaintDegradedPartitions asserts that the cluster enables the
+	// DRADeviceTaints feature gate, so that a partition whose smt the kernel
+	// contradicts publishes its devices with a taint rather than none.
+	// Defaults to false.
+	TaintDegradedPartitions bool `json:"taintDegradedPartitions,omitempty"`
 	// CPUPartitions splits the node's CPUs into named partitions. Left out,
 	// null and empty all mean the node uses no partitions.
 	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
@@ -86,6 +91,7 @@ func (c Config) LogValues() []any {
 		"fullPhysicalCPUsOnly", c.FullPhysicalCPUsOnly,
 		"assumeUnsolicitedUpdatesSafe", c.AssumeUnsolicitedUpdatesSafe,
 		"allowFractionalCapacityRequests", c.AllowFractionalCapacityRequests,
+		"taintDegradedPartitions", c.TaintDegradedPartitions,
 		"cpuPartitions", c.CPUPartitions,
 		"profiles", c.Profiles,
 	}
@@ -110,6 +116,7 @@ type dumpConfig struct {
 	FullPhysicalCPUsOnly                  bool               `json:"fullPhysicalCPUsOnly"`
 	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe"`
 	AllowFractionalCapacityRequests       bool               `json:"allowFractionalCapacityRequests"`
+	TaintDegradedPartitions               bool               `json:"taintDegradedPartitions"`
 	CPUPartitions                         []CPUPartition     `json:"cpuPartitions"`
 	Profiles                              map[string]Profile `json:"profiles"`
 }

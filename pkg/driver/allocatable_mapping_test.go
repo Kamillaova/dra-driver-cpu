@@ -47,15 +47,15 @@ type mappingDropCounter struct {
 
 func (r *mappingDropCounter) RecordNodeAllocatableMappingDropped() { r.dropped.Add(1) }
 
-func testMappedSlice(mapped bool, taints int) *resourceapi.ResourceSlice {
+func testMappedSlice(mapped bool, bindingConditions int) *resourceapi.ResourceSlice {
 	dev := resourceapi.Device{Name: "cpudevnuma000"}
 	if mapped {
 		dev.NodeAllocatableResources = map[corev1.ResourceName]resourceapi.NodeAllocatableResource{
 			corev1.ResourceCPU: {Mapping: &resourceapi.NodeAllocatableMapping{DeviceMultiplier: new(resource.MustParse("1"))}},
 		}
 	}
-	for range taints {
-		dev.Taints = append(dev.Taints, resourceapi.DeviceTaint{Key: "example.com/taint", Effect: resourceapi.DeviceTaintEffectNoSchedule})
+	for range bindingConditions {
+		dev.BindingConditions = append(dev.BindingConditions, "example.com/attached")
 	}
 	return &resourceapi.ResourceSlice{Spec: resourceapi.ResourceSliceSpec{Devices: []resourceapi.Device{dev}}}
 }

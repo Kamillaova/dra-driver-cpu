@@ -38,6 +38,7 @@ type Recorder interface {
 	RecordNodeAllocatableMappingDropped()
 	SetPartitionVerified(partition string, verified bool)
 	SetNodeReservationOK(ok bool)
+	RecordDeviceTaintsDropped()
 }
 
 // refreshAllocationMetrics requires stateMu once the driver is serving callbacks.

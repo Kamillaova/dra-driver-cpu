@@ -1220,6 +1220,104 @@ func TestBuildSharedDevices(t *testing.T) {
 	}
 }
 
+func TestBuildTaintsDegradedPartitions(t *testing.T) {
+	topo := coreTopology(true, onNUMANode0, twoThreadCores(4)...)
+	declared := []device.Partition{
+		{Name: device.DefaultPartitionName, ThreadsPerCore: 1},
+		{Name: "spdk", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(1, 2), ThreadsPerCore: 1},
+		{Name: "vms", Role: device.PARTITION_ROLE_EXCLUSIVE, CPUs: cpuset.New(3, 7)},
+	}
+	degraded := resourceapi.DeviceTaint{Key: "dra.cpu/degraded", Value: "SiblingThreadsOnline", Effect: resourceapi.DeviceTaintEffectNoSchedule}
+	for _, tc := range []struct {
+		name         string
+		tainted      map[string]bool
+		withheld     map[string]bool
+		wantTainted  map[string]bool
+		wantWithheld map[string]string
+	}{
+		{
+			name:         "a degraded exclusive partition's owned devices",
+			tainted:      map[string]bool{"spdk": true},
+			wantTainted:  map[string]bool{"cpudevcache000": false, "cpudevcache000-spdk": true, "cpudevcache000-vms": false},
+			wantWithheld: map[string]string{},
+		},
+		{
+			name:         "the degraded default entry's shared devices",
+			tainted:      map[string]bool{device.DefaultPartitionName: true},
+			wantTainted:  map[string]bool{"cpudevcache000": true, "cpudevcache000-spdk": false, "cpudevcache000-vms": false},
+			wantWithheld: map[string]string{},
+		},
+		{
+			name:         "a degraded partition withheld names its devices",
+			withheld:     map[string]bool{"spdk": true},
+			wantTainted:  map[string]bool{"cpudevcache000": false, "cpudevcache000-vms": false},
+			wantWithheld: map[string]string{"cpudevcache000-spdk": "spdk"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := device.Build(device.BuildInput{
+				Inventory:      device.Inventory{CPUTopology: topo, ReservedCPUs: cpuset.New()},
+				Layout:         device.LayoutUncoreCache,
+				PCIeRootMapper: store.NewPCIeRootMapper(),
+				Partitions:     device.ResolvePartitions(declared, topo.CPUDetails, cpuset.New()),
+				PartitionsUsed: true,
+				Tainted:        tc.tainted,
+				Withheld:       tc.withheld,
+			})
+			require.NoError(t, err)
+			got := make(map[string]bool, len(res.Devices))
+			for _, dev := range res.Devices {
+				got[dev.Name] = len(dev.Taints) > 0
+				if tc.wantTainted[dev.Name] {
+					require.Equalf(t, []resourceapi.DeviceTaint{degraded}, dev.Taints, "device %q carries the one taint, with no time", dev.Name)
+				}
+			}
+			require.Equal(t, tc.wantTainted, got)
+			require.Equal(t, tc.wantWithheld, res.WithheldDevices)
+		})
+	}
+}
+
+func TestChunkDevices(t *testing.T) {
+	devices := func(n int, tainted bool) []resourceapi.Device {
+		devs := make([]resourceapi.Device, n)
+		for i := range devs {
+			devs[i].Name = fmt.Sprintf("cpudevcache%03d", i)
+			if tainted {
+				devs[i].Taints = []resourceapi.DeviceTaint{device.DegradedTaint()}
+			}
+		}
+		return devs
+	}
+	for _, tc := range []struct {
+		name            string
+		byPartition     [][]resourceapi.Device
+		devicesPerSlice int
+		wantSizes       []int
+	}{
+		{
+			name:            "a degraded partition of 65 devices in two slices of at most 64, a healthy one of 128 in one",
+			byPartition:     [][]resourceapi.Device{devices(65, true), devices(128, false)},
+			devicesPerSlice: resourceapi.ResourceSliceMaxDevices,
+			wantSizes:       []int{64, 1, 128},
+		},
+		{
+			name:            "a smaller size kept for every partition",
+			byPartition:     [][]resourceapi.Device{devices(65, true), devices(65, false)},
+			devicesPerSlice: resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures,
+			wantSizes:       []int{64, 1, 64, 1},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sizes []int
+			for _, slice := range device.ChunkDevices(tc.byPartition, tc.devicesPerSlice) {
+				sizes = append(sizes, len(slice))
+			}
+			require.Equal(t, tc.wantSizes, sizes)
+		})
+	}
+}
+
 func TestBuildMapsOnlyTheDefaultEntryWherePartitionsAreUsed(t *testing.T) {
 	topo := coreTopology(true, onNUMANode0, twoThreadCores(4)...)
 	for _, tc := range []struct {

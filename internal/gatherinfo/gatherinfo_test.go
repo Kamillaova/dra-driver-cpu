@@ -296,6 +296,33 @@ func TestRunReportsAllowFractionalCapacityRequests(t *testing.T) {
 	}
 }
 
+func TestRunReportsTaintDegradedPartitions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config string
+		want   bool
+	}{
+		{name: "default", config: "groupBy: socket\n", want: false},
+		{name: "from the config file", config: "taintDegradedPartitions: true\n", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupFakeHostWithConfig(t, tc.config)
+
+			stdout, err := captureStdout(t, func() error {
+				return gatherinfo.Run([]string{"--stdout"}, gatherinfo.Options{}, logr.Discard())
+			})
+			if err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+
+			report := readReport(t, []byte(stdout))
+			if report.DriverConfig.TaintDegradedPartitions != tc.want {
+				t.Fatalf("taintDegradedPartitions = %v, want %v", report.DriverConfig.TaintDegradedPartitions, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunReportsAssumeUnsolicitedUpdatesSafe(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

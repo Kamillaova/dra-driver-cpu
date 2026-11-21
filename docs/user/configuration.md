@@ -186,6 +186,20 @@ on - is configured through other Helm values, not through this file.
   default, fractional amounts are always allowed and the option is removed, after a release that
   deprecates it.
 
+`taintDegradedPartitions` (bool, default: `false`)
+
+- Publish the devices of a degraded partition, one whose `smt` the kernel contradicts, with the taint
+  `dra.cpu/degraded=SiblingThreadsOnline:NoSchedule`, so that a claim tolerating the taint can use
+  them. Without it such a partition publishes no devices. See
+  [A degraded partition](cpu-partitions.md#a-degraded-partition).
+- Set it only where the API server and every scheduler that places claim pods run with the
+  `DRADeviceTaints` feature gate, off by default in Kubernetes 1.34 and 1.35 and on from 1.36. An API
+  server without the gate drops the taint: the driver then withholds the devices and refuses every
+  claim on them until it restarts.
+- Once the driver's minimum supported Kubernetes version is 1.36, where `DRADeviceTaints` is on by
+  default, degraded partitions are always tainted and the option is removed, after a release that
+  deprecates it.
+
 `cpuPartitions` (list of partitions, default: none)
 
 - Splits the node's CPUs into named partitions; see [CPU Partitions](cpu-partitions.md). Each entry

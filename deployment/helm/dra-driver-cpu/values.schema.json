@@ -393,6 +393,9 @@
         },
         "sysfsOverlay": {
           "type": "string"
+        },
+        "taintDegradedPartitions": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
