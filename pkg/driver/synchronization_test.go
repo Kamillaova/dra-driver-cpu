@@ -28,8 +28,12 @@ import (
 	cpumetrics "github.com/kubernetes-sigs/dra-driver-cpu/pkg/metrics"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/store"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/utils/cpuset"
 )
@@ -744,6 +748,7 @@ func TestSynchronizeJudgesRequestVariables(t *testing.T) {
 		wantBound   bool
 		wantKept    float64
 		wantRefused float64
+		wantWarning string
 	}{
 		{
 			name:      "a container naming every request binds the claim",
@@ -752,12 +757,13 @@ func TestSynchronizeJudgesRequestVariables(t *testing.T) {
 			wantBound: true,
 		},
 		{
-			name:      "a partial holder pinned to the whole claim keeps it",
-			env:       vars("vcpus"),
-			pinned:    "0-2",
-			wantCPUs:  "0-2",
-			wantBound: true,
-			wantKept:  1,
+			name:        "a partial holder pinned to the whole claim keeps it",
+			env:         vars("vcpus"),
+			pinned:      "0-2",
+			wantCPUs:    "0-2",
+			wantBound:   true,
+			wantKept:    1,
+			wantWarning: `container "app" breaks a rule that was not applied when it was created and keeps its claims until it is created again, when it is refused by rule partial_holder: it uses only request "vcpus" of claim "vm-claim", which must be used whole; use the whole claim, or give the container its own claim`,
 		},
 		{
 			name:        "a partial holder off the claim's CPUs runs on the shared CPUs",
@@ -783,6 +789,8 @@ func TestSynchronizeJudgesRequestVariables(t *testing.T) {
 				{Request: "vcpus", CPUs: cpuset.New(0, 2)},
 			}}
 			d.cdiMgr = cdi
+			events := &capturingRecorder{}
+			d.eventRecorder = events
 			app := &api.Container{Id: "c-app", Name: "app", PodSandboxId: pod.Id, Env: tc.env}
 			if tc.pinned != "" {
 				app.Linux = pinnedTo(tc.pinned)
@@ -797,6 +805,13 @@ func TestSynchronizeJudgesRequestVariables(t *testing.T) {
 				require.Equal(t, "0-2", d.allocationState.GetPreparedCPUs().String(), "the claim stays prepared")
 				require.Equal(t, float64(attempt)*tc.wantKept, metricValue(t, reg, "dra_cpu_containers_kept_under_older_rule_total", map[string]string{"rule": string(cpumetrics.RulePartialHolder)}))
 				require.Equal(t, float64(attempt)*tc.wantRefused, metricValue(t, reg, "dra_cpu_nri_synchronize_refused_claims_total", nil))
+				var want []string
+				for range attempt {
+					if tc.wantWarning != "" {
+						want = append(want, "Warning KeptUnderOlderRule "+tc.wantWarning)
+					}
+				}
+				require.Equal(t, want, events.lines(), "attempt %d: one Warning per kept container and Synchronize", attempt)
 			}
 
 			if tc.wantKept > 0 {
@@ -806,6 +821,92 @@ func TestSynchronizeJudgesRequestVariables(t *testing.T) {
 					"the rule applies at the container's next CreateContainer")
 			}
 		})
+	}
+}
+
+type capturedEvent struct {
+	object    runtime.Object
+	eventType string
+	reason    string
+	message   string
+}
+
+// capturingRecorder is a fake event recorder that also keeps each event's
+// object, which record.FakeRecorder drops.
+type capturingRecorder struct {
+	record.EventRecorder
+	events []capturedEvent
+}
+
+func (r *capturingRecorder) Event(object runtime.Object, eventType, reason, message string) {
+	r.events = append(r.events, capturedEvent{object: object, eventType: eventType, reason: reason, message: message})
+}
+
+func (r *capturingRecorder) lines() []string {
+	var lines []string
+	for _, event := range r.events {
+		lines = append(lines, event.eventType+" "+event.reason+" "+event.message)
+	}
+	return lines
+}
+
+func TestSynchronizeWarnsOncePerKeptContainer(t *testing.T) {
+	podA := &api.PodSandbox{Id: "sandbox-a", Uid: "pod-a-uid", Namespace: "ns", Name: "pod-a"}
+	podB := &api.PodSandbox{Id: "sandbox-b", Uid: "pod-b-uid", Namespace: "ns", Name: "pod-b"}
+	request := func(claim, name string) string {
+		return fmt.Sprintf("%s_%s_%s=%s", cdiEnvVarPrefix, claim, name, cdiEnvDynamicValue)
+	}
+	containers := []*api.Container{
+		// Pinned to both of its claims' CPUs, it keeps both and gets one Warning.
+		{Id: "c-app", Name: "app", PodSandboxId: podA.Id, Env: []string{request("vm", "vcpus"), request("vm2", "a")}, Linux: pinnedTo("0-3")},
+		// Off its claim's CPUs, it runs on the shared CPUs and gets none.
+		{Id: "c-stray", Name: "stray", PodSandboxId: podA.Id, Env: []string{request("web", "x")}, Linux: pinnedTo("100")},
+		{Id: "c-db", Name: "db", PodSandboxId: podB.Id, Env: []string{request("db", "main")}, Linux: pinnedTo("4-5")},
+	}
+	cdi := newMockCdiMgr()
+	cdi.records["vm"] = cdiClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []cdiRequestRecord{
+		{Request: "helpers", CPUs: cpuset.New(1)},
+		{Request: "vcpus", CPUs: cpuset.New(0)},
+	}}
+	cdi.records["vm2"] = cdiClaimRecord{Namespace: "ns", Name: "vm2-claim", Requests: []cdiRequestRecord{
+		{Request: "a", CPUs: cpuset.New(2)},
+		{Request: "b", CPUs: cpuset.New(3)},
+	}}
+	cdi.records["db"] = cdiClaimRecord{Namespace: "ns", Name: "db-claim", Requests: []cdiRequestRecord{
+		{Request: "extra", CPUs: cpuset.New(5)},
+		{Request: "main", CPUs: cpuset.New(4)},
+	}}
+	cdi.records["web"] = cdiClaimRecord{Namespace: "ns", Name: "web-claim", Requests: []cdiRequestRecord{
+		{Request: "x", CPUs: cpuset.New(6)},
+		{Request: "y", CPUs: cpuset.New(7)},
+	}}
+	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_DualSocket_120CPUsPerSocket_HT)
+	d.cdiMgr = cdi
+	events := &capturingRecorder{}
+	d.eventRecorder = events
+
+	wantApp := `container "app" breaks a rule that was not applied when it was created and keeps its claims until it is created again, when it is refused by ` +
+		`rule partial_holder: it uses only request "vcpus" of claim "vm-claim", which must be used whole; use the whole claim, or give the container its own claim, ` +
+		`and by rule partial_holder: it uses only request "a" of claim "vm2-claim", which must be used whole; use the whole claim, or give the container its own claim`
+	wantDB := `container "db" breaks a rule that was not applied when it was created and keeps its claims until it is created again, when it is refused by ` +
+		`rule partial_holder: it uses only request "main" of claim "db-claim", which must be used whole; use the whole claim, or give the container its own claim`
+	// The first attempt is a fresh process, the second a reconnect.
+	for attempt := 1; attempt <= 2; attempt++ {
+		events.events = nil
+		_, err := d.Synchronize(t.Context(), []*api.PodSandbox{podA, podB}, containers)
+		require.NoError(t, err)
+		require.True(t, d.allocationState.IsOwner("vm", "pod-a-uid", "app"))
+		require.True(t, d.allocationState.IsOwner("vm2", "pod-a-uid", "app"))
+		require.True(t, d.allocationState.IsOwner("db", "pod-b-uid", "db"))
+		_, webBound := d.allocationState.Owner("web")
+		require.False(t, webBound)
+
+		require.Equal(t, []string{"Warning KeptUnderOlderRule " + wantApp, "Warning KeptUnderOlderRule " + wantDB}, events.lines(), "attempt %d", attempt)
+		for i, pod := range []*api.PodSandbox{podA, podB} {
+			object, ok := events.events[i].object.(*corev1.Pod)
+			require.True(t, ok, "attempt %d: the Warning is on a pod, got %T", attempt, events.events[i].object)
+			require.Equal(t, metav1.ObjectMeta{Namespace: pod.Namespace, Name: pod.Name, UID: types.UID(pod.Uid)}, object.ObjectMeta)
+		}
 	}
 }
 
