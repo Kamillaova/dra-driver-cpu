@@ -143,6 +143,9 @@ type BuildInput struct {
 	// partition's CPUs alone, and every partition of role default publishes
 	// shared devices.
 	PartitionsUsed bool
+	// Withheld names the partitions that publish no device, those whose smt
+	// the kernel contradicts.
+	Withheld map[string]bool
 	// AllowFractionalCapacityRequests lets a request on a shared device book
 	// an amount in millicores rather than in whole CPUs. Every device
 	// publishes it.
@@ -228,7 +231,7 @@ func Build(input BuildInput) (BuildResult, error) {
 	var ends []int
 	for _, partition := range partitions {
 		shared := partition.PublishesSharedDevices(input.PartitionsUsed)
-		if !shared && !partition.PublishesOwnedDevices(input.PartitionsUsed) {
+		if input.Withheld[partition.Name] || (!shared && !partition.PublishesOwnedDevices(input.PartitionsUsed)) {
 			continue
 		}
 		counted := topo.CPUDetails

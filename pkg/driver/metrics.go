@@ -36,6 +36,7 @@ type Recorder interface {
 	RecordContainerKeptUnderOlderRule(rule cpumetrics.Rule)
 	SetWatchdogStuck(stalled time.Duration)
 	RecordNodeAllocatableMappingDropped()
+	SetPartitionVerified(partition string, verified bool)
 }
 
 // refreshAllocationMetrics requires stateMu once the driver is serving callbacks.
