@@ -421,6 +421,50 @@ Running without profiles, the node's CPUs named, if at all, by the fleet-wide `r
 `- name: default`, with every node labelled. So is running one Helm release per kind of node; see
 [Installing with Helm](installation.md#installing-with-helm).
 
+### Threaded cgroups: the startup check
+
+With `cgroupThreadedMode` set to `create` or `place`, the driver writes the host's cgroup2 tree
+through the mount at `/sys/fs/cgroup` in its container, and checks that it can before it serves
+anything. It exits with an error that says what the mode needs, what the driver found and how to
+fix it when:
+
+- the mount at `/sys/fs/cgroup` is not of type `cgroup2`: the threaded modes do not support cgroup
+  v1;
+- the mount is read-only, as the runtime's own cgroup mount is in a container whose runtime handler
+  does not set `cgroup_writable`; a read-only bind of the host's tree is read-only even where the
+  host mounts the tree read-write;
+- at its first synchronization with the runtime, the runtime lists no container whose process is
+  the driver's, or the mount does not show the driver's process at or below that container's
+  cgroup: the driver then runs outside the host's pid namespace (`hostPID`), or the mount is not
+  the host's cgroup2 tree.
+
+With `place` the driver also moves processes of other containers, into a group whose CPUs differ
+from those of the cgroup the process leaves. The kernel then requires `CAP_SYS_NICE` of the driver
+for a process whose permitted capabilities are not all among the driver's, as those of a container
+running as root, a privileged one or one with an added capability are. No attempt at start can show
+it before such a container starts, so under `place` the driver reads its capabilities and refuses
+to start without `CAP_SYS_NICE`, on every node. Where the host mounts cgroup2 with `nsdelegate` and
+the driver runs in a cgroup namespace of its own, the kernel allows the move only from the host's
+cgroup namespace, so the driver enters it once at start, as each move does. Opening
+`/proc/1/ns/cgroup` needs `CAP_SYS_PTRACE` and entering it `CAP_SYS_ADMIN`, and the error names the
+capabilities the driver's container lacks. With both granted, a user namespace or a security module
+refused: containerd's default AppArmor profile allows ptrace only between processes of its own
+profile, and so can refuse the driver's open of PID 1's namespace. Run the driver in the host's user
+namespace, under an AppArmor profile that allows the open.
+
+The check at start names every problem it finds in one error, the mount's state beside the missing
+capabilities, for example:
+
+```text
+`cgroupThreadedMode: place` needs the host's cgroup v2 hierarchy mounted read-write at /sys/fs/cgroup, CAP_SYS_NICE, CAP_SYS_PTRACE and CAP_SYS_ADMIN: /sys/fs/cgroup is mounted read-only; the driver lacks CAP_SYS_ADMIN; fix its pod, or set `cgroupThreadedMode: false`
+```
+
+The checks at the first synchronization each depend on the one before, and are reported one at a
+time. The error is also the container's termination message; see
+[A Driver That Exits](troubleshooting.md#a-driver-that-exits).
+
+With `cgroupThreadedMode: false` the driver checks none of this.
+
 ### Helm: deprecated args values vs driverConfig
 
 `driverConfig` is the Helm value that generates the config file described above (a single map

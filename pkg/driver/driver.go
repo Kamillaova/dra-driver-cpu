@@ -33,6 +33,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/admission"
 	"github.com/kubernetes-sigs/dra-driver-cpu/internal/ctxlog"
+	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cgroupfs"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuallocator"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/cpuinfo"
 	"github.com/kubernetes-sigs/dra-driver-cpu/pkg/device"
@@ -203,6 +204,17 @@ type CPUDriver struct {
 	reservedHolds       map[types.UID]reservedHold
 	reservedHoldsClaims atomic.Bool
 
+	// cgroupThreadedMode is Config.CgroupThreadedMode. Under create and place,
+	// cgroups is the host's cgroup2 tree, and cgroupHostNamespace is whether
+	// moving a process into a cgroup has to enter the cgroup namespace of PID
+	// 1; all set in New, read-only after that. ownCgroupFound, kept under
+	// stateMu, is set once a Synchronize has found the driver's process in
+	// that tree.
+	cgroupThreadedMode  string
+	cgroups             cgroupfs.FS
+	cgroupHostNamespace bool
+	ownCgroupFound      bool
+
 	// window is set, under stateMu, while the node's profile is not read yet;
 	// see Config.SelectProfile.
 	window *unconfiguredWindow
@@ -273,6 +285,26 @@ type Providers struct {
 	CPUInfo   CPUInfoProvider
 	SysFS     sysfs.FS
 	K8SClient kubernetes.Interface
+	// CgroupFS is the host's cgroup2 tree, opened under cgroupThreadedMode
+	// create and place.
+	CgroupFS cgroupfs.FS
+	// Process is the driver's own process, read by the start checks of
+	// cgroupThreadedMode.
+	Process ProcessProbe
+}
+
+func (pr Providers) EnsureCgroupFS() (cgroupfs.FS, error) {
+	if pr.CgroupFS == nil {
+		return cgroupfs.Host()
+	}
+	return pr.CgroupFS, nil
+}
+
+func (pr Providers) EnsureProcess() ProcessProbe {
+	if pr.Process == nil {
+		return hostProcess{}
+	}
+	return pr.Process
 }
 
 func (pr Providers) EnsureCPUInfo() CPUInfoProvider {
@@ -318,6 +350,9 @@ type Config struct {
 	AllowFractionalCapacityRequests bool
 	// TaintDegradedPartitions is driverconfig.Config.TaintDegradedPartitions.
 	TaintDegradedPartitions bool
+	// CgroupThreadedMode is driverconfig.Config.CgroupThreadedMode. Under create
+	// and place New checks the privileges the mode needs.
+	CgroupThreadedMode string
 	// ClassKinds is admission.ClassKinds of the whole configuration, every
 	// profile included, so that Prepare judges a claim as it is judged on any
 	// node.
@@ -380,6 +415,11 @@ func New(logger logr.Logger, providers Providers, config *Config) (*CPUDriver, e
 	}
 	if config.AssumeUnsolicitedUpdatesSafe {
 		plugin.reconcileTrigger = make(chan struct{}, 1)
+	}
+	if threadedModeOn(config.CgroupThreadedMode) {
+		if err := plugin.setUpThreadedMode(logger, providers, config.CgroupThreadedMode); err != nil {
+			return nil, err
+		}
 	}
 	if config.SelectProfile != nil {
 		plugin.window = newUnconfiguredWindow()
