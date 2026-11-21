@@ -118,6 +118,7 @@ func main() {
 	})
 	if err != nil {
 		logger.Error(err, "failed to load configuration")
+		writeTerminationMessage(logger, err)
 		os.Exit(1)
 	}
 
@@ -129,9 +130,18 @@ func main() {
 func runDriver(logger logr.Logger, cfg driverconfig.Config) error {
 	if err := run(logger, cfg); err != nil {
 		logger.Error(err, "failed to run")
+		writeTerminationMessage(logger, err)
 		return err
 	}
 	return nil
+}
+
+// writeTerminationMessage leaves the reason for the exit where kubectl describe
+// pod shows it, under the container's last state.
+func writeTerminationMessage(logger logr.Logger, err error) {
+	if werr := shutdown.WriteTerminationMessage(shutdown.TerminationMessagePath, err.Error()); werr != nil {
+		logger.Info("termination message not written", "err", werr)
+	}
 }
 
 func run(logger logr.Logger, cfg driverconfig.Config) error {
