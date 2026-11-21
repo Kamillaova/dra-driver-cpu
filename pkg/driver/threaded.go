@@ -348,20 +348,103 @@ func (cp *CPUDriver) buildTree(ctr *api.Container, uids []types.UID) (string, er
 	if root == "" {
 		return "", cp.initOutside(ctr.GetName(), pid, dir)
 	}
-	groups, err := cp.threadedGroupsOf(uids)
+	groups, err := cp.buildableGroups(ctr.GetName(), uids)
 	if err != nil {
-		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
-	}
-	for _, g := range groups {
-		if g.CPUs.IsEmpty() {
-			return "", fmt.Errorf("container %q: group %q has no CPUs left", ctr.GetName(), g.Name)
-		}
+		return "", err
 	}
 	owner, err := cp.processOwner(pid)
 	if err != nil {
 		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
 	}
 	if err := cgroupfs.Build(cp.cgroups, root, groups, owner); err != nil {
+		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
+	}
+	return root, nil
+}
+
+// buildableGroups returns the groups the threaded claims among uids build,
+// refusing a group left no CPU.
+func (cp *CPUDriver) buildableGroups(container string, uids []types.UID) ([]cgroupfs.Group, error) {
+	groups, err := cp.threadedGroupsOf(uids)
+	if err != nil {
+		return nil, fmt.Errorf("container %q: %w", container, err)
+	}
+	for _, g := range groups {
+		if g.CPUs.IsEmpty() {
+			return nil, fmt.Errorf("container %q: group %q has no CPUs left", container, g.Name)
+		}
+	}
+	return groups, nil
+}
+
+// threadedRepair is a running container whose threaded groups Synchronize
+// repairs once it has bound the container's claims.
+type threadedRepair struct {
+	sc   *syncContainer
+	uids []types.UID
+}
+
+// repairThreadedTrees finds and repairs the groups of each running threaded
+// container Synchronize listed. A repair that fails is logged and counted and
+// fails nothing: NRI closes a plugin whose Synchronize fails. Callers hold
+// stateMu.
+func (cp *CPUDriver) repairThreadedTrees(repairs []threadedRepair) {
+	if !threadedModeOn(cp.cgroupThreadedMode) {
+		return
+	}
+	for _, r := range repairs {
+		root, err := cp.repairTree(r.sc.container, r.uids)
+		if err != nil {
+			r.sc.logger.Error(err, "the container keeps its threaded groups as they are until the driver synchronizes again")
+			cp.metrics.RecordThreadedContainer(cp.cgroupThreadedMode, cpumetrics.ResultRepairError)
+			continue
+		}
+		cp.podState.SetThreadRoot(r.sc.owner.PodUID, r.sc.container.GetName(), types.UID(r.sc.container.GetId()), root)
+		r.sc.logger.V(2).Info("repaired the container's threaded groups", "threadRoot", root)
+	}
+}
+
+// repairTree finds a running container's thread root, the cgroup of its
+// cgroup's subtree that the kernel marks as one and that holds one of its
+// groups, since the process may have left it for a group. It makes the groups
+// that are missing, sets every group again and hands the files of the groups
+// it made to the user the process runs as now. Where it finds none, the
+// container started while the driver missed it, and the groups are built
+// where its init is, as StartContainer builds them; no process is moved.
+func (cp *CPUDriver) repairTree(ctr *api.Container, uids []types.UID) (string, error) {
+	dir, err := cgroupfs.Dir(ctr.GetLinux().GetCgroupsPath())
+	if err != nil {
+		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
+	}
+	var names []string
+	for _, uid := range uids {
+		if record, ok := cp.allocationState.GetClaimRecord(uid); ok && record.Layout != nil {
+			names = append(names, recordGroups(record)...)
+		}
+	}
+	root, err := cgroupfs.FindThreadRoot(cp.cgroups, dir, names)
+	if err != nil {
+		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
+	}
+	if root == "" {
+		return cp.buildTree(ctr, uids)
+	}
+	groups, err := cp.buildableGroups(ctr.GetName(), uids)
+	if err != nil {
+		return "", err
+	}
+	made, err := cgroupfs.Repair(cp.cgroups, root, groups)
+	if err != nil {
+		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
+	}
+	if len(made) == 0 {
+		return root, nil
+	}
+	owner, err := cp.processOwner(int(ctr.GetPid()))
+	if err != nil {
+		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
+	}
+	if err := cgroupfs.HandOver(cp.cgroups, root, made, owner); err != nil {
 		return "", fmt.Errorf("container %q: %w", ctr.GetName(), err)
 	}
 	return root, nil
