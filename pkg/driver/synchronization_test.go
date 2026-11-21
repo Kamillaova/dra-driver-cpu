@@ -692,6 +692,43 @@ func TestSynchronizeClaimNamedByTwoContainers(t *testing.T) {
 	}
 }
 
+// A created container the kubelet never started can share its name with the
+// running one created again after it. Synchronize keeps the running one's
+// state in either list order, so that its CPU updates reach it.
+func TestSynchronizeKeepsTheRunningOneOfTwoNamesakes(t *testing.T) {
+	pod := &api.PodSandbox{Id: "pod", Uid: "pod-uid"}
+	for _, tc := range []struct {
+		name     string
+		env      []string
+		wantCPUs string
+	}{
+		{name: "a container without claims", wantCPUs: "1-3"},
+		{name: "a container holding a claim", env: []string{"DRA_CPUSET_a=0"}, wantCPUs: "0"},
+	} {
+		for _, reversed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/reversed=%v", tc.name, reversed), func(t *testing.T) {
+				d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
+				d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)})
+				d.seedAllocationStoreFromDisk(testr.New(t))
+				containers := []*api.Container{
+					{Id: "orphan", Name: "app", PodSandboxId: pod.Id, Env: tc.env, State: api.ContainerState_CONTAINER_CREATED},
+					{Id: "retry", Name: "app", PodSandboxId: pod.Id, Env: tc.env, State: api.ContainerState_CONTAINER_RUNNING},
+				}
+				if reversed {
+					slices.Reverse(containers)
+				}
+
+				updates, err := d.Synchronize(t.Context(), []*api.PodSandbox{pod}, containers)
+				require.NoError(t, err)
+				state := d.podState.GetContainerState("pod-uid", "app")
+				require.NotNil(t, state)
+				require.True(t, state.MatchesContainer("app", "retry"), "the running container's state is kept")
+				require.Equal(t, tc.wantCPUs, cpusByContainer(updates)["retry"])
+			})
+		}
+	}
+}
+
 func TestSynchronizeBindsClaimOnceUncontested(t *testing.T) {
 	d, _ := newMetricsTestDriverWithCPUInfos(t, mockCPUInfos_SingleSocket_4CPUS_HT)
 	d.cdiMgr = newMockCdiMgrWithAllocations(map[types.UID]cpuset.CPUSet{"a": cpuset.New(0)})

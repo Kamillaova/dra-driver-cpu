@@ -230,6 +230,7 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 	var noSharedCPUs []string
 	var kept []cpumetrics.Rule
 	var warnings []olderRuleWarning
+	running := sets.New[store.OwnerIdent]()
 	for _, sc := range listed {
 		if uid, hold, held := cp.heldClaimOf(sc.claims); held {
 			if hasTask(sc.container) {
@@ -310,6 +311,16 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 				convergeCap(sc, members, guaranteedUpdate)
 			}
 			containerUpdates = append(containerUpdates, guaranteedUpdate)
+		}
+		// PodState holds one container per name, and a created container that
+		// is never started can share its name with the running one created
+		// again after it.
+		if !hasTask(sc.container) && running.Has(sc.owner) {
+			sc.logger.V(2).Info("keeping the state of the running container of this name")
+			continue
+		}
+		if hasTask(sc.container) {
+			running.Insert(sc.owner)
 		}
 		podState.SetContainerState(sc.owner.PodUID, state)
 		sc.logger.V(6).Info("set container state", "claims", len(claimUIDs))
