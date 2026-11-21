@@ -46,6 +46,7 @@ jobs:
               should replace the amount with a written limit as the cap
               should run a share whose limit is max uncapped
               should cap a share of 0 at its written limit
+              should prepare a claim whose parameters write a limit as 1.0, and keep them as sent
               should refuse a container holding a second capped share
               should give a flagged request CPUs of its own and move the other containers off them until it is deleted
               should refuse a flagged request on a node whose default partition does not allow it
@@ -75,6 +76,7 @@ jobs:
               should replace the amount with a written limit as the cap
               should run a share whose limit is max uncapped
               should cap a share of 0 at its written limit
+              should prepare a claim whose parameters write a limit as 1.0, and keep them as sent
               should refuse a container holding a second capped share
               should give a flagged request CPUs of its own and move the other containers off them until it is deleted
               should refuse a flagged request on a node whose default partition does not allow it
