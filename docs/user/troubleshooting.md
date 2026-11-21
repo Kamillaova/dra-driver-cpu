@@ -240,6 +240,54 @@ claims the message names: once the last such claim is unprepared, the condition 
 reason `PartitionsVerified`, or stays `True` with `SiblingThreadsOnline` where a partition's `smt`
 is still contradicted, and the driver pod is ready again.
 
+## A Node Missing Its Kubelet CPU Reservation
+
+On a node whose partitions keep CPUs from pods without claims, the kubelet must reserve those CPUs
+through `kubeReserved` or `systemReserved`, or the scheduler and the kubelet admit pods without
+claims against CPUs they never run on. The driver counts every online CPU outside the `default`
+partition: every thread of the cores its `exclusive` and `reserved` partitions name, every CPU of a
+named partition of role `default`, and every thread a partition's `smt` expects offline that is
+online. It compares that count with what the kubelet reserves, the Node's CPU capacity minus its
+allocatable CPU. Where the count is 0, on a node without `cpuPartitions` or whose partitions keep no
+CPU from those pods, the driver checks nothing and keeps no condition for it.
+
+Where the kubelet reserves less, the node is degraded: the driver publishes no devices, refuses to
+prepare every claim, so pods holding claims stay `Pending` with a `FailedPrepareDynamicResources`
+event naming the reservation, and its pod is not ready, so a rolling update stops at the first such
+node. It still unprepares claims, and running containers keep their CPUs. The driver reports it in
+the condition `CPUReservationMissing` on its Node:
+
+```bash
+kubectl get node <node> -o jsonpath='{.status.conditions[?(@.type=="CPUReservationMissing")]}'
+```
+
+- `True`, reason `InsufficientCPUReservation`: the message gives the reservation to set.
+  `dra_cpu_node_reservation_ok` is `0`.
+- `False`, reason `SufficientCPUReservation`: the message gives what the kubelet reserves and the
+  count.
+- `Unknown`, reason `DriverStopped`: the driver has stopped and checks nothing.
+
+A node degrades when the driver's partitions are installed before the kubelet reserves their CPUs,
+when its partitions grow without the reservation, when the kubelet's configuration loses it, or when
+the boot configuration brings more of a partition's CPUs online. Drain the node, set the reservation
+the message gives and restart the kubelet: the driver reads the Node again when the kubelet updates
+it, publishes its devices and turns the condition `False`. Without `list` and `watch` on nodes the
+driver sees the change only when it restarts.
+
+Where the count includes threads a partition's `smt` expects offline, the message names them and
+gives as the reservation to set the count without them, to be set together with taking them offline
+at boot. Once they are offline the kubelet counts them in neither its capacity nor what it reserves,
+so reserving them too would take as many CPUs from the pods without claims; where they are all the
+default partition has, nothing would be left to them. Where the kubelet already reserves the count
+without them and they are still online, the message only asks to take them offline at boot.
+
+An alert on the condition needs a `for:` longer than a driver restart, during which the condition
+is `Unknown`.
+
+If the Node object is deleted and the kubelet registers it again within 40 seconds, the running
+driver's ResourceSlices still name the old Node, and the garbage collector removes each one the
+driver publishes. Delete the driver pod on that node.
+
 ## Integration With Bug Reports
 
 1. Run `dracpu gatherinfo` on the affected node.
