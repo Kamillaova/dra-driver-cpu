@@ -32,6 +32,11 @@ const testDriverName = "dra.cpu"
 
 func TestClassKinds(t *testing.T) {
 	owned := func(why string) Kind { return Kind{Owned: true, Exclusive: "exclusive request (" + why + ")"} }
+	ownedClass := func(class string) Kind {
+		kind := owned("class " + class)
+		kind.OwnedClass = class
+		return kind
+	}
 	shared := Kind{Shared: true}
 	for _, tc := range []struct {
 		name string
@@ -48,7 +53,7 @@ func TestClassKinds(t *testing.T) {
 			{Name: "infra", Role: device.PARTITION_ROLE_DEFAULT},
 			{Name: "system", Role: device.PARTITION_ROLE_RESERVED},
 		}},
-		want: map[string]Kind{"dra.cpu": shared, "dra.cpu.vms": owned("class dra.cpu.vms"), "dra.cpu.infra": shared},
+		want: map[string]Kind{"dra.cpu": shared, "dra.cpu.vms": ownedClass("dra.cpu.vms"), "dra.cpu.infra": shared},
 	}, {
 		name: "every profile's partitions",
 		cfg: driverconfig.Config{Profiles: map[string]driverconfig.Profile{
@@ -56,7 +61,7 @@ func TestClassKinds(t *testing.T) {
 			"spdk":  {CPUPartitions: []driverconfig.CPUPartition{{Name: "default"}, {Name: "spdk", Role: device.PARTITION_ROLE_EXCLUSIVE}}},
 			"plain": {CPUPartitions: []driverconfig.CPUPartition{{Name: "default"}}},
 		}},
-		want: map[string]Kind{"dra.cpu": shared, "dra.cpu.vms": owned("class dra.cpu.vms"), "dra.cpu.spdk": owned("class dra.cpu.spdk")},
+		want: map[string]Kind{"dra.cpu": shared, "dra.cpu.vms": ownedClass("dra.cpu.vms"), "dra.cpu.spdk": ownedClass("dra.cpu.spdk")},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Equal(t, tc.want, ClassKinds(testDriverName, tc.cfg))
@@ -72,6 +77,20 @@ var fleetKinds = ClassKinds(testDriverName, driverconfig.Config{CPUPartitions: [
 }})
 
 var plainKinds = ClassKinds(testDriverName, driverconfig.Config{})
+
+// onNode is kinds as a node judges a claim, naming itself.
+func onNode(kinds map[string]Kind, node string) map[string]Kind {
+	named := make(map[string]Kind, len(kinds))
+	for class, kind := range kinds {
+		kind.Node = node
+		named[class] = kind
+	}
+	return named
+}
+
+func exclusive(value string) string {
+	return `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": ` + value + `}}`
+}
 
 func byClass(kinds map[string]Kind) func(ref, class string) (Kind, bool) {
 	return func(_, class string) (Kind, bool) {
@@ -335,6 +354,72 @@ func TestCheckClaim(t *testing.T) {
 		name:     "another driver's entry is not judged",
 		requests: cpus("250m"),
 		entries:  []testEntry{{driver: "gpu.example.com", params: `{"limit": 0}`}},
+	}, {
+		name:     "two entries giving a request different cpuConfig.exclusive",
+		requests: cpus("2"),
+		entries:  []testEntry{{requests: []string{"cpus"}, params: exclusive(`true`)}, {requests: []string{"cpus"}, params: exclusive(`false`)}},
+		wantErr:  `request "cpus": cpuConfig.exclusive set by two config entries (#0 and #1); set it in one entry`,
+	}, {
+		name:     "two entries giving a request the same cpuConfig.exclusive",
+		requests: cpus("2"),
+		entries:  []testEntry{{requests: []string{"cpus"}, params: exclusive(`true`)}, {params: exclusive(`true`)}},
+		wantErr:  `request "cpus": cpuConfig.exclusive set by two config entries (#0 and #1); set it in one entry`,
+	}, {
+		name:     "a parent entry and an alternative's entry giving one alternative cpuConfig.exclusive",
+		requests: []testRequest{{name: "cpus", alternatives: []testRequest{{name: "two", class: "dra.cpu", amount: "2"}, {name: "one", class: "dra.cpu", amount: "1"}}}},
+		entries:  []testEntry{{requests: []string{"cpus/two"}, params: exclusive(`false`)}, {requests: []string{"cpus"}, params: exclusive(`true`)}},
+		wantErr:  `subrequest "cpus/two": cpuConfig.exclusive set by two config entries (#0 and #1); set it in one entry`,
+	}, {
+		name:     "a numeric limit with the flag",
+		requests: cpus("2"),
+		entries:  []testEntry{{requests: []string{"cpus"}, params: `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": true, "limit": "2"}}`}},
+		wantErr:  "request \"cpus\": limit 2 on exclusive request (`cpuConfig.exclusive: true`); only `limit: max` is allowed",
+	}, {
+		name:     "limit max with the flag",
+		requests: cpus("2"),
+		entries:  []testEntry{{requests: []string{"cpus"}, params: `{"apiVersion": "v1alpha1", "cpuConfig": {"exclusive": true, "limit": "max"}}`}},
+	}, {
+		name:     "the flag's amount is no cap on several devices",
+		requests: []testRequest{{name: "cpus", class: "dra.cpu", amount: "1", count: 2}},
+		entries:  []testEntry{{params: exclusive(`true`)}},
+	}, {
+		name:     "the flag's amount is no cap beside another request",
+		requests: []testRequest{{name: "cpus", class: "dra.cpu", amount: "2"}, {name: "vcpu", class: "dra.cpu.vms", amount: "2"}},
+		entries:  []testEntry{{requests: []string{"cpus"}, params: exclusive(`true`)}},
+	}, {
+		name:     "a capped share beside a flagged request",
+		requests: []testRequest{{name: "cpus", class: "dra.cpu", amount: "2"}, {name: "vmm-cpu", class: "dra.cpu", amount: "250m"}},
+		entries:  []testEntry{{requests: []string{"cpus"}, params: exclusive(`true`)}},
+		wantErr:  `request "vmm-cpu" has limit of 250m, so it cannot be used together with request "cpus": remove the limit`,
+	}, {
+		name:     "exclusive false on a shared class",
+		requests: cpus("500m"),
+		entries:  []testEntry{{params: exclusive(`false`)}},
+	}, {
+		name:     "exclusive true on an exclusive class has no effect",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}},
+		entries:  []testEntry{{params: exclusive(`true`)}},
+	}, {
+		name:     "exclusive false on a named exclusive partition's class",
+		requests: []testRequest{{name: "vcpu", class: "dra.cpu.vms", amount: "2"}},
+		entries:  []testEntry{{requests: []string{"vcpu"}, params: exclusive(`false`)}},
+		wantErr:  "request \"vcpu\": `cpuConfig.exclusive: false`, but class dra.cpu.vms gives exclusive CPUs only; drop cpuConfig.exclusive, or use a shared class such as dra.cpu",
+	}, {
+		name:     "exclusive false on an alternative of an exclusive class",
+		requests: []testRequest{{name: "cpus", alternatives: []testRequest{{name: "shared", class: "dra.cpu", amount: "1"}, {name: "owned", class: "dra.cpu.vms", amount: "1"}}}},
+		entries:  []testEntry{{requests: []string{"cpus"}, params: exclusive(`false`)}},
+		wantErr:  "subrequest \"cpus/owned\": `cpuConfig.exclusive: false`, but class dra.cpu.vms gives exclusive CPUs only; drop cpuConfig.exclusive, or use a shared class such as dra.cpu",
+	}, {
+		name:     "exclusive false on a node without partitions",
+		kinds:    onNode(plainKinds, "worker-1"),
+		requests: cpus("500m"),
+		entries:  []testEntry{{requests: []string{"cpus"}, params: exclusive(`false`)}},
+		wantErr:  "request \"cpus\": `cpuConfig.exclusive: false`, but node \"worker-1\" runs without partitions, where dra.cpu gives exclusive CPUs only; add `- name: default` to cpuPartitions, or drop cpuConfig.exclusive",
+	}, {
+		name:     "exclusive true on a node without partitions",
+		kinds:    onNode(plainKinds, "worker-1"),
+		requests: cpus("2"),
+		entries:  []testEntry{{params: exclusive(`true`)}},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			kinds := tc.kinds

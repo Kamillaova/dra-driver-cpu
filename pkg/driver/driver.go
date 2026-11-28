@@ -260,6 +260,8 @@ type deviceTopology struct {
 	// sharedDevices is the CPUs of each published device whose CPUs its
 	// claims share, by device name.
 	sharedDevices map[string]cpuset.CPUSet
+	// sharedPartitions is the partition of each device in sharedDevices.
+	sharedPartitions map[string]device.Partition
 	// degradedDevices is the partition of each device of a partition whose
 	// smt the kernel contradicts, published tainted or withheld, by device
 	// name.
@@ -526,12 +528,14 @@ func (cp *CPUDriver) configure(logger logr.Logger, providers Providers, config *
 	}
 	cp.allowFractionalCapacityRequests = config.AllowFractionalCapacityRequests
 	cp.topology.sharedDevices = make(map[string]cpuset.CPUSet, len(result.Shared))
+	cp.topology.sharedPartitions = make(map[string]device.Partition, len(result.Shared))
 	for name := range result.Shared {
 		cpus, ok := result.Mapping.NameToCPUs[name]
 		if !ok {
 			cpus = result.DevicePartitions[name].CPUs
 		}
 		cp.topology.sharedDevices[name] = cpus
+		cp.topology.sharedPartitions[name] = result.DevicePartitions[name]
 	}
 	cp.allocationState.SetSharedDevices(cp.topology.sharedDevices)
 	cp.topology.degradedDevices = make(map[string]string, len(result.WithheldDevices))

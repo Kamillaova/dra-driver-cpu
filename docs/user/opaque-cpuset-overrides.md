@@ -40,15 +40,41 @@ The Kubelet driver parses this configuration at prepare time from the claim's al
 
 The `opaque.parameters` field must conform to the following schema:
 
-| Field              | Type             | Description                                                                                                                                                                        |
-| :----------------- | :--------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apiVersion`       | string           | Must be set to `v1alpha1`.                                                                                                                                                         |
-| `cpuConfig`        | object           | Container object for CPU configurations.                                                                                                                                           |
-| `cpuConfig.cpuset` | string           | Specifies the list of CPU cores in standard Linux cpuset format (e.g. `"2-5"`, `"0,4-6"`).                                                                                         |
-| `cpuConfig.limit`  | number or string | The CPU limit of a shared request: a quantity above zero, such as `500m` or `2`, or `max` for none. See [Capped Shared Requests](workload-requirements.md#capped-shared-requests). |
+| Field                 | Type             | Description                                                                                                                                                                                                                                                                                                    |
+| :-------------------- | :--------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apiVersion`          | string           | Must be set to `v1alpha1`.                                                                                                                                                                                                                                                                                     |
+| `cpuConfig`           | object           | Container object for CPU configurations.                                                                                                                                                                                                                                                                       |
+| `cpuConfig.cpuset`    | string           | Specifies the list of CPU cores in standard Linux cpuset format (e.g. `"2-5"`, `"0,4-6"`).                                                                                                                                                                                                                     |
+| `cpuConfig.limit`     | number or string | The CPU limit of a shared request: a quantity above zero, such as `500m` or `2`, or `max` for none. See [Capped Shared Requests](workload-requirements.md#capped-shared-requests).                                                                                                                             |
+| `cpuConfig.exclusive` | bool             | `true` takes CPUs of the request's own out of a shared device whose partition sets `allowExclusive`. Left out, a request is a share on a node with `cpuPartitions` and exclusive on one without. See [Exclusive requests on a default partition](cpu-partitions.md#exclusive-requests-on-a-default-partition). |
 
 A `cpuset` on a shared request, one on the `dra.cpu` class of a node with `cpuPartitions`, is
 undefined behavior.
+
+On a node with `cpuPartitions` the default allocator is the only one, and it takes no `cpuset`: a
+`cpuset` on a request that holds exclusive CPUs is refused when the claim is prepared, with
+
+```text
+request "vcpu": cpuConfig.cpuset is not supported with cpuPartitions; the default allocator chooses the CPUs itself
+```
+
+`exclusive: false` asks for a share, and where the request's devices are owned there is none to
+give, so the claim is refused when it is prepared: on a node without `cpuPartitions`, whose
+`dra.cpu` devices are all owned, with
+
+```text
+request "cpus": `cpuConfig.exclusive: false`, but node "worker-a" runs without partitions, where dra.cpu gives exclusive CPUs only; add `- name: default` to cpuPartitions, or drop cpuConfig.exclusive
+```
+
+and on an `exclusive` partition's class, owned on every node, with
+
+```text
+request "vcpu": `cpuConfig.exclusive: false`, but class dra.cpu.vms gives exclusive CPUs only; drop cpuConfig.exclusive, or use a shared class such as dra.cpu
+```
+
+`exclusive: true` there changes nothing: those CPUs are exclusive already. Two config entries that
+give one request `exclusive`, with the same value or not, and an `exclusive` from a DeviceClass are
+refused as a `limit` is.
 
 A `limit` is checked when the claim is prepared, and the claim is refused where:
 

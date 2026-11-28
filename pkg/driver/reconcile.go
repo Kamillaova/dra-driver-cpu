@@ -102,5 +102,10 @@ func (cp *CPUDriver) sharedContainerUpdates(logger logr.Logger) ([]*api.Containe
 		logger.Error(err, "leaving containers without claims on their current CPUs")
 		return nil, false
 	}
-	return updates, true
+	holderUpdates, err := shareHolderUpdatesFor(logger, cp.allocationState, cp.podState, types.UID(""))
+	if err != nil {
+		logger.Error(err, "leaving the containers without claims and those holding shares on their current CPUs")
+		return nil, false
+	}
+	return append(updates, holderUpdates...), true
 }

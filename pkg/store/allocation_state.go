@@ -353,9 +353,10 @@ func NewAllocationState(cpuTopology *cpuinfo.CPUTopology, reservedCPUs cpuset.CP
 // Its CPUs remain unavailable to shared containers and other exclusive claims
 // until Unprepare. While containers without claims run, it refuses a
 // reservation that takes the last of the CPUs they run on, GetClaimlessCPUs,
-// because NRI cannot represent an empty CPUSet; one that takes none of those
-// CPUs is never refused for it.
-func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, record ClaimRecord, hasSharedContainers bool) error {
+// and so for each running container of holders, given by the requests it
+// uses, because NRI cannot represent an empty CPUSet; one that takes none of
+// those CPUs is never refused for it.
+func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, record ClaimRecord, hasSharedContainers bool, holders ...[]ClaimRequestRef) error {
 	logger = logger.WithValues("claimUID", claimUID)
 	reserved := newClaimAllocation(record)
 	cpus := reserved.cpus
@@ -372,7 +373,8 @@ func (s *AllocationState) Reserve(logger logr.Logger, claimUID types.UID, record
 		return AssignmentOverlapError{ClaimUID: claimUID, CPUs: cpus, Holders: s.holdersLocked(cpus)}
 	}
 	claimless := s.claimlessCPUsLocked()
-	if hasSharedContainers && !cpus.Intersection(claimless).IsEmpty() && claimless.Difference(cpus).IsEmpty() {
+	if hasSharedContainers && !cpus.Intersection(claimless).IsEmpty() && claimless.Difference(cpus).IsEmpty() ||
+		s.lastCPUsOfAHolderLocked(cpus, holders) {
 		return fmt.Errorf("claim %q would exhaust the shared CPU pool while shared containers are running", claimUID)
 	}
 	s.resourceClaimAllocations[claimUID] = reserved
@@ -640,10 +642,26 @@ func (s *AllocationState) GetClaimRecord(claimUID types.UID) (ClaimRecord, bool)
 	return allocation.record(), true
 }
 
+// lastCPUsOfAHolderLocked reports whether cpus are every CPU one of holders
+// runs on.
+func (s *AllocationState) lastCPUsOfAHolderLocked(cpus cpuset.CPUSet, holders [][]ClaimRequestRef) bool {
+	for _, refs := range holders {
+		held, err := s.requestAllocationUnionLocked(refs)
+		if err == nil && !cpus.Intersection(held).IsEmpty() && held.Difference(cpus).IsEmpty() {
+			return true
+		}
+	}
+	return false
+}
+
 // GetRequestAllocationUnion returns the CPUs the referenced requests were given together.
 func (s *AllocationState) GetRequestAllocationUnion(refs ...ClaimRequestRef) (cpuset.CPUSet, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.requestAllocationUnionLocked(refs)
+}
+
+func (s *AllocationState) requestAllocationUnionLocked(refs []ClaimRequestRef) (cpuset.CPUSet, error) {
 	union := cpuset.New()
 	for _, ref := range refs {
 		allocation, ok := s.resourceClaimAllocations[ref.ClaimUID]

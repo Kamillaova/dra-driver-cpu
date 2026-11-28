@@ -88,7 +88,8 @@ The scheduler and kubelet are unaware of claim CPUs, so you MUST configure your 
   ```
 
 On a node with `cpuPartitions`, either option counts only the amounts booked on the `default`
-partition, the amounts of the claim's shared requests on the `dra.cpu` class. Never count CPUs a claim
+partition, the amounts of the claim's shared requests on the `dra.cpu` class and of its requests
+there with `cpuConfig.exclusive: true`. Never count CPUs a claim
 holds on an exclusive partition, nor an amount booked on a named partition of role `default`: no
 container without claims runs there, so those CPUs are not the node's to give to pods.
 
