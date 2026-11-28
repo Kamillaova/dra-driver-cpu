@@ -73,22 +73,28 @@ type ToolVersion struct {
 // Future version of `gatherinfo` will just expose the serialized most recent version driverconfig data.
 // See the driverconfig API for details.
 type DriverConfig struct {
-	Kubeconfig                            string         `json:"kubeconfig,omitempty"`
-	HostnameOverride                      string         `json:"hostnameOverride,omitempty"`
-	BindAddress                           string         `json:"bindAddress,omitempty"`
-	ReservedCPUs                          string         `json:"reservedCPUs,omitempty"`
-	CPUDeviceMode                         string         `json:"cpuDeviceMode,omitempty"`
-	GroupBy                               string         `json:"groupBy,omitempty"`
-	ExposePCIeRoots                       bool           `json:"exposePCIeRoots,omitempty"`
-	SysFSOverlay                          string         `json:"sysfsOverlay,omitempty"`
-	KubeletRootDir                        string         `json:"kubeletRootDir,omitempty"`
-	PublishNodeAllocatableResourceMapping bool           `json:"publishNodeAllocatableResourceMapping,omitempty"`
-	Allocator                             string         `json:"allocator,omitempty"`
-	QPS                                   float32        `json:"qps,omitempty"`
-	Burst                                 int            `json:"burst,omitempty"`
-	FullPhysicalCPUsOnly                  bool           `json:"fullPhysicalCPUsOnly,omitempty"`
-	AssumeUnsolicitedUpdatesSafe          bool           `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
-	CPUPartitions                         []CPUPartition `json:"cpuPartitions,omitempty"`
+	Kubeconfig                            string             `json:"kubeconfig,omitempty"`
+	HostnameOverride                      string             `json:"hostnameOverride,omitempty"`
+	BindAddress                           string             `json:"bindAddress,omitempty"`
+	ReservedCPUs                          string             `json:"reservedCPUs,omitempty"`
+	CPUDeviceMode                         string             `json:"cpuDeviceMode,omitempty"`
+	GroupBy                               string             `json:"groupBy,omitempty"`
+	ExposePCIeRoots                       bool               `json:"exposePCIeRoots,omitempty"`
+	SysFSOverlay                          string             `json:"sysfsOverlay,omitempty"`
+	KubeletRootDir                        string             `json:"kubeletRootDir,omitempty"`
+	PublishNodeAllocatableResourceMapping bool               `json:"publishNodeAllocatableResourceMapping,omitempty"`
+	Allocator                             string             `json:"allocator,omitempty"`
+	QPS                                   float32            `json:"qps,omitempty"`
+	Burst                                 int                `json:"burst,omitempty"`
+	FullPhysicalCPUsOnly                  bool               `json:"fullPhysicalCPUsOnly,omitempty"`
+	AssumeUnsolicitedUpdatesSafe          bool               `json:"assumeUnsolicitedUpdatesSafe,omitempty"`
+	CPUPartitions                         []CPUPartition     `json:"cpuPartitions,omitempty"`
+	Profiles                              map[string]Profile `json:"profiles,omitempty"`
+}
+
+// Profile is one profiles entry as configured, by the profile's name.
+type Profile struct {
+	CPUPartitions []CPUPartition `json:"cpuPartitions,omitempty"`
 }
 
 // CPUPartition is one cpuPartitions entry as configured.

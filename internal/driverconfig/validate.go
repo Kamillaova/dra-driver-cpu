@@ -36,7 +36,7 @@ var groupings = []string{
 }
 
 // Validate checks that enum fields hold recognised values, that cpuPartitions
-// is well formed, that kubeletRootDir is non-empty and absolute, and that qps
+// and every profile are well formed, that kubeletRootDir is non-empty and absolute, and that qps
 // and burst are positive. The root is required rather than optional because the hostPath
 // mounts render from the same value.
 // Config files bypass the flag.Value validators, so Resolve calls this after merging.
@@ -51,17 +51,6 @@ func (c Config) Validate() error {
 	if c.Allocator != cpuallocator.ModeExternal && c.Allocator != cpuallocator.ModeCPUManager {
 		return fmt.Errorf("invalid allocator %q: must be %q or %q",
 			c.Allocator, cpuallocator.ModeExternal, cpuallocator.ModeCPUManager)
-	}
-	if err := c.validateCPUPartitions(); err != nil {
-		return err
-	}
-	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED && c.GroupBy == device.GROUP_BY_MACHINE && c.Allocator != cpuallocator.ModeExternal {
-		return fmt.Errorf("invalid allocator %q with groupBy %q: must be %q", c.Allocator, device.GROUP_BY_MACHINE, cpuallocator.ModeExternal)
-	}
-	// In individual mode the scheduler, not the driver, picks every CPU a claim gets.
-	if c.FullPhysicalCPUsOnly && c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
-		return fmt.Errorf("invalid fullPhysicalCPUsOnly with cpuDeviceMode %q: requires cpuDeviceMode %q",
-			c.CPUDeviceMode, device.CPU_DEVICE_MODE_GROUPED)
 	}
 	// The kubelet root becomes socket and mount locations, so a relative path
 	// would resolve against the working directory and silently break
@@ -87,6 +76,22 @@ func (c Config) Validate() error {
 	}
 	if c.Burst < 1 {
 		return fmt.Errorf("invalid burst %d: must be at least 1", c.Burst)
+	}
+	// Checked after the fields no profile carries: validateProfiles validates
+	// each profile whole and would report them under a profile's name.
+	if err := c.validateCPUPartitions(); err != nil {
+		return err
+	}
+	if err := c.validateProfiles(); err != nil {
+		return err
+	}
+	if c.CPUDeviceMode == device.CPU_DEVICE_MODE_GROUPED && c.GroupBy == device.GROUP_BY_MACHINE && c.Allocator != cpuallocator.ModeExternal {
+		return fmt.Errorf("invalid allocator %q with groupBy %q: must be %q", c.Allocator, device.GROUP_BY_MACHINE, cpuallocator.ModeExternal)
+	}
+	// In individual mode the scheduler, not the driver, picks every CPU a claim gets.
+	if c.FullPhysicalCPUsOnly && c.CPUDeviceMode != device.CPU_DEVICE_MODE_GROUPED {
+		return fmt.Errorf("invalid fullPhysicalCPUsOnly with cpuDeviceMode %q: requires cpuDeviceMode %q",
+			c.CPUDeviceMode, device.CPU_DEVICE_MODE_GROUPED)
 	}
 	return nil
 }
