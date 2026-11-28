@@ -176,14 +176,44 @@ The CPUs of each request, its CPU request and its CPU limit are in the request's
 
 ### Capped Shared Requests
 
-A shared request with an amount above `0` is capped at that amount: the driver writes the
-container's CPU quota (`cpu.max`) as that share of each 100 ms period, `250m` as 25 ms, and an
-amount below `10m` as 1 ms, the kernel's minimum. A shared request without an amount, or with an
-amount of `0`, is not capped. The cap needs a kernel built with `CONFIG_CFS_BANDWIDTH`, see
-[Installation](installation.md).
+A shared request is capped at its limit: the `limit` its claim writes in `cpuConfig`, or, where it
+writes none, its amount, so an amount above `0` alone is the request's limit. `limit: max` removes
+it. The driver writes the container's CPU quota (`cpu.max`) as that share of each 100 ms period,
+`250m` as 25 ms, and a limit below `10m` as 1 ms, the kernel's minimum. A shared request without a
+limit and without an amount, or with an amount of `0`, is not capped. The cap needs a kernel built
+with `CONFIG_CFS_BANDWIDTH`, see [Installation](installation.md).
 
 A container capped this way shows the cap in its status as a CPU limit, `limits.cpu` in
 `status.containerStatuses[].resources`, though its spec sets none.
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: vmm
+spec:
+  spec:
+    devices:
+      requests:
+      - name: vmm-cpu
+        exactly:
+          deviceClassName: dra.cpu
+          capacity:
+            requests:
+              dra.cpu/cpu: 250m # booked against the node's CPU, and the cap without a limit
+      config:
+      - requests: [vmm-cpu]
+        opaque:
+          driver: dra.cpu
+          parameters:
+            apiVersion: v1alpha1
+            cpuConfig:
+              limit: "1" # the cap; max for none
+```
+
+A limit is a quantity above `0` or `max`, at least the amount, and needs an amount, which may be `0`;
+see [the opaque parameters](opaque-cpuset-overrides.md#opaque-parameters-schema-v1alpha1) for the
+rules Prepare refuses a claim by.
 
 A cgroup has one CPU quota, so a capped request takes one device and is alone in its container's
 cgroup:

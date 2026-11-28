@@ -3074,7 +3074,7 @@ func TestOpaqueConfigAllocation(t *testing.T) {
 				}(),
 			},
 			expectedErrors: map[string]string{
-				"claim-1": "is targeted by 0 configurations, must be targeted by exactly 1",
+				"claim-1": "`allocator: external` needs one cpuConfig.cpuset entry for this request",
 			},
 		},
 		{

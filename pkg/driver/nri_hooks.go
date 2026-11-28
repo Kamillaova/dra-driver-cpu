@@ -735,10 +735,10 @@ type cappedBesideError struct {
 
 func (err cappedBesideError) Error() string {
 	if err.other.capMilli > 0 {
-		return fmt.Sprintf("container %q: %s and %s both have limits, so they cannot be used together: use the claims in separate containers",
+		return fmt.Sprintf("container %q: %s and %s both have limits, so they cannot be used together: use the claims in separate containers, or remove one of the limits",
 			err.container, err.capped, err.other)
 	}
-	return fmt.Sprintf("container %q: %s has limit of %s, so it cannot be used together with %s: use the claims in separate containers",
+	return fmt.Sprintf("container %q: %s has limit of %s, so it cannot be used together with %s: use the claims in separate containers, or remove the limit",
 		err.container, err.capped, resource.NewMilliQuantity(err.capped.capMilli, resource.DecimalSI), err.other)
 }
 

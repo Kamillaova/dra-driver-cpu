@@ -78,12 +78,12 @@ their own files.
 Each device carries the attributes it publishes in its `ResourceSlice`, described in
 [Device Attributes and Selectors](device-attributes.md), and these, which exist only in the file:
 
-| Attribute                  | Type   | Description                                                                                                                                                                                                             |
-| -------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `dra.cpu/cpuset`           | string | The CPUs the request holds on this device, in cpuset list form, for a request that holds exclusive CPUs, in either device mode                                                                                          |
-| `dra.cpu/cpuRequest`       | string | The CPU amount booked for the request on this device, as a quantity such as `4` or `1500m`, when the claim consumes `dra.cpu/cpu` capacity                                                                              |
-| `dra.cpu/cpuLimit`         | string | The request's CPU limit as a quantity, or `max` where the request has none; a shared request's is its amount, `max` where it books nothing, and a request that holds exclusive CPUs has none; written with `cpuRequest` |
-| `dra.cpu/allocatedNumCPUs` | int    | **Deprecated:** use `dra.cpu/cpuRequest`. The number of CPUs allocated from the device, written for each request that holds exclusive CPUs when the claim consumes `dra.cpu/cpu` capacity                               |
+| Attribute                  | Type   | Description                                                                                                                                                                                                                                                   |
+| -------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dra.cpu/cpuset`           | string | The CPUs the request holds on this device, in cpuset list form, for a request that holds exclusive CPUs, in either device mode                                                                                                                                |
+| `dra.cpu/cpuRequest`       | string | The CPU amount booked for the request on this device, as a quantity such as `4` or `1500m`, when the claim consumes `dra.cpu/cpu` capacity                                                                                                                    |
+| `dra.cpu/cpuLimit`         | string | The request's CPU limit as a quantity, or `max` where the request has none; a shared request's is the `cpuConfig.limit` it writes, else its amount, `max` where it books nothing, and a request that holds exclusive CPUs has none; written with `cpuRequest` |
+| `dra.cpu/allocatedNumCPUs` | int    | **Deprecated:** use `dra.cpu/cpuRequest`. The number of CPUs allocated from the device, written for each request that holds exclusive CPUs when the claim consumes `dra.cpu/cpu` capacity                                                                     |
 
 `dra.cpu/cpuRequest` and `dra.cpu/cpuLimit` mirror a container's CPU request and limit.
 
@@ -92,8 +92,9 @@ node with `cpuPartitions`, holds no CPU alone, and its CPUs can move while its c
 it started with. So its file carries neither `dra.cpu/cpuset` nor `dra.cpu/allocatedNumCPUs`: a workload
 reads its current CPUs from its own CPU affinity, for example `Cpus_allowed_list` in
 `/proc/self/status`. Its `dra.cpu/cpuRequest` is the amount it booked, `0` where it books nothing, and
-its `dra.cpu/cpuLimit` is the same amount, the cap the claim asks for, `max` where it books nothing. A
-CPU limit on the container replaces that cap, see
+its `dra.cpu/cpuLimit` is the cap the claim asks for: the `cpuConfig.limit` the claim writes for it,
+such as `1` beside an amount of `250m`, `max` for `limit: max`, and else the same amount, `max` where
+it books nothing. A CPU limit on the container replaces that cap, see
 [Workload Configuration Requirements](workload-requirements.md#capped-shared-requests). Like
 every file it carries its device's attributes, so its `dra.cpu/numCPUs` is the device's CPU count, not
 the share's. A request that holds exclusive CPUs keeps `dra.cpu/allocatedNumCPUs` with upstream's

@@ -133,21 +133,21 @@ label.
 
 ## A Capped Shared Request
 
-A shared request with an amount above `0` is capped at that amount, and must take one device and be
-alone in its container's cgroup, see
+A shared request with a limit, its `cpuConfig.limit` or else an amount above `0`, is capped at it,
+and must take one device and be alone in its container's cgroup, see
 [Capped Shared Requests](workload-requirements.md#capped-shared-requests). Prepare refuses a claim
 that breaks this, and the pod's `FailedPrepareDynamicResources` event carries one of:
 
 ```text
-request "vmm-cpu" has limit of 250m with `count: 2`; a limit can be applied to only one device: ask for one device
-request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu"
+request "vmm-cpu" has limit of 250m with `count: 2`; a limit can be applied to only one device: ask for one device, or remove the limit
+request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu": remove the limit
 ```
 
 A container whose claims together put a capped request beside another request shows
 `CreateContainerError` with:
 
 ```text
-container "app": request "cpus" of claim "app-a-x7k2p" has limit of 250m, so it cannot be used together with request "cpus" of claim "app-b-q9m4t": use the claims in separate containers
+container "app": request "cpus" of claim "app-a-x7k2p" has limit of 250m, so it cannot be used together with request "cpus" of claim "app-b-q9m4t": use the claims in separate containers, or remove the limit
 ```
 
 A container the driver finds running when it starts or reconnects to the container runtime, holding
