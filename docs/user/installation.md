@@ -198,6 +198,10 @@ driver.
   the driver's connection breaks is not refused, and neither is one whose creation the driver
   does not answer within `plugin_request_timeout` (2 seconds unless set): containerd closes the
   connection and creates the container without the driver.
+- With [profiles](configuration.md#per-node-profiles) and `assumeUnsolicitedUpdatesSafe` off, the
+  driver closes its connection once at start, after it reads the node's profile, so the first
+  container created right then is not refused either. On containerd 2.4.0 and later set
+  `assumeUnsolicitedUpdatesSafe`, and the driver does not reconnect.
 
 Without either setting, the driver refuses to prepare claims while it is not connected to NRI,
 and the kubelet retries the preparation later. The kubelet prepares a pod's claims only when it

@@ -76,7 +76,7 @@ func (cp *CPUDriver) reconcileSharedContainers(logger logr.Logger) {
 		if maps.Equal(cpusByContainer, sent) {
 			return
 		}
-		logger.V(2).Info("updating containers without claims after an unprepare", "numContainers", len(updates))
+		logger.V(2).Info("updating containers without claims", "numContainers", len(updates))
 		failed, err := cp.containerUpdater.UpdateContainers(updates)
 		if err != nil {
 			logger.Error(err, "containers without claims keep their CPUs until their next update", "numFailed", len(failed))

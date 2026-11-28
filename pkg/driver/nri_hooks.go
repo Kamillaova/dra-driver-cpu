@@ -152,6 +152,10 @@ func (cp *CPUDriver) Synchronize(ctx context.Context, pods []*api.PodSandbox, co
 		return nil, err
 	}
 	cp.nriDisconnected.Store(false)
+	if cp.resynced != nil {
+		close(cp.resynced)
+		cp.resynced = nil
+	}
 	logger.V(6).Info("synchronization complete", "updatesCount", len(containerUpdates))
 	return containerUpdates, nil
 }
@@ -274,7 +278,12 @@ func (cp *CPUDriver) judgeContainersLocked(ctx context.Context, logger logr.Logg
 	// or restarted and missed updating the cgroup settings.
 	// See: https://github.com/containerd/nri/issues/282
 	sharedContainerUpdates, err := sharedContainerUpdatesFor(logger, allocationState, podState, types.UID(""))
-	if err != nil {
+	switch {
+	case errors.Is(err, errNoDefaultPartitionCPUs):
+		containers := podState.GetContainersWithSharedCPUs()
+		slices.Sort(containers)
+		logger.Error(err, "leaving containers without claims on their current CPUs", "containers", containers)
+	case err != nil:
 		// NRI cannot give a container an empty cpuset; the driver leaves it
 		// running rather than stopping it.
 		logger.Error(err, "leaving containers without claims on their current CPUs until a claim is unprepared", "containers", podState.GetContainersWithSharedCPUs())
@@ -597,13 +606,18 @@ func contendersForUnboundClaims(allocations *store.AllocationState, listed []*sy
 	return result
 }
 
+var errNoDefaultPartitionCPUs = errors.New("cannot update containers without claims: the default partition holds no CPU")
+
 // sharedContainerUpdatesFor computes updates from the supplied stores. Callers
 // using the live driver stores must hold stateMu; Synchronize passes candidate stores.
 func sharedContainerUpdatesFor(logger logr.Logger, allocations *store.AllocationState, pods *store.PodState, excludeID types.UID) ([]*api.ContainerUpdate, error) {
 	updates := []*api.ContainerUpdate{}
-	sharedCPUs := allocations.GetSharedCPUs()
+	sharedCPUs := allocations.GetClaimlessCPUs()
 	preparedCPUs := allocations.GetPreparedCPUs()
 	sharedCPUContainers := pods.GetContainersWithSharedCPUs()
+	if confined, ok := allocations.ConfinedClaimlessCPUs(); ok && confined.IsEmpty() && len(sharedCPUContainers) > 0 {
+		return nil, errNoDefaultPartitionCPUs
+	}
 	// An empty CPUSet is serialized by NRI as Cpus="", which means "do not
 	// change the current CPUSet" rather than "clear the CPUSet". Never emit
 	// that update while a prepared DRA allocation has exhausted the pool and
@@ -663,7 +677,7 @@ func (cp *CPUDriver) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 
 	if claimCount == 0 {
 		// This is a shared container.
-		sharedCPUs := cp.allocationState.GetSharedCPUs()
+		sharedCPUs := cp.allocationState.GetClaimlessCPUs()
 		if sharedCPUs.IsEmpty() && !cp.allocationState.GetPreparedCPUs().IsEmpty() {
 			// NRI cannot represent an empty CPUSet as a ContainerAdjustment. Fail
 			// closed instead of allowing the runtime to keep its default affinity.
