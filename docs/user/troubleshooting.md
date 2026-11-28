@@ -103,13 +103,16 @@ The watchdog makes no API call, so an unreachable API server does not set it off
 A rule on a claim's shape reaches a container only when the driver applies it at the container's
 creation, so a container created before a driver release added the rule, or while the driver was not
 connected, keeps breaking it until it is created again. When the driver starts or reconnects to the
-container runtime, a running container that breaks such a rule keeps the CPUs of its claims where
-the runtime shows it pinned to exactly those CPUs. The driver then posts a `KeptUnderOlderRule`
-Warning event on its pod, which names the container, the rule and the claim, and what to change
-where its detail gives advice, and counts the container in
-`dra_cpu_containers_kept_under_older_rule_total`, whose entry in [metrics](metrics.md) lists the
-rules. Change the pod so it no longer breaks the rule: when the container is created again, the
-driver refuses it.
+container runtime, a running container that uses only some of a claim's requests keeps that claim
+where the runtime shows it pinned to exactly the claim's CPUs, and one whose claims break a rule on
+what may share its cgroup, such as a capped request beside another request, keeps its claims and
+runs without the limits the rule would give it. The driver then posts a `KeptUnderOlderRule` Warning
+event on its pod, which names the container, the rule and the claim, and what to change where its
+detail gives advice, and counts the container in `dra_cpu_containers_kept_under_older_rule_total`,
+whose entry in [metrics](metrics.md) lists the rules. What a container created while the driver was
+not connected, or slower than NRI's timeout to answer, runs on and under which limits is undefined.
+Change the pod so it no longer breaks the rule: when the container is created again, the driver
+refuses it.
 
 ## A Profile Label Without Profiles
 
@@ -127,6 +130,35 @@ labels name. To move a fleet to profiles, change the configuration first, declar
 each kind of node, then label each node and restart its driver: the driver reads the configuration
 and the label only when it starts, and once profiles are declared it refuses a node without the
 label.
+
+## A Capped Shared Request
+
+A shared request with an amount above `0` is capped at that amount, and must take one device and be
+alone in its container's cgroup, see
+[Capped Shared Requests](workload-requirements.md#capped-shared-requests). Prepare refuses a claim
+that breaks this, and the pod's `FailedPrepareDynamicResources` event carries one of:
+
+```text
+request "vmm-cpu" has limit of 250m with `count: 2`; a limit can be applied to only one device: ask for one device
+request "vmm-cpu" has limit of 250m, so it cannot be used together with request "vcpu"
+```
+
+A container whose claims together put a capped request beside another request shows
+`CreateContainerError` with:
+
+```text
+container "app": request "cpus" of claim "app-a-x7k2p" has limit of 250m, so it cannot be used together with request "cpus" of claim "app-b-q9m4t": use the claims in separate containers
+```
+
+A container the driver finds running when it starts or reconnects to the container runtime, holding
+a capped request beside another request, keeps running without the cap, and gets a
+`KeptUnderOlderRule` Warning with the rule `limit_with_others`, see
+[A Container Kept Under an Older Rule](#a-container-kept-under-an-older-rule). A running container
+whose cap is missing, where the container has no CPU limit, gets it then.
+
+To see the cap a container runs under, read `cpu.max` in its cgroup: `25000 100000` for `250m`, and
+`max 100000` for none. A container that shows another quota has a CPU limit, set in its pod or by a
+`LimitRange` or another admission controller, which replaces the cap.
 
 ## CPUs Held by Another Claim
 

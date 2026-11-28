@@ -174,6 +174,49 @@ The CPUs of each request, its CPU request and its CPU limit are in the request's
 
 **Shared requests:** keep a shared request, such as one on the `dra.cpu` class of a node with `cpuPartitions`, out of a claim's `matchAttribute` constraints. A constraint ties every request it names to devices with the same value, so it would tie the claim's exclusive requests, a VM's cores for example, to the NUMA node of the shared device.
 
+### Capped Shared Requests
+
+A shared request with an amount above `0` is capped at that amount: the driver writes the
+container's CPU quota (`cpu.max`) as that share of each 100 ms period, `250m` as 25 ms, and an
+amount below `10m` as 1 ms, the kernel's minimum. A shared request without an amount, or with an
+amount of `0`, is not capped. The cap needs a kernel built with `CONFIG_CFS_BANDWIDTH`, see
+[Installation](installation.md).
+
+A container capped this way shows the cap in its status as a CPU limit, `limits.cpu` in
+`status.containerStatuses[].resources`, though its spec sets none.
+
+A cgroup has one CPU quota, so a capped request takes one device and is alone in its container's
+cgroup:
+
+- Prepare refuses a capped request with `count` above 1 or with `allocationMode: All`, and a claim
+  that holds a capped request beside any other request of this driver: the container that uses the
+  claim holds every request of it in its one cgroup, where an uncapped share would run under the cap
+  and exclusive CPUs would be throttled. The pod stays `ContainerCreating` with a
+  `FailedPrepareDynamicResources` event.
+- The driver refuses a container whose claims together put a capped request beside any other
+  request, and the container shows `CreateContainerError`. Give each capped request a container of
+  its own.
+
+The driver writes the cap only where the container arrives without a CPU quota from the kubelet. A
+CPU limit on the container, or a pod-level CPU limit it inherits, makes the kubelet set a quota of its
+own, which then caps the container instead of the claim, and with KEP-5517 on the kubelet adds the
+claim's mapped amount to that limit. A CPU limit can be set without anyone writing it in the pod: a
+namespace `LimitRange` with a `default` limit, a VerticalPodAutoscaler, or a mutating admission
+webhook can put one on every container. A CPU limit an in-place resize adds later replaces the cap
+the same way. A kubelet with `cpuCFSQuota: false` sends no quota even for a CPU limit, so there the
+driver's cap stays.
+
+Limitation: one limit per cgroup. A request with a limit on the shared default CPUs must be alone in
+its container: any other request beside it in the same container is refused. When you hit this: a
+workload needs more of the shared default CPUs than one device offers, for example with
+`groupBy: uncorecache` and 8 shared CPUs per cache a request for 8500m fits no single cache. The
+amount has to be split into two requests, one per cache, and those two parts cannot be limited
+together. Why the limits are not simply added together: a limit is one CPU-time budget for the whole
+cgroup; with two parts in one budget, either part could spend all of it, on any of the caches, so a
+request that was meant to stay small could use the large part's share, on CPUs it was never meant to
+load. Status: open for discussion upstream; DRA has no way to request one amount across several
+devices.
+
 ## Claims Shared Between Pods
 
 A `dra.cpu` claim serves one container: once a container uses it, the driver refuses every other

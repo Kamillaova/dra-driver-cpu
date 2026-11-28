@@ -252,6 +252,7 @@ func TestAllocationStateRequestsSurviveBindAndUnbind(t *testing.T) {
 	requests := []RequestAllocation{
 		{Request: "vcpus", CPUs: cpuset.New(0, 1)},
 		{Request: "helpers", CPUs: cpuset.New(2)},
+		{Request: "housekeeping", CPUs: cpuset.New(3), Role: RoleShared, Devices: []string{"cpudevnuma000"}, Cap: 250},
 	}
 	require.NoError(t, store.Reserve(logger, "vm", ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: requests}, false))
 	byRequest := map[ClaimRequestRef]cpuset.CPUSet{
@@ -263,7 +264,7 @@ func TestAllocationStateRequestsSurviveBindAndUnbind(t *testing.T) {
 		require.True(t, ok)
 		return record
 	}
-	want := ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []RequestAllocation{requests[1], requests[0]}}
+	want := ClaimRecord{Namespace: "ns", Name: "vm-claim", Requests: []RequestAllocation{requests[1], requests[2], requests[0]}}
 	require.Equal(t, want, recorded(store), "the record reads back sorted by request")
 
 	_, err := store.Bind(logger, "pod", "app", nil, byRequest)
